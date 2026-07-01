@@ -222,56 +222,66 @@ void conv_step(float* ring, const float* qkv, const float* convw, float* out, in
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Gated delta rule, one token, one block per v-head, thread = v-index j.
-//   S = S*exp(g); pred_j = sum_i k_i S_ij; d_j = beta*(v_j - pred_j);
-//   S_ij += k_i d_j; o_j = sum_i q_i S_ij      (q pre-scaled by 1/sqrt(128))
+// Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
+// The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
+// consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
 __global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,
                              float* __restrict__ o) {
     constexpr int SK = 128;
-    const int h = blockIdx.x;        // v-head 0..47
-    const int j = threadIdx.x;       // v-index 0..127
+    const int h = blockIdx.x;
+    const int j = threadIdx.x & (SK - 1);   // 0..127
+    const int it = threadIdx.x >> 7;        // 0..3
+    const int i0 = it * 32;
 #if Q27_GDN_HEAD_TILE
     const int qk = h % 16;
 #else
     const int qk = h / 3;
 #endif
-    __shared__ float sq[SK], sk[SK];
+    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
     const float scale = rsqrtf((float)SK);
-    if (j < SK) {
-        sq[j] = conv[qk * SK + j] * scale;         // q block at offset 0
-        sk[j] = conv[2048 + qk * SK + j];          // k block at offset 16*128
+    if (it == 0) {
+        sq[j] = conv[qk * SK + j] * scale;
+        sk[j] = conv[2048 + qk * SK + j];
     }
     __syncthreads();
 
     const float decay = expf(g[h]);
-    const float b = beta[h];
-    const float vj = conv[4096 + h * SK + j];      // v block at offset 2*16*128
-    // S stored as S[i*SK + j]: per i-iteration, consecutive threads j access
-    // consecutive addresses -> fully coalesced (engine-internal layout).
     float* Sh = S + (size_t)h * SK * SK;
 
     float pred = 0.f;
-#pragma unroll 4
-    for (int i = 0; i < SK; i++) {
+#pragma unroll 8
+    for (int i = i0; i < i0 + 32; i++) {
         float s = Sh[i * SK + j] * decay;
         Sh[i * SK + j] = s;
         pred += sk[i] * s;
     }
-    float d = b * (vj - pred);
+    part[it][j] = pred;
+    __syncthreads();
+    if (it == 0) {
+        float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        float vj = conv[4096 + h * SK + j];
+        dj[j] = beta[h] * (vj - p);
+    }
+    __syncthreads();
+
+    float d = dj[j];
     float acc = 0.f;
-#pragma unroll 4
-    for (int i = 0; i < SK; i++) {
+#pragma unroll 8
+    for (int i = i0; i < i0 + 32; i++) {
         float s = Sh[i * SK + j] + sk[i] * d;
         Sh[i * SK + j] = s;
         acc += sq[i] * s;
     }
-    o[h * SK + j] = acc;
+    part[it][j] = acc;
+    __syncthreads();
+    if (it == 0)
+        o[h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
 }
 
 void delta_step(float* S, const float* conv_out, const float* g, const float* beta, float* o,
                 cudaStream_t st) {
-    k_delta_step<<<48, 128, 0, st>>>(S, conv_out, g, beta, o);
+    k_delta_step<<<48, 512, 0, st>>>(S, conv_out, g, beta, o);
     CUDA_CHECK(cudaGetLastError());
 }
 
