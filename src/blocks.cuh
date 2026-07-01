@@ -51,15 +51,17 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
                const float* ssm_dt, float* g, float* beta_out, int n_heads,
                cudaStream_t st = 0);
 
-// One decode conv step over all channels; ring [3][channels] rotates in place.
-// convw: [channels][4] f32 (taps contiguous). out = silu(conv). qkv = current column.
-void conv_step(float* ring, const float* qkv, const float* convw, float* out, int channels,
-               cudaStream_t st = 0);
+// One decode conv step over all channels. Reads ring_src, writes rotated ring to
+// ring_dst (== ring_src for in-place / committed tokens; spare buffer for
+// speculative tokens -> accept = pointer swap, reject = free rollback).
+void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const float* convw,
+               float* out, int channels, cudaStream_t st = 0);
 
 // Gated delta rule, one token. conv_out layout [q 16x128 | k 16x128 | v 48x128]
-// (L2 norm already applied to q,k in place). S: [48][128*128] (i fast). o: [48*128].
-void delta_step(float* S, const float* conv_out, const float* g, const float* beta, float* o,
-                cudaStream_t st = 0);
+// (L2 norm already applied to q,k in place). Reads S_src, writes S_dst (same
+// pointer for committed tokens, spare for speculative).
+void delta_step(const float* S_src, float* S_dst, const float* conv_out, const float* g,
+                const float* beta, float* o, cudaStream_t st = 0);
 
 // out[h*128+d] = rms_norm(o_h)[d] * w[d] * silu(z[h*128+d])   (DeltaNet gated norm)
 void gated_norm_gdn(const float* o, const float* w, const float* z, float* out, int n_heads,

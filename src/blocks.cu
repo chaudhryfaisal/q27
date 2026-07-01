@@ -199,33 +199,36 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_conv_step(float* __restrict__ ring, const float* __restrict__ qkv,
-                            const float* __restrict__ w, float* __restrict__ out, int channels) {
+__global__ void k_conv_step(const float* __restrict__ rin, float* __restrict__ rout,
+                            const float* __restrict__ qkv, const float* __restrict__ w,
+                            float* __restrict__ out, int channels) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* wc = w + (size_t)c * 4; // [channels][4], taps contiguous
-    float r0 = ring[c], r1 = ring[channels + c], r2 = ring[2 * channels + c], x = qkv[c];
+    float r0 = rin[c], r1 = rin[channels + c], r2 = rin[2 * channels + c], x = qkv[c];
 #if Q27_CONV_OLDEST_FIRST
     float acc = r0 * wc[0] + r1 * wc[1] + r2 * wc[2] + x * wc[3];
 #else
     float acc = r0 * wc[3] + r1 * wc[2] + r2 * wc[1] + x * wc[0];
 #endif
     out[c] = acc / (1.0f + expf(-acc)); // silu
-    ring[c] = r1;
-    ring[channels + c] = r2;
-    ring[2 * channels + c] = x;
+    rout[c] = r1;
+    rout[channels + c] = r2;
+    rout[2 * channels + c] = x;
 }
 
-void conv_step(float* ring, const float* qkv, const float* convw, float* out, int channels,
-               cudaStream_t st) {
-    k_conv_step<<<(channels + 255) / 256, 256, 0, st>>>(ring, qkv, convw, out, channels);
+void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const float* convw,
+               float* out, int channels, cudaStream_t st) {
+    k_conv_step<<<(channels + 255) / 256, 256, 0, st>>>(ring_src, ring_dst, qkv, convw, out,
+                                                        channels);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
-__global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ conv,
+__global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
+                             const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,
                              float* __restrict__ o) {
     constexpr int SK = 128;
@@ -247,13 +250,14 @@ __global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ co
     __syncthreads();
 
     const float decay = expf(g[h]);
-    float* Sh = S + (size_t)h * SK * SK;
+    const float* Si = Ssrc + (size_t)h * SK * SK;
+    float* So = Sdst + (size_t)h * SK * SK;
 
     float pred = 0.f;
 #pragma unroll 8
     for (int i = i0; i < i0 + 32; i++) {
-        float s = Sh[i * SK + j] * decay;
-        Sh[i * SK + j] = s;
+        float s = Si[i * SK + j] * decay;
+        So[i * SK + j] = s;
         pred += sk[i] * s;
     }
     part[it][j] = pred;
@@ -269,8 +273,8 @@ __global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ co
     float acc = 0.f;
 #pragma unroll 8
     for (int i = i0; i < i0 + 32; i++) {
-        float s = Sh[i * SK + j] + sk[i] * d;
-        Sh[i * SK + j] = s;
+        float s = So[i * SK + j] + sk[i] * d;
+        So[i * SK + j] = s;
         acc += sq[i] * s;
     }
     part[it][j] = acc;
@@ -279,9 +283,9 @@ __global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ co
         o[h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
 }
 
-void delta_step(float* S, const float* conv_out, const float* g, const float* beta, float* o,
-                cudaStream_t st) {
-    k_delta_step<<<48, 512, 0, st>>>(S, conv_out, g, beta, o);
+void delta_step(const float* S_src, float* S_dst, const float* conv_out, const float* g,
+                const float* beta, float* o, cudaStream_t st) {
+    k_delta_step<<<48, 512, 0, st>>>(S_src, S_dst, conv_out, g, beta, o);
     CUDA_CHECK(cudaGetLastError());
 }
 
