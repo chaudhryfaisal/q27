@@ -5,12 +5,11 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-// [VERIFY-1] DeltaNet 16->48 head expansion: 1 = tile/modulo (h%16), 0 = interleave (h/3)
+// VERIFY-1/3/4/5 all resolved against ggml source (workflow wf_b19a6dde, high confidence):
+// head expansion = tile/modulo (converter pre-permutes V heads to tiled order),
+// imrope == neox for text, conv oldest-first, l2norm eps floors the norm.
 #define Q27_GDN_HEAD_TILE 1
-// [VERIFY-4] conv window orientation: 1 = tap j multiplies oldest+j (oldest first)
 #define Q27_CONV_OLDEST_FIRST 1
-// [VERIFY-5] l2norm eps: 1 = rsqrt(sum+eps), 0 = rsqrt(max(sum,eps))
-#define Q27_L2NORM_EPS_ADD 1
 
 namespace q27k {
 

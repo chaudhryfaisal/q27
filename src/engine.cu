@@ -36,6 +36,7 @@ struct Engine {
     float *qkv, *convout, *z, *alpha, *betar, *g, *beta, *o, *og;
     float *ffn_g, *ffn_u, *logits;
     int* d_argmax;
+    q27k::XQuant xq;
     // state
     float* conv_ring[N_LAYER];  // [3][10240] per ssm layer
     float* S[N_LAYER];          // [48][128*128] per ssm layer
@@ -67,6 +68,7 @@ struct Engine {
         A((void**)&o, GDN_V * 4); A((void**)&og, GDN_V * 4);
         A((void**)&ffn_g, N_FFN * 4); A((void**)&ffn_u, N_FFN * 4);
         A((void**)&logits, VOCAB * 4); A((void**)&d_argmax, 4);
+        xq = q27k::xquant_alloc(N_FFN);
 
         int cache_slot = 0;
         for (int il = 0; il < N_LAYER; il++) {
@@ -96,14 +98,18 @@ struct Engine {
         return dm.get(buf);
     }
 
-    // y = W x, dispatch on dtype
+    // quantize activation vector for subsequent Q4/Q8 mm() calls
+    void qx(const float* x, int cols) { q27k::quantize_x(x, cols, xq); }
+
+    // y = W x, dispatch on dtype. Q4/Q8 read the activations quantized by the
+    // most recent qx() call — caller discipline, checked by cols match only.
     void mm(const DevTensor& w, const float* x, float* out) {
         switch (w.dtype) {
             case DType::Q4_G64:
-                q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, x, out, w.rows, w.cols);
+                q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows, w.cols);
                 break;
             case DType::Q8_G128:
-                q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, x, out, w.rows, w.cols);
+                q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, xq, out, w.rows, w.cols);
                 break;
             case DType::F16:
                 q27k::gemv_f16((const __half*)w.data, x, out, w.rows, w.cols);
@@ -115,6 +121,7 @@ struct Engine {
     }
 
     void gdn_block(int il, const float* xin, float* yout) {
+        qx(xin, N_EMBD);
         mm(T(il, "attn_qkv.weight"), xin, qkv);
         mm(T(il, "attn_gate.weight"), xin, z);
         mm(T(il, "ssm_alpha.weight"), xin, alpha);
@@ -128,11 +135,13 @@ struct Engine {
         q27k::delta_step(S[il], convout, g, beta, o);
         q27k::gated_norm_gdn(o, (const float*)T(il, "ssm_norm.weight").data, z, og, GDN_HEADS,
                              GDN_DIM, EPS);
+        qx(og, GDN_V);
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
     void attn_block(int il, const float* xin, float* yout, int pos) {
         int ci = attn_cache_idx[il];
+        qx(xin, N_EMBD);
         mm(T(il, "attn_q.weight"), xin, qg);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
                             HEAD_DIM, 2 * HEAD_DIM, EPS);
@@ -148,13 +157,16 @@ struct Engine {
         q27k::attn_decode(qg, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout, scratch, pos + 1,
                           N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM));
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM);
+        qx(attnout, N_HEAD * HEAD_DIM);
         mm(T(il, "attn_output.weight"), attnout, yout);
     }
 
     void ffn(int il, const float* xin, float* yout) {
+        qx(xin, N_EMBD);
         mm(T(il, "ffn_gate.weight"), xin, ffn_g);
         mm(T(il, "ffn_up.weight"), xin, ffn_u);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN);
+        qx(ffn_g, N_FFN);
         mm(T(il, "ffn_down.weight"), ffn_g, yout);
     }
 
@@ -172,6 +184,7 @@ struct Engine {
             q27k::add_inplace(h, y, N_EMBD);
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS);
+        qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_argmax);
         int next;
@@ -214,11 +227,19 @@ int main(int argc, char** argv) {
 
     printf("generated:");
     int pos = (int)toks.size();
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+    CUDA_CHECK(cudaEventRecord(t0));
     for (int i = 0; i < n_gen; i++) {
         printf(" %d", next);
         fflush(stdout);
         next = e.forward(next, pos++);
     }
-    printf("\n");
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    printf("\ndecode: %d tokens in %.1f ms = %.2f t/s\n", n_gen, ms, n_gen * 1000.0f / ms);
     return 0;
 }

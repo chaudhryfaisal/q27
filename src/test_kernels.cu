@@ -80,13 +80,15 @@ static void test_gemv(q27::DeviceModel& dm, const q27::Model& m, const char* nam
     CUDA_CHECK(cudaMalloc(&d_x, cols * 4));
     CUDA_CHECK(cudaMalloc(&d_y, rows * 4));
     CUDA_CHECK(cudaMemcpy(d_x, x.data(), cols * 4, cudaMemcpyHostToDevice));
+    q27k::XQuant xq = q27k::xquant_alloc(cols);
+    q27k::quantize_x(d_x, cols, xq);
 
     switch (t.dtype) {
         case DType::Q4_G64:
-            q27k::gemv_q4((const uint8_t*)d.data, (const __half*)d.scales, d_x, d_y, rows, cols);
+            q27k::gemv_q4((const uint8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
             break;
         case DType::Q8_G128:
-            q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, d_x, d_y, rows, cols);
+            q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
             break;
         case DType::F16:
             q27k::gemv_f16((const __half*)d.data, d_x, d_y, rows, cols);
@@ -100,16 +102,20 @@ static void test_gemv(q27::DeviceModel& dm, const q27::Model& m, const char* nam
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_y));
 
-    double max_rel = 0;
+    // normalize worst abs error by RMS of the reference dots: per-row relative
+    // error is meaningless when a row's true dot is near zero (int8-x noise
+    // dominates the tiny denominator).
+    double max_abs = 0, ss = 0;
     for (int64_t r = 0; r < check_rows; r++) {
         double ref = 0;
         for (int64_t c = 0; c < cols; c++) ref += (double)cpu_deq(t, r, c) * x[c];
-        double rel = std::fabs(got[r] - ref) / (std::fabs(ref) + 1e-3);
-        max_rel = std::max(max_rel, rel);
+        ss += ref * ref;
+        max_abs = std::max(max_abs, std::fabs(got[r] - ref));
     }
+    double max_rel = max_abs / (std::sqrt(ss / check_rows) + 1e-9);
     char label[128];
     snprintf(label, sizeof label, "gemv %s (%s)", name, q27::dtype_name(t.dtype));
-    check(label, max_rel, 1e-3);
+    check(label, max_rel, 2e-2); // includes int8 activation-quant error
 }
 
 static void test_rmsnorm(const q27::Model& m) {

@@ -41,11 +41,8 @@ __global__ void k_l2norm_heads(float* __restrict__ x, int head_dim, float eps) {
         if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
         __syncthreads();
     }
-#if Q27_L2NORM_EPS_ADD
-    float inv = rsqrtf(sh[0] + eps);
-#else
-    float inv = rsqrtf(fmaxf(sh[0], eps));
-#endif
+    // ggml semantics: y = x / max(sqrt(sum), eps)  == x * rsqrt(max(sum, eps^2))
+    float inv = rsqrtf(fmaxf(sh[0], eps * eps));
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) xh[i] *= inv;
 }
 

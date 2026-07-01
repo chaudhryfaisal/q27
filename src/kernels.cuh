@@ -11,10 +11,23 @@ void dequant_q4(const uint8_t* W, const __half* S, float* out, int64_t rows, int
 void dequant_q8(const int8_t* W, const __half* S, float* out, int64_t rows, int64_t cols,
                 cudaStream_t st = 0);
 
+// Quantized activation vector (mmvq-style): per 32-element block, int8 values with
+// f32 scale and integer block sum. Two byte orders are kept: natural (for Q8 weights)
+// and even/odd split per 8 (matching Q4 nibble unpack for dp4a).
+struct XQuant {
+    int8_t* nat = nullptr;   // [cols]
+    uint2* eo = nullptr;     // [cols/8]: .x = bytes {x0,x2,x4,x6}, .y = {x1,x3,x5,x7}
+    float* scale = nullptr;  // [cols/32]
+    int* isum = nullptr;     // [cols/32] sum of quantized values per block
+};
+XQuant xquant_alloc(int64_t max_cols);
+void quantize_x(const float* x, int64_t cols, const XQuant& xq, cudaStream_t st = 0);
+
 // y[r] = sum_c W[r,c] * x[c].  W quantized row-major, reduction along contiguous axis.
-void gemv_q4(const uint8_t* W, const __half* S, const float* x, float* y, int64_t rows,
+// Q4/Q8 use dp4a against the pre-quantized activation vector.
+void gemv_q4(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
              int64_t cols, cudaStream_t st = 0);
-void gemv_q8(const int8_t* W, const __half* S, const float* x, float* y, int64_t rows,
+void gemv_q8(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
              int64_t cols, cudaStream_t st = 0);
 void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t cols,
               cudaStream_t st = 0);
