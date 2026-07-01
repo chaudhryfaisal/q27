@@ -218,20 +218,23 @@ __global__ void k_delta_step(float* __restrict__ S, const float* __restrict__ co
     const float decay = expf(g[h]);
     const float b = beta[h];
     const float vj = conv[4096 + h * SK + j];      // v block at offset 2*16*128
-    float* Sh = S + (size_t)h * SK * SK;           // S[i,j] at Sh[j*SK + i]
+    // S stored as S[i*SK + j]: per i-iteration, consecutive threads j access
+    // consecutive addresses -> fully coalesced (engine-internal layout).
+    float* Sh = S + (size_t)h * SK * SK;
 
     float pred = 0.f;
-    float* col = Sh + (size_t)j * SK;
+#pragma unroll 4
     for (int i = 0; i < SK; i++) {
-        float s = col[i] * decay;
-        col[i] = s;
+        float s = Sh[i * SK + j] * decay;
+        Sh[i * SK + j] = s;
         pred += sk[i] * s;
     }
     float d = b * (vj - pred);
     float acc = 0.f;
+#pragma unroll 4
     for (int i = 0; i < SK; i++) {
-        float s = col[i] + sk[i] * d;
-        col[i] = s;
+        float s = Sh[i * SK + j] + sk[i] * d;
+        Sh[i * SK + j] = s;
         acc += sq[i] * s;
     }
     o[h * SK + j] = acc;

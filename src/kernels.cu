@@ -211,15 +211,18 @@ void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t c
 
 __global__ void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
                           float* __restrict__ y, int n, float eps) {
-    __shared__ float sh[256];
+    __shared__ float sh[32];
     float acc = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
-    sh[threadIdx.x] = acc;
+    acc = warp_reduce(acc);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = acc;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+        v = warp_reduce(v);
+        if (threadIdx.x == 0) sh[0] = v;
     }
+    __syncthreads();
     float inv = rsqrtf(sh[0] / n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
 }
@@ -242,7 +245,7 @@ __global__ void k_embed_row_q8(const int8_t* __restrict__ W, const __half* __res
 }
 
 void rmsnorm(const float* x, const float* w, float* y, int n, float eps, cudaStream_t st) {
-    k_rmsnorm<<<1, 256, 0, st>>>(x, w, y, n, eps);
+    k_rmsnorm<<<1, 1024, 0, st>>>(x, w, y, n, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 void silu_mul(const float* g, const float* u, float* o, int n, cudaStream_t st) {
