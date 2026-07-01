@@ -42,6 +42,10 @@ struct Engine {
     // device decode state
     int *d_pos, *d_token, *d_step, *d_gen;
     unsigned long long* d_amax;
+    // MTP draft head state (stage 1: host-driven acceptance measurement)
+    float *h_next, *e_hn, *x_mtp, *mtp_logits;
+    float *mtp_k, *mtp_v;
+    int *d_pos_m, *d_draft;
     q27k::XQuant xq;
     // layer state
     float* conv_ring[N_LAYER];
@@ -78,6 +82,13 @@ struct Engine {
         A((void**)&d_pos, 4); A((void**)&d_token, 4); A((void**)&d_step, 4);
         A((void**)&d_gen, MAX_GEN_TRACK * 4);
         A((void**)&d_amax, 8);
+        A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
+        A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
+        A((void**)&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
+        A((void**)&mtp_v, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
+        A((void**)&d_pos_m, 4); A((void**)&d_draft, 4);
+        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
@@ -150,8 +161,14 @@ struct Engine {
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
-    void attn_block(int il, const float* xin, float* yout) {
-        int ci = attn_cache_idx[il];
+    void attn_block(int il, const float* xin, float* yout, float* kc = nullptr,
+                    float* vc = nullptr, const int* pos_src = nullptr) {
+        if (!kc) {
+            int ci = attn_cache_idx[il];
+            kc = kcache[ci];
+            vc = vcache[ci];
+        }
+        if (!pos_src) pos_src = d_pos;
         qx(xin, N_EMBD);
         mm(T(il, "attn_q.weight"), xin, qg);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
@@ -160,10 +177,10 @@ struct Engine {
         q27k::rmsnorm_heads(kbuf, (const float*)T(il, "attn_k_norm.weight").data, kbuf, N_KV,
                             HEAD_DIM, HEAD_DIM, EPS, stm);
         mm(T(il, "attn_v.weight"), xin, vbuf);
-        q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos, FREQ_BASE, stm);
-        q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos, FREQ_BASE, stm);
-        q27k::kv_store(kbuf, vbuf, kcache[ci], vcache[ci], d_pos, N_KV * HEAD_DIM, stm);
-        q27k::attn_decode(qg, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout, scratch, d_pos,
+        q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos_src, FREQ_BASE, stm);
+        q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos_src, FREQ_BASE, stm);
+        q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, stm);
+        q27k::attn_decode(qg, 2 * HEAD_DIM, kc, vc, attnout, scratch, pos_src,
                           max_ctx, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm);
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, stm);
         qx(attnout, N_HEAD * HEAD_DIM);
@@ -199,6 +216,34 @@ struct Engine {
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_token, d_amax, stm); // d_token becomes NEXT token
         q27k::advance(d_pos, d_step, d_gen, d_token, stm); // record + pos++
+    }
+
+    // MTP draft head (blk.64, SPEC.md): draft the token AFTER d_token, given
+    // h_next = post-output_norm hidden of the current position (*d_pos_m).
+    void mtp_forward() {
+        const int il = 64;
+        const DevTensor& emb = dm.get("token_embd.weight");
+        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD,
+                           e_hn, stm);
+        q27k::rmsnorm(e_hn, (const float*)T(il, "nextn.enorm.weight").data, e_hn, N_EMBD, EPS,
+                      stm);
+        q27k::rmsnorm(h_next, (const float*)T(il, "nextn.hnorm.weight").data, e_hn + N_EMBD,
+                      N_EMBD, EPS, stm);
+        qx(e_hn, 2 * N_EMBD);
+        mm(T(il, "nextn.eh_proj.weight"), e_hn, x_mtp);
+
+        q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
+        attn_block(il, x1, y, mtp_k, mtp_v, d_pos_m);
+        q27k::add_inplace(x_mtp, y, N_EMBD, stm);
+        q27k::rmsnorm(x_mtp, (const float*)T(il, "post_attention_norm.weight").data, x1, N_EMBD,
+                      EPS, stm);
+        ffn(il, x1, y);
+        q27k::add_inplace(x_mtp, y, N_EMBD, stm);
+        q27k::rmsnorm(x_mtp, (const float*)T(il, "nextn.shared_head_norm.weight").data, x1,
+                      N_EMBD, EPS, stm);
+        qx(x1, N_EMBD);
+        mm(dm.get("output.weight"), x1, mtp_logits);
+        q27k::argmax(mtp_logits, VOCAB, d_draft, d_amax, stm);
     }
 
     void build_graph() {
@@ -254,13 +299,31 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
     }
+    bool mtp_stats = false;
+    for (int i = 2; i < argc; i++)
+        if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
     if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
     Engine e(path, ctx);
     e.build_graph();
 
-    // prompt
-    for (int t : toks) e.step_with(t);
+    // prompt (with MTP KV warmup when measuring acceptance: pair h(i) with the
+    // ACTUAL next prompt token at position i+1, mirroring llama.cpp prefill)
+    for (size_t i = 0; i < toks.size(); i++) {
+        e.step_with(toks[i]);
+        if (mtp_stats && i + 1 < toks.size()) {
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                       e.stm));
+            int next_tok = toks[i + 1], mpos = (int)i + 1;
+            CUDA_CHECK(cudaMemcpyAsync(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice, e.stm));
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mpos, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward();
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            // restore d_token for the next main step (it was clobbered)
+            // (step_with overwrites d_token anyway; nothing to restore)
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(e.stm));
 
     if (!dump.empty()) {
@@ -276,8 +339,31 @@ int main(int argc, char** argv) {
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
+    int accepted = 0, drafted = 0;
     CUDA_CHECK(cudaEventRecord(t0, e.stm));
-    for (int i = 0; i < n_gen; i++) e.step_free();
+    if (mtp_stats) {
+        // At loop entry: d_token = main's prediction for the next position,
+        // x1 = h of the last processed position (= toks.size()-1 + i).
+        int hpos = (int)toks.size() - 1;
+        for (int i = 0; i < n_gen; i++) {
+            CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                       e.stm));
+            int mpos = hpos + 1; // position of the token being embedded (= d_token)
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mpos, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward(); // drafts the token AFTER d_token
+            int draft, main_next;
+            CUDA_CHECK(cudaMemcpyAsync(&draft, e.d_draft, 4, cudaMemcpyDeviceToHost, e.stm));
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            e.step_free(); // main processes d_token -> new d_token = ground truth
+            CUDA_CHECK(cudaMemcpyAsync(&main_next, e.d_token, 4, cudaMemcpyDeviceToHost, e.stm));
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            drafted++;
+            if (draft == main_next) accepted++;
+            hpos++;
+        }
+    } else {
+        for (int i = 0; i < n_gen; i++) e.step_free();
+    }
     CUDA_CHECK(cudaEventRecord(t1, e.stm));
     CUDA_CHECK(cudaStreamSynchronize(e.stm));
     float ms = 0;
@@ -289,5 +375,8 @@ int main(int argc, char** argv) {
     printf("generated:");
     for (size_t i = toks.size() - 1; i < toks.size() - 1 + n_gen; i++) printf(" %d", gen[i]);
     printf("\ndecode: %d tokens in %.1f ms = %.2f t/s\n", n_gen, ms, n_gen * 1000.0f / ms);
+    if (drafted)
+        printf("mtp acceptance: %d/%d = %.1f%%\n", accepted, drafted,
+               100.0 * accepted / drafted);
     return 0;
 }
