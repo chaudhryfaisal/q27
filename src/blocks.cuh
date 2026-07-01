@@ -23,14 +23,24 @@ void l2norm_heads(float* x, int n_heads, int head_dim, float eps, cudaStream_t s
 
 // Neox-style partial rope over first n_rot dims of each head (pairs d, d+n_rot/2),
 // theta_d = pos * freq_base^(-2d/n_rot). In place; stride between heads.
-void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int stride, int pos,
-                       float freq_base, cudaStream_t st = 0);
+// pos read from device (*d_pos) so the launch is CUDA-graph-stable.
+void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int stride,
+                       const int* d_pos, float freq_base, cudaStream_t st = 0);
 
-// Causal decode attention for one new token. Q strided (interleaved qg), caches
-// contiguous [pos][n_kv][head_dim] f32. scratch: [n_q_heads * (seq_len)] floats.
+// Causal decode attention for one new token; seq_len = *d_pos + 1 read on device.
+// Q strided (interleaved qg), caches contiguous [pos][n_kv][head_dim] f32.
+// scratch: [n_q_heads * max_ctx] floats.
 void attn_decode(const float* q, int q_stride, const float* kcache, const float* vcache,
-                 float* out, float* scratch, int seq_len, int n_q_heads, int n_kv_heads,
-                 int head_dim, float scale, cudaStream_t st = 0);
+                 float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
+                 int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0);
+
+// Store this token's K/V rows into the caches at position *d_pos.
+void kv_store(const float* kbuf, const float* vbuf, float* kcache, float* vcache,
+              const int* d_pos, int rowlen, cudaStream_t st = 0);
+
+// End-of-token bookkeeping (device-chained decode): d_gen[*d_step] = *d_token;
+// (*d_step)++; (*d_pos)++.
+void advance(int* d_pos, int* d_step, int* d_gen, const int* d_token, cudaStream_t st = 0);
 
 // out[h*head_dim+d] *= sigmoid(qg[h*(2*head_dim) + head_dim + d])
 void sigmoid_gate_mul(float* out, const float* qg, int n_heads, int head_dim,
@@ -59,6 +69,8 @@ void gated_norm_gdn(const float* o, const float* w, const float* z, float* out, 
 void add_inplace(float* x, const float* y, int n, cudaStream_t st = 0);
 
 // index of max element (greedy sampling). d_out: single int on device.
-void argmax(const float* x, int n, int* d_out, cudaStream_t st = 0);
+// d_scratch: one u64 on device (caller-allocated; no allocation during graph capture).
+void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
+            cudaStream_t st = 0);
 
 } // namespace q27k

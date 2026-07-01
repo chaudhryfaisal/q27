@@ -236,7 +236,9 @@ __global__ void k_silu_mul(const float* __restrict__ g, const float* __restrict_
 }
 
 __global__ void k_embed_row_q8(const int8_t* __restrict__ W, const __half* __restrict__ S,
-                               int64_t row, int64_t cols, float* __restrict__ out) {
+                               const int* __restrict__ d_token, int64_t cols,
+                               float* __restrict__ out) {
+    int64_t row = *d_token;
     const int8_t* wr = W + row * cols;
     const __half* sr = S + row * (cols / 128);
     for (int64_t c = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; c < cols;
@@ -252,9 +254,9 @@ void silu_mul(const float* g, const float* u, float* o, int n, cudaStream_t st) 
     k_silu_mul<<<(n + 255) / 256, 256, 0, st>>>(g, u, o, n);
     CUDA_CHECK(cudaGetLastError());
 }
-void embed_row_q8(const int8_t* W, const __half* S, int64_t row, int64_t cols, float* out,
+void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
                   cudaStream_t st) {
-    k_embed_row_q8<<<8, 256, 0, st>>>(W, S, row, cols, out);
+    k_embed_row_q8<<<8, 256, 0, st>>>(W, S, d_token, cols, out);
     CUDA_CHECK(cudaGetLastError());
 }
 

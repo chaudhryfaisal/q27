@@ -169,8 +169,12 @@ static void test_embed(q27::DeviceModel& dm, const q27::Model& m) {
     const q27::DevTensor& d = dm.upload("token_embd.weight");
     int64_t row = 1234, cols = t.cols();
     float* d_out;
+    int* d_tok;
+    int row_i = (int)row;
     CUDA_CHECK(cudaMalloc(&d_out, cols * 4));
-    q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, row, cols, d_out);
+    CUDA_CHECK(cudaMalloc(&d_tok, 4));
+    CUDA_CHECK(cudaMemcpy(d_tok, &row_i, 4, cudaMemcpyHostToDevice));
+    q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
     std::vector<float> got(cols);
     CUDA_CHECK(cudaMemcpy(got.data(), d_out, cols * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(d_out));

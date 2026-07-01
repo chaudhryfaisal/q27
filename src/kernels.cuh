@@ -38,8 +38,8 @@ void rmsnorm(const float* x, const float* w, float* y, int n, float eps, cudaStr
 // out[i] = silu(gate[i]) * up[i]
 void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_t st = 0);
 
-// out[0..cols) = dequantized row `row` of a Q8_G128 matrix (embedding lookup)
-void embed_row_q8(const int8_t* W, const __half* S, int64_t row, int64_t cols, float* out,
+// out[0..cols) = dequantized row *d_token of a Q8_G128 matrix (embedding lookup)
+void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
                   cudaStream_t st = 0);
 
 } // namespace q27k

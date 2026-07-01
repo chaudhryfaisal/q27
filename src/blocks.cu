@@ -53,21 +53,21 @@ void l2norm_heads(float* x, int n_heads, int head_dim, float eps, cudaStream_t s
 
 // ---------------- rope ----------------
 
-__global__ void k_rope_neox(float* __restrict__ x, int head_dim, int n_rot, int stride, int pos,
-                            float freq_base) {
+__global__ void k_rope_neox(float* __restrict__ x, int head_dim, int n_rot, int stride,
+                            const int* __restrict__ d_pos, float freq_base) {
     float* xh = x + (size_t)blockIdx.x * stride;
     int d = threadIdx.x; // pair index 0..n_rot/2-1
     if (d >= n_rot / 2) return;
-    float theta = pos * powf(freq_base, -2.0f * d / n_rot);
+    float theta = (float)(*d_pos) * powf(freq_base, -2.0f * d / n_rot);
     float c = cosf(theta), s = sinf(theta);
     float x0 = xh[d], x1 = xh[d + n_rot / 2];
     xh[d] = x0 * c - x1 * s;
     xh[d + n_rot / 2] = x0 * s + x1 * c;
 }
 
-void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int stride, int pos,
-                       float freq_base, cudaStream_t st) {
-    k_rope_neox<<<n_heads, 32, 0, st>>>(x, head_dim, n_rot, stride, pos, freq_base);
+void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int stride,
+                       const int* d_pos, float freq_base, cudaStream_t st) {
+    k_rope_neox<<<n_heads, 32, 0, st>>>(x, head_dim, n_rot, stride, d_pos, freq_base);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -75,12 +75,14 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 
 __global__ void k_attn_decode(const float* __restrict__ q, int q_stride,
                               const float* __restrict__ kc, const float* __restrict__ vc,
-                              float* __restrict__ out, float* __restrict__ scratch, int seq_len,
+                              float* __restrict__ out, float* __restrict__ scratch,
+                              const int* __restrict__ d_pos, int max_ctx,
                               int n_kv_heads, int head_dim, float scale) {
+    const int seq_len = *d_pos + 1;
     const int h = blockIdx.x;
     const int kvh = h / (gridDim.x / n_kv_heads);
     const float* qh = q + (size_t)h * q_stride;
-    float* sc = scratch + (size_t)h * seq_len;
+    float* sc = scratch + (size_t)h * max_ctx;
     __shared__ float sh[256];
     __shared__ float s_max, s_sum;
 
@@ -130,10 +132,37 @@ __global__ void k_attn_decode(const float* __restrict__ q, int q_stride,
 }
 
 void attn_decode(const float* q, int q_stride, const float* kcache, const float* vcache,
-                 float* out, float* scratch, int seq_len, int n_q_heads, int n_kv_heads,
-                 int head_dim, float scale, cudaStream_t st) {
-    k_attn_decode<<<n_q_heads, 256, 0, st>>>(q, q_stride, kcache, vcache, out, scratch, seq_len,
-                                             n_kv_heads, head_dim, scale);
+                 float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
+                 int n_kv_heads, int head_dim, float scale, cudaStream_t st) {
+    k_attn_decode<<<n_q_heads, 256, 0, st>>>(q, q_stride, kcache, vcache, out, scratch, d_pos,
+                                             max_ctx, n_kv_heads, head_dim, scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_kv_store(const float* __restrict__ kbuf, const float* __restrict__ vbuf,
+                           float* __restrict__ kc, float* __restrict__ vc,
+                           const int* __restrict__ d_pos, int rowlen) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rowlen) return;
+    size_t off = (size_t)(*d_pos) * rowlen + i;
+    kc[off] = kbuf[i];
+    vc[off] = vbuf[i];
+}
+
+void kv_store(const float* kbuf, const float* vbuf, float* kcache, float* vcache,
+              const int* d_pos, int rowlen, cudaStream_t st) {
+    k_kv_store<<<(rowlen + 255) / 256, 256, 0, st>>>(kbuf, vbuf, kcache, vcache, d_pos, rowlen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_advance(int* d_pos, int* d_step, int* d_gen, const int* d_token) {
+    d_gen[*d_step] = *d_token;
+    (*d_step)++;
+    (*d_pos)++;
+}
+
+void advance(int* d_pos, int* d_step, int* d_gen, const int* d_token, cudaStream_t st) {
+    k_advance<<<1, 1, 0, st>>>(d_pos, d_step, d_gen, d_token);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -285,31 +314,40 @@ void add_inplace(float* x, const float* y, int n, cudaStream_t st) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_argmax(const float* __restrict__ x, int n, int* __restrict__ out) {
-    __shared__ float sv[256];
-    __shared__ int si[256];
-    float best = -FLT_MAX;
+// Multi-block argmax: pack (orderable float bits, index) into u64, atomicMax.
+__device__ __forceinline__ unsigned long long am_pack(float v, int idx) {
+    unsigned u = __float_as_uint(v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u); // monotonic float->uint map
+    return ((unsigned long long)u << 32) | (unsigned)idx;
+}
+
+__global__ void k_argmax_reset(unsigned long long* best) { *best = 0; }
+
+__global__ void k_argmax(const float* __restrict__ x, int n,
+                         unsigned long long* __restrict__ best) {
+    float bv = -FLT_MAX;
     int bi = 0;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        if (x[i] > best) { best = x[i]; bi = i; }
-    sv[threadIdx.x] = best;
-    si[threadIdx.x] = bi;
+        if (x[i] > bv) { bv = x[i]; bi = i; }
+    unsigned long long p = am_pack(bv, bi);
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = p;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s && sv[threadIdx.x + s] > sv[threadIdx.x]) {
-            sv[threadIdx.x] = sv[threadIdx.x + s];
-            si[threadIdx.x] = si[threadIdx.x + s];
-        }
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) {
-        // single-block final reduce via atomics on (value, index) packed compare
-        // simple approach: gridDim.x == 1 required
-        *out = si[0];
-    }
+    if (threadIdx.x == 0) atomicMax(best, sh[0]);
 }
-void argmax(const float* x, int n, int* d_out, cudaStream_t st) {
-    k_argmax<<<1, 256, 0, st>>>(x, n, d_out); // single block: 248320/256 ~ 970 iters/thread, fine
+
+__global__ void k_argmax_extract(const unsigned long long* best, int* out) {
+    *out = (int)(unsigned)(*best & 0xffffffffull);
+}
+
+void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
+    k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
+    k_argmax<<<128, 256, 0, st>>>(x, n, d_scratch);
+    k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
     CUDA_CHECK(cudaGetLastError());
 }
 
