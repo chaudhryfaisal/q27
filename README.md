@@ -44,12 +44,29 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 ## Milestones
 
-- **M0** -- repack tool: BF16 GGUF -> q27 format; PPL/logit-diff validation vs llama.cpp Q5_K_M
-- **M1** -- correctness: full forward pass, greedy decode, logits match llama.cpp BF16 reference (tolerance TBD) on fixed prompts
-- **M2** -- perf GEMV + FP8 KV: beat 88 t/s base (llama.cpp +40%)
-- **M3** -- MTP pipeline: 165+ t/s
-- **M4** -- CUDA graph whole-step, kernel fusion polish: 200+ t/s
+- **M0** DONE -- repack tool: BF16 GGUF -> q27 4-bit format (policy v1.2)
+- **M1** DONE -- correctness: greedy decode, output verified vs llama.cpp
+- **M2** DONE -- dp4a GEMVs + CUDA-graph decode: 80.1 t/s plain
+- **M3** IN PROGRESS -- MTP speculative pipeline, lossless (token-identical):
+  depth-2 drafting, batched verify, 3-perm cyclic state graphs. **115 t/s**
+  (llama.cpp MTP fork on same model/GPU: 101.5). Target 165.
+- **M4** -- remaining: Q4 lm_head, MTP-pass trim, graph gap squeeze
 - **M5** -- HTTP server (OpenAI shape)
+
+## Progress log (tg t/s, greedy, token-identical output verified each step)
+
+| change | t/s |
+|---|---|
+| reference kernels e2e | 43.4 |
+| dp4a int8-activation GEMVs | 58.8 |
+| coalesced delta state + wide norms + multiblock argmax | 66.5 |
+| CUDA-graph token replay, device-chained decode | 75.9 |
+| delta_step i-parallel v2 | 80.1 |
+| + speculative decode depth-1 (host-driven) | 84.2 |
+| + direct-write batched GEMV | 92.2 |
+| + parity-pair captured graphs | 109.3 |
+| + depth-2 drafting (2.13 tok/round) | 107.3 |
+| + grid-merged 3-token small kernels | **115.1** |
 
 ## Risk register
 
