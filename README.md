@@ -169,16 +169,46 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 | + GEMM tuning + FA-lite attention | 61s |
 | turn 2+ with prefix cache | **1.3s** |
 
-## Backlog
+## Roadmap (reordered 2026-07-02 after external review)
 
-1. Prefill GEMM tuning: double-buffered staging, TB=48/64 via dynamic smem
-   (fork reference: ~2,300-2,400 t/s; q27 at 583 @512 / 528 @4k / ~300 @26k)
-2. FA-lite tiled attention prefill (smem K/V tiles shared across the 32-token
-   sub-batch; kills the remaining quadratic degradation at long contexts)
-3. Decode queue from the nsys research plan: E2 mem OC (user gate), E3
-   instrumentation pack, E4 per-shape GEMV tuning (+6-8%), E5 grid-dim fusions
-   (+4-6%), E6 confidence-gated depth-3, E7 draft-head diet (ceiling ~187)
-4. Tensor-core prefill path (parity+ with the fork's cuBLAS GEMM prefill)
+Context for the ordering: decode is in good shape (188.9 lossless = 1.86x the
+fork; three consecutive micro-opt attempts on the remaining tail came back
+negative). The user-visible gaps are cold prefill (~8x behind the fork's
+tensor-core GEMM; 61s cold TTFT @26.7K, warm turns 1.3s via prefix cache) and
+two advertised claims with no measurement behind them. Cheapest-blocking-first:
+
+**P0 -- claims gates (one session; block every advertised number):**
+- Long-context correctness gate: needle/consistency check vs llama.cpp at
+  >=64K (risk 5). Validates M-RoPE sections + GDN state over length, and is
+  the first real test of a large --ctx allocation (~4.3 GB KV @64K).
+- 4-bit PPL/NLL delta vs Q5_K_M (risk 2, threshold >3%, never run). Needs a
+  small teacher-forced NLL mode in the CLI (--dump-logits generalized over a
+  token file). The t/s-vs-fork comparison is only honest next to this number.
+
+**P1 -- prefill via int8 tensor-core MMA (biggest user-visible lever):**
+mma.sync m16n8k32 s8s8s32 (sm_80+ PTX, works on sm_120) replaces dp4a in the
+prefill GEMM. Key property: int32 accumulation is order-independent, and the
+per-group fp scale-and-add already matches serial order -- so THE BITWISE
+IDENTITY GATE SURVIVES, unlike an fp16/fp8 MMA path (risk 6). No CUTLASS
+needed; "plain CUDA" stays true. dp4a prefill: ~590 t/s @512 / ~300 @26K;
+fork reference 2,300-2,400. Realistic target 2-4x -> cold 26.7K TTFT from
+61s toward ~15-25s. Fallbacks if hand-rolled IMMA stalls: scoped cuBLASLt
+int8 GEMM for prefill only, or status quo + prefix cache.
+
+**P2 -- fp8 (E4M3) KV cache:** halves KV again (68 -> 34 KB/token: ~8.9 GB
+@256K) and cuts long-ctx decode KV bandwidth. NOT lossless -- changes logits,
+so it lands behind the P0 gates and ships opt-in until the needle/PPL gates
+pass at tolerance. Design-decisions section already marks it planned.
+
+**P3 -- decode odds and ends (only after the above):**
+- E6 round-cost audit: round time rose 15% for depth-3 but only ~7% is
+  accounted for (3rd MTP pass ~4%, 4th verify lane ~2-3%); the rest is 4x
+  sequential argmax over 248320 logits + small-kernel launch count. Batch the
+  4 argmaxes into one kernel; nsys the rest.
+- Depth-4: measure first (extend --stats with a pass-4 chain, same method
+  that green-lit E6); build only if p(d4|chain-3) holds ~>=60%. Perm
+  machinery generalizes to mod-5.
+- Remove pf_scratch (dead: only consumer voids it; ~3 KB/token of ctx).
 
 ## Risk register
 
@@ -187,4 +217,4 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
 5. **Long-context correctness is untested.** All token-identity gates run at 2-8K. Risk 3 (M-RoPE) is precisely the failure mode that is correct at 2K and silently degraded at 128K. Needed before any context number is advertised as fact: needle/consistency check vs llama.cpp at >=64K. OPEN.
-6. **Tensor-core prefill will break the bitwise gate.** Batched prefill is currently bit-identical to serial because the dp4a GEMM matches the serial per-lane accumulation order exactly. fp16/fp8 MMA changes accumulation order, so the identical-continuations gate stops working for that path. A tolerance gate (logit cosine / top-k agreement vs serial) must exist BEFORE that work starts, or the hardest kernel has no regression signal. Related fork-in-the-road: "plain CUDA, no CUTLASS" vs "parity with cuBLAS prefill (~2,300 t/s)" are in tension -- hand-rolled sm_120 wgmma at cuBLAS parity is CUTLASS-grade effort. Options: (a) scoped CUTLASS/cuBLASLt dep for the prefill GEMM only, (b) hand-rolled TC GEMM accepting less than parity, (c) keep dp4a prefill and lean on the prefix cache (cold first turn stays ~60s @26K; warm turns are already 1.3s). Decision pending.
+6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the roadmap's int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). STILL OPEN for fp8 KV (P2) and any future fp16/fp8 MMA: those change logits, so a tolerance gate (logit cosine / top-k agreement vs the exact path, plus the P0 needle/PPL gates) must exist before they ship. The old fork-in-the-road (scoped CUTLASS/cuBLASLt vs hand-rolled vs status quo) is now the P1 fallback ladder rather than a blocker.
