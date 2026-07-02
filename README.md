@@ -55,6 +55,14 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   round bookkeeping. `--fast-head` opt-in: **156.5 t/s**
 - **M5** DONE -- HTTP serving: OpenAI + Anthropic + OpenAI Responses, exact
   byte-level BPE tokenizer (gated 21/21 vs llama-tokenize), tool calling
+- **E6** DONE -- ungated depth-3 speculation: measured p(d3 | d1,d2 correct)
+  = 83.7% offline (docs/E6-design.md), so the round always drafts 3 and
+  batch-4-verifies {pending, d1, d2, d3}. 4 GDN buffers under a mod-4 role
+  permutation, 4 captured graphs. 3.12 tok/round, **188.9 t/s** @2k
+  (204.8 long-gen); 8000-token output bit-identical to depth-2. Also fixed
+  two latent bugs found en route: flash-decode scratch under-allocation at
+  ctx<4128, and missing ctx guard letting spec rounds write KV rows past
+  max_ctx (silent corruption the prefix cache could then reuse).
 
 ## Serving
 
@@ -115,6 +123,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | flash-decode (split-K, K/V shared across GQA heads) | **173.1** @2k / **159.6** @8k ctx lossless; 178.1 fast |
 | fp16 KV cache (attn + MTP) | 169.7 @2k / 159.7 @8k; halves KV bytes, -2.1GB @32k ctx |
 | E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
+| E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
 
 ## Prefill (M6)
 

@@ -1,5 +1,15 @@
 # E6: depth-3 speculation -- design
 
+> **2026-07-02 SHIPPED (commits 5c90fb0..5a1f205): 188.9 t/s @2k 128-tok
+> (+6.9%), 204.8 t/s long-gen (+12.7%), 3.12 tok/round. Runtime d3
+> acceptance 85.7% vs 83.7% predicted. 8000-token output bit-identical to
+> depth-2. Adversarial review (9 agents): 38 design claims confirmed, 1
+> real major found and fixed (missing ctx guard -- spec rounds wrote KV
+> rows past max_ctx; pre-existing, widened by depth-3). Round time +15%
+> (3rd MTP pass ~4%, 4th verify lane ~2-3%, 4 extra argmax/small-kernel
+> launches the rest) -- future tuning headroom. Outcome readback is 20B
+> {n, t1, dr1, dr2, dr3} from a 32B buffer.**
+
 > **2026-07-02 Phase-0b RESULT (supersedes the gated design below):**
 > measured p(d3 | d1,d2 correct) = 83.7% ungated over 512 positions
 > (design assumed ~65%). Every margin bin pays for itself (worst bin:
