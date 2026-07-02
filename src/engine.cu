@@ -71,6 +71,12 @@ int main(int argc, char** argv) {
         long bn[5] = {0}, bok[5] = {0};
         auto bin = [](float m) { return m < 0.5f ? 0 : m < 1 ? 1 : m < 2 ? 2 : m < 4 ? 3 : 4; };
         std::vector<Pend> pend1(N + 8), pend2(N + 8);
+        // E6 gate: depth-3 chain, binned by PASS-2 margin (the runtime gate
+        // signal). d3 only matters when the d1,d2 prefix is accepted, so track
+        // p(prefix ok | bin) and p(d3 ok | prefix ok, bin) separately.
+        struct Pend3 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1; };
+        std::vector<Pend3> pend3(N + 8);
+        long c3n[5] = {0}, c3pre[5] = {0}, c3ok[5] = {0};
         for (int step = 0; step < N + (int)toks.size() - 1; step++) {
             bool prompt_phase = step < (int)toks.size();
             int tok = prompt_phase ? toks[step] : -1;
@@ -99,6 +105,15 @@ int main(int argc, char** argv) {
                 int b = bin(pend2[known_idx].margin);
                 bn[b]++;
                 if (ok) { n2ok++; bok[b]++; }
+            }
+            if (pend3[known_idx].pred >= 0 && known_idx >= 2) {
+                const Pend3& p3 = pend3[known_idx];
+                int b = bin(p3.margin2);
+                c3n[b]++;
+                if (p3.d1 == seq[known_idx - 2] && p3.d2 == seq[known_idx - 1]) {
+                    c3pre[b]++;
+                    if (p3.pred == seq[known_idx]) c3ok[b]++;
+                }
             }
             if (step >= N + (int)toks.size() - 2) break;
             // MTP pass 1: draft seq[known_idx+1] from (h(pos), next_tok)
@@ -141,6 +156,18 @@ int main(int argc, char** argv) {
             auto [d2, d2b, m2] = top2(l1);
             (void)d2b;
             if (known_idx + 2 < (int)pend2.size()) pend2[known_idx + 2] = {d2, pos + 3, m2, -1};
+            // MTP pass 3: chain from pass-2 hidden, draft seq[known_idx+3];
+            // keyed by the PASS-2 margin (the E6 runtime gate signal)
+            int mp3 = pos + 3;
+            CUDA_CHECK(cudaMemcpyAsync(e.d_token, &d2, 4, cudaMemcpyHostToDevice, e.stm));
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp3, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward(e.x1, nullptr, nullptr, nullptr);
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
+                                  cudaMemcpyDeviceToHost));
+            auto [d3, d3b, m3] = top2(l1);
+            (void)d3b; (void)m3;
+            if (known_idx + 3 < (int)pend3.size()) pend3[known_idx + 3] = {d3, m2, d1, d2};
             // restore d_token for the next step_free
             CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
         }
@@ -157,6 +184,28 @@ int main(int argc, char** argv) {
         for (int b = 0; b < 5; b++)
             printf("    margin %-5s: %5.1f%% (n=%ld)\n", bl[b],
                    100.0 * bok[b] / (bn[b] ? bn[b] : 1), bn[b]);
+        printf("  depth-3 chain by pass-2 margin (E6 gate):\n");
+        for (int b = 0; b < 5; b++)
+            printf("    margin %-5s: n=%4ld  p(prefix)=%5.1f%%  p(d3|prefix)=%5.1f%%\n", bl[b],
+                   c3n[b], 100.0 * c3pre[b] / (c3n[b] ? c3n[b] : 1),
+                   100.0 * c3ok[b] / (c3pre[b] ? c3pre[b] : 1));
+        // cumulative gate margin>=theta; extra tokens/round ~= f * p(prefix|gate)
+        // * p(d3|prefix,gate). Caveat: per-POSITION sampling; live rounds sample
+        // accepted spans, so f here slightly understates the gated fraction.
+        printf("  E6 projection (gate = pass-2 margin >= theta):\n");
+        const char* tl[5] = {"0 (ungated)", "0.5", "1", "2", "4"};
+        long t3n = 0;
+        for (int b = 0; b < 5; b++) t3n += c3n[b];
+        for (int t = 0; t < 5; t++) {
+            long n = 0, pre = 0, ok = 0;
+            for (int b = t; b < 5; b++) { n += c3n[b]; pre += c3pre[b]; ok += c3ok[b]; }
+            double f = (double)n / (t3n ? t3n : 1);
+            double ppre = (double)pre / (n ? n : 1);
+            double pd3 = (double)ok / (pre ? pre : 1);
+            printf("    theta %-11s: f=%4.1f%%  p(prefix|gate)=%5.1f%%  "
+                   "p(d3|prefix,gate)=%5.1f%%  extra t/round=+%.3f\n",
+                   tl[t], 100 * f, 100 * ppre, 100 * pd3, f * ppre * pd3);
+        }
         return 0;
     }
 
