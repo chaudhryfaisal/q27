@@ -140,6 +140,7 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 | pre-M6 (serial prefill) | 15-min timeout, 0 tokens |
 | M6 (batched) | 139s |
 | + coalesced attention prefill | 90s |
+| + GEMM tuning + FA-lite attention | 61s |
 | turn 2+ with prefix cache | **1.3s** |
 
 ## Backlog
