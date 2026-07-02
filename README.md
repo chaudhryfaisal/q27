@@ -132,6 +132,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
 | P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
 | P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
+| v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -198,12 +199,31 @@ two advertised claims with no measurement behind them. Cheapest-blocking-first:
 - PPL delta: **+3.35% vs Q5_K_M** (7.2135 vs 6.9797), marginally over the 3%
   bar -> NEW ITEM below.
 
-**P0.5 -- v1.4 quant policy (opened by the PPL measurement):** recover part
-of the 3.35% by moving the most PPL-sensitive tensors up-bit (usual suspects:
-early-layer ffn_down / attn_v; measure per-tensor sensitivity with --nll on a
-few candidate repacks). Budget: each Q4->Q8 tensor class costs decode
-bandwidth, so gate on (PPL gain) / (t/s cost). Repack invalidates all
-canonical token gates -- re-derive canonicals in the same commit.
+**P0.5 -- DONE 2026-07-02: v1.4 = ssm_out + attn_output promoted to Q8.**
+Sensitivity study (full-corpus --nll per candidate repack; baseline v1.3
+PPL 7.2139, Q5_K_M 6.9797):
+
+| candidate (Q4 -> Q8) | +GB | PPL | verdict |
+|---|---|---|---|
+| ffn_down first4+last4 | 0.35 | 7.2079 | dud |
+| ffn_down first8+last8 | 0.69 | 7.2074 | dud |
+| ffn_down ALL (ceiling probe) | 2.76 | 7.1466 | 29% of gap, unshippable ratio |
+| attn_qkv (GDN in-proj) | 1.22 | 7.2396 | **WORSE than baseline** |
+| residual writers, late-only | 0.12 | 7.2112 | dud (not concentrated) |
+| **residual writers ALL = v1.4** | **0.98** | **7.1928** | shipped |
+
+Findings: (1) ffn_down sensitivity is spread uniformly across layers -- no
+cheap subset exists; (2) promoting the GDN in-projections HURTS: v1.3's Q4
+errors there partially cancel against downstream quant errors, and breaking
+the correlation costs +0.36% PPL; (3) v1.4's decode got FASTER (+3.3% on a
+2000-token soak, 203.9 -> 210.6 t/s) because cleaner residual writers raise
+MTP draft acceptance (3.47 -> 3.67 tokens/round) by more than the +0.98 GB
+of reads cost -- quant policy and speculation acceptance are coupled.
+Remaining gap to Q5_K_M: +3.05% (was +3.35%); closing more via uniform
+promotion has terrible ROI (see ceiling probe) -- importance-weighted scales
+(AWQ-style) are the real path if quality ever becomes the priority.
+v1.3 archived at qwopus-27b-mtp-v13.q27 (old canonical sequences apply to
+it); all canonical gates re-derived for v1.4 in this commit.
 
 **P1 -- DONE 2026-07-02: prefill 2.35x, cold 28.1K TTFT 63.8s -> 35.7s.**
 Kernel: k_gemm_mma_T (prefill.cu), one mma.sync per 32-element quant block,
@@ -267,7 +287,7 @@ this model, silent wrongness if reused elsewhere); Q fp16 saturation above
 ## Risk register
 
 1. **Gated DeltaNet decode kernel** is the new risk center (was "simple dense" until we read the GGUF). llama.cpp's implementation is the semantic reference; validate per-layer.
-2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED 2026-07-02** -- wikitext-2 test, identical tokens and chunk protocol (`--nll`, replicates llama-perplexity -c 512): q27 4-bit PPL **7.2135** vs Q5_K_M **6.9797 +/- 0.046** = **+3.35%**, marginally over the 3% bar (and against a 5.5-bpw quant reading 18.2 GB vs q27's 14.8 -- part of the t/s win is bit-width). Mitigation opened in the roadmap: v1.4 quant policy (bump the most PPL-sensitive tensors to Q8 / importance-weighted scales). CAUTION: any repack changes the model file, which invalidates every canonical token gate -- re-derive canonicals immediately after.
+2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED + MITIGATED 2026-07-02** -- v1.3 measured +3.35% vs Q5_K_M (7.2135 vs 6.9797, identical tokens/protocol via `--nll`); v1.4 policy (residual writers to Q8, chosen by a 6-candidate sensitivity study -- see roadmap P0.5) lands at **7.1928 = +3.05%**, and decode got faster (+3.3%, acceptance-coupled). Still marginally over the 3% bar; the study shows uniform promotion cannot close the rest at acceptable cost (ffn_down ceiling probe: 29% of gap for +2.76 GB) -- importance-weighted scales are the documented path if ever needed. The t/s comparison remains bit-width-assisted (15.8 GB reads vs 18.2).
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
 5. **Long-context correctness: VALIDATED to 64K (2026-07-02).** Three gates: (a) `--nll-long 65536` (one pass, no resets) shows NLL flat across position buckets -- 32-48K: PPL 5.45, 48K+: 5.80, no late-position blowup; (b) cross-engine: q27 pooled [32K,64K) PPL 5.622 vs llama-perplexity -c 65536 chunk-1 5.511 = **+2.0%, smaller than the +3.35% short-context delta**, so no length-dependent divergence (M-RoPE + GDN state hold); (c) needle retrieval 3/3 at depths 3/50/95% of a ~55K-token haystack through q27-server, think traces correctly naming surrounding sections. Beyond 64K remains unvalidated (VRAM alloc ceiling ~180K at fp16 KV); rerun tools: `--nll-long`, scratchpad needle harness. Risk 3 is covered to 64K by (a)+(b).

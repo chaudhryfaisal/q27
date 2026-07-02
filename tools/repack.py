@@ -26,6 +26,9 @@ DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4
 GROUP_Q4, GROUP_Q8 = 64, 128
 
 
+Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
+
+
 def policy(name: str) -> int:
     if (name.endswith("_norm.weight") or name.endswith("norm.weight")
             or name.endswith(".ssm_a") or name.endswith(".ssm_dt.bias")
@@ -39,6 +42,8 @@ def policy(name: str) -> int:
         return DTYPE_Q8
     if re.match(r"blk\.\d+\.attn_(k|v)\.weight$", name):
         return DTYPE_Q8  # KV projections: worst Q4 RMSE + errors persist in KV cache; ~84 MB total
+    if Q8_EXTRA and name.endswith(".weight") and Q8_EXTRA.search(name):
+        return DTYPE_Q8  # v1.4: PPL-sensitive tensors promoted per experiment
     if name.endswith(".weight"):
         return DTYPE_Q4
     return DTYPE_F32  # biases and anything unrecognized stay f32
@@ -92,13 +97,20 @@ def main():
     ap.add_argument("output")
     ap.add_argument("--only", default=None)
     ap.add_argument("--report", type=int, default=15)
+    ap.add_argument("--q8", default=None,
+                    help="extra tensor-name regex forced to Q8_G128 (v1.4 policy experiments)")
     args = ap.parse_args()
+    global Q8_EXTRA
+    if args.q8:
+        Q8_EXTRA = re.compile(args.q8)
 
     t0 = time.time()
     r = GGUFReader(args.input)
 
-    meta = {"q27_version": VERSION, "quant_policy": "v1.3",
+    meta = {"q27_version": VERSION, "quant_policy": "v1.4" if args.q8 else "v1.3",
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
+    if args.q8:
+        meta["q8_extra"] = args.q8
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
             try:
