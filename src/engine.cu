@@ -51,14 +51,28 @@ struct Engine {
     float *qkv_b, *convout_b, *z_b, *alpha_b, *betar_b, *g_b, *beta_b, *o_b, *og_b;
     float *ffn_g_b, *ffn_u_b, *logits2, *y2big;
     float *S_spare[N_LAYER], *ring_spare[N_LAYER];
+    float *S_spare2[N_LAYER], *ring_spare2[N_LAYER];
+    float *h_c, *x1_c, *y_c, *qg_c, *kbuf_c, *vbuf_c, *attnout_c;
+    float *qkv_c, *convout_c, *z_c, *alpha_c, *betar_c, *g_c, *beta_c, *o_c, *og_c;
+    float *ffn_g_c, *ffn_u_c;
+    float *h_next2;
+    q27k::XQuant xqC;
+    int *d_pos_c, *d_pos_m2, *d_draft2, *d_vc;
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
-    int parity = 0; // which of S/S_spare (and rings) is primary; flips on accept
-    cudaGraphExec_t spec_graph[2] = {nullptr, nullptr};
-    float* Sp(int il) { return parity ? S_spare[il] : S[il]; }
-    float* Ss(int il) { return parity ? S[il] : S_spare[il]; }
-    float* Rp(int il) { return parity ? ring_spare[il] : conv_ring[il]; }
-    float* Rs(int il) { return parity ? conv_ring[il] : ring_spare[il]; }
+    // GDN state as 3 physical buffers with a cyclic role permutation:
+    // role r (0=primary, 1=post-b, 2=post-c) -> physical (r + perm) % 3.
+    // accept-1 token -> perm += 1; accept-2 -> perm += 2 (mod 3). 3 captured graphs.
+    int perm = 0;
+    cudaGraphExec_t spec_graph[3] = {nullptr, nullptr, nullptr};
+    float* SBuf(int il, int role) {
+        int ph = (role + perm) % 3;
+        return ph == 0 ? S[il] : ph == 1 ? S_spare[il] : S_spare2[il];
+    }
+    float* RBuf(int il, int role) {
+        int ph = (role + perm) % 3;
+        return ph == 0 ? conv_ring[il] : ph == 1 ? ring_spare[il] : ring_spare2[il];
+    }
     q27k::XQuant xq;
     // layer state
     float* conv_ring[N_LAYER];
@@ -110,12 +124,26 @@ struct Engine {
         A((void**)&g_b, GDN_HEADS * 4); A((void**)&beta_b, GDN_HEADS * 4);
         A((void**)&o_b, GDN_V * 4); A((void**)&og_b, GDN_V * 4);
         A((void**)&ffn_g_b, N_FFN * 4); A((void**)&ffn_u_b, N_FFN * 4);
-        A((void**)&logits2, 2 * (size_t)VOCAB * 4);
+        A((void**)&logits2, 3 * (size_t)VOCAB * 4);
         A((void**)&y2big, 2 * (size_t)N_FFN * 4);
         xq2[0] = q27k::xquant_alloc(N_FFN);
         xq2[1] = q27k::xquant_alloc(N_FFN);
         A((void**)&d_pos_a, 4); A((void**)&d_pos_b, 4);
         A((void**)&d_va, 4); A((void**)&d_vb, 4);
+        A((void**)&h_c, N_EMBD * 4); A((void**)&x1_c, N_EMBD * 4); A((void**)&y_c, N_EMBD * 4);
+        A((void**)&qg_c, 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_c, N_KV * HEAD_DIM * 4); A((void**)&vbuf_c, N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_c, N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_c, GDN_CH * 4); A((void**)&convout_c, GDN_CH * 4);
+        A((void**)&z_c, GDN_V * 4);
+        A((void**)&alpha_c, GDN_HEADS * 4); A((void**)&betar_c, GDN_HEADS * 4);
+        A((void**)&g_c, GDN_HEADS * 4); A((void**)&beta_c, GDN_HEADS * 4);
+        A((void**)&o_c, GDN_V * 4); A((void**)&og_c, GDN_V * 4);
+        A((void**)&ffn_g_c, N_FFN * 4); A((void**)&ffn_u_c, N_FFN * 4);
+        A((void**)&h_next2, N_EMBD * 4);
+        xqC = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_c, 4); A((void**)&d_pos_m2, 4); A((void**)&d_draft2, 4);
+        A((void**)&d_vc, 4);
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
@@ -138,6 +166,8 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S[il], 0, (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
                 A((void**)&S_spare[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
                 A((void**)&ring_spare[il], 3 * GDN_CH * 4);
+                A((void**)&S_spare2[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                A((void**)&ring_spare2[il], 3 * GDN_CH * 4);
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -251,20 +281,25 @@ struct Engine {
 
     // MTP draft head (blk.64, SPEC.md): draft the token AFTER d_token, given
     // h_next = post-output_norm hidden of the current position (*d_pos_m).
-    void mtp_forward() {
+    void mtp_forward(const float* h_src = nullptr, const int* tok_src = nullptr,
+                     int* draft_dst = nullptr, const int* pos_src = nullptr) {
+        if (!h_src) h_src = h_next;
+        if (!tok_src) tok_src = d_token;
+        if (!draft_dst) draft_dst = d_draft;
+        if (!pos_src) pos_src = d_pos_m;
         const int il = 64;
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD,
+        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, tok_src, N_EMBD,
                            e_hn, stm);
         q27k::rmsnorm(e_hn, (const float*)T(il, "nextn.enorm.weight").data, e_hn, N_EMBD, EPS,
                       stm);
-        q27k::rmsnorm(h_next, (const float*)T(il, "nextn.hnorm.weight").data, e_hn + N_EMBD,
+        q27k::rmsnorm(h_src, (const float*)T(il, "nextn.hnorm.weight").data, e_hn + N_EMBD,
                       N_EMBD, EPS, stm);
         qx(e_hn, 2 * N_EMBD);
         mm(T(il, "nextn.eh_proj.weight"), e_hn, x_mtp);
 
         q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
-        attn_block(il, x1, y, mtp_k, mtp_v, d_pos_m);
+        attn_block(il, x1, y, mtp_k, mtp_v, pos_src);
         q27k::add_inplace(x_mtp, y, N_EMBD, stm);
         q27k::rmsnorm(x_mtp, (const float*)T(il, "post_attention_norm.weight").data, x1, N_EMBD,
                       EPS, stm);
@@ -274,29 +309,30 @@ struct Engine {
                       N_EMBD, EPS, stm);
         qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, mtp_logits);
-        q27k::argmax(mtp_logits, VOCAB, d_draft, d_amax, stm);
+        q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
     }
 
-    void qx2(const float* xa, const float* xb, int cols) {
+    void qx3(const float* xa, const float* xb, const float* xc, int cols) {
         q27k::quantize_x(xa, cols, xq2[0], stm);
         q27k::quantize_x(xb, cols, xq2[1], stm);
+        q27k::quantize_x(xc, cols, xqC, stm);
     }
-    // batched matmul over xq2, direct per-token outputs (no split copies)
-    void mm2(const DevTensor& w, float* out_a, float* out_b) {
-        float* const ys[2] = {out_a, out_b};
+    void mm3(const DevTensor& w, float* out_a, float* out_b, float* out_c) {
+        q27k::XQuant qs[3] = {xq2[0], xq2[1], xqC};
+        float* const ys[3] = {out_a, out_b, out_c};
         if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, xq2, 2, ys, w.rows,
+            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, 3, ys, w.rows,
                             w.cols, stm);
         else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, xq2, 2, ys, w.rows,
+            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, 3, ys, w.rows,
                             w.cols, stm);
     }
 
     void gdn_pair(int il) {
         const float eps = EPS;
-        qx2(x1, x1_b, N_EMBD);
-        mm2(T(il, "attn_qkv.weight"), qkv, qkv_b);
-        mm2(T(il, "attn_gate.weight"), z, z_b);
+        qx3(x1, x1_b, x1_c, N_EMBD);
+        mm3(T(il, "attn_qkv.weight"), qkv, qkv_b, qkv_c);
+        mm3(T(il, "attn_gate.weight"), z, z_b, z_c);
         q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1, alpha, GDN_HEADS,
                        N_EMBD, stm);
         q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1_b, alpha_b, GDN_HEADS,
@@ -305,43 +341,58 @@ struct Engine {
                        N_EMBD, stm);
         q27k::gemv_f16((const __half*)T(il, "ssm_beta.weight").data, x1_b, betar_b, GDN_HEADS,
                        N_EMBD, stm);
+        q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1_c, alpha_c, GDN_HEADS,
+                       N_EMBD, stm);
+        q27k::gemv_f16((const __half*)T(il, "ssm_beta.weight").data, x1_c, betar_c, GDN_HEADS,
+                       N_EMBD, stm);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
         q27k::gdn_gates(alpha, betar, sa, sdt, g, beta, GDN_HEADS, stm);
         q27k::gdn_gates(alpha_b, betar_b, sa, sdt, g_b, beta_b, GDN_HEADS, stm);
+        q27k::gdn_gates(alpha_c, betar_c, sa, sdt, g_c, beta_c, GDN_HEADS, stm);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
-        q27k::conv_step(Rp(il), Rp(il), qkv, cw, convout, GDN_CH, stm);   // a: commit in place
-        q27k::conv_step(Rp(il), Rs(il), qkv_b, cw, convout_b, GDN_CH, stm); // b: to spare
+        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm);   // a
+        q27k::conv_step(RBuf(il, 0), RBuf(il, 1), qkv_b, cw, convout_b, GDN_CH, stm); // b
+        q27k::conv_step(RBuf(il, 1), RBuf(il, 2), qkv_c, cw, convout_c, GDN_CH, stm); // c
         q27k::l2norm_heads(convout, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout + 2048, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout_b, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout_b + 2048, 16, GDN_DIM, eps, stm);
-        q27k::delta_step(Sp(il), Sp(il), convout, g, beta, o, stm);        // a: commit
-        q27k::delta_step(Sp(il), Ss(il), convout_b, g_b, beta_b, o_b, stm); // b: spare
+        q27k::l2norm_heads(convout_c, 16, GDN_DIM, eps, stm);
+        q27k::l2norm_heads(convout_c + 2048, 16, GDN_DIM, eps, stm);
+        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm);          // a
+        q27k::delta_step(SBuf(il, 0), SBuf(il, 1), convout_b, g_b, beta_b, o_b, stm);   // b
+        q27k::delta_step(SBuf(il, 1), SBuf(il, 2), convout_c, g_c, beta_c, o_c, stm);   // c
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
         q27k::gated_norm_gdn(o, nw, z, og, GDN_HEADS, GDN_DIM, eps, stm);
         q27k::gated_norm_gdn(o_b, nw, z_b, og_b, GDN_HEADS, GDN_DIM, eps, stm);
-        qx2(og, og_b, GDN_V);
-        mm2(T(il, "ssm_out.weight"), y, y_b);
+        q27k::gated_norm_gdn(o_c, nw, z_c, og_c, GDN_HEADS, GDN_DIM, eps, stm);
+        qx3(og, og_b, og_c, GDN_V);
+        mm3(T(il, "ssm_out.weight"), y, y_b, y_c);
     }
 
     void attn_pair(int il) {
         int ci = attn_cache_idx[il];
-        qx2(x1, x1_b, N_EMBD);
-        mm2(T(il, "attn_q.weight"), qg, qg_b);
+        qx3(x1, x1_b, x1_c, N_EMBD);
+        mm3(T(il, "attn_q.weight"), qg, qg_b, qg_c);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
         q27k::rmsnorm_heads(qg, qn, qg, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(qg_b, qn, qg_b, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm2(T(il, "attn_k.weight"), kbuf, kbuf_b);
+        q27k::rmsnorm_heads(qg_c, qn, qg_c, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
+        mm3(T(il, "attn_k.weight"), kbuf, kbuf_b, kbuf_c);
         q27k::rmsnorm_heads(kbuf, kn, kbuf, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(kbuf_b, kn, kbuf_b, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm2(T(il, "attn_v.weight"), vbuf, vbuf_b);
+        q27k::rmsnorm_heads(kbuf_c, kn, kbuf_c, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
+        mm3(T(il, "attn_v.weight"), vbuf, vbuf_b, vbuf_c);
         q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_a, FREQ_BASE, stm);
         q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_a, FREQ_BASE, stm);
         q27k::rope_neox_partial(qg_b, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_b, FREQ_BASE,
                                 stm);
         q27k::rope_neox_partial(kbuf_b, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_b, FREQ_BASE, stm);
+        q27k::rope_neox_partial(qg_c, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_c, FREQ_BASE,
+                                stm);
+        q27k::rope_neox_partial(kbuf_c, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_c, FREQ_BASE, stm);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         q27k::kv_store(kbuf, vbuf, kcache[ci], vcache[ci], d_pos_a, N_KV * HEAD_DIM, stm);
         q27k::attn_decode(qg, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout, scratch, d_pos_a,
@@ -349,62 +400,81 @@ struct Engine {
         q27k::kv_store(kbuf_b, vbuf_b, kcache[ci], vcache[ci], d_pos_b, N_KV * HEAD_DIM, stm);
         q27k::attn_decode(qg_b, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout_b, scratch, d_pos_b,
                           max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm);
+        q27k::kv_store(kbuf_c, vbuf_c, kcache[ci], vcache[ci], d_pos_c, N_KV * HEAD_DIM, stm);
+        q27k::attn_decode(qg_c, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout_c, scratch, d_pos_c,
+                          max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm);
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, stm);
         q27k::sigmoid_gate_mul(attnout_b, qg_b, N_HEAD, HEAD_DIM, stm);
-        qx2(attnout, attnout_b, N_HEAD * HEAD_DIM);
-        mm2(T(il, "attn_output.weight"), y, y_b);
+        q27k::sigmoid_gate_mul(attnout_c, qg_c, N_HEAD, HEAD_DIM, stm);
+        qx3(attnout, attnout_b, attnout_c, N_HEAD * HEAD_DIM);
+        mm3(T(il, "attn_output.weight"), y, y_b, y_c);
     }
 
     void ffn_pair(int il) {
-        qx2(x1, x1_b, N_EMBD);
-        mm2(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b);
-        mm2(T(il, "ffn_up.weight"), ffn_u, ffn_u_b);
+        qx3(x1, x1_b, x1_c, N_EMBD);
+        mm3(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b, ffn_g_c);
+        mm3(T(il, "ffn_up.weight"), ffn_u, ffn_u_b, ffn_u_c);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
         q27k::silu_mul(ffn_g_b, ffn_u_b, ffn_g_b, N_FFN, stm);
-        qx2(ffn_g, ffn_g_b, N_FFN);
-        mm2(T(il, "ffn_down.weight"), y, y_b);
+        q27k::silu_mul(ffn_g_c, ffn_u_c, ffn_g_c, N_FFN, stm);
+        qx3(ffn_g, ffn_g_b, ffn_g_c, N_FFN);
+        mm3(T(il, "ffn_down.weight"), y, y_b, y_c);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
     // through device memory, pointers fixed for a given parity)
     void spec_round_launches() {
-        mtp_forward(); // -> d_draft (uses shared a-side buffers; done before pair pass)
+        // draft 1: (h_next, embed(t1)) at pos_m -> d_draft; MTP's own post-head-norm
+        // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2 (also fills MTP KV)
+        mtp_forward(h_next, d_token, d_draft, d_pos_m);
+        CUDA_CHECK(cudaMemcpyAsync(h_next2, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
+        mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2);
 
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
                            stm);
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_draft, N_EMBD,
                            h_b, stm);
+        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_draft2, N_EMBD,
+                           h_c, stm);
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
             q27k::rmsnorm(h, an, x1, N_EMBD, EPS, stm);
             q27k::rmsnorm(h_b, an, x1_b, N_EMBD, EPS, stm);
+            q27k::rmsnorm(h_c, an, x1_c, N_EMBD, EPS, stm);
             if (attn_layer[il]) attn_pair(il);
             else gdn_pair(il);
             q27k::add_inplace(h, y, N_EMBD, stm);
             q27k::add_inplace(h_b, y_b, N_EMBD, stm);
+            q27k::add_inplace(h_c, y_c, N_EMBD, stm);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
             q27k::rmsnorm(h, pn, x1, N_EMBD, EPS, stm);
             q27k::rmsnorm(h_b, pn, x1_b, N_EMBD, EPS, stm);
+            q27k::rmsnorm(h_c, pn, x1_c, N_EMBD, EPS, stm);
             ffn_pair(il);
             q27k::add_inplace(h, y, N_EMBD, stm);
             q27k::add_inplace(h_b, y_b, N_EMBD, stm);
+            q27k::add_inplace(h_c, y_c, N_EMBD, stm);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
         q27k::rmsnorm(h, on, x1, N_EMBD, EPS, stm);
         q27k::rmsnorm(h_b, on, x1_b, N_EMBD, EPS, stm);
-        qx2(x1, x1_b, N_EMBD);
-        mm2(dm.get("output.weight"), logits2, logits2 + VOCAB);
+        q27k::rmsnorm(h_c, on, x1_c, N_EMBD, EPS, stm);
+        qx3(x1, x1_b, x1_c, N_EMBD);
+        mm3(dm.get("output.weight"), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB);
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
         q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
+        q27k::argmax(logits2 + 2 * (size_t)VOCAB, VOCAB, d_vc, d_amax, stm);
     }
 
     void build_spec_graphs() {
         // one warm (executing) round to initialize lazy CUDA state, then reset
-        int z0 = 0, z1 = 1;
+        int z0 = 0, z1 = 1, z2 = 2;
         CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &z2, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -415,12 +485,14 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
+                CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
-        // capture both parities (capture records; it does not execute)
-        for (int p = 0; p < 2; p++) {
-            parity = p;
+        // capture all 3 cyclic permutations (capture records; does not execute)
+        for (int p = 0; p < 3; p++) {
+            perm = p;
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_round_launches();
@@ -428,33 +500,44 @@ struct Engine {
             CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gr));
         }
-        parity = 0;
-        fprintf(stderr, "spec graphs captured (parity pair)\n");
+        perm = 0;
+        fprintf(stderr, "spec graphs captured (3 perms, depth-2)\n");
     }
 
-    // one speculative round; returns tokens emitted (1 or 2)
+    // one speculative round (depth 2); returns tokens emitted (1..3)
     int spec_round(int P, int* emit) {
-        int pa = P + 1, pb = P + 2;
+        int pa = P + 1, pb = P + 2, pc = P + 3;
         CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &pa, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &pb, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &pc, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &pa, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaGraphLaunch(spec_graph[parity], stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &pb, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
 
-        int va, vb, draft, t1;
+        int va, vb, vc, dr1, dr2, t1;
         CUDA_CHECK(cudaMemcpyAsync(&va, d_va, 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaMemcpyAsync(&vb, d_vb, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&draft, d_draft, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaMemcpyAsync(&vc, d_vc, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaMemcpyAsync(&dr1, d_draft, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaMemcpyAsync(&dr2, d_draft2, 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaMemcpyAsync(&t1, d_token, 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
 
-        if (va == draft) { // accept: b's spare state becomes primary (parity flip)
-            parity ^= 1;
-            emit[0] = t1; emit[1] = draft;
+        if (va == dr1 && vb == dr2) { // both drafts verified
+            perm = (perm + 2) % 3;
+            emit[0] = t1; emit[1] = dr1; emit[2] = dr2;
+            CUDA_CHECK(cudaMemcpyAsync(d_token, &vc, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(h_next, x1_c, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
+            return 3;
+        }
+        if (va == dr1) { // first draft verified
+            perm = (perm + 1) % 3;
+            emit[0] = t1; emit[1] = dr1;
             CUDA_CHECK(cudaMemcpyAsync(d_token, &vb, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(h_next, x1_b, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
             return 2;
         }
-        emit[0] = t1; // reject: b's spare state discarded, next = va
+        emit[0] = t1;
         CUDA_CHECK(cudaMemcpyAsync(d_token, &va, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         return 1;
@@ -562,23 +645,26 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, e.stm));
         std::vector<int> out;
         int P = (int)toks.size() - 1;
+        int total_emitted = 0, rounds = 0;
         while ((int)out.size() < n_gen) {
-            int em[2];
+            int em[3];
             int n = e.spec_round(P, em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
-            drafted++;
-            if (n == 2) accepted++;
+            rounds++;
+            total_emitted += n;
             P += n;
         }
+        drafted = rounds;
+        accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));
         CUDA_CHECK(cudaStreamSynchronize(e.stm));
         float msf = 0;
         CUDA_CHECK(cudaEventElapsedTime(&msf, t0, t1));
         printf("generated:");
         for (int i = 0; i < n_gen; i++) printf(" %d", out[i]);
-        printf("\nspec decode: %d tokens in %.1f ms = %.2f t/s (%d/%d rounds accepted = %.0f%%)\n",
-               (int)out.size(), msf, out.size() * 1000.0f / msf, accepted, drafted,
-               100.0 * accepted / drafted);
+        printf("\nspec decode: %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round over %d rounds)\n",
+               (int)out.size(), msf, out.size() * 1000.0f / msf,
+               (double)accepted / drafted, drafted);
         return 0;
     }
     if (mtp_stats) {
