@@ -311,9 +311,14 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMalloc((void**)&d_nll, PT * 4));
             CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
             e.reset();
-            const int NB = 6;
-            const int bl[NB + 1] = {0, 2048, 8192, 16384, 32768, 49152, 1 << 30};
-            const char* bn[NB] = {"0-2k", "2k-8k", "8k-16k", "16k-32k", "32k-48k", "48k+"};
+            const int NB = 14;
+            const int bl[NB + 1] = {0,      2048,   8192,   16384,  32768,
+                                    49152,  65536,  98304,  131072, 163840,
+                                    196608, 229376, 262144, 327680, 1 << 30};
+            const char* bn[NB] = {"0-2k",      "2k-8k",     "8k-16k",    "16k-32k",
+                                  "32k-48k",   "48k-64k",   "64k-96k",   "96k-128k",
+                                  "128k-160k", "160k-192k", "192k-224k", "224k-256k",
+                                  "256k-320k", "320k+"};
             double bs[NB] = {0};
             long bc[NB] = {0};
             std::vector<float> h_nll(PT);
