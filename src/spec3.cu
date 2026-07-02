@@ -129,19 +129,24 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_kv_store3(CP3 kp, CP3 vp, __half* __restrict__ kc, __half* __restrict__ vc,
+template <typename CT>
+__global__ void k_kv_store3(CP3 kp, CP3 vp, CT* __restrict__ kc, CT* __restrict__ vc,
                             IP3 pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
     size_t off = (size_t)(*pos.p[t]) * rowlen + i;
-    kc[off] = __float2half_rn(kp.p[t][i]);
-    vc[off] = __float2half_rn(vp.p[t][i]);
+    kv_set(kc[off], kp.p[t][i]);
+    kv_set(vc[off], vp.p[t][i]);
 }
-void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st,
-               int ntok) {
+void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st,
+               int ntok, bool fp8) {
     dim3 g((rowlen + 255) / 256, ntok);
-    k_kv_store3<<<g, 256, 0, st>>>(k, v, kc, vc, pos, rowlen);
+    if (fp8)
+        k_kv_store3<<<g, 256, 0, st>>>(k, v, (__nv_fp8_e4m3*)kc, (__nv_fp8_e4m3*)vc, pos,
+                                       rowlen);
+    else
+        k_kv_store3<<<g, 256, 0, st>>>(k, v, (__half*)kc, (__half*)vc, pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -151,8 +156,9 @@ static inline P3 out2p(float* o) { return P3{{o, o, o, o}}; }
 // range for ALL 6 GQA q-heads of its kv head (K/V read once, not 6x), online
 // softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
 // combine kernel merges splits. Works for 1..4 tokens via gridDim.z.
-__global__ void k_attn_fd(CP3 qp, int q_stride, const __half* __restrict__ kc,
-                          const __half* __restrict__ vc, float* __restrict__ part, IP3 pos,
+template <typename CT>
+__global__ void k_attn_fd(CP3 qp, int q_stride, const CT* __restrict__ kc,
+                          const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
                           int n_kv_heads, int gqa, int head_dim, float scale) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int seq = *pos.p[t] + 1;
@@ -178,13 +184,13 @@ __global__ void k_attn_fd(CP3 qp, int q_stride, const __half* __restrict__ kc,
     float* accw = s_acc + warp * 6 * 256;
 
     for (int p = p_lo + warp; p < p_hi; p += NW) {
-        const __half* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        const __half* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        const CT* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        const CT* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
         float kv[8], vv[8];
 #pragma unroll
         for (int u = 0; u < 8; u++) {
-            kv[u] = __half2float(kp[lane + 32 * u]);
-            vv[u] = __half2float(vp[lane + 32 * u]);
+            kv[u] = kv2f(kp[lane + 32 * u]);
+            vv[u] = kv2f(vp[lane + 32 * u]);
         }
 #pragma unroll
         for (int j = 0; j < 6; j++) {
@@ -259,48 +265,52 @@ __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n
     }
 }
 
-void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 out, float* scratch,
-                  IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st, int ntok) {
-    (void)max_ctx;
-    int gqa = n_q_heads / n_kv_heads;
-    size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
+// per-instantiation one-shot smem-attribute raise for k_attn_fd<CT>
+template <typename CT>
+static void fd_setattr(size_t sm) {
     static bool attr = false;
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_attn_fd,
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_fd<CT>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
         attr = true;
     }
+}
+
+template <typename CT>
+static void fd_launch(CP3 q, int q_stride, const void* kc, const void* vc, float* scratch,
+                      IP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, size_t sm,
+                      int ntok, cudaStream_t st) {
+    fd_setattr<CT>(sm);
     dim3 g1(n_kv_heads, FD_NS, ntok);
-    k_attn_fd<<<g1, 256, sm, st>>>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa,
-                                   head_dim, scale);
+    k_attn_fd<CT><<<g1, 256, sm, st>>>(q, q_stride, (const CT*)kc, (const CT*)vc, scratch, pos,
+                                       n_kv_heads, gqa, head_dim, scale);
+}
+
+void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
+                  IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
+                  cudaStream_t st, int ntok, bool fp8) {
+    (void)max_ctx;
+    int gqa = n_q_heads / n_kv_heads;
+    size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
+    if (fp8)
+        fd_launch<__nv_fp8_e4m3>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa, head_dim,
+                                 scale, sm, ntok, st);
+    else
+        fd_launch<__half>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa, head_dim, scale,
+                          sm, ntok, st);
     dim3 g2(n_q_heads, ntok);
     k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // single-token plain-path attention through the same flash-decode kernels
-void attn_decode(const float* q, int q_stride, const __half* kcache, const __half* vcache,
+void attn_decode(const float* q, int q_stride, const void* kcache, const void* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
-                 int n_kv_heads, int head_dim, float scale, cudaStream_t st) {
-    (void)max_ctx;
-    int gqa = n_q_heads / n_kv_heads;
-    size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
-    static bool attr = false;
-    if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_attn_fd,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
-        attr = true;
-    }
+                 int n_kv_heads, int head_dim, float scale, cudaStream_t st, bool fp8) {
     CP3 qp{{q, q, q}};
     IP3 pp{{d_pos, d_pos, d_pos}};
-    P3 op{{out, out, out}};
-    dim3 g1(n_kv_heads, FD_NS, 1);
-    k_attn_fd<<<g1, 256, sm, st>>>(qp, q_stride, kcache, vcache, scratch, pp, n_kv_heads, gqa,
-                                   head_dim, scale);
-    dim3 g2(n_q_heads, 1);
-    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out2p(out), n_q_heads, head_dim);
-    CUDA_CHECK(cudaGetLastError());
+    attn_decode3(qp, q_stride, kcache, vcache, out2p(out), scratch, pp, max_ctx, n_q_heads,
+                 n_kv_heads, head_dim, scale, st, 1, fp8);
 }
 
 __global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict__ S, IP3 tok,

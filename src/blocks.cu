@@ -75,19 +75,26 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 
 // attention decode implemented in spec3.cu (flash-decode)
 
+template <typename CT>
 __global__ void k_kv_store(const float* __restrict__ kbuf, const float* __restrict__ vbuf,
-                           __half* __restrict__ kc, __half* __restrict__ vc,
+                           CT* __restrict__ kc, CT* __restrict__ vc,
                            const int* __restrict__ d_pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     size_t off = (size_t)(*d_pos) * rowlen + i;
-    kc[off] = __float2half_rn(kbuf[i]);
-    vc[off] = __float2half_rn(vbuf[i]);
+    kv_set(kc[off], kbuf[i]);
+    kv_set(vc[off], vbuf[i]);
 }
 
-void kv_store(const float* kbuf, const float* vbuf, __half* kcache, __half* vcache,
-              const int* d_pos, int rowlen, cudaStream_t st) {
-    k_kv_store<<<(rowlen + 255) / 256, 256, 0, st>>>(kbuf, vbuf, kcache, vcache, d_pos, rowlen);
+void kv_store(const float* kbuf, const float* vbuf, void* kcache, void* vcache,
+              const int* d_pos, int rowlen, cudaStream_t st, bool fp8) {
+    dim3 g((rowlen + 255) / 256);
+    if (fp8)
+        k_kv_store<<<g, 256, 0, st>>>(kbuf, vbuf, (__nv_fp8_e4m3*)kcache,
+                                      (__nv_fp8_e4m3*)vcache, d_pos, rowlen);
+    else
+        k_kv_store<<<g, 256, 0, st>>>(kbuf, vbuf, (__half*)kcache, (__half*)vcache, d_pos,
+                                      rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 

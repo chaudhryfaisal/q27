@@ -6,11 +6,13 @@
 #include <random>
 #include <vector>
 
+#include "blocks.cuh"
 #include "cuda_common.h"
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
 #include "prefill.cuh"
+#include "spec3.cuh"
 
 using q27::DType;
 
@@ -330,6 +332,125 @@ static void test_attn_mma() {
     CUDA_CHECK(cudaFree(d_v));
 }
 
+// P2: fp8 E4M3 KV-cache store kernels vs the host-side saturating conversion,
+// bitwise. Seeds the input with range edges: saturation (+-500 -> +-448),
+// sub-denormal (1e-4 -> 0), zero, and an exactly representable value.
+static void test_kv_fp8_store() {
+    const int ROW = 4 * 256, T = 8;
+    std::vector<float> kf = rand_vec((size_t)T * ROW, 21), vf = rand_vec((size_t)T * ROW, 22);
+    for (auto* f : {&kf, &vf}) {
+        (*f)[0] = 500.f; (*f)[1] = -500.f; (*f)[2] = 1e-4f;
+        (*f)[3] = 0.f;   (*f)[4] = 0.4375f; (*f)[5] = 448.f;
+    }
+    float *d_k, *d_v;
+    uint8_t *d_kc, *d_vc;
+    CUDA_CHECK(cudaMalloc(&d_k, (size_t)T * ROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_v, (size_t)T * ROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_kc, (size_t)T * ROW));
+    CUDA_CHECK(cudaMalloc(&d_vc, (size_t)T * ROW));
+    CUDA_CHECK(cudaMemcpy(d_k, kf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, vf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
+    q27k::kv_store_T(d_k, d_v, d_kc, d_vc, 0, ROW, T, 0, true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint8_t> kc((size_t)T * ROW), vc((size_t)T * ROW);
+    CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(vc.data(), d_vc, vc.size(), cudaMemcpyDeviceToHost));
+    long bad = 0;
+    for (size_t i = 0; i < kc.size(); i++) {
+        if (kc[i] != __nv_fp8_e4m3(kf[i]).__x) bad++;
+        if (vc[i] != __nv_fp8_e4m3(vf[i]).__x) bad++;
+    }
+    check("fp8 kv_store_T vs host cvt (bitwise)", (double)bad, 1);
+    // single-row store at a device-side position (decode path)
+    int pos = 3;
+    int* d_pos;
+    CUDA_CHECK(cudaMalloc(&d_pos, 4));
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
+    q27k::kv_store(d_k, d_v, d_kc, d_vc, d_pos, ROW, 0, true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size(), cudaMemcpyDeviceToHost));
+    bad = 0;
+    for (int i = 0; i < ROW; i++)
+        if (kc[(size_t)pos * ROW + i] != __nv_fp8_e4m3(kf[i]).__x) bad++;
+    check("fp8 kv_store row vs host cvt (bitwise)", (double)bad, 1);
+    CUDA_CHECK(cudaFree(d_k)); CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_kc)); CUDA_CHECK(cudaFree(d_vc));
+    CUDA_CHECK(cudaFree(d_pos));
+}
+
+// P2: every E4M3 value is exactly representable in fp16, so the fp8 kernels
+// reading an fp8 cache must match the fp16 kernels reading the host-dequantized
+// cache BITWISE -- this isolates the load-conversion plumbing with no tolerance.
+static void test_attn_fp8() {
+    const int NKV = 4, GQA = 6, HD = 256, T = 23, BASE = 37, SEQ = BASE + T;
+    const int QROW = NKV * GQA * 2 * HD, OROW = NKV * GQA * HD, ROW = NKV * HD;
+    std::vector<float> qh = rand_vec((size_t)T * QROW, 31);
+    std::vector<float> kf = rand_vec((size_t)SEQ * ROW, 32), vf = rand_vec((size_t)SEQ * ROW, 33);
+    std::vector<uint8_t> k8(kf.size()), v8(vf.size());
+    std::vector<__half> kh(kf.size()), vh(vf.size());
+    for (size_t i = 0; i < kf.size(); i++) {
+        __nv_fp8_e4m3 a(kf[i]), b(vf[i]);
+        k8[i] = a.__x; v8[i] = b.__x;
+        kh[i] = __float2half_rn(float(a)); vh[i] = __float2half_rn(float(b));
+    }
+    float *d_q, *d_oa, *d_ob;
+    uint8_t *d_k8, *d_v8;
+    __half *d_kh, *d_vh;
+    CUDA_CHECK(cudaMalloc(&d_q, (size_t)T * QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_oa, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_ob, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_k8, k8.size()));
+    CUDA_CHECK(cudaMalloc(&d_v8, v8.size()));
+    CUDA_CHECK(cudaMalloc(&d_kh, kh.size() * 2));
+    CUDA_CHECK(cudaMalloc(&d_vh, vh.size() * 2));
+    CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kh, kh.data(), kh.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vh, vh.data(), vh.size() * 2, cudaMemcpyHostToDevice));
+
+    std::vector<float> oa((size_t)T * OROW), ob((size_t)T * OROW);
+    auto maxd = [&]() {
+        CUDA_CHECK(cudaMemcpy(oa.data(), d_oa, oa.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ob.data(), d_ob, ob.size() * 4, cudaMemcpyDeviceToHost));
+        double m = 0;
+        for (size_t i = 0; i < oa.size(); i++)
+            m = std::max(m, (double)std::fabs(oa[i] - ob[i]));
+        return m;
+    };
+    const float scale = 1.0f / sqrtf((float)HD);
+    for (const char* mode : {"lite", "mma"}) {
+        setenv("Q27_ATTN_PF", mode, 1);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
+                             SEQ, NKV * GQA, NKV, HD, scale, 0, true);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
+                             SEQ, NKV * GQA, NKV, HD, scale, 0, false);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        char label[80];
+        snprintf(label, sizeof label, "fp8 attn prefill %s == fp16(deq) (bitwise)", mode);
+        check(label, maxd(), 1e-30);
+    }
+    unsetenv("Q27_ATTN_PF");
+    // flash-decode: one token at position SEQ-1 (reads rows [0, SEQ))
+    int pos = SEQ - 1;
+    int* d_pos;
+    float* d_scr;
+    CUDA_CHECK(cudaMalloc(&d_pos, 4));
+    CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)NKV * GQA * q27k::FD_NS * q27k::FD_ST * 4));
+    q27k::attn_decode(d_q, 2 * HD, d_k8, d_v8, d_oa, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
+                      scale, 0, true);
+    q27k::attn_decode(d_q, 2 * HD, d_kh, d_vh, d_ob, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
+                      scale, 0, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    oa.resize(OROW); ob.resize(OROW);
+    check("fp8 attn decode == fp16(deq) (bitwise)", maxd(), 1e-30);
+    CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_oa)); CUDA_CHECK(cudaFree(d_ob));
+    CUDA_CHECK(cudaFree(d_k8)); CUDA_CHECK(cudaFree(d_v8));
+    CUDA_CHECK(cudaFree(d_kh)); CUDA_CHECK(cudaFree(d_vh));
+    CUDA_CHECK(cudaFree(d_pos)); CUDA_CHECK(cudaFree(d_scr));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -348,6 +469,8 @@ int main(int argc, char** argv) {
     test_gemm_mma(dm, m, "blk.3.attn_k.weight");    // Q8 1024x5120
     test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
     test_attn_mma();
+    test_kv_fp8_store();
+    test_attn_fp8();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

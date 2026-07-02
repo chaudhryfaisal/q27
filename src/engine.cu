@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     int stats_n = 0;
     int pfdbg_n = 0;
     std::string nll_path;
-    int nll_chunk = 512, nll_long = 0, nll_max = 0;
+    int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--nll-max") && i + 1 < argc) nll_max = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
         if (!strcmp(argv[i], "--verify-weights")) verify_weights = true;
+        if (!strcmp(argv[i], "--kvstats") && i + 1 < argc) kvstats_n = atoi(argv[++i]);
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
@@ -215,6 +216,65 @@ int main(int argc, char** argv) {
                    "p(d3|prefix,gate)=%5.1f%%  extra t/round=+%.3f\n",
                    tl[t], 100 * f, 100 * ppre, 100 * pd3, f * ppre * pd3);
         }
+        return 0;
+    }
+
+    if (kvstats_n > 0) {
+        // P2 design probe: prefill real text at fp16, then scan the attention
+        // KV caches for value magnitudes. Decides scale-free E4M3 vs per-row
+        // scales (E4M3: max 448, min denormal 2^-9).
+        if (nll_path.empty()) { fprintf(stderr, "--kvstats needs --nll FILE for tokens\n"); return 1; }
+        FILE* f = fopen(nll_path.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", nll_path.c_str()); return 1; }
+        fseek(f, 0, SEEK_END);
+        long fb = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        std::vector<int> tk(fb / 4);
+        if (fread(tk.data(), 4, tk.size(), f) != tk.size()) { fclose(f); return 1; }
+        fclose(f);
+        int N = std::min((int)tk.size(), std::min(kvstats_n, ctx));
+        fprintf(stderr, "kvstats: prefilling %d tokens\n", N);
+        int* d_toks;
+        CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)N * 4));
+        CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+        e.reset();
+        const DevTensor& onw = e.dm.get("output_norm.weight");
+        for (int c0 = 0; c0 < N; c0 += Engine::PF_T) {
+            int T = std::min((int)Engine::PF_T, N - c0);
+            e.prefill_chunk(d_toks + c0, c0, T);
+            if (c0 + T < N) { // mtp_warm reads toks[c0+1 .. c0+T]
+                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                e.mtp_warm_T(d_toks + c0 + 1, c0, T);
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        size_t n = (size_t)N * N_KV * HEAD_DIM;
+        std::vector<__half> hb(n);
+        auto scan = [&](const char* tag, int layer, const __half* dev) {
+            CUDA_CHECK(cudaMemcpy(hb.data(), dev, n * 2, cudaMemcpyDeviceToHost));
+            double amax = 0, asum = 0;
+            long sat = 0, sub = 0; // |x| > 448 (E4M3 sat) / 0 < |x| < 2^-10 (flush to 0)
+            for (size_t i = 0; i < n; i++) {
+                double a = fabs((double)__half2float(hb[i]));
+                asum += a;
+                if (a > amax) amax = a;
+                if (a > 448.0) sat++;
+                if (a > 0 && a < 0.0009765625) sub++;
+            }
+            printf("%s L%-2d  amax %10.3f  mean|x| %8.4f  sat448 %ld (%.4f%%)  "
+                   "sub2^-10 %ld (%.2f%%)\n", tag, layer, amax, asum / n, sat,
+                   100.0 * sat / n, sub, 100.0 * sub / n);
+        };
+        if (e.kv_fp8) { fprintf(stderr, "--kvstats reads fp16 caches; unset Q27_KV\n"); return 1; }
+        for (size_t s = 0; s < e.kcache.size(); s++) {
+            int layer = -1;
+            for (int il = 0; il < N_LAYER; il++)
+                if (e.attn_cache_idx[il] == (int)s) layer = il;
+            scan("K", layer, (const __half*)e.kcache[s]);
+            scan("V", layer, (const __half*)e.vcache[s]);
+        }
+        scan("K", 64, (const __half*)e.mtp_k);
+        scan("V", 64, (const __half*)e.mtp_v);
         return 0;
     }
 
@@ -496,8 +556,8 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < n; i++) out[i] = __half2float(tmp[i]);
             return out;
         };
-        auto s_kc = grabh(e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
-        auto s_mk = grabh(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
+        auto s_kc = grabh((const __half*)e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
+        auto s_mk = grabh((const __half*)e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
         // pass 2: batched (chunked prefill only, no final serial token)
         e.reset();
         if (e.d_prompt_cap < N) {
@@ -519,8 +579,8 @@ int main(int argc, char** argv) {
         auto b_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
         auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
-        auto b_kc = grabh(e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
-        auto b_mk = grabh(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
+        auto b_kc = grabh((const __half*)e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
+        auto b_mk = grabh((const __half*)e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
         printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
         printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
         printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");

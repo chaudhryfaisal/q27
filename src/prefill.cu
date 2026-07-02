@@ -4,19 +4,10 @@
 #include <cstring>
 
 #include "blocks.cuh"
+#include "cuda_common.h"
 #include "prefill.cuh"
 
 namespace q27k {
-
-#define CUDA_CHECK(x)                                                                     \
-    do {                                                                                  \
-        cudaError_t err__ = (x);                                                          \
-        if (err__ != cudaSuccess) {                                                       \
-            fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err__),        \
-                    __FILE__, __LINE__);                                                  \
-            exit(1);                                                                      \
-        }                                                                                 \
-    } while (0)
 
 static __device__ __forceinline__ float warp_reduce_f(float v) {
     for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
@@ -648,21 +639,26 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename CT>
 __global__ void k_kv_store_T(const float* __restrict__ kT, const float* __restrict__ vT,
-                             __half* __restrict__ kc, __half* __restrict__ vc, int base_pos,
+                             CT* __restrict__ kc, CT* __restrict__ vc, int base_pos,
                              int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
     size_t off = (size_t)(base_pos + t) * rowlen + i;
-    kc[off] = __float2half_rn(kT[(size_t)t * rowlen + i]);
-    vc[off] = __float2half_rn(vT[(size_t)t * rowlen + i]);
+    kv_set(kc[off], kT[(size_t)t * rowlen + i]);
+    kv_set(vc[off], vT[(size_t)t * rowlen + i]);
 }
 
-void kv_store_T(const float* kT, const float* vT, __half* kc, __half* vc, int base_pos,
-                int rowlen, int T, cudaStream_t st) {
+void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
+                int rowlen, int T, cudaStream_t st, bool fp8) {
     dim3 grid((rowlen + 255) / 256, T);
-    k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, kc, vc, base_pos, rowlen);
+    if (fp8)
+        k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, (__nv_fp8_e4m3*)kc, (__nv_fp8_e4m3*)vc,
+                                           base_pos, rowlen);
+    else
+        k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, (__half*)kc, (__half*)vc, base_pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -691,9 +687,10 @@ static __device__ __forceinline__ uint32_t h2u(__half2 h) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+template <typename CT>
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
-                   const __half* __restrict__ kc, const __half* __restrict__ vc,
+                   const CT* __restrict__ kc, const CT* __restrict__ vc,
                    float* __restrict__ outT, int out_row, int base_pos, int tile_t0, int T,
                    int n_kv_heads, int head_dim, float scale) {
     constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8; // padded smem rows (halfs)
@@ -738,8 +735,8 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
             int pp = idx / HD, d = idx % HD;
             size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
             bool ok = pp < np;
-            s_k[pp * LDH + d] = ok ? kc[off] : __float2half_rn(0.f);
-            s_v[pp * LDH + d] = ok ? vc[off] : __float2half_rn(0.f);
+            s_k[pp * LDH + d] = ok ? kv2h(kc[off]) : __float2half_rn(0.f);
+            s_v[pp * LDH + d] = ok ? kv2h(vc[off]) : __float2half_rn(0.f);
         }
         __syncthreads();
 
@@ -875,8 +872,9 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
 // (head, token) pairs. Online softmax (no position scratch). Note: fp
 // summation order differs from the serial decode kernel; gated empirically
 // on identical continuations.
+template <typename CT>
 __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int q_row,
-                                 const __half* __restrict__ kc, const __half* __restrict__ vc,
+                                 const CT* __restrict__ kc, const CT* __restrict__ vc,
                                  float* __restrict__ outT, int out_row, int base_pos,
                                  int tile_t0, int T, int n_kv_heads, int gqa, int head_dim,
                                  float scale) {
@@ -910,8 +908,8 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
         for (int idx = threadIdx.x; idx < np * HD; idx += blockDim.x) {
             int pp = idx / HD, d = idx % HD;
             size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
-            s_kv[(pp * 2) * HD + d] = __half2float(kc[off]);
-            s_kv[(pp * 2 + 1) * HD + d] = __half2float(vc[off]);
+            s_kv[(pp * 2) * HD + d] = kv2f(kc[off]);
+            s_kv[(pp * 2 + 1) * HD + d] = kv2f(vc[off]);
         }
         __syncthreads();
         if (!live) continue;
@@ -948,11 +946,11 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
     }
 }
 
-void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, const __half* vc,
-                    float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
-                    int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                    cudaStream_t st) {
-    (void)scratch; (void)max_ctx;
+template <typename CT>
+static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const void* kc,
+                                const void* vc, float* outT, int out_row, int base_pos, int t0,
+                                int SB, int n_q_heads, int n_kv_heads, int head_dim,
+                                float scale, cudaStream_t st) {
     const char* e = getenv("Q27_ATTN_PF");
     const bool use_mma =
         !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads;
@@ -961,14 +959,14 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, 
         const size_t SM = (size_t)(6 * TT + 2 * PP) * LDH * sizeof(__half);
         static bool attr2 = false;
         if (!attr2) {
-            CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma,
+            CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma<CT>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
             attr2 = true;
         }
         dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
-        k_attn_prefill_mma<<<grid, 192, SM, st>>>(qT, q_stride, q_row, kc, vc, outT, out_row,
-                                                  base_pos, t0, t0 + SB, n_kv_heads, head_dim,
-                                                  scale);
+        k_attn_prefill_mma<CT><<<grid, 192, SM, st>>>(qT, q_stride, q_row, (const CT*)kc,
+                                                      (const CT*)vc, outT, out_row, base_pos,
+                                                      t0, t0 + SB, n_kv_heads, head_dim, scale);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -976,16 +974,30 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, 
     const size_t SM = (size_t)PP * 2 * 256 * sizeof(float);
     static bool attr = false;
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_T,
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_T<CT>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
     int gqa = n_q_heads / n_kv_heads;
     dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
-    k_attn_prefill_T<<<grid, 256, SM, st>>>(qT, q_stride, q_row, kc, vc, outT, out_row,
-                                            base_pos, t0, t0 + SB, n_kv_heads, gqa, head_dim,
-                                            scale);
+    k_attn_prefill_T<CT><<<grid, 256, SM, st>>>(qT, q_stride, q_row, (const CT*)kc,
+                                                (const CT*)vc, outT, out_row, base_pos, t0,
+                                                t0 + SB, n_kv_heads, gqa, head_dim, scale);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
+                    float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
+                    int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
+                    cudaStream_t st, bool fp8) {
+    (void)scratch; (void)max_ctx;
+    if (fp8)
+        attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                           base_pos, t0, SB, n_q_heads, n_kv_heads, head_dim,
+                                           scale, st);
+    else
+        attn_prefill_launch<__half>(qT, q_stride, q_row, kc, vc, outT, out_row, base_pos, t0,
+                                    SB, n_q_heads, n_kv_heads, head_dim, scale, st);
 }
 
 // Sequential delta rule over the chunk: S tile lives in dynamic shared memory

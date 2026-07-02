@@ -6,7 +6,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. The advertised 262K native does NOT fit on this card at fp16 alongside 16.75 GB of weights -- practical allocation ceiling is ~180K (fp8 KV, planned, would double that); correctness validated to 64K (see risk 5)
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~370K -- the advertised 262K native now fits** (allocates and runs; correctness validated to 64K, see risk 5)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -43,7 +43,7 @@ recurrence + ~140 small-kernel launches/token, and three attempts on it
 ## Design decisions
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF.
-- **KV cache**: fp16 for the 17 attention layers (implemented; f32 originally). FP8 E4M3 is planned, not done -- it halves KV capacity cost again and cuts long-ctx decode bandwidth. DeltaNet recurrent state is tiny and stays f32.
+- **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships opt-in via `Q27_KV=fp8` (P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline repack tool is Python (runs once).
 - **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary.
@@ -133,6 +133,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
 | P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
 | v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
+| P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -253,10 +254,23 @@ Still no CUTLASS; "plain CUDA" stays true. dp4a prefill: ~590 t/s @512 /
 ~300 @26K; fork reference 2,300-2,400. Realistic target 2-4x -> cold 26.7K
 TTFT from 61s toward ~15-25s.
 
-**P2 -- fp8 (E4M3) KV cache:** halves KV again (68 -> 34 KB/token: ~8.9 GB
-@256K) and cuts long-ctx decode KV bandwidth. NOT lossless -- changes logits,
-so it lands behind the P0 gates and ships opt-in until the needle/PPL gates
-pass at tolerance. Design-decisions section already marks it planned.
+**P2 -- DONE 2026-07-02: fp8 (E4M3) KV cache, opt-in via `Q27_KV=fp8`.**
+Halves KV (68 -> 34 KB/token); measure-first probe (`--kvstats`, 8K wikitext
+tokens through prefill) showed K amax <= 21.8 / V amax <= 118.6 vs the E4M3
+448 saturation bound with negligible sub-denormal mass, so the design is
+scale-free saturating conversion -- per-row scales only pay when a float
+format is range-limited, and this one is not. All 3 store kernels + 3
+attention consumers (flash-decode, MMA and lite FA prefill) templated on the
+cache element type; fp16 stays the default and its canonicals hold bitwise
+(md5 re-verified post-refactor). Gates: unit tests prove store == host
+saturating cvt bitwise and fp8 kernels == fp16 kernels on the dequantized
+cache bitwise (E4M3 is exact in fp16); corpus PPL 7.1889 vs 7.1928 (-0.05%,
+noise); `--nll-long 65536` buckets flat and within 0.3% of fp16; needle 3/3
+@55K through the server; logit A/B @512-tok prompt: cosine 0.9995, top-1
+exact, KL 3.4e-5; pf/pfcache identical under fp8; acceptance 3.64 vs 3.67
+t/round (-1% @2K soak). Wins: decode @28.5K ctx 105.7 -> 117.2 t/s (+11%),
+alloc ceiling ~180K -> ~370K (262K native allocates and runs; cold TTFT
+unchanged). Risk-6 tolerance-gate machinery now exists for future fp paths.
 
 **P1.5 -- DONE 2026-07-02: cold 28.1K TTFT 35.7s -> 24.3s.**
 k_attn_prefill_mma: fp16 flash-attention prefill on mma.sync.m16n8k16 --
@@ -290,5 +304,5 @@ this model, silent wrongness if reused elsewhere); Q fp16 saturation above
 2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED + MITIGATED 2026-07-02** -- v1.3 measured +3.35% vs Q5_K_M (7.2135 vs 6.9797, identical tokens/protocol via `--nll`); v1.4 policy (residual writers to Q8, chosen by a 6-candidate sensitivity study -- see roadmap P0.5) lands at **7.1928 = +3.05%**, and decode got faster (+3.3%, acceptance-coupled). Still marginally over the 3% bar; the study shows uniform promotion cannot close the rest at acceptable cost (ffn_down ceiling probe: 29% of gap for +2.76 GB) -- importance-weighted scales are the documented path if ever needed. The t/s comparison remains bit-width-assisted (15.8 GB reads vs 18.2).
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
-5. **Long-context correctness: VALIDATED to 64K (2026-07-02).** Three gates: (a) `--nll-long 65536` (one pass, no resets) shows NLL flat across position buckets -- 32-48K: PPL 5.45, 48K+: 5.80, no late-position blowup; (b) cross-engine: q27 pooled [32K,64K) PPL 5.622 vs llama-perplexity -c 65536 chunk-1 5.511 = **+2.0%, smaller than the +3.35% short-context delta**, so no length-dependent divergence (M-RoPE + GDN state hold); (c) needle retrieval 3/3 at depths 3/50/95% of a ~55K-token haystack through q27-server, think traces correctly naming surrounding sections. Beyond 64K remains unvalidated (VRAM alloc ceiling ~180K at fp16 KV); rerun tools: `--nll-long`, scratchpad needle harness. Risk 3 is covered to 64K by (a)+(b).
-6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the roadmap's int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). STILL OPEN for fp8 KV (P2) and any future fp16/fp8 MMA: those change logits, so a tolerance gate (logit cosine / top-k agreement vs the exact path, plus the P0 needle/PPL gates) must exist before they ship. The old fork-in-the-road (scoped CUTLASS/cuBLASLt vs hand-rolled vs status quo) is now the P1 fallback ladder rather than a blocker.
+5. **Long-context correctness: VALIDATED to 64K (2026-07-02).** Three gates: (a) `--nll-long 65536` (one pass, no resets) shows NLL flat across position buckets -- 32-48K: PPL 5.45, 48K+: 5.80, no late-position blowup; (b) cross-engine: q27 pooled [32K,64K) PPL 5.622 vs llama-perplexity -c 65536 chunk-1 5.511 = **+2.0%, smaller than the +3.35% short-context delta**, so no length-dependent divergence (M-RoPE + GDN state hold); (c) needle retrieval 3/3 at depths 3/50/95% of a ~55K-token haystack through q27-server, think traces correctly naming surrounding sections. Beyond 64K remains unvalidated (VRAM alloc ceiling ~180K at fp16 KV, ~370K at fp8 -- capacity now exceeds validation); rerun tools: `--nll-long`, scratchpad needle harness. Risk 3 is covered to 64K by (a)+(b).
+6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the roadmap's int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). **RESOLVED for fp8 KV (P2, 2026-07-02):** the tolerance-gate machinery now exists and passed -- logit A/B vs the fp16 path (cosine 0.9995, top-1 exact, KL 3.4e-5 @512-tok prompt), corpus PPL delta -0.05%, needle 3/3 -- and fp8 ships opt-in (`Q27_KV=fp8`) with the fp16 default still bitwise-canonical. The same gate recipe applies to any future fp16/fp8 MMA decode path.

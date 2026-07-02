@@ -32,9 +32,9 @@ void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st = 
 void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, float freq_base,
            cudaStream_t st = 0, int ntok = 3);
 
-// KV store for ntok tokens (disjoint slots).
-void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st = 0,
-               int ntok = 3);
+// KV store for ntok tokens (disjoint slots). fp8: E4M3 cache elements (P2).
+void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st = 0,
+               int ntok = 3, bool fp8 = false);
 
 // Flash-decode split-K partial layout: FD_NS position splits per (token, head)
 // pair, each partial = {m, l, acc[256]} = FD_ST floats. Every split writes its
@@ -45,9 +45,9 @@ static constexpr int FD_ST = 258;  // per-partial stride: m, l, acc[256]
 
 // causal decode attention for ntok tokens; token t attends cache[0 .. *pos.p[t]].
 // scratch: [ntok][n_q_heads][FD_NS][FD_ST] floats (see above).
-void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 out, float* scratch,
+void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st = 0, int ntok = 3);
+                  cudaStream_t st = 0, int ntok = 3, bool fp8 = false);
 
 // embedding row lookup for ntok device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,
