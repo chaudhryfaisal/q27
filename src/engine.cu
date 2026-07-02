@@ -464,17 +464,18 @@ int main(int argc, char** argv) {
         std::vector<int> out;
         int P = (int)toks.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
-        int total_emitted = 0, rounds = 0, hist1 = 0, hist2 = 0, hist3 = 0;
+        int total_emitted = 0, rounds = 0, hist[4] = {0, 0, 0, 0};
         while ((int)out.size() < n_gen) {
-            int em[3];
+            int em[4];
             int n = e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
             total_emitted += n;
-            if (n == 1) hist1++; else if (n == 2) hist2++; else hist3++;
+            hist[n - 1]++;
             P += n;
         }
-        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d\n", hist1, hist2, hist3);
+        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d\n", hist[0],
+                hist[1], hist[2], hist[3]);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

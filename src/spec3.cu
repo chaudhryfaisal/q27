@@ -24,8 +24,8 @@ __global__ void k_l2norm3(P3 xp, int head_dim, float eps) {
     float inv = rsqrtf(fmaxf(sh[0], eps * eps));
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) xh[i] *= inv;
 }
-void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st) {
-    dim3 g(n_heads, 3);
+void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st, int ntok) {
+    dim3 g(n_heads, ntok);
     k_l2norm3<<<g, 128, 0, st>>>(x, head_dim, eps);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -45,8 +45,9 @@ __global__ void k_gemv_f16_3(const __half* __restrict__ W, CP3 xp, P3 yp, int64_
     }
     if (threadIdx.x == 0) yp.p[blockIdx.y][blockIdx.x] = sh[0];
 }
-void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaStream_t st) {
-    dim3 g((unsigned)rows, 3);
+void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaStream_t st,
+                int ntok) {
+    dim3 g((unsigned)rows, ntok);
     k_gemv_f16_3<<<g, 256, 0, st>>>(W, x, y, cols);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -62,8 +63,8 @@ __global__ void k_gdn_gates3(CP3 ar, CP3 br, const float* __restrict__ a,
     b.p[t][h] = 1.0f / (1.0f + expf(-br.p[t][h]));
 }
 void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int n,
-                cudaStream_t st) {
-    k_gdn_gates3<<<3, 64, 0, st>>>(ar, br, a, dt, g, b, n);
+                cudaStream_t st, int ntok) {
+    k_gdn_gates3<<<ntok, 64, 0, st>>>(ar, br, a, dt, g, b, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -89,8 +90,8 @@ __global__ void k_gated_norm3(CP3 op, const float* __restrict__ w, CP3 zp, P3 ou
     }
 }
 void gated_norm3(CP3 o, const float* w, CP3 z, P3 out, int n_heads, int head_dim, float eps,
-                 cudaStream_t st) {
-    dim3 g(n_heads, 3);
+                 cudaStream_t st, int ntok) {
+    dim3 g(n_heads, ntok);
     k_gated_norm3<<<g, 128, 0, st>>>(o, w, z, out, head_dim, eps);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -103,9 +104,9 @@ __global__ void k_sigmoid_gate3(P3 outp, CP3 qgp, int head_dim, int n) {
     float gv = qgp.p[t][(size_t)h * 2 * head_dim + head_dim + d];
     outp.p[t][e] *= 1.0f / (1.0f + expf(-gv));
 }
-void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st) {
+void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st, int ntok) {
     int n = n_heads * head_dim;
-    dim3 g((n + 255) / 256, 3);
+    dim3 g((n + 255) / 256, ntok);
     k_sigmoid_gate3<<<g, 256, 0, st>>>(out, qg, head_dim, n);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -122,8 +123,8 @@ __global__ void k_rope3(P3 xp, int head_dim, int n_rot, int stride, IP3 pos, flo
     xh[d + n_rot / 2] = x0 * s + x1 * c;
 }
 void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, float freq_base,
-           cudaStream_t st) {
-    dim3 g(n_heads, 3);
+           cudaStream_t st, int ntok) {
+    dim3 g(n_heads, ntok);
     k_rope3<<<g, 32, 0, st>>>(x, head_dim, n_rot, stride, pos, freq_base);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -137,18 +138,19 @@ __global__ void k_kv_store3(CP3 kp, CP3 vp, __half* __restrict__ kc, __half* __r
     kc[off] = __float2half_rn(kp.p[t][i]);
     vc[off] = __float2half_rn(vp.p[t][i]);
 }
-void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st) {
-    dim3 g((rowlen + 255) / 256, 3);
+void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st,
+               int ntok) {
+    dim3 g((rowlen + 255) / 256, ntok);
     k_kv_store3<<<g, 256, 0, st>>>(k, v, kc, vc, pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 
-static inline P3 out2p(float* o) { return P3{{o, o, o}}; }
+static inline P3 out2p(float* o) { return P3{{o, o, o, o}}; }
 
 // Flash-decode: grid (kv_head, split, token). Each block covers one position
 // range for ALL 6 GQA q-heads of its kv head (K/V read once, not 6x), online
 // softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
-// combine kernel merges splits. Works for 1..3 tokens via gridDim.z.
+// combine kernel merges splits. Works for 1..4 tokens via gridDim.z.
 __global__ void k_attn_fd(CP3 qp, int q_stride, const __half* __restrict__ kc,
                           const __half* __restrict__ vc, float* __restrict__ part, IP3 pos,
                           int n_kv_heads, int gqa, int head_dim, float scale) {
@@ -259,7 +261,7 @@ __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n
 
 void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st) {
+                  cudaStream_t st, int ntok) {
     (void)max_ctx;
     int gqa = n_q_heads / n_kv_heads;
     size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
@@ -269,10 +271,10 @@ void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 ou
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
         attr = true;
     }
-    dim3 g1(n_kv_heads, FD_NS, 3);
+    dim3 g1(n_kv_heads, FD_NS, ntok);
     k_attn_fd<<<g1, 256, sm, st>>>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa,
                                    head_dim, scale);
-    dim3 g2(n_q_heads, 3);
+    dim3 g2(n_q_heads, ntok);
     k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -311,53 +313,64 @@ __global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict_
          c += (int64_t)gridDim.x * blockDim.x)
         outp.p[t][c] = (float)wr[c] * __half2float(sr[c / 128]);
 }
-void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st) {
-    dim3 g(8, 3);
+void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st,
+            int ntok) {
+    dim3 g(8, ntok);
     k_embed3<<<g, 256, 0, st>>>(W, S, tok, cols, out);
     CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_prep_round(const int* __restrict__ dP, const int* __restrict__ dtok,
-                             int* pa, int* pb, int* pc, int* pm, int* pm2, int* outcome) {
+                             int* pa, int* pb, int* pc, int* pd, int* pm, int* pm2, int* pm3,
+                             int* outcome) {
     int P = *dP;
     *pa = P + 1;
     *pb = P + 2;
     *pc = P + 3;
+    *pd = P + 4;
     *pm = P + 1;
     *pm2 = P + 2;
+    *pm3 = P + 3;
     outcome[1] = *dtok; // t1 snapshot (pre-round)
 }
 void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
-                int* pos_m, int* pos_m2, int* outcome, cudaStream_t st) {
-    k_prep_round<<<1, 1, 0, st>>>(d_P, d_token, pos_a, pos_b, pos_c, pos_m, pos_m2, outcome);
+                int* pos_d, int* pos_m, int* pos_m2, int* pos_m3, int* outcome,
+                cudaStream_t st) {
+    k_prep_round<<<1, 1, 0, st>>>(d_P, d_token, pos_a, pos_b, pos_c, pos_d, pos_m, pos_m2,
+                                  pos_m3, outcome);
     CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
                                const int* __restrict__ dr1p, const int* __restrict__ dr2p,
-                               const int* __restrict__ vap, const int* __restrict__ vbp,
-                               const int* __restrict__ vcp, const float* __restrict__ x1a,
+                               const int* __restrict__ dr3p, const int* __restrict__ vap,
+                               const int* __restrict__ vbp, const int* __restrict__ vcp,
+                               const int* __restrict__ vdp, const float* __restrict__ x1a,
                                const float* __restrict__ x1b, const float* __restrict__ x1c,
-                               float* __restrict__ h_next, int* __restrict__ outcome,
-                               int n_embd) {
-    int dr1 = *dr1p, dr2 = *dr2p, va = *vap, vb = *vbp, vc = *vcp;
-    int n = 1 + (va == dr1 ? 1 : 0) + ((va == dr1 && vb == dr2) ? 1 : 0);
-    const float* src = n == 3 ? x1c : n == 2 ? x1b : x1a;
+                               const float* __restrict__ x1d, float* __restrict__ h_next,
+                               int* __restrict__ outcome, int n_embd) {
+    int dr1 = *dr1p, dr2 = *dr2p, dr3 = *dr3p;
+    int va = *vap, vb = *vbp, vc = *vcp, vd = *vdp;
+    bool a1 = va == dr1, a2 = a1 && vb == dr2, a3 = a2 && vc == dr3;
+    int n = 1 + (a1 ? 1 : 0) + (a2 ? 1 : 0) + (a3 ? 1 : 0);
+    const float* src = n == 4 ? x1d : n == 3 ? x1c : n == 2 ? x1b : x1a;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         h_next[i] = src[i];
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        *dtok = n == 3 ? vc : n == 2 ? vb : va;
+        *dtok = n == 4 ? vd : n == 3 ? vc : n == 2 ? vb : va;
         *dP += n;
         outcome[0] = n;
         outcome[2] = dr1;
         outcome[3] = dr2;
+        outcome[4] = dr3;
     }
 }
-void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2, const int* va,
-                  const int* vb, const int* vc, const float* x1a, const float* x1b,
-                  const float* x1c, float* h_next, int* outcome, int n_embd, cudaStream_t st) {
-    k_finish_round<<<4, 256, 0, st>>>(d_P, d_token, d_draft, d_draft2, va, vb, vc, x1a, x1b, x1c,
-                                      h_next, outcome, n_embd);
+void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
+                  const int* d_draft3, const int* va, const int* vb, const int* vc,
+                  const int* vd, const float* x1a, const float* x1b, const float* x1c,
+                  const float* x1d, float* h_next, int* outcome, int n_embd, cudaStream_t st) {
+    k_finish_round<<<4, 256, 0, st>>>(d_P, d_token, d_draft, d_draft2, d_draft3, va, vb, vc, vd,
+                                      x1a, x1b, x1c, x1d, h_next, outcome, n_embd);
     CUDA_CHECK(cudaGetLastError());
 }
 
