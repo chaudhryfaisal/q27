@@ -78,56 +78,65 @@ __global__ void k_attn_decode(const float* __restrict__ q, int q_stride,
                               float* __restrict__ out, float* __restrict__ scratch,
                               const int* __restrict__ d_pos, int max_ctx,
                               int n_kv_heads, int head_dim, float scale) {
+    // warp-cooperative: warps stride positions, lanes stride dims (coalesced K/V)
     const int seq_len = *d_pos + 1;
     const int h = blockIdx.x;
     const int kvh = h / (gridDim.x / n_kv_heads);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    constexpr int NW = 8;
     const float* qh = q + (size_t)h * q_stride;
     float* sc = scratch + (size_t)h * max_ctx;
-    __shared__ float sh[256];
-    __shared__ float s_max, s_sum;
+    __shared__ float s_q[256];
+    __shared__ float s_red[NW];
+    __shared__ float s_part[NW][256 + 4];
 
-    // scores
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) s_q[i] = qh[i];
+    __syncthreads();
+
     float lmax = -FLT_MAX;
-    for (int p = threadIdx.x; p < seq_len; p += blockDim.x) {
+    for (int p = warp; p < seq_len; p += NW) {
         const float* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        float dot = 0.f;
-        for (int i = 0; i < head_dim; i++) dot += qh[i] * kp[i];
-        float sv = dot * scale;
-        sc[p] = sv;
-        lmax = fmaxf(lmax, sv);
+        float d = 0.f;
+        for (int i = lane; i < head_dim; i += 32) d += s_q[i] * kp[i];
+        for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffff, d, off);
+        d = __shfl_sync(0xffffffff, d, 0) * scale;
+        if (lane == 0) sc[p] = d;
+        lmax = fmaxf(lmax, d);
     }
-    sh[threadIdx.x] = lmax;
+    for (int off = 16; off > 0; off >>= 1)
+        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
+    if (lane == 0) s_red[warp] = lmax;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) s_max = sh[0];
+    float bmax = -FLT_MAX;
+    for (int w = 0; w < NW; w++) bmax = fmaxf(bmax, s_red[w]);
     __syncthreads();
 
-    // softmax weights
     float lsum = 0.f;
     for (int p = threadIdx.x; p < seq_len; p += blockDim.x) {
-        float e = expf(sc[p] - s_max);
+        float e = expf(sc[p] - bmax);
         sc[p] = e;
         lsum += e;
     }
-    sh[threadIdx.x] = lsum;
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
+    if (lane == 0) s_red[warp] = lsum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) s_sum = sh[0];
-    __syncthreads();
+    float bsum = 0.f;
+    for (int w = 0; w < NW; w++) bsum += s_red[w];
+    const float inv = 1.0f / bsum;
 
-    // weighted V accumulation: thread d walks all positions
-    float inv = 1.0f / s_sum;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float* part = s_part[warp];
+    for (int i = lane; i < head_dim; i += 32) part[i] = 0.f;
+    __syncwarp();
+    for (int p = warp; p < seq_len; p += NW) {
+        const float* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        float w = sc[p];
+        for (int i = lane; i < head_dim; i += 32) part[i] += w * vp[i];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float acc = 0.f;
-        for (int p = 0; p < seq_len; p++)
-            acc += sc[p] * vc[((size_t)p * n_kv_heads + kvh) * head_dim + d];
-        out[(size_t)h * head_dim + d] = acc * inv;
+        for (int w = 0; w < NW; w++) acc += s_part[w][i];
+        out[(size_t)h * head_dim + i] = acc * inv;
     }
 }
 
