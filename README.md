@@ -137,14 +137,19 @@ depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
 weights load once -- a bit flipped by a marginal OC during a long session is a
 persistent silent error the token-identity gates cannot catch (they compare
 against the same resident state). **OBSERVED 2026-07-02:** after ~30 min of
-sustained VRAM load (long-context benches), the canonical 128-token sequence
-came out WRONG -- deterministically across immediate re-runs -- then returned
-to correct after a few minutes of cooldown, on an unchanged binary. Everything
-fits a heat-marginal +4000 offset flipping a resident weight bit. Treat +4000
-as unsafe for sustained load; +3000 (where E2 measured the gains flattening)
-or stock is the recommendation for anything long-running. A device-side
-weight-checksum tool (verify after load, recheck on demand) is on the roadmap
-as the detection mechanism.
+sustained VRAM load (long-context benches), one run of the canonical
+128-token gate came out WRONG (divergent text, acceptance down) on an
+unchanged binary, then all subsequent runs -- ~2 min of idle later -- were
+correct again; a cross-build check confirmed the binary was innocent. A
+one-shot soft error from the heat-marginal +4000 offset is the only
+explanation that fits. **Resolution: the daily offset is now +3000
+(tools/mem_oc.py 3000, 2026-07-02) -- E2 measured gains flattening past
++3000, and depth-3 confirms: 188.2 t/s @2k at +3000 vs 188.9 at +4000 vs
+183.1 stock. The marginal band above +3000 bought ~0.4% and produced the
+soft error.** +4000 only for short supervised benches. A device-side
+weight-checksum tool (verify after load, recheck on demand) is on the
+roadmap as the detection mechanism. Offset is volatile -- reapply after
+reboot.
 
 ## Prefill (M6)
 
