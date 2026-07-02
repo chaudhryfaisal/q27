@@ -6,7 +6,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers -- 256K context costs ~3 GB of KV, not 30
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. The advertised 262K native does NOT fit on this card at fp16 alongside 16.75 GB of weights -- practical allocation ceiling is ~180K (fp8 KV, planned, would double that); correctness is only validated to 8K so far (see risk 5)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -32,12 +32,18 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 |---|---|---|---|
 | llama.cpp Q5_K_M (62% BW eff) | 18.2 GB | 61.6 t/s measured | 106-127 t/s measured |
 | q27 Q5-class, 85-90% eff | ~18 GB | ~88 t/s | ~165 |
-| **q27 custom 4-bit (target)** | **~14.8 GB** | **~120 t/s** | **~225** |
+| q27 custom 4-bit at 85-90% eff | ~14.8 GB | ~103-109 t/s | ~200-225 |
+| q27 4-bit **measured** (2026-07-02, +4000 OC) | ~15.5 GB/step | **91.0 t/s plain** (~75% eff) | **188.9** (depth-3 spec, 2.07x) |
+
+The original "~120 t/s ceiling" row implied ~99% BW efficiency and is retired.
+Plain decode sits ~15% under the honest 85-90% ceiling; that tail is GDN
+recurrence + ~140 small-kernel launches/token, and three attempts on it
+(E4 launch geometry, E5 fusions, cp.async) all came back negative.
 
 ## Design decisions
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF.
-- **KV cache**: FP8 E4M3 for the 17 attention layers. DeltaNet recurrent state is tiny and stays f32.
+- **KV cache**: fp16 for the 17 attention layers (implemented; f32 originally). FP8 E4M3 is planned, not done -- it halves KV capacity cost again and cuts long-ctx decode bandwidth. DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline repack tool is Python (runs once).
 - **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary.
@@ -125,6 +131,14 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
 | E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
 
+Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
+depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
+weights load once -- a bit flipped by a marginal OC during a long session is a
+persistent silent error the token-identity gates cannot catch (they compare
+against the same resident state). The +5000 512-token stock-identical soak was
+a point-in-time check, not a long-session guarantee. For unattended multi-hour
+serving, stock clocks are the conservative choice.
+
 ## Prefill (M6)
 
 Batched prefill: 256-token chunks, smem-staged dp4a GEMM (16 rows/block share
@@ -169,6 +183,8 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 ## Risk register
 
 1. **Gated DeltaNet decode kernel** is the new risk center (was "simple dense" until we read the GGUF). llama.cpp's implementation is the semantic reference; validate per-layer.
-2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M.
+2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: the PPL delta has never actually been measured** -- the threshold is unbacked, and the t/s win over Q5_K_M partly comes from reading 14.8 GB instead of 18.2, so the speed comparison is only honest next to a quality number. OPEN.
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
-4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup).
+4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
+5. **Long-context correctness is untested.** All token-identity gates run at 2-8K. Risk 3 (M-RoPE) is precisely the failure mode that is correct at 2K and silently degraded at 128K. Needed before any context number is advertised as fact: needle/consistency check vs llama.cpp at >=64K. OPEN.
+6. **Tensor-core prefill will break the bitwise gate.** Batched prefill is currently bit-identical to serial because the dp4a GEMM matches the serial per-lane accumulation order exactly. fp16/fp8 MMA changes accumulation order, so the identical-continuations gate stops working for that path. A tolerance gate (logit cosine / top-k agreement vs serial) must exist BEFORE that work starts, or the hardest kernel has no regression signal. Related fork-in-the-road: "plain CUDA, no CUTLASS" vs "parity with cuBLAS prefill (~2,300 t/s)" are in tension -- hand-rolled sm_120 wgmma at cuBLAS parity is CUTLASS-grade effort. Options: (a) scoped CUTLASS/cuBLASLt dep for the prefill GEMM only, (b) hand-rolled TC GEMM accepting less than parity, (c) keep dp4a prefill and lean on the prefix cache (cold first turn stays ~60s @26K; warm turns are already 1.3s). Decision pending.
