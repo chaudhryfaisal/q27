@@ -74,6 +74,29 @@ int main(int argc, char** argv) {
         return tok.encode(body.value("prompt", std::string()));
     };
 
+    // Anthropic: top-level `system` (string or blocks) + messages with string or
+    // block content -> ChatML token ids.
+    auto build_prompt_anthropic = [&](const json& body) -> std::vector<int> {
+        std::vector<std::pair<std::string, std::string>> msgs;
+        if (body.contains("system")) {
+            std::string sys;
+            if (body["system"].is_string()) sys = body["system"];
+            else if (body["system"].is_array())
+                for (auto& b : body["system"])
+                    if (b.value("type", "") == "text") sys += b.value("text", "");
+            if (!sys.empty()) msgs.push_back({"system", sys});
+        }
+        for (auto& m : body["messages"]) {
+            std::string role = m.value("role", "user"), content;
+            if (m["content"].is_string()) content = m["content"];
+            else if (m["content"].is_array())
+                for (auto& part : m["content"])
+                    if (part.value("type", "") == "text") content += part.value("text", "");
+            msgs.push_back({role, content});
+        }
+        return tok.apply_chat_template(msgs);
+    };
+
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
         json body;
         try { body = json::parse(req.body); }
@@ -136,6 +159,65 @@ int main(int argc, char** argv) {
                 return true;
             });
     };
+
+    srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (...) { res.status = 400; res.set_content("{\"type\":\"error\"}", "application/json"); return; }
+        int n_max = body.value("max_tokens", 256);
+        bool stream = body.value("stream", false);
+        std::vector<int> prompt = build_prompt_anthropic(body);
+        if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
+        std::string mid = "msg_q27";
+
+        if (!stream) {
+            std::lock_guard<std::mutex> lk(gpu);
+            std::string text;
+            int n = eng.generate(prompt, n_max, EOS,
+                                 [&](int id) { text += tok.decode_one(id); return true; });
+            json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
+                        {"model", "q27-qwopus-27b"},
+                        {"content", json::array({{{"type", "text"}, {"text", text}}})},
+                        {"stop_reason", n >= n_max ? "max_tokens" : "end_turn"},
+                        {"stop_sequence", nullptr},
+                        {"usage", {{"input_tokens", (int)prompt.size()},
+                                   {"output_tokens", n}}}};
+            res.set_content(out.dump(), "application/json");
+            return;
+        }
+
+        res.set_header("Content-Type", "text/event-stream");
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [&, prompt, n_max, mid](size_t, httplib::DataSink& sink) {
+                std::lock_guard<std::mutex> lk(gpu);
+                auto ev = [&](const char* name, const json& j) {
+                    std::string s = std::string("event: ") + name + "\ndata: " + j.dump() + "\n\n";
+                    return sink.write(s.data(), s.size());
+                };
+                json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
+                            {"model", "q27-qwopus-27b"}, {"content", json::array()},
+                            {"stop_reason", nullptr}, {"stop_sequence", nullptr},
+                            {"usage", {{"input_tokens", (int)prompt.size()}, {"output_tokens", 0}}}};
+                ev("message_start", {{"type", "message_start"}, {"message", msg}});
+                ev("content_block_start", {{"type", "content_block_start"}, {"index", 0},
+                                           {"content_block", {{"type", "text"}, {"text", ""}}}});
+                int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
+                    json d = {{"type", "content_block_delta"}, {"index", 0},
+                              {"delta", {{"type", "text_delta"}, {"text", tok.decode_one(id)}}}};
+                    return ev("content_block_delta", d);
+                });
+                ev("content_block_stop", {{"type", "content_block_stop"}, {"index", 0}});
+                ev("message_delta", {{"type", "message_delta"},
+                                     {"delta", {{"stop_reason",
+                                                 produced >= n_max ? "max_tokens" : "end_turn"},
+                                                {"stop_sequence", nullptr}}},
+                                     {"usage", {{"output_tokens", produced}}}});
+                ev("message_stop", {{"type", "message_stop"}});
+                sink.done();
+                return true;
+            });
+    });
 
     srv.Post("/v1/chat/completions",
              [&](const httplib::Request& r, httplib::Response& s) { handle(r, s, true); });
