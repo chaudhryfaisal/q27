@@ -308,7 +308,12 @@ struct Engine {
         q27k::rmsnorm(x_mtp, (const float*)T(il, "nextn.shared_head_norm.weight").data, x1,
                       N_EMBD, EPS, stm);
         qx(x1, N_EMBD);
-        mm(dm.get("output.weight"), x1, mtp_logits);
+        // drafts use the Q4 head copy when present (verify keeps the Q8 head,
+        // so output remains exactly the faithful model's greedy text)
+        const DevTensor* head = dm.model_has("output_q4.weight")
+                                    ? &dm.get("output_q4.weight")
+                                    : &dm.get("output.weight");
+        mm(*head, x1, mtp_logits);
         q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
     }
 

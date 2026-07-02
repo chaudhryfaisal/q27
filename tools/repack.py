@@ -33,9 +33,9 @@ def policy(name: str) -> int:
         return DTYPE_F32
     if "ssm_alpha" in name or "ssm_beta" in name:
         return DTYPE_F16
-    if name == "output.weight":
-        return DTYPE_Q4  # v1.2: logits head to Q4 -- 3 full reads/spec-round, argmax-only consumer
-    if name == "token_embd.weight" or name.startswith("blk.64."):
+    if name == "output_q4.weight":
+        return DTYPE_Q4  # v1.3: extra Q4 copy of the lm_head for MTP DRAFT passes only
+    if name in ("token_embd.weight", "output.weight") or name.startswith("blk.64."):
         return DTYPE_Q8
     if re.match(r"blk\.\d+\.attn_(k|v)\.weight$", name):
         return DTYPE_Q8  # KV projections: worst Q4 RMSE + errors persist in KV cache; ~84 MB total
@@ -97,7 +97,7 @@ def main():
     t0 = time.time()
     r = GGUFReader(args.input)
 
-    meta = {"q27_version": VERSION, "quant_policy": "v1.2",
+    meta = {"q27_version": VERSION, "quant_policy": "v1.3",
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
@@ -127,7 +127,15 @@ def main():
     offset = 0
     n_bytes_in = n_bytes_out = 0
 
+    extra = []
     for t in r.tensors:
+        if t.name == "output.weight":
+            extra.append(("output_q4.weight", t))
+    class _Alias:
+        def __init__(self, name, t):
+            self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
+    tensor_iter = list(r.tensors) + [_Alias(n, t) for n, t in extra]
+    for t in tensor_iter:
         if only and not only.search(t.name):
             continue
         w = to_f32(t)

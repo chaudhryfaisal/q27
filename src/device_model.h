@@ -28,6 +28,7 @@ class DeviceModel {
     void upload_all();
 
     const DevTensor& get(const std::string& name) const;
+    bool model_has(const std::string& name) const { return model_.find(name) != nullptr; }
     size_t bytes_resident() const { return bytes_; }
 
   private:
