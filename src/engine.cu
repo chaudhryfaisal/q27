@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "blocks.cuh"
+#include "spec3.cuh"
 #include "cuda_common.h"
 #include "device_model.h"
 #include "kernels.cuh"
@@ -100,7 +101,7 @@ struct Engine {
         A((void**)&qg, 2 * N_HEAD * HEAD_DIM * 4);
         A((void**)&kbuf, N_KV * HEAD_DIM * 4); A((void**)&vbuf, N_KV * HEAD_DIM * 4);
         A((void**)&attnout, N_HEAD * HEAD_DIM * 4);
-        A((void**)&scratch, (size_t)N_HEAD * max_ctx * 4);
+        A((void**)&scratch, 3 * (size_t)N_HEAD * max_ctx * 4);
         A((void**)&qkv, GDN_CH * 4); A((void**)&convout, GDN_CH * 4); A((void**)&z, GDN_V * 4);
         A((void**)&alpha, GDN_HEADS * 4); A((void**)&betar, GDN_HEADS * 4);
         A((void**)&g, GDN_HEADS * 4); A((void**)&beta, GDN_HEADS * 4);
@@ -338,40 +339,26 @@ struct Engine {
         qx3(x1, x1_b, x1_c, N_EMBD);
         mm3(T(il, "attn_qkv.weight"), qkv, qkv_b, qkv_c);
         mm3(T(il, "attn_gate.weight"), z, z_b, z_c);
-        q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1, alpha, GDN_HEADS,
-                       N_EMBD, stm);
-        q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1_b, alpha_b, GDN_HEADS,
-                       N_EMBD, stm);
-        q27k::gemv_f16((const __half*)T(il, "ssm_beta.weight").data, x1, betar, GDN_HEADS,
-                       N_EMBD, stm);
-        q27k::gemv_f16((const __half*)T(il, "ssm_beta.weight").data, x1_b, betar_b, GDN_HEADS,
-                       N_EMBD, stm);
-        q27k::gemv_f16((const __half*)T(il, "ssm_alpha.weight").data, x1_c, alpha_c, GDN_HEADS,
-                       N_EMBD, stm);
-        q27k::gemv_f16((const __half*)T(il, "ssm_beta.weight").data, x1_c, betar_c, GDN_HEADS,
-                       N_EMBD, stm);
+        q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data, {{x1, x1_b, x1_c}},
+                         {{alpha, alpha_b, alpha_c}}, GDN_HEADS, N_EMBD, stm);
+        q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data, {{x1, x1_b, x1_c}},
+                         {{betar, betar_b, betar_c}}, GDN_HEADS, N_EMBD, stm);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates(alpha, betar, sa, sdt, g, beta, GDN_HEADS, stm);
-        q27k::gdn_gates(alpha_b, betar_b, sa, sdt, g_b, beta_b, GDN_HEADS, stm);
-        q27k::gdn_gates(alpha_c, betar_c, sa, sdt, g_c, beta_c, GDN_HEADS, stm);
+        q27k::gdn_gates3({{alpha, alpha_b, alpha_c}}, {{betar, betar_b, betar_c}}, sa, sdt,
+                         {{g, g_b, g_c}}, {{beta, beta_b, beta_c}}, GDN_HEADS, stm);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm);   // a
         q27k::conv_step(RBuf(il, 0), RBuf(il, 1), qkv_b, cw, convout_b, GDN_CH, stm); // b
         q27k::conv_step(RBuf(il, 1), RBuf(il, 2), qkv_c, cw, convout_c, GDN_CH, stm); // c
-        q27k::l2norm_heads(convout, 16, GDN_DIM, eps, stm);
-        q27k::l2norm_heads(convout + 2048, 16, GDN_DIM, eps, stm);
-        q27k::l2norm_heads(convout_b, 16, GDN_DIM, eps, stm);
-        q27k::l2norm_heads(convout_b + 2048, 16, GDN_DIM, eps, stm);
-        q27k::l2norm_heads(convout_c, 16, GDN_DIM, eps, stm);
-        q27k::l2norm_heads(convout_c + 2048, 16, GDN_DIM, eps, stm);
+        // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
+        q27k::l2norm3({{convout, convout_b, convout_c}}, 32, GDN_DIM, eps, stm);
         q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm);          // a
         q27k::delta_step(SBuf(il, 0), SBuf(il, 1), convout_b, g_b, beta_b, o_b, stm);   // b
         q27k::delta_step(SBuf(il, 1), SBuf(il, 2), convout_c, g_c, beta_c, o_c, stm);   // c
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm_gdn(o, nw, z, og, GDN_HEADS, GDN_DIM, eps, stm);
-        q27k::gated_norm_gdn(o_b, nw, z_b, og_b, GDN_HEADS, GDN_DIM, eps, stm);
-        q27k::gated_norm_gdn(o_c, nw, z_c, og_c, GDN_HEADS, GDN_DIM, eps, stm);
+        q27k::gated_norm3({{o, o_b, o_c}}, nw, {{z, z_b, z_c}}, {{og, og_b, og_c}}, GDN_HEADS,
+                          GDN_DIM, eps, stm);
         qx3(og, og_b, og_c, GDN_V);
         mm3(T(il, "ssm_out.weight"), y, y_b, y_c);
     }
@@ -390,27 +377,19 @@ struct Engine {
         q27k::rmsnorm_heads(kbuf_b, kn, kbuf_b, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(kbuf_c, kn, kbuf_c, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         mm3(T(il, "attn_v.weight"), vbuf, vbuf_b, vbuf_c);
-        q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_a, FREQ_BASE, stm);
-        q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_a, FREQ_BASE, stm);
-        q27k::rope_neox_partial(qg_b, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_b, FREQ_BASE,
-                                stm);
-        q27k::rope_neox_partial(kbuf_b, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_b, FREQ_BASE, stm);
-        q27k::rope_neox_partial(qg_c, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, d_pos_c, FREQ_BASE,
-                                stm);
-        q27k::rope_neox_partial(kbuf_c, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, d_pos_c, FREQ_BASE, stm);
+        q27k::IP3 P{{d_pos_a, d_pos_b, d_pos_c}};
+        q27k::rope3({{qg, qg_b, qg_c}}, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P, FREQ_BASE, stm);
+        q27k::rope3({{kbuf, kbuf_b, kbuf_c}}, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, P, FREQ_BASE, stm);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
-        q27k::kv_store(kbuf, vbuf, kcache[ci], vcache[ci], d_pos_a, N_KV * HEAD_DIM, stm);
-        q27k::attn_decode(qg, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout, scratch, d_pos_a,
-                          max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm);
-        q27k::kv_store(kbuf_b, vbuf_b, kcache[ci], vcache[ci], d_pos_b, N_KV * HEAD_DIM, stm);
-        q27k::attn_decode(qg_b, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout_b, scratch, d_pos_b,
-                          max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm);
-        q27k::kv_store(kbuf_c, vbuf_c, kcache[ci], vcache[ci], d_pos_c, N_KV * HEAD_DIM, stm);
-        q27k::attn_decode(qg_c, 2 * HEAD_DIM, kcache[ci], vcache[ci], attnout_c, scratch, d_pos_c,
-                          max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm);
-        q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, stm);
-        q27k::sigmoid_gate_mul(attnout_b, qg_b, N_HEAD, HEAD_DIM, stm);
-        q27k::sigmoid_gate_mul(attnout_c, qg_c, N_HEAD, HEAD_DIM, stm);
+        // store all 3 first (disjoint slots); each token's attention only reads
+        // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
+        q27k::kv_store3({{kbuf, kbuf_b, kbuf_c}}, {{vbuf, vbuf_b, vbuf_c}}, kcache[ci],
+                        vcache[ci], P, N_KV * HEAD_DIM, stm);
+        q27k::attn_decode3({{qg, qg_b, qg_c}}, 2 * HEAD_DIM, kcache[ci], vcache[ci],
+                           {{attnout, attnout_b, attnout_c}}, scratch, P, max_ctx, N_HEAD, N_KV,
+                           HEAD_DIM, kq, stm);
+        q27k::sigmoid_gate3({{attnout, attnout_b, attnout_c}}, {{qg, qg_b, qg_c}}, N_HEAD,
+                            HEAD_DIM, stm);
         qx3(attnout, attnout_b, attnout_c, N_HEAD * HEAD_DIM);
         mm3(T(il, "attn_output.weight"), y, y_b, y_c);
     }
@@ -434,12 +413,8 @@ struct Engine {
         mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2);
 
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
-                           stm);
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_draft, N_EMBD,
-                           h_b, stm);
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_draft2, N_EMBD,
-                           h_c, stm);
+        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
+                     {{d_token, d_draft, d_draft2}}, N_EMBD, {{h, h_b, h_c}}, stm);
         q27k::CP3 Hc{{h, h_b, h_c}}, Yc{{y, y_b, y_c}};
         q27k::P3 Hm{{h, h_b, h_c}}, X1m{{x1, x1_b, x1_c}};
         for (int il = 0; il < N_LAYER; il++) {

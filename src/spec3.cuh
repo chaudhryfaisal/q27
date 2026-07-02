@@ -1,0 +1,45 @@
+// 3-token grid-merged variants for the speculative round. Same per-token work
+// distribution as the single-token kernels; tokens ride an extra grid dim.
+#pragma once
+#include <cuda_runtime.h>
+
+#include "kernels.cuh" // P3/CP3
+
+namespace q27k {
+
+struct IP3 { const int* p[3]; };
+
+// L2 norm over contiguous heads, 3 tokens. (q||k are contiguous: pass 32 heads.)
+void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0);
+
+// f16 GEMV, one weight, 3 activation columns.
+void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaStream_t st = 0);
+
+// gdn gate math for 3 tokens.
+void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int n,
+                cudaStream_t st = 0);
+
+// gated RMS norm (DeltaNet output), 3 tokens.
+void gated_norm3(CP3 o, const float* w, CP3 z, P3 out, int n_heads, int head_dim, float eps,
+                 cudaStream_t st = 0);
+
+// attention output sigmoid gate, 3 tokens.
+void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st = 0);
+
+// neox partial rope, 3 tokens with per-token device positions.
+void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, float freq_base,
+           cudaStream_t st = 0);
+
+// KV store for 3 tokens (disjoint slots).
+void kv_store3(CP3 k, CP3 v, float* kc, float* vc, IP3 pos, int rowlen, cudaStream_t st = 0);
+
+// causal decode attention for 3 tokens; token t attends cache[0 .. *pos.p[t]].
+// scratch: [3][n_q_heads][max_ctx].
+void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out, float* scratch,
+                  IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
+                  cudaStream_t st = 0);
+
+// embedding row lookup for 3 device tokens.
+void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0);
+
+} // namespace q27k
