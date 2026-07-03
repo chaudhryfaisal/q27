@@ -449,12 +449,23 @@ input contracts before a tolerance FAIL means anything. Prefill cost order
    a SERVING-LAYER property. P7 constrained decoding makes the drift
    unsampleable at the source (phases 1-2 landed: ToolGrammar + ToolMaskCache
    + argmax_masked, 45faf91/38b6b39/911f2ea).
-2. **Periodic GDN state checkpoints** (upgrades the prefix-snapshot-pool
-   idea): snapshot S + conv rings every N tokens during prefill so a
-   mid-context divergence (edited file, changed tool result -- the normal
-   agentic case) restarts from the nearest checkpoint <= m instead of from
-   zero. LCP-from-the-front cannot help mid-document branching; this turns
-   most cache misses into partial hits. State is ~28 MB/layer-set snapshot.
+2. **P8 -- DONE 2026-07-03: stable-prefix snapshot.** Root cause of the 7.9x
+   eval wall-time: the snapshot included the volatile prompt tail
+   (assistant-open + no-think prefill), which every re-rendering client
+   replaces next turn -- divergence ~6 tokens before snapshot end, voided by
+   the all-or-nothing check -> full re-prefill EVERY turn. The old --pfcache
+   gate appended raw tokens (a flow no real client takes) and hid it since
+   M6.5. Fix: chatml_prompt reports the boundary (end of last input message,
+   always abutting <|im_start|> so split-encoding is tokenization-invariant),
+   generate() prefills in two stages and snapshots at the boundary. Gate v2
+   uses a tail-divergent turn 2: warm restore, continuations IDENTICAL.
+   Measured: collab-server trial 2434s -> 536s (4.5x), score unchanged
+   (0.836), prefix_hit=54-58K logged turn over turn -- the first real-traffic
+   cache hits this server has ever had. Remaining for TRUE mid-history edits
+   (client compaction, edited files): periodic GDN checkpoints -- snapshot S
+   + conv rings every N tokens, restart from nearest checkpoint <= divergence
+   (llama.cpp PR #24785 / commit b9180 n_rs_seq is the reference design).
+   State is ~28 MB/layer-set snapshot.
 3. Sampling (temperature/top-p vs spec-verify acceptance).
 4. Depth-4 acceptance on REAL think-heavy generation: the 4.36 t/round was
    measured on the soak corpus; Claude Code think-blocks are higher-entropy.
