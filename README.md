@@ -136,6 +136,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
 | P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
 | P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
+| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s**; 128K prefill ~78 -> ~57s; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -333,6 +334,29 @@ fp8==fp16(deq) bitwise identities hold under splits, canonical md5 exact,
 pf/pfcache IDENTICAL, nll-long 32K split-on/off equal to the 4th decimal,
 needle 3/3 @55K with verbatim-identical answers. Remaining long-ctx costs:
 delta_scan_T (~50s @361K), GEMM tile tuning at short ctx.
+
+**P5 -- DONE 2026-07-02: GEMM tile tuning (prefill GEMM -36%/-48%, cold
+28.5K TTFT 21.4s -> 16.8s, short-prompt prefill 1388 -> 1790 t/s).**
+Ladder, each step measured on an ffn_gate micro (17408x5120, T=256):
+1. Grid swap (token blocks on blockIdx.x): the old row-major schedule
+   re-read weights from DRAM once per 32-token block (8x traffic at T=256);
+   swapped order gets 94% L2 hit rate (ncu). Alone it was NEUTRAL --
+   the kernel was latency-bound, not BW-bound (2 blocks/SM, reg-limited,
+   31% occupancy).
+2. Register-pipelined staging: stage st+1's global loads issue right after
+   stage st's smem stores, hiding DRAM latency behind mma work. 258 -> ~248.
+3. Vectorized Q4 nibble unpack (byte_perm + vsub4, 2 u32 smem stores
+   replacing 8 byte stores): 258 -> 217.
+4. NT 32 -> 64 (halves token blocks, L2 traffic, and duplicated staging):
+   217 -> 204 us.
+Negatives (local optimum, do not retry): __launch_bounds__ 3 blocks/SM
+(spills, 254), double-buffered smem at NT=64 (225) and NT=32 (237).
+In-engine @26.6K: Q4 GEMM 9.78 -> 6.26s, Q8 1.44 -> 0.75s; whole prefill
+GPU 22.2 -> 15.2s vs the pre-P4 morning baseline (1.46x today combined).
+128K prefill wall ~78 -> ~57s (prefill-only). All arithmetic unchanged --
+unit errors byte-identical, canonical md5 exact, pf/pfcache IDENTICAL,
+soak 217.0 (decode untouched). Prefill cost order @26K is now
+delta_scan_T 25% / attention 21% / Q4 GEMM 41%.
 
 ## Risk register
 

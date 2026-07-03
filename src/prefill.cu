@@ -192,8 +192,12 @@ template <bool Q4IN>
 __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                              const int8_t* __restrict__ nat, const float* __restrict__ xs,
                              float* __restrict__ y, int64_t rows, int64_t cols, int T) {
-    constexpr int MR = 64, NT = 32, KS = 128;   // block tile: rows, tokens, staged K
+    constexpr int MR = 64, NT = 64, KS = 128;   // block tile: rows, tokens, staged K
+    constexpr int TS = NT / 16;                 // token subtiles per warp (x2 warps)
     constexpr int LDW = KS + 16, LDX = KS + 16; // padded smem strides (bytes)
+    // (double-buffered stages and __launch_bounds__ occupancy forcing both
+    // measured SLOWER than this single-buffer + register-pipeline shape --
+    // 225/254 vs 204 us on the ffn_gate micro; local optimum, do not retry)
     extern __shared__ unsigned char smem_raw[];
     int8_t* s_w = (int8_t*)smem_raw;                  // [MR][LDW]
     int8_t* s_x = (int8_t*)(s_w + MR * LDW);          // [NT][LDX]
@@ -203,75 +207,120 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     const int wm = warp % 4, wn = warp / 4;      // warp tile: rows wm*16, tokens wn*16
     const int gid = lane >> 2, tg = lane & 3;    // mma fragment coords
-    const int64_t r0 = (int64_t)blockIdx.x * MR; // block row base
-    const int t0 = blockIdx.y * NT;              // block token base
+    // token blocks ride blockIdx.x (fastest-scheduled) so the T/NT blocks
+    // sharing one row group's weights run near-concurrently and hit L2;
+    // row-major scheduling re-read the weights from DRAM once PER TOKEN
+    // BLOCK (8x traffic at T=256 -- measured, this was the whole gap)
+    const int64_t r0 = (int64_t)blockIdx.y * MR; // block row base
+    const int t0 = blockIdx.x * NT;              // block token base
     const int n_stages = (int)(cols / KS);
 
-    float acc[2][4];
+    float acc[TS][4];
 #pragma unroll
-    for (int s = 0; s < 2; s++)
+    for (int s = 0; s < TS; s++)
 #pragma unroll
         for (int e = 0; e < 4; e++) acc[s][e] = 0.f;
 
-    for (int st = 0; st < n_stages; st++) {
-        const int64_t k0 = (int64_t)st * KS;
-        __syncthreads();
-        // stage weights: MR rows x KS elements (unpack nibbles if Q4)
-        if (Q4IN) {
-            // KS/2 = 64 packed bytes per row; thread handles 4 packed -> 8 s8
-            for (int idx = threadIdx.x; idx < MR * (KS / 2) / 4; idx += blockDim.x) {
-                int rr = idx / 16, pb4 = idx % 16; // 16 u32 of packed bytes per row
-                uint32_t p = r0 + rr < rows
-                                 ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) +
-                                         pb4)
-                                 : 0x88888888u; // unpacks to 0 after -8
-                int8_t* dst = s_w + rr * LDW + pb4 * 8;
-#pragma unroll
-                for (int b = 0; b < 4; b++) {
-                    uint32_t byte = (p >> (8 * b)) & 0xFF;
-                    dst[2 * b] = (int8_t)((int)(byte & 0xF) - 8);
-                    dst[2 * b + 1] = (int8_t)((int)(byte >> 4) - 8);
-                }
-            }
-        } else {
-            for (int idx = threadIdx.x; idx < MR * KS / 4; idx += blockDim.x) {
-                int rr = idx / (KS / 4), u = idx % (KS / 4);
-                *(uint32_t*)(s_w + rr * LDW + u * 4) =
-                    r0 + rr < rows ? __ldg((const uint32_t*)(W + (r0 + rr) * cols + k0) + u) : 0u;
-            }
-        }
-        // stage activations: NT tokens x KS bytes (zero-fill past T)
-        for (int idx = threadIdx.x; idx < NT * KS / 4; idx += blockDim.x) {
-            int tt = idx / (KS / 4), u = idx % (KS / 4);
-            *(uint32_t*)(s_x + tt * LDX + u * 4) =
-                t0 + tt < T ? __ldg((const uint32_t*)(nat + (size_t)(t0 + tt) * cols + k0) + u)
-                            : 0u;
-        }
-        // stage scales: weight scale per group, x scale per 32-chunk
-        if (Q4IN) {
-            for (int idx = threadIdx.x; idx < MR * 2; idx += blockDim.x) {
-                int rr = idx / 2, g = idx % 2;
-                s_ws[rr * 2 + g] =
-                    r0 + rr < rows
-                        ? __half2float(__ldg(S + (r0 + rr) * (cols / 64) + k0 / 64 + g))
-                        : 0.f;
-            }
-        } else {
-            for (int idx = threadIdx.x; idx < MR; idx += blockDim.x)
-                s_ws[idx] = r0 + idx < rows
-                                ? __half2float(__ldg(S + (r0 + idx) * (cols / 128) + k0 / 128))
-                                : 0.f;
-        }
-        for (int idx = threadIdx.x; idx < NT * 4; idx += blockDim.x) {
-            int tt = idx / 4, cc = idx % 4;
-            s_xs[tt * 4 + cc] =
-                t0 + tt < T
-                    ? __ldg(xs + (size_t)(t0 + tt) * (cols / 32) + k0 / 32 + cc)
-                    : 0.f;
-        }
-        __syncthreads();
+    // Register-buffered staging pipeline: stage st+1's global loads are
+    // issued right after stage st's smem stores, so their DRAM latency hides
+    // behind stage st's mma work (the old serial stage->compute structure
+    // was latency-bound, not BW-bound). Per-thread slice: 4 (Q4) / 8 (Q8)
+    // weight u32 + 4 activation u32 + 2 predicated scale floats. The Q4
+    // nibble unpack happens at the reg->smem store, off the load path.
+    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : MR * KS / 4 / 256;
+    constexpr int XLD = NT * KS / 4 / 256;
+    const int tid = threadIdx.x;
+    const int nws = Q4IN ? MR * 2 : MR;
+    uint32_t rw[WLD], rx[XLD];
+    float rws = 0.f, rxs = 0.f;
 
-        // 4 chunks of 32 per stage; per chunk, 2 mma (token subtiles of 8)
+    auto load_stage = [&](int st) {
+        const int64_t k0 = (int64_t)st * KS;
+        if (Q4IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / 16, pb4 = idx % 16; // 16 u32 of packed bytes per row
+                rw[i] = r0 + rr < rows
+                            ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) + pb4)
+                            : 0x88888888u; // unpacks to 0 after -8
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 4), u = idx % (KS / 4);
+                rw[i] = r0 + rr < rows
+                            ? __ldg((const uint32_t*)(W + (r0 + rr) * cols + k0) + u)
+                            : 0u;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < XLD; i++) {
+            int idx = i * 256 + tid;
+            int tt = idx / (KS / 4), u = idx % (KS / 4);
+            rx[i] = t0 + tt < T
+                        ? __ldg((const uint32_t*)(nat + (size_t)(t0 + tt) * cols + k0) + u)
+                        : 0u;
+        }
+        if (tid < nws) {
+            if (Q4IN) {
+                int rr = tid / 2, g = tid % 2;
+                rws = r0 + rr < rows
+                          ? __half2float(__ldg(S + (r0 + rr) * (cols / 64) + k0 / 64 + g))
+                          : 0.f;
+            } else {
+                rws = r0 + tid < rows
+                          ? __half2float(__ldg(S + (r0 + tid) * (cols / 128) + k0 / 128))
+                          : 0.f;
+            }
+        }
+        if (tid < NT * 4) {
+            int tt = tid / 4, cc = tid % 4;
+            rxs = t0 + tt < T ? __ldg(xs + (size_t)(t0 + tt) * (cols / 32) + k0 / 32 + cc) : 0.f;
+        }
+    };
+    auto store_stage = [&]() {
+        if (Q4IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / 16, pb4 = idx % 16;
+                int8_t* dst = s_w + rr * LDW + pb4 * 8;
+                // vector unpack: interleave lo/hi nibbles bytewise, then
+                // per-byte -8 (modular = two's complement, same s8 values as
+                // the old byte-store loop) -- 2 u32 stores instead of 8
+                // byte stores
+                const uint32_t p = rw[i];
+                const uint32_t lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
+                *(uint32_t*)dst = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
+                *(uint32_t*)(dst + 4) = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 4), u = idx % (KS / 4);
+                *(uint32_t*)(s_w + rr * LDW + u * 4) = rw[i];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < XLD; i++) {
+            int idx = i * 256 + tid;
+            int tt = idx / (KS / 4), u = idx % (KS / 4);
+            *(uint32_t*)(s_x + tt * LDX + u * 4) = rx[i];
+        }
+        if (tid < nws) s_ws[tid] = rws;
+        if (tid < NT * 4) s_xs[tid] = rxs;
+    };
+
+    load_stage(0);
+    for (int st = 0; st < n_stages; st++) {
+        __syncthreads();
+        store_stage();
+        if (st + 1 < n_stages) load_stage(st + 1);
+        __syncthreads();
+        // 4 chunks of 32 per stage; per chunk, TS mma pairs (token subtiles of 8)
 #pragma unroll
         for (int cc = 0; cc < 4; cc++) {
             const int kb = cc * 32;
@@ -284,8 +333,8 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
             const float wsc1 =
                 s_ws[(wm * 16 + gid + 8) * (Q4IN ? 2 : 1) + (Q4IN ? kb / 64 : 0)];
 #pragma unroll
-            for (int s = 0; s < 2; s++) {
-                const int tb = wn * 16 + s * 8; // token subtile base
+            for (int s = 0; s < TS; s++) {
+                const int tb = wn * (NT / 2) + s * 8; // token subtile base
                 const int8_t* xcol = s_x + (tb + gid) * LDX + kb;
                 uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
                 uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
@@ -303,8 +352,8 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
 
     const int64_t row0 = r0 + wm * 16 + gid;
 #pragma unroll
-    for (int s = 0; s < 2; s++) {
-        const int tok0 = t0 + wn * 16 + s * 8 + tg * 2;
+    for (int s = 0; s < TS; s++) {
+        const int tok0 = t0 + wn * (NT / 2) + s * 8 + tg * 2;
 #pragma unroll
         for (int e = 0; e < 4; e++) {
             int64_t row = row0 + (e >= 2 ? 8 : 0);
@@ -324,7 +373,7 @@ static bool prefill_use_mma() {
 template <bool Q4IN>
 static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                             int64_t rows, int64_t cols, int T, cudaStream_t st) {
-    constexpr int MR = 64, NT = 32, KS = 128, LDW = KS + 16, LDX = KS + 16;
+    constexpr int MR = 64, NT = 64, KS = 128, LDW = KS + 16, LDX = KS + 16;
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * 4) * 4;
     if (cols % KS) {
         fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);
@@ -336,7 +385,7 @@ static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
-    dim3 grid((unsigned)((rows + MR - 1) / MR), (unsigned)((T + NT - 1) / NT));
+    dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR));
     k_gemm_mma_T<Q4IN><<<grid, 256, SM, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T);
     CUDA_CHECK(cudaGetLastError());
 }
