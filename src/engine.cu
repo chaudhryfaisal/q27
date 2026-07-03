@@ -471,6 +471,7 @@ int main(int argc, char** argv) {
         // appended raw tokens -- a flow no re-rendering client takes -- and
         // hid a 100% cache-miss bug in real serving.)
         if (!spec) e.build_spec_graphs();
+        e.ckpt_interval = 128; // dense ring so the mid-divergence leg has cover
         std::vector<int> A, B;
         for (int i = 0; i < 600; i++) A.push_back(toks[i % toks.size()]);
         const int SBL = 585; // turn-1 stable boundary
@@ -496,6 +497,7 @@ int main(int argc, char** argv) {
         double t1 = timed(A, o1, SBL);                    // turn 1 (cold, snapshot at SBL)
         double tw = timed(B, warm, (int)B.size() - 8);    // turn 2 (tail-divergent resume)
         e.have_snap = false;
+        e.ckpt_clear(); // truly cold: no checkpoint assistance either
         double tc = timed(B, cold, (int)B.size() - 8);    // turn 2 cold rerun
         printf("turn1 TTFT %.3fs | turn2 warm TTFT %.3fs | turn2 cold TTFT %.3fs "
                "(warm speedup %.1fx)\n", t1, tw, tc, tc / tw);
@@ -507,6 +509,24 @@ int main(int argc, char** argv) {
             printf("\n");
             return 1;
         }
+        // P9 gate: MID-history divergence (compaction/edit/retry). Turn 3
+        // keeps only the first 300 tokens of B, replaces the middle, and
+        // extends. The stable snapshot (at B.size()-8) is useless; recovery
+        // must come from a GDN checkpoint <= the divergence point, and
+        // continuations must match a cold run. Requires checkpoints enabled
+        // (Q27_CKPT_INTERVAL=128 set by the harness for a dense ring).
+        std::vector<int> C(B.begin(), B.begin() + 300);
+        for (int i = 0; i < 200; i++) C.push_back(toks[(i * 5 + 2) % toks.size()]);
+        std::vector<int> warm3, cold3;
+        double tw3 = timed(C, warm3, (int)C.size() - 8);  // checkpoint-assisted
+        e.have_snap = false;
+        e.ckpt_clear();
+        double tc3 = timed(C, cold3, (int)C.size() - 8);  // cold rerun
+        printf("turn3 (mid-divergence) warm TTFT %.3fs | cold TTFT %.3fs | ckpt base used: "
+               "see [gen] log\n", tw3, tc3);
+        printf("mid-divergence continuations: %s\n",
+               warm3 == cold3 ? "IDENTICAL -- gate PASS" : "MISMATCH -- gate FAIL");
+        if (warm3 != cold3) return 1;
         return 0;
     }
 

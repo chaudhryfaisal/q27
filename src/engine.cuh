@@ -198,6 +198,8 @@ struct Engine {
         mask_words = (VOCAB + 31) / 32;
         A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
         A((void**)&d_mask_ids, 8 * 4);
+        if (const char* ce = getenv("Q27_CKPT_INTERVAL")) ckpt_interval = atoi(ce);
+        if (const char* cs = getenv("Q27_CKPT_SLOTS")) ckpt_slots = std::max(1, atoi(cs));
         A((void**)&d_accept_cap, 4);
         CUDA_CHECK(cudaMemset(d_mask_ids, 0xFF, 8 * 4)); // all -1 = unconstrained
         CUDA_CHECK(cudaMemset(d_accept_cap, 0, 4));
@@ -822,6 +824,84 @@ struct Engine {
         q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
     }
 
+    // ---- P9: same-session GDN checkpoint ring (host pinned RAM) ----
+    // Dropped every ckpt_interval tokens at prefill chunk boundaries; on a
+    // stable-snapshot miss, generation restores the nearest checkpoint <=
+    // the first divergence point instead of a full cold prefill. GDN-only:
+    // divergence at m means tokens [0,m) are unchanged, so the append-only
+    // attention/MTP KV rows below m stay valid in place. Cleared on reset()
+    // (new session -> old KV rows no longer describe this conversation).
+    struct Ckpt {
+        std::vector<int> toks;
+        float* buf = nullptr; // pinned: per GDN layer, S then conv ring
+    };
+    std::vector<Ckpt> ckpts;
+    int ckpt_interval = 4096, ckpt_slots = 16, ckpt_next = 0;
+
+    size_t ckpt_layer_floats() const {
+        return (size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH;
+    }
+    void ckpt_clear() {
+        for (auto& c : ckpts) c.toks.clear();
+        ckpt_next = 0;
+    }
+    void ckpt_save(const std::vector<int>& prompt, int len) {
+        if (ckpt_interval <= 0) return;
+        if ((int)ckpts.size() < ckpt_slots) ckpts.resize(ckpt_slots);
+        Ckpt& c = ckpts[ckpt_next];
+        ckpt_next = (ckpt_next + 1) % ckpt_slots;
+        size_t lf = ckpt_layer_floats();
+        if (!c.buf) {
+            size_t total = 0;
+            for (int il = 0; il < N_LAYER; il++)
+                if (!attn_layer[il]) total += lf;
+            CUDA_CHECK(cudaMallocHost((void**)&c.buf, total * 4));
+        }
+        float* h = c.buf;
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(h, S[il],
+                                           (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4,
+                                           cudaMemcpyDeviceToHost, stm));
+                h += (size_t)GDN_HEADS * GDN_DIM * GDN_DIM;
+                CUDA_CHECK(cudaMemcpyAsync(h, conv_ring[il], 3 * GDN_CH * 4,
+                                           cudaMemcpyDeviceToHost, stm));
+                h += 3 * GDN_CH;
+            }
+        c.toks.assign(prompt.begin(), prompt.begin() + len);
+    }
+    // largest checkpoint whose covered prefix matches the new prompt
+    int ckpt_best(const std::vector<int>& prompt) const {
+        int best = -1;
+        size_t best_len = 0;
+        for (size_t k = 0; k < ckpts.size(); k++) {
+            const auto& c = ckpts[k];
+            if (!c.buf || c.toks.empty() || c.toks.size() > prompt.size() - 1) continue;
+            if (c.toks.size() <= best_len) continue;
+            if (std::equal(c.toks.begin(), c.toks.end(), prompt.begin())) {
+                best = (int)k;
+                best_len = c.toks.size();
+            }
+        }
+        return best;
+    }
+    void ckpt_restore(int k) {
+        CUDA_CHECK(cudaStreamSynchronize(stm)); // pending D2H saves must land
+        const float* h = ckpts[k].buf;
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(S[il], h,
+                                           (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4,
+                                           cudaMemcpyHostToDevice, stm));
+                h += (size_t)GDN_HEADS * GDN_DIM * GDN_DIM;
+                CUDA_CHECK(cudaMemcpyAsync(conv_ring[il], h, 3 * GDN_CH * 4,
+                                           cudaMemcpyHostToDevice, stm));
+                h += 3 * GDN_CH;
+            }
+        perm = 0;
+        CUDA_CHECK(cudaMemset(d_P, 0, 4));
+    }
+
     void snap_save(const std::vector<int>& prompt, int upto = -1) {
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
@@ -902,10 +982,16 @@ struct Engine {
                 while (L < snap_toks.size() && snap_toks[L] == prompt[L]) L++;
                 if (L == snap_toks.size()) base = (int)L;
             }
-            fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu\n", NP, base,
-                    snap_toks.size());
-            if (base > 0) snap_restore();
-            else reset();
+            int ck = -1;
+            if (base == 0) {
+                ck = ckpt_best(prompt); // P9: mid-history divergence fallback
+                if (ck >= 0) base = (int)ckpts[ck].toks.size();
+            }
+            fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d\n", NP, base,
+                    snap_toks.size(), ck);
+            if (ck >= 0) ckpt_restore(ck);
+            else if (base > 0) snap_restore();
+            else { reset(); ckpt_clear(); }
             if (d_prompt_cap < NP) {
                 if (d_prompt) CUDA_CHECK(cudaFree(d_prompt));
                 CUDA_CHECK(cudaMalloc((void**)&d_prompt, (size_t)NP * 4));
@@ -916,11 +1002,16 @@ struct Engine {
             const DevTensor& onw = dm.get("output_norm.weight");
             const int snap_upto =
                 (stable_len > base && stable_len < NP) ? stable_len : NP - 1;
+            int last_ck = base;
             for (int c0 = base; c0 < snap_upto; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, snap_upto - c0);
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
+                    ckpt_save(prompt, c0 + Tc);
+                    last_ck = c0 + Tc;
+                }
             }
             snap_save(prompt, snap_upto);
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
@@ -928,6 +1019,10 @@ struct Engine {
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
+                    ckpt_save(prompt, c0 + Tc);
+                    last_ck = c0 + Tc;
+                }
             }
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
