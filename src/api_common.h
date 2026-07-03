@@ -73,11 +73,13 @@ struct ToolCall {
     std::string raw;
 };
 
+inline std::string escape_content_tags(const std::string& text);
+
 inline ToolCall parse_tool_call(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
     try {
-        json j = json::parse(seg);
+        json j = json::parse(escape_content_tags(seg));
         tc.name = j.value("name", std::string());
         tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
         if (tc.arguments.is_string()) // some models double-encode
@@ -100,9 +102,37 @@ inline std::string strip_ws2(const std::string& s) {
 // first balanced {...} that parses as {"name":..., "arguments":...}. On
 // success: prefix = text before the JSON, suffix = text after it (typically
 // junk like "</file>" -- caller decides to drop it).
-inline ToolCall parse_bare_tool_call(const std::string& text, std::string* prefix,
+// Third observed drift mode: JSON framing with a raw-code value inside
+// <content>...</content> tags (the fine-tune's SFT file format leaking into
+// arguments). Rewrite `: <content>RAW</content>` spans into proper JSON
+// strings so the call parses. Returns the input unchanged if no tag pair.
+inline std::string escape_content_tags(const std::string& text) {
+    size_t a = text.find("<content>");
+    if (a == std::string::npos) return text;
+    size_t v = a + 9;
+    size_t b = text.rfind("</content>");
+    if (b == std::string::npos || b < v) return text;
+    // only rewrite when the tag sits in value position (": <content>")
+    size_t k = text.find_last_not_of(" \t\r\n", a - 1);
+    if (k == std::string::npos || text[k] != ':') return text;
+    std::string esc;
+    for (char c : text.substr(v, b - v)) {
+        switch (c) {
+            case '"': esc += "\\\""; break;
+            case '\\': esc += "\\\\"; break;
+            case '\n': esc += "\\n"; break;
+            case '\r': esc += "\\r"; break;
+            case '\t': esc += "\\t"; break;
+            default: esc += c;
+        }
+    }
+    return text.substr(0, a) + "\"" + esc + "\"" + text.substr(b + 10);
+}
+
+inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
                                      std::string* suffix) {
     ToolCall none;
+    const std::string text = escape_content_tags(text_in);
     for (size_t i = text.find('{'); i != std::string::npos; i = text.find('{', i + 1)) {
         int depth = 0;
         bool in_str = false, esc = false;

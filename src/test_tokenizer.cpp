@@ -65,7 +65,18 @@ int main(int argc, char** argv) {
                    c4.arguments.value("content", "").find("export const x") == 0 &&
                    c4.arguments.value("content", "").find("</file>") == std::string::npos &&
                    pre == "Writing now.";
-        bool ok = ok1 && !c2.ok && !c3.ok && ok4;
+        // third observed mode (task-queue/plugin-marketplace trials): the
+        // model emits JSON framing but the content VALUE as raw code inside
+        // <content>...</content> tags -- invalid JSON. Recovery must
+        // JSON-escape the tagged span. Both orders (content-first and
+        // content-last) occur.
+        auto c5 = q27::parse_bare_tool_call(
+            "{\"name\": \"write\", \"arguments\": {\"content\": <content>const a = \"x\";\n"
+            "if (a) { b(); }\n</content>, \"file_path\": \"/w/s.ts\"}}", &pre, &suf);
+        bool ok5 = c5.ok && c5.name == "write" &&
+                   c5.arguments.value("file_path", "") == "/w/s.ts" &&
+                   c5.arguments.value("content", "").find("const a = \"x\";") == 0;
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
