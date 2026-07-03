@@ -7,6 +7,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
 - Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~355K (was ~370K before P3's 5th GDN buffer set) -- the advertised 262K native fits** (allocates and runs; correctness validated to 361K, see risk 5)
+- The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see roadmap)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -39,6 +40,24 @@ The original "~120 t/s ceiling" row implied ~99% BW efficiency and is retired.
 Plain decode sits ~15% under the honest 85-90% ceiling; that tail is GDN
 recurrence + ~140 small-kernel launches/token, and three attempts on it
 (E4 launch geometry, E5 fusions, cp.async) all came back negative.
+
+### Why self-speculation is the whole game at batch 1
+
+Arithmetic-intensity framing (the same napkin datacenters use for the
+opposite conclusion): a 5090 offers on the order of hundreds of int8 ops per
+byte of DRAM bandwidth, and batch-1 decode with a KV/state cache uses ~2 ops
+per byte -- >99% of the compute sits idle while weights stream. Datacenter
+serving closes that gap by batching hundreds of USERS per weight read, which
+is why API tokens are cheap and why a single-user GPU looks "wasted" in
+cost-per-token terms. MTP self-speculation is the batch-1 counter-move: the
+batch-5 verify amortizes one weight read across 5 candidate positions --
+batching with yourself instead of with other users. That is exactly how
+218.6 t/s clears the ~91 t/s plain-decode bandwidth ceiling (2.4x, at 4.36
+accepted tokens/round): the idle ops-per-byte gets converted into
+single-stream latency instead of multi-tenant throughput. Corollary: every
+future decode win here is either (a) fewer bytes per step (quant policy,
+fp8 KV) or (b) more accepted positions per weight read (deeper/gated
+speculation) -- there is no third lever at batch 1.
 
 ### Decode methodology (canonical, 2026-07-02)
 
