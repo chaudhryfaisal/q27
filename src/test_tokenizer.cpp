@@ -10,6 +10,7 @@
 
 #include "api_common.h"
 #include "tokenizer.h"
+#include "toolgram.h"
 
 int main(int argc, char** argv) {
     if (argc != 3) { fprintf(stderr, "usage: %s q27.tok cases.txt\n", argv[0]); return 1; }
@@ -102,6 +103,76 @@ int main(int argc, char** argv) {
                    v7[0].arguments.value("content", "").find("interface A {\n  x: number;") == 0;
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
+    // P7: ToolGrammar -- char-level pushdown machine enforcing the
+    // <tool_call> body. Each observed drift mode must be UNSAMPLEABLE:
+    // the machine rejects the first illegal char, and done() stays false
+    // until the call is complete (EOS gets masked off that state upstream).
+    {
+        std::vector<std::string> names = {"write", "view", "ls"};
+        auto fresh = [&]() { q27::ToolGrammar g; g.reset(names); return g; };
+
+        // legal call accepted end-to-end, done() flips only at the end
+        auto g1 = fresh();
+        std::string legal =
+            "{\"name\": \"write\", \"arguments\": {\"file_path\": \"/w/s.ts\", "
+            "\"content\": \"const a = 1;\\nexport {a};\"}}";
+        bool ok_legal = true;
+        for (size_t k = 0; k < legal.size(); k++) {
+            if (k + 1 < legal.size() && g1.done()) ok_legal = false;  // early done
+            if (!g1.advance(legal[k])) { ok_legal = false; break; }
+        }
+        ok_legal = ok_legal && g1.done();
+
+        // mode 5: RAW newline inside a string -- illegal at that char
+        auto g2 = fresh();
+        bool m5 = g2.advance_str("{\"name\": \"write\", \"arguments\": {\"content\": \"line1");
+        bool m5_reject = m5 && !g2.advance('\n');
+
+        // mode 3: <content> tag in value position -- '<' is no legal value start
+        auto g3 = fresh();
+        bool m3 = g3.advance_str("{\"name\": \"write\", \"arguments\": {\"content\": ");
+        bool m3_reject = m3 && !g3.advance('<');
+
+        // mode 4: {"tool_call": opener -- key must be "name"
+        auto g4 = fresh();
+        bool m4 = g4.advance_str("{\"");
+        bool m4_reject = m4 && !g4.advance('t');
+
+        // unknown tool name rejected at first divergent char
+        auto g5 = fresh();
+        bool m6 = g5.advance_str("{\"name\": \"wri");
+        bool m6_cont = m6 && g5.advance('t') && g5.advance('e');
+        bool m6_reject = m6_cont && !g5.advance('x');  // "writex" is no tool
+
+        // mode 2: unterminated call -- done() false mid-string (EOS gate)
+        auto g6 = fresh();
+        bool m2 = g6.advance_str("{\"name\": \"write\", \"arguments\": {\"content\": \"abc");
+        bool m2_notdone = m2 && !g6.done();
+
+        // token_ok simulates without committing: same state gives same answer
+        auto g7 = fresh();
+        g7.advance_str("{\"name\": \"view\", \"arguments\": {\"file_path\": \"/a\"}");
+        bool tok_ok = g7.token_ok("}") && !g7.token_ok("]") && g7.token_ok("}") &&
+                      !g7.done();
+
+        // edges: nested containers, \uXXXX, exponent numbers, empty args,
+        // literals, ws-heavy formatting -- all legal JSON must stay sampleable
+        auto g8 = fresh();
+        bool edge1 = g8.advance_str(
+            "{ \"name\" : \"ls\" ,\n  \"arguments\" : {\"a\": [1, -2.5e+3, true, null, "
+            "{\"b\": [\"\\u00e9\", false]}], \"c\": \"\"} }") && g8.done();
+        auto g9 = fresh();
+        bool edge2 = g9.advance_str("{\"name\": \"view\", \"arguments\": {}}") && g9.done();
+        auto g10 = fresh();
+        bool edge3 = g10.advance_str("{\"name\": \"write\", \"arguments\": {\"x\": 1}}") &&
+                     g10.done() && g10.advance('\n') && !g10.advance('}');
+
+        bool ok = ok_legal && m5_reject && m3_reject && m4_reject && m6_reject &&
+                  m2_notdone && tok_ok && edge1 && edge2 && edge3;
+        printf("toolgram drift modes: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
 
