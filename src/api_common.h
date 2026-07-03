@@ -34,7 +34,10 @@ inline std::string tools_preamble(const json& tools) {
 
 // Build the full ChatML prompt string. If tools are present they are merged
 // into the (first) system message per the template's merged_system behavior.
-inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools) {
+// think=false appends the empty think block (enable_thinking=false
+// convention); the tokenizer matches <think>/</think> as single added tokens.
+inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
+                                 bool think = true) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -49,6 +52,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     for (size_t i = start; i < msgs.size(); i++)
         p += "<|im_start|>" + msgs[i].role + "\n" + msgs[i].content + "<|im_end|>\n";
     p += "<|im_start|>assistant\n";
+    if (!think) p += "<think>\n\n</think>\n\n";
     return p;
 }
 

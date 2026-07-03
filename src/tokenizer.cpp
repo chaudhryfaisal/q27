@@ -73,6 +73,14 @@ Tokenizer::Tokenizer(const std::string& path) : impl_(new Impl) {
     build_byte_maps(impl_->b2u, impl_->u2b);
     for (uint32_t i = 0; i < n; i++)
         if (types_[i] == 3) impl_->specials.push_back({tokens_[i], (int)i});
+    // added tokens that are not type-3 controls but that BPE merges cannot
+    // form -- must match in text like HF added tokens (think-block prefills
+    // and the server's string-rendered prompts depend on this)
+    for (const char* s : {"<think>", "</think>"}) {
+        auto it = impl_->tok2id.find(s);
+        if (it != impl_->tok2id.end() && types_[it->second] != 3)
+            impl_->specials.push_back({s, it->second});
+    }
     // longest-first for greedy matching
     std::sort(impl_->specials.begin(), impl_->specials.end(),
               [](auto& a, auto& b) { return a.first.size() > b.first.size(); });

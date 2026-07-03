@@ -41,6 +41,19 @@ int main(int argc, char** argv) {
     printf("\nexact: %d/%d cases   token-prefix agreement: %d/%d = %.2f%%\n", pass, total,
            tok_match, tok_total, 100.0 * tok_match / (tok_total ? tok_total : 1));
 
+    // added-token matching: encode() must map literal <think>/</think> text to
+    // their single vocab ids (HF added-token semantics; BPE merges cannot form
+    // them). The server's Anthropic path string-renders prompts, so prefills
+    // and prior-turn thinking reconstruction depend on this.
+    {
+        int t1 = tok.token_id("<think>"), t2 = tok.token_id("</think>");
+        auto e1 = tok.encode("<think>"), e2 = tok.encode("</think>");
+        bool ok = t1 >= 0 && t2 >= 0 && e1.size() == 1 && e1[0] == t1 &&
+                  e2.size() == 1 && e2[0] == t2;
+        printf("added-token encode <think>: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
     // chat-template no-think: think=false must append the empty think block
     // exactly like the Qwen3-family template with enable_thinking=false, and
     // it must use the SINGLE added-token ids (BPE renders "<think>" as 3

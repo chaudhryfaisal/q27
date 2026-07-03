@@ -37,12 +37,15 @@ int main(int argc, char** argv) {
     std::string model = argv[1], tokpath = argv[2], host = "0.0.0.0";
     int port = 8080, ctx = 8192;
     bool fast = false;
+    bool no_think_srv = false;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast-head")) fast = true;
+        else if (!strcmp(argv[i], "--no-think")) no_think_srv = true;
     }
+    if (no_think_srv) fprintf(stderr, "no-think: empty-think prefill on all chat paths\n");
 
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
@@ -101,6 +104,7 @@ int main(int argc, char** argv) {
             bool think = body.value("enable_thinking", true);
             if (body.contains("chat_template_kwargs"))
                 think = body["chat_template_kwargs"].value("enable_thinking", think);
+            if (no_think_srv) think = false;
             return tok.apply_chat_template(msgs, think);
         }
         return tok.encode(body.value("prompt", std::string()));
@@ -238,7 +242,8 @@ int main(int argc, char** argv) {
         bool stream = body.value("stream", false);
         json tools = anthropic_tools(body);
         auto tk0 = std::chrono::steady_clock::now();
-        std::string rendered = q27::chatml_prompt(anthropic_msgs(body), tools);
+        std::string rendered =
+            q27::chatml_prompt(anthropic_msgs(body), tools, !no_think_srv);
         auto tk1 = std::chrono::steady_clock::now();
         std::vector<int> prompt = tok.encode(rendered);
         auto tk2 = std::chrono::steady_clock::now();
@@ -511,7 +516,8 @@ int main(int argc, char** argv) {
         }
 
         int n_max = body.value("max_output_tokens", 4096);
-        std::vector<int> prompt = tok.encode(q27::chatml_prompt(merged, tools));
+        std::vector<int> prompt =
+            tok.encode(q27::chatml_prompt(merged, tools, !no_think_srv));
         if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
         if (n_max <= 0) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
