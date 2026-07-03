@@ -71,8 +71,9 @@ Two numbers are reported and they are NOT interchangeable (~16% gap):
   (acceptance only reaches 3.56 t/round at 128 tokens vs 4.36 on the soak;
   the depth-4 round tax doesn't amortize) -- depth-4 was tuned on and pays on
   long generations.
-- **2K soak** (long-generation number): 2000-token generation, **218.6 t/s at
-  +3000 OC** (4.36 t/round). Headline for agentic reply-length outputs.
+- **2K soak** (long-generation number): 2000-token generation, **213.2 t/s
+  STOCK / 218.6 at +3000 OC** (4.36 t/round both). Headline for agentic
+  reply-length outputs.
 
 OC policy: headline + SOTA comparisons are reported STOCK (community numbers
 aren't OC'd; sidesteps the non-ECC tail-risk conversation). +3000 stays a
@@ -85,7 +86,7 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
 - **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships opt-in via `Q27_KV=fp8` (P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline repack tool is Python (runs once).
-- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary.
+- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
 
 ## Milestones
 
@@ -469,16 +470,26 @@ input contracts before a tolerance FAIL means anything. Prefill cost order
    uses a tail-divergent turn 2: warm restore, continuations IDENTICAL.
    Measured: collab-server trial 2434s -> 536s (4.5x), score unchanged
    (0.836), prefix_hit=54-58K logged turn over turn -- the first real-traffic
-   cache hits this server has ever had. Remaining for TRUE mid-history edits
+   cache hits this server has ever had. Wall-time refresh on the full
+   P7+P8+P9 stack (2026-07-03, worst two remaining tasks, n=3):
+   analytics-dashboard 1954s -> 667s AND score 0.641 -> 0.820 (constraint
+   fixed drift that was costing points, now beats the Q5 leg's 0.715);
+   ecommerce-backend 1025s -> 199s (score 0.518 unchanged). The 13-19x
+   pathological multipliers are now a uniform ~3-4x vs llama.cpp; the
+   residual is per-turn suffix prefill + the in-call constraint cap. Remaining for TRUE mid-history edits
    (client compaction, edited files): periodic GDN checkpoints -- snapshot S
    + conv rings every N tokens, restart from nearest checkpoint <= divergence
    (llama.cpp PR #24785 / commit b9180 n_rs_seq is the reference design).
    State is ~28 MB/layer-set snapshot.
 3. Sampling (temperature/top-p vs spec-verify acceptance).
-4. Depth-4 acceptance on REAL think-heavy generation: the 4.36 t/round was
-   measured on the soak corpus; Claude Code think-blocks are higher-entropy.
-   Measure acceptance there before trusting the depth-4 win in production;
-   entropy-gated adaptive depth is the robustness play (deferred twice now).
+4. Depth-5 UPGRADED from "likely marginal" (measured 2026-07-03): the
+   conditional chain barely decays (98.1/94.5/97.4% at d2/d3/d4 on the soak)
+   and 71% of rounds accept all 5 -- extrapolated p(d5|chain-4) ~97% projects
+   ~+5-6% net after the ~7% round tax. Next: extend the --stats rig with a
+   pass-5 evaluation (same pattern as P3's pass-4) to measure instead of
+   extrapolate. CAVEAT the margin bins confirm: low-margin chains are much
+   weaker, so think-heavy/high-entropy traffic needs its own measurement --
+   entropy/margin-gated adaptive depth remains the robustness play.
 5. Known stale claim: "128K prefill ~57s" (P5 note) does not reconcile with
    the direct fp16-KV kvstats measurement (117.6s post-P6); the ~57s was a
    P5-era extrapolation on what were likely fp8-KV runs. Re-measure 128K

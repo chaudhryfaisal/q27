@@ -146,6 +146,7 @@ int main(int argc, char** argv) {
     int port = 8080, ctx = 8192;
     bool fast = false;
     bool no_think_srv = false;
+    bool kv_fp16 = false;
     bool constrain_tools = false;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
@@ -154,8 +155,17 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fast-head")) fast = true;
         else if (!strcmp(argv[i], "--no-think")) no_think_srv = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
+        else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
     }
     if (no_think_srv) fprintf(stderr, "no-think: empty-think prefill on all chat paths\n");
+
+    // P2/P10-prep: the SERVER defaults to fp8 E4M3 KV (quality gated at noise
+    // -- PPL -0.05%, needle 6/6 to 361K -- and it doubles the ctx budget).
+    // --kv-fp16 or Q27_KV=fp16 opts out. The CLI binary keeps fp16 default so
+    // the bitwise canonical gates are untouched.
+    if (kv_fp16) setenv("Q27_KV", "fp16", 1);
+    else if (!getenv("Q27_KV")) setenv("Q27_KV", "fp8", 0);
+    fprintf(stderr, "kv cache: %s\n", getenv("Q27_KV"));
 
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
