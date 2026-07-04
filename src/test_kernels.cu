@@ -641,6 +641,72 @@ static void test_attn_split() {
 // so the split only reorders the row reductions (4x32-serial -> NTILE x RPT)
 // -> tolerance gate like P4's attention split. Q27_DS_SPLIT=1 must route to
 // the untouched legacy kernel.
+static void test_delta_wy() {
+    const int NH = 48, SK = 128, CH = 10240, T = 256;
+    const size_t SN = (size_t)NH * SK * SK, ON = (size_t)T * NH * SK;
+    std::vector<float> S0 = rand_vec(SN, 61), conv = rand_vec((size_t)T * CH, 62);
+    std::vector<float> g = rand_vec((size_t)T * NH, 63), beta = rand_vec((size_t)T * NH, 64);
+    for (auto& x : beta) x = 1.f / (1.f + std::exp(-x));
+    for (int t = 0; t < T; t++)
+        for (int hh = 0; hh < 32; hh++) {
+            float* p = conv.data() + (size_t)t * CH + hh * SK;
+            double n2 = 0;
+            for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
+            float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
+            for (int i = 0; i < SK; i++) p[i] *= inv;
+        }
+    float *d_S, *d_conv, *d_g, *d_beta, *d_o;
+    CUDA_CHECK(cudaMalloc(&d_S, SN * 4));
+    CUDA_CHECK(cudaMalloc(&d_conv, conv.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_g, g.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_beta, beta.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_o, ON * 4));
+    CUDA_CHECK(cudaMemcpy(d_conv, conv.data(), conv.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_beta, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice));
+
+    std::vector<float> Sa(SN), oa(ON), Sb(SN), ob(ON);
+    // mild decay (engine-typical) and strong decay (lambda underflows f32 over
+    // a 64-chunk -- exercises the log-space ratio path; absolute-tol check
+    // because outputs themselves shrink toward 0 there)
+    for (float dscale : {0.1f, 2.5f}) {
+        std::vector<float> gs = g;
+        for (auto& x : gs) x = -std::fabs(x) * dscale;
+        CUDA_CHECK(cudaMemcpy(d_g, gs.data(), gs.size() * 4, cudaMemcpyHostToDevice));
+        // T=1 (no recurrence: index bugs undamped), 64 (single chunk),
+        // 200 (ragged tail), 256 (full multi-chunk)
+        for (int Tn : {1, 64, 200, 256}) {
+            unsetenv("Q27_DS_MODE");
+            setenv("Q27_DS_SPLIT", "1", 1);
+            CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(Sa.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(oa.data(), d_o, (size_t)Tn * NH * SK * 4,
+                                  cudaMemcpyDeviceToHost));
+            setenv("Q27_DS_MODE", "wy", 1);
+            CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(Sb.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ob.data(), d_o, (size_t)Tn * NH * SK * 4,
+                                  cudaMemcpyDeviceToHost));
+            unsetenv("Q27_DS_MODE");
+            double mo = 0, ms = 0;
+            for (size_t i = 0; i < (size_t)Tn * NH * SK; i++)
+                mo = std::max(mo, (double)std::fabs(oa[i] - ob[i]) / (1.0 + std::fabs(oa[i])));
+            for (size_t i = 0; i < SN; i++)
+                ms = std::max(ms, (double)std::fabs(Sa[i] - Sb[i]) / (1.0 + std::fabs(Sa[i])));
+            char label[64];
+            double tol = Tn == 1 ? 1e-5 : 2e-3;
+            snprintf(label, sizeof label, "delta wy vs seq (o, T=%d, d=%.1f)", Tn, dscale);
+            check(label, mo, tol);
+            snprintf(label, sizeof label, "delta wy vs seq (S, T=%d, d=%.1f)", Tn, dscale);
+            check(label, ms, tol);
+        }
+    }
+    cudaFree(d_S); cudaFree(d_conv); cudaFree(d_g); cudaFree(d_beta); cudaFree(d_o);
+}
+
 static void test_delta_split() {
     const int NH = 48, SK = 128, CH = 10240, T = 64;
     const size_t SN = (size_t)NH * SK * SK, ON = (size_t)T * NH * SK;
@@ -775,6 +841,7 @@ int main(int argc, char** argv) {
     test_attn_mma();
     test_attn_split();
     test_delta_split();
+    test_delta_wy();
     test_masked_argmax();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();

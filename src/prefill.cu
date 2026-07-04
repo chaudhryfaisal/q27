@@ -1333,8 +1333,228 @@ int delta_scan_nsplit(int T) {
     return n <= 1 ? 1 : n < 4 ? 2 : n < 8 ? 4 : 8;
 }
 
+// ---------------- chunked-WY delta scan (Q27_DS_MODE=wy) ----------------
+// Reformulates the per-token rank-1 recurrence as per-64-token-chunk GEMMs +
+// a forward substitution, sequential only ACROSS chunks (T/64 steps instead
+// of T). Derivation validated to 1e-15 in f64 (scratchpad delta_wy.py):
+//   Lam_t = prod_{s<=t} d_s (ratios Lam_t/Lam_s <= 1 only -- numerically safe)
+//   (I + diag(beta) tril(ratio .* K K^T, -1)) rhat = diag(beta)(V - Lam K S0)
+//   O   = Lam (Q S0) + tril(ratio .* Q K^T, 0) rhat
+//   S_C = Lam_C S0 + K^T diag(Lam_C/Lam_s) rhat
+// The solve is independent per v-column, so the state stays column-split.
+// NOT bitwise vs the sequential scan (different reduction order) -- gated by
+// the wy-vs-seq tolerance test in test_kernels.
+
+constexpr int WY_C = 64; // chunk length
+
+// Kernel A: per (qk-head, chunk): KKt[t][s] = k_t.k_s, QKt[t][s] = q_t.k_s
+// (q pre-scaled by rsqrt(128) exactly as the sequential path does).
+__global__ void k_delta_wy_kk(const float* __restrict__ convT, float* __restrict__ KKt,
+                              float* __restrict__ QKt, int T, int nch) {
+    constexpr int SK = 128, GDN_CH = 10240;
+    const int qk = blockIdx.y;
+    const int c = blockIdx.x;
+    const int t0 = c * WY_C;
+    const int rows = min(WY_C, T - t0);
+    const float scale = rsqrtf((float)SK);
+    extern __shared__ float akq[];
+    float* skm = akq;              // [WY_C][SK]
+    float* sqm = skm + WY_C * SK;  // [WY_C][SK]
+    const int tid = threadIdx.x;   // 256
+    for (int i = tid; i < rows * SK; i += blockDim.x) {
+        int t = i / SK, d = i % SK;
+        skm[i] = convT[(size_t)(t0 + t) * GDN_CH + 2048 + qk * SK + d];
+        sqm[i] = convT[(size_t)(t0 + t) * GDN_CH + qk * SK + d];
+    }
+    __syncthreads();
+    // lower-triangle pairs (incl diag) of KKt; full rows of QKt (s <= t used)
+    for (int e = tid; e < WY_C * WY_C; e += blockDim.x) {
+        int tt = e / WY_C, ss = e % WY_C;
+        if (tt >= rows || ss > tt) continue;
+        const float* kt = skm + tt * SK;
+        const float* ks = skm + ss * SK;
+        const float* qt = sqm + tt * SK;
+        float dk = 0.f, dq = 0.f;
+#pragma unroll 4
+        for (int i = 0; i < SK; i++) {
+            float kv = ks[i];
+            dk += kt[i] * kv;
+            dq += qt[i] * kv;
+        }
+        size_t base = ((size_t)qk * nch + c) * WY_C * WY_C;
+        KKt[base + e] = dk;
+        QKt[base + e] = dq * scale;
+    }
+}
+
+// Kernel B: per (v-head, column-block of NCOLW): sequential over chunks.
+// State S[:, j0:j0+NCOLW] lives in smem; per chunk: rhs GEMV-ish, forward
+// substitution over 64 rows, output + state update.
+constexpr int NCOLW = 32;
+__global__ void k_delta_wy(float* __restrict__ Sg, const float* __restrict__ convT,
+                           const float* __restrict__ gT, const float* __restrict__ betaT,
+                           float* __restrict__ oT, const float* __restrict__ KKt,
+                           const float* __restrict__ QKt, int T, int nch) {
+    constexpr int SK = 128, GDN_CH = 10240, NH = 48;
+    const int h = blockIdx.y;
+    const int qk = h % 16;
+    const int j0 = blockIdx.x * NCOLW;
+    const int tid = threadIdx.x; // 256
+    const float qscale = rsqrtf((float)SK);
+
+    extern __shared__ float wsm[];
+    // sk (K chunk) and kk (KKt tile) stay in L2: sk is shared by the 4
+    // col-blocks of the head and kk by 3 v-heads -- keeping them out of smem
+    // halves the block footprint (82 -> 41KB) so 2 blocks/SM overlap.
+    float* S = wsm;                    // [SK][NCOLW]   16KB
+    float* rhat = S + SK * NCOLW;      // [WY_C][NCOLW]  8KB
+    float* R = rhat + WY_C * NCOLW;    // [WY_C][WY_C]  16KB ratio expf(ll_t-ll_s)
+    float* ll = R + WY_C * WY_C;       // [WY_C] log-lambda
+    float* bm = ll + WY_C;             // [WY_C]
+    float* lamv = bm + WY_C;           // [WY_C] expf(ll_t)
+    float* wv = lamv + WY_C;           // [WY_C] expf(ll_C - ll_t)
+
+    float* Sgh = Sg + (size_t)h * SK * SK;
+    for (int i = tid; i < SK * NCOLW; i += blockDim.x)
+        S[i] = Sgh[(i / NCOLW) * SK + j0 + i % NCOLW];
+
+    for (int c = 0; c < nch; c++) {
+        const int t0 = c * WY_C;
+        const int rows = min(WY_C, T - t0);
+        __syncthreads();
+        if (tid == 0) {
+            float run = 0.f;
+            for (int t = 0; t < rows; t++) {
+                run += gT[(size_t)(t0 + t) * NH + h]; // g <= 0
+                ll[t] = run;
+            }
+        }
+        for (int t = tid; t < rows; t += blockDim.x)
+            bm[t] = betaT[(size_t)(t0 + t) * NH + h];
+        __syncthreads();
+        // ratio matrix: R[t][s] = expf(ll_t - ll_s) for s <= t (log-space:
+        // immune to lambda underflow; exp of a <=0 argument, underflow-to-0
+        // is the correct fully-decayed limit)
+        for (int e = tid; e < rows * WY_C; e += blockDim.x) {
+            int tt = e / WY_C, ss = e % WY_C;
+            R[e] = ss <= tt ? expf(ll[tt] - ll[ss]) : 0.f;
+        }
+        for (int t = tid; t < rows; t += blockDim.x) {
+            lamv[t] = expf(ll[t]);
+            wv[t] = expf(ll[rows - 1] - ll[t]);
+        }
+        __syncthreads();
+
+        // rhat[t][j] = beta_t (v_t[j] - lam_t * (k_t . S[:,j]))
+        for (int e = tid; e < rows * NCOLW; e += blockDim.x) {
+            int t = e / NCOLW, j = e % NCOLW;
+            const float* kr = convT + (size_t)(t0 + t) * GDN_CH + 2048 + qk * SK;
+            float acc = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < SK; i++) acc += __ldg(kr + i) * S[i * NCOLW + j];
+            float vt = convT[(size_t)(t0 + t) * GDN_CH + 4096 + h * SK + j0 + j];
+            rhat[e] = bm[t] * (vt - lamv[t] * acc);
+        }
+        __syncthreads();
+
+        // forward substitution: serial over t, columns = lanes of warp 0
+        // (NCOLW == warp size), so step-to-step visibility only needs
+        // __syncwarp -- the 63 block barriers were the whole kernel's cost
+        if (tid < 32) {
+            const float* kkg = KKt + ((size_t)qk * nch + c) * WY_C * WY_C;
+            for (int t = 1; t < rows; t++) {
+                float acc = 0.f;
+                const float* kkr = kkg + t * WY_C;
+                const float* Rr = R + t * WY_C;
+                for (int s = 0; s < t; s++)
+                    acc += Rr[s] * kkr[s] * rhat[s * NCOLW + tid];
+                rhat[t * NCOLW + tid] -= bm[t] * acc;
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+
+        // outputs
+        for (int e = tid; e < rows * NCOLW; e += blockDim.x) {
+            int t = e / NCOLW, j = e % NCOLW;
+            const float* qt = convT + (size_t)(t0 + t) * GDN_CH + qk * SK;
+            float qs = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < SK; i++) qs += qt[i] * S[i * NCOLW + j];
+            float acc = lamv[t] * qs * qscale;
+            const float* qkr = QKt + ((size_t)qk * nch + c) * WY_C * WY_C + t * WY_C;
+            const float* Rr = R + t * WY_C;
+            for (int s = 0; s <= t; s++)
+                acc += Rr[s] * qkr[s] * rhat[s * NCOLW + j];
+            oT[(size_t)(t0 + t) * (NH * SK) + h * SK + j0 + j] = acc;
+        }
+        __syncthreads();
+
+        // state: S = lam_C S + sum_t k_t[i] (lam_C/lam_t) rhat[t][j]
+        const float lC = wv[0] * lamv[0]; // = expf(ll_{rows-1})
+        for (int e = tid; e < SK * NCOLW; e += blockDim.x) {
+            int i = e / NCOLW, j = e % NCOLW;
+            float s = S[e] * lC;
+            for (int t = 0; t < rows; t++)
+                s += __ldg(convT + (size_t)(t0 + t) * GDN_CH + 2048 + qk * SK + i) * wv[t] *
+                     rhat[t * NCOLW + j];
+            S[e] = s;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < SK * NCOLW; i += blockDim.x)
+        Sgh[(i / NCOLW) * SK + j0 + i % NCOLW] = S[i];
+}
+
+static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
+                          const float* betaT, float* oT, int T, cudaStream_t st) {
+    const int nch = (T + WY_C - 1) / WY_C;
+    // scratch for KKt/QKt: lazily sized for the largest T seen (engine.cuh is
+    // off-limits to this path for now; static lifetime matches the process)
+    static float *d_kkt = nullptr, *d_qkt = nullptr;
+    static int cap_nch = 0;
+    if (nch > cap_nch) {
+        if (d_kkt) { cudaFree(d_kkt); cudaFree(d_qkt); }
+        CUDA_CHECK(cudaMalloc(&d_kkt, (size_t)16 * nch * WY_C * WY_C * 4));
+        CUDA_CHECK(cudaMalloc(&d_qkt, (size_t)16 * nch * WY_C * WY_C * 4));
+        cap_nch = nch;
+    }
+    {
+        dim3 g(nch, 16);
+        const size_t sma = (size_t)2 * WY_C * 128 * 4;
+        static bool attra = false;
+        if (!attra) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_delta_wy_kk,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, sma));
+            attra = true;
+        }
+        k_delta_wy_kk<<<g, 256, sma, st>>>(convT, d_kkt, d_qkt, T, nch);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        dim3 g(128 / NCOLW, 48);
+        const size_t sm = ((size_t)128 * NCOLW + (size_t)WY_C * NCOLW +
+                           (size_t)WY_C * WY_C + 4 * WY_C) * 4;
+        static bool attr = false;
+        if (!attr) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_delta_wy,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
+            attr = true;
+        }
+        k_delta_wy<<<g, 256, sm, st>>>(S_global, convT, gT, betaT, oT, d_kkt, d_qkt, T, nch);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st) {
+    // re-read per call (getenv is noise next to a launch) so tests can flip
+    // paths in-process via setenv, same policy as prefill_use_mma
+    const char* mode = getenv("Q27_DS_MODE");
+    if (mode && !strcmp(mode, "wy")) {
+        delta_scan_wy(S_global, convT, gT, betaT, oT, T, st);
+        return;
+    }
     const int cs = delta_scan_nsplit(T);
     if (cs == 1) {
         static bool attr_set = false;
