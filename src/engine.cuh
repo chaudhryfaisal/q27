@@ -116,6 +116,10 @@ struct Engine {
     bool have_snap = false;
     int perm = 0;
     cudaGraphExec_t spec_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    // P11: split draft/verify graphs for the constrained tool path
+    cudaGraphExec_t draft_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    cudaGraphExec_t verify_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 5;
         return ph == 0 ? S[il]
@@ -560,7 +564,10 @@ struct Engine {
 
     // launch sequence for one speculative round (graph-capturable: all state
     // through device memory, pointers fixed for a given parity)
-    void spec_round_launches() {
+    // P11: draft half -- prep + the 4 sequential MTP passes producing
+    // d_draft..d_draft4. Split out so the constrained path can read the
+    // drafts back and stage per-lane grammar masks before the verify half.
+    void spec_draft_launches() {
         q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_m,
                          d_pos_m2, d_pos_m3, d_pos_m4, d_outcome, stm);
         // draft 1: (h_next, embed(t1)) at pos_m -> d_draft; MTP's own post-head-norm
@@ -574,7 +581,12 @@ struct Engine {
         mtp_forward(h_next3, d_draft2, d_draft3, d_pos_m3);
         CUDA_CHECK(cudaMemcpyAsync(h_next4, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         mtp_forward(h_next4, d_draft3, d_draft4, d_pos_m4);
+    }
 
+    // P11: verify half -- batch-5 forward of {pending, d1..d4}, masked argmax
+    // per lane, finish_round. Reads d_draft..d_draft4 (set by the draft half)
+    // and d_mask_ids/d_accept_cap (staged by the host between halves).
+    void spec_verify_launches() {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
                      {{d_token, d_draft, d_draft2, d_draft3, d_draft4}}, N_EMBD,
@@ -615,6 +627,11 @@ struct Engine {
         q27k::finish_round(d_P, d_token, d_draft, d_draft2, d_draft3, d_draft4, d_va, d_vb,
                            d_vc, d_vd, d_ve, x1, x1_b, x1_c, x1_d, x1_e, h_next, d_outcome,
                            N_EMBD, d_accept_cap, stm);
+    }
+
+    void spec_round_launches() {
+        spec_draft_launches();
+        spec_verify_launches();
     }
 
     void build_spec_graphs() {
@@ -658,15 +675,45 @@ struct Engine {
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
             CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gr));
+            // P11: same round, split at the draft/verify boundary. The two
+            // halves reference the identical buffers, so launching D then V
+            // back-to-back on stm equals the monolithic graph; the host reads
+            // drafts + stages masks between them in the constrained path.
+            cudaGraph_t gd, gv;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_draft_launches();
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
+            CUDA_CHECK(cudaGraphInstantiate(&draft_graph[p], gd, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gd));
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_verify_launches();
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
+            CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gv));
         }
         perm = 0;
-        fprintf(stderr, "spec graphs captured (5 perms, depth-4)\n");
+        fprintf(stderr, "spec graphs captured (5 perms, depth-4; +split D/V)\n");
     }
 
     // one speculative round (depth 4); returns tokens emitted (1..5).
     // All position math + acceptance runs on device; host reads 24 bytes.
     int spec_round(int* emit) {
-        CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
+        if (tool_split_active && on_drafts) {
+            // P11 constrained path: run drafts, read them back, let the host
+            // stage per-lane grammar masks (uncapped), then verify. Full spec
+            // acceptance survives inside tool-call bodies (vs the cap=1 hack).
+            CUDA_CHECK(cudaGraphLaunch(draft_graph[perm], stm));
+            int dr[4];
+            CUDA_CHECK(cudaMemcpyAsync(&dr[0], d_draft, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaMemcpyAsync(&dr[1], d_draft2, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaMemcpyAsync(&dr[2], d_draft3, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaMemcpyAsync(&dr[3], d_draft4, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
+            CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
+        }
         int oc[7];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -677,6 +724,10 @@ struct Engine {
         return n;
     }
     int last_pending = -1;
+    // P11: called mid-round in the constrained path with the 4 draft tokens;
+    // the host advances a grammar copy over [pending, d1..d4] and stages the
+    // 5 lane masks + cap=0. Null -> capped path (or unconstrained).
+    std::function<void(const int*)> on_drafts;
     // P7: called after each spec round with the NEW pending token so the
     // host grammar can stage next round's slot-0 mask (state must include
     // the pending token -- masks lag one token otherwise).
@@ -693,10 +744,23 @@ struct Engine {
     }
     // Constrain slot 0 to pool[mask_id] and cap acceptance at 1/round
     // (mask_id -1 = deactivate). Takes effect from the next spec round.
+    // With on_drafts wired (P11) the round runs split and per-lane masks are
+    // staged mid-round, so activate the split path instead of capping.
     void set_tool_constraint(int mask_id) {
         h_mask_id0 = mask_id;
-        h_cap0 = mask_id >= 0 ? 1 : 0;
+        static const bool nosplit = getenv("Q27_TOOL_NOSPLIT") != nullptr; // gate A/B
+        tool_split_active = (mask_id >= 0) && (bool)on_drafts && !nosplit;
+        // cap only when constraining WITHOUT the split path (P7 v1 fallback)
+        h_cap0 = (mask_id >= 0 && !tool_split_active) ? 1 : 0;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, &h_mask_id0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+    }
+    // P11: stage all 5 lane mask ids at once (split path). cap stays 0.
+    int h_mask_ids5[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    void set_tool_masks5(const int ids[5]) {
+        for (int i = 0; i < 5; i++) h_mask_ids5[i] = ids[i];
+        h_cap0 = 0;
+        CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, 5 * 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
     }
 

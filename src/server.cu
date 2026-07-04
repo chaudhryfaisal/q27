@@ -42,6 +42,7 @@ struct ToolConstrainer {
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
     q27::ToolGrammar tg;
+    q27::ToolGrammar staged_state; // grammar state whose mask is in verify slot 0
     std::vector<std::string> names;
     std::string tail; // rolling decoded-text window for the opener trigger
     long engaged = 0, disengaged = 0;
@@ -51,13 +52,39 @@ struct ToolConstrainer {
         tail.clear();
         names = std::move(n);
     }
-    void apply(const q27::ToolGrammar& g) {
+    // pool id for grammar state g's legal-token mask (-1 if pool full)
+    int mask_id(const q27::ToolGrammar& g) {
         int ci = cache->get(g);
         if ((int)host2dev->size() <= ci) host2dev->resize(ci + 1, -2);
         int& slot = (*host2dev)[ci];
         if (slot == -2) slot = eng->mask_pool_add(cache->mask(ci).data());
+        return slot;
+    }
+    void apply(const q27::ToolGrammar& g) {
+        int slot = mask_id(g);
         if (slot < 0) { drop("mask pool full"); return; }
+        staged_state = g; // P11: on_drafts advances from here for lanes 1-4
         eng->set_tool_constraint(slot);
+    }
+    // P11: mid-round, given the 4 draft tokens, stage per-lane masks. Lane 0 =
+    // staged_state (the pending position, legal set already correct); lane k =
+    // that state advanced over drafts d1..dk. If a draft is grammar-illegal,
+    // remaining lanes reuse the last legal mask -- moot, since acceptance
+    // breaks at that lane anyway (its verify argmax is legal != the draft).
+    void on_drafts(const int* dr) {
+        int ids[5];
+        q27::ToolGrammar c = staged_state;
+        ids[0] = mask_id(c);
+        bool alive = true;
+        for (int k = 1; k <= 4; k++) {
+            if (alive)
+                for (char ch : tok->decode_one(dr[k - 1]))
+                    if (!c.advance(ch)) { alive = false; break; }
+            ids[k] = alive ? mask_id(c) : ids[k - 1];
+            if (ids[k] < 0) ids[k] = ids[k - 1] < 0 ? ids[0] : ids[k - 1];
+        }
+        if (ids[0] < 0) return; // pool exhausted; verify keeps prior masks
+        eng->set_tool_masks5(ids);
     }
     // Stage next round's slot-0 mask: the constrained lane decides the token
     // AFTER the pending one, so simulate the pending token on a copy first.
@@ -417,6 +444,7 @@ int main(int argc, char** argv) {
             tc.enabled = constrain_tools;
             tc.begin(tool_names_v);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
+            eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
                 tc.on_id(id);
                 for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
@@ -424,6 +452,7 @@ int main(int argc, char** argv) {
             }, stable_len);
             tc.end();
             eng.on_pending = nullptr;
+            eng.on_drafts = nullptr;
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
                 calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
@@ -561,6 +590,7 @@ int main(int argc, char** argv) {
                             {"delta", {{"type", "text_delta"}, {"text", t}}}});
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
+                eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
                 int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
                     tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(tok.decode_one(id))) emit_seg(ch, t);
@@ -568,6 +598,7 @@ int main(int argc, char** argv) {
                 }, stable_len);
                 tc.end();
                 eng.on_pending = nullptr;
+                eng.on_drafts = nullptr;
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
                 if (has_tools) {
