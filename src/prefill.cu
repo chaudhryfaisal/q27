@@ -1388,18 +1388,26 @@ __global__ void k_delta_wy_kk(const float* __restrict__ convT, float* __restrict
 }
 
 // Kernel B: per (v-head, column-block of NCOLW): sequential over chunks.
-// State S[:, j0:j0+NCOLW] lives in smem; per chunk: rhs GEMV-ish, forward
-// substitution over 64 rows, output + state update.
+// State S[:, j0:j0+NCOLW] lives in smem. Phases are warp-tiled register
+// GEMMs (the one-thread-one-output scalar dots ran latency-bound at ~1
+// instr/cycle): warp w owns token rows 8w..8w+7 with lane = column, K.S and
+// Q.S accumulate together over ONE pass of S (Q.S rides in registers across
+// the substitution, so the output phase never re-reads S -- which also lets
+// the state update share its barrier region). K/Q rows come in as float4
+// warp-broadcast __ldg (the chunk is L1/L2-hot; staging it in smem would
+// break the 2-blocks/SM occupancy that covers the warp-0-only substitution).
 constexpr int NCOLW = 32;
-__global__ void k_delta_wy(float* __restrict__ Sg, const float* __restrict__ convT,
-                           const float* __restrict__ gT, const float* __restrict__ betaT,
-                           float* __restrict__ oT, const float* __restrict__ KKt,
-                           const float* __restrict__ QKt, int T, int nch) {
+__global__ void __launch_bounds__(256, 2)
+k_delta_wy(float* __restrict__ Sg, const float* __restrict__ convT,
+           const float* __restrict__ gT, const float* __restrict__ betaT,
+           float* __restrict__ oT, const float* __restrict__ KKt,
+           const float* __restrict__ QKt, int T, int nch) {
     constexpr int SK = 128, GDN_CH = 10240, NH = 48;
     const int h = blockIdx.y;
     const int qk = h % 16;
     const int j0 = blockIdx.x * NCOLW;
     const int tid = threadIdx.x; // 256
+    const int warp = tid >> 5, lane = tid & 31;
     const float qscale = rsqrtf((float)SK);
 
     extern __shared__ float wsm[];
@@ -1413,21 +1421,33 @@ __global__ void k_delta_wy(float* __restrict__ Sg, const float* __restrict__ con
     float* bm = ll + WY_C;             // [WY_C]
     float* lamv = bm + WY_C;           // [WY_C] expf(ll_t)
     float* wv = lamv + WY_C;           // [WY_C] expf(ll_C - ll_t)
+    float* A = wv + WY_C;              // packed strict-lower bm.R.KKt   8KB
 
     float* Sgh = Sg + (size_t)h * SK * SK;
     for (int i = tid; i < SK * NCOLW; i += blockDim.x)
         S[i] = Sgh[(i / NCOLW) * SK + j0 + i % NCOLW];
+    // ragged-tail rows are read through R == 0 terms in the tri product;
+    // keep them finite (0 * NaN would poison live rows)
+    for (int i = tid; i < WY_C * NCOLW; i += blockDim.x) rhat[i] = 0.f;
 
     for (int c = 0; c < nch; c++) {
         const int t0 = c * WY_C;
         const int rows = min(WY_C, T - t0);
         __syncthreads();
-        if (tid == 0) {
-            float run = 0.f;
-            for (int t = 0; t < rows; t++) {
-                run += gT[(size_t)(t0 + t) * NH + h]; // g <= 0
-                ll[t] = run;
+        if (tid < 32) {
+            // pair-per-lane inclusive shuffle scan replaces the 64-step
+            // serial prefix (reassociation only -- tolerance-gated)
+            float g0 = 2 * lane < rows ? gT[(size_t)(t0 + 2 * lane) * NH + h] : 0.f;
+            float g1 = 2 * lane + 1 < rows ? gT[(size_t)(t0 + 2 * lane + 1) * NH + h] : 0.f;
+            float ps = g0 + g1;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                float v = __shfl_up_sync(0xffffffffu, ps, off);
+                if (lane >= off) ps += v;
             }
+            float base = ps - (g0 + g1);
+            if (2 * lane < rows) ll[2 * lane] = base + g0;
+            if (2 * lane + 1 < rows) ll[2 * lane + 1] = base + g0 + g1;
         }
         for (int t = tid; t < rows; t += blockDim.x)
             bm[t] = betaT[(size_t)(t0 + t) * NH + h];
@@ -1445,60 +1465,200 @@ __global__ void k_delta_wy(float* __restrict__ Sg, const float* __restrict__ con
         }
         __syncthreads();
 
-        // rhat[t][j] = beta_t (v_t[j] - lam_t * (k_t . S[:,j]))
-        for (int e = tid; e < rows * NCOLW; e += blockDim.x) {
-            int t = e / NCOLW, j = e % NCOLW;
-            const float* kr = convT + (size_t)(t0 + t) * GDN_CH + 2048 + qk * SK;
-            float acc = 0.f;
-#pragma unroll 4
-            for (int i = 0; i < SK; i++) acc += __ldg(kr + i) * S[i * NCOLW + j];
-            float vt = convT[(size_t)(t0 + t) * GDN_CH + 4096 + h * SK + j0 + j];
-            rhat[e] = bm[t] * (vt - lamv[t] * acc);
+        // fused K.S / Q.S (each 64x32 over k = 128): lane accumulates its
+        // column for the warp's 8 rows; ragged rows clamp to row rows-1
+        // (loads stay in-bounds, writes are guarded)
+        const int tw = warp * 8;
+        float accK[8], accQ[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            accK[r] = 0.f;
+            accQ[r] = 0.f;
         }
-        __syncthreads();
-
-        // forward substitution: serial over t, columns = lanes of warp 0
-        // (NCOLW == warp size), so step-to-step visibility only needs
-        // __syncwarp -- the 63 block barriers were the whole kernel's cost
-        if (tid < 32) {
-            const float* kkg = KKt + ((size_t)qk * nch + c) * WY_C * WY_C;
-            for (int t = 1; t < rows; t++) {
-                float acc = 0.f;
-                const float* kkr = kkg + t * WY_C;
-                const float* Rr = R + t * WY_C;
-                for (int s = 0; s < t; s++)
-                    acc += Rr[s] * kkr[s] * rhat[s * NCOLW + tid];
-                rhat[t * NCOLW + tid] -= bm[t] * acc;
-                __syncwarp();
+        if (tw + 8 <= rows) {
+            // full band: one base pointer, row strides fold into the LDG
+            // immediate (a per-row pointer array spilled at 128 regs)
+            const float4* kp0 =
+                (const float4*)(convT + (size_t)(t0 + tw) * GDN_CH + 2048 + qk * SK);
+#pragma unroll 2
+            for (int k4 = 0; k4 < SK / 4; k4++) {
+                const float s0 = S[(4 * k4) * NCOLW + lane];
+                const float s1 = S[(4 * k4 + 1) * NCOLW + lane];
+                const float s2 = S[(4 * k4 + 2) * NCOLW + lane];
+                const float s3 = S[(4 * k4 + 3) * NCOLW + lane];
+#pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float4 kv = __ldg(kp0 + r * (GDN_CH / 4) + k4);
+                    accK[r] = fmaf(kv.x, s0, accK[r]);
+                    accK[r] = fmaf(kv.y, s1, accK[r]);
+                    accK[r] = fmaf(kv.z, s2, accK[r]);
+                    accK[r] = fmaf(kv.w, s3, accK[r]);
+                    // q row = k row - 2048 floats
+                    float4 qv = __ldg(kp0 + r * (GDN_CH / 4) - 512 + k4);
+                    accQ[r] = fmaf(qv.x, s0, accQ[r]);
+                    accQ[r] = fmaf(qv.y, s1, accQ[r]);
+                    accQ[r] = fmaf(qv.z, s2, accQ[r]);
+                    accQ[r] = fmaf(qv.w, s3, accQ[r]);
+                }
+            }
+        } else {
+            // ragged band (cold: T tail only): clamp to row rows-1 with
+            // inline address math (loads in-bounds, writes guarded)
+            for (int k4 = 0; k4 < SK / 4; k4++) {
+                const float s0 = S[(4 * k4) * NCOLW + lane];
+                const float s1 = S[(4 * k4 + 1) * NCOLW + lane];
+                const float s2 = S[(4 * k4 + 2) * NCOLW + lane];
+                const float s3 = S[(4 * k4 + 3) * NCOLW + lane];
+#pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    const float4* kp =
+                        (const float4*)(convT + (size_t)(t0 + min(tw + r, rows - 1)) * GDN_CH +
+                                        2048 + qk * SK);
+                    float4 kv = __ldg(kp + k4);
+                    accK[r] = fmaf(kv.x, s0, accK[r]);
+                    accK[r] = fmaf(kv.y, s1, accK[r]);
+                    accK[r] = fmaf(kv.z, s2, accK[r]);
+                    accK[r] = fmaf(kv.w, s3, accK[r]);
+                    float4 qv = __ldg(kp - 512 + k4);
+                    accQ[r] = fmaf(qv.x, s0, accQ[r]);
+                    accQ[r] = fmaf(qv.y, s1, accQ[r]);
+                    accQ[r] = fmaf(qv.z, s2, accQ[r]);
+                    accQ[r] = fmaf(qv.w, s3, accQ[r]);
+                }
             }
         }
-        __syncthreads();
-
-        // outputs
-        for (int e = tid; e < rows * NCOLW; e += blockDim.x) {
-            int t = e / NCOLW, j = e % NCOLW;
-            const float* qt = convT + (size_t)(t0 + t) * GDN_CH + qk * SK;
-            float qs = 0.f;
-#pragma unroll 4
-            for (int i = 0; i < SK; i++) qs += qt[i] * S[i * NCOLW + j];
-            float acc = lamv[t] * qs * qscale;
-            const float* qkr = QKt + ((size_t)qk * nch + c) * WY_C * WY_C + t * WY_C;
-            const float* Rr = R + t * WY_C;
-            for (int s = 0; s <= t; s++)
-                acc += Rr[s] * qkr[s] * rhat[s * NCOLW + j];
-            oT[(size_t)(t0 + t) * (NH * SK) + h * SK + j0 + j] = acc;
+        // rhat[t][j] = beta_t (v_t[j] - lam_t * (k_t . S[:,j]))
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const int t = tw + r;
+            if (t < rows) {
+                float vt = convT[(size_t)(t0 + t) * GDN_CH + 4096 + h * SK + j0 + lane];
+                rhat[t * NCOLW + lane] = bm[t] * (vt - lamv[t] * accK[r]);
+            }
+        }
+        // fold bm.R.KKt into a packed strict-lower triangle so the serial
+        // substitution runs on smem only (its per-step L2 KKt loads were the
+        // kernel's dominant stall), and QKt into R for the output pass (R is
+        // read-only below; s > t entries stay 0); both read only R/bm and
+        // globals, so they ride the pre-substitution barrier
+        {
+            const float* kkg = KKt + ((size_t)qk * nch + c) * WY_C * WY_C;
+            for (int e = tid; e < rows * WY_C; e += blockDim.x) {
+                int tt = e / WY_C, ss = e % WY_C;
+                if (ss < tt) A[tt * (tt - 1) / 2 + ss] = bm[tt] * R[e] * __ldg(kkg + e);
+            }
+            const float* qkg = QKt + ((size_t)qk * nch + c) * WY_C * WY_C;
+            for (int e = tid; e < rows * WY_C; e += blockDim.x)
+                R[e] *= __ldg(qkg + e);
         }
         __syncthreads();
 
-        // state: S = lam_C S + sum_t k_t[i] (lam_C/lam_t) rhat[t][j]
-        const float lC = wv[0] * lamv[0]; // = expf(ll_{rows-1})
-        for (int e = tid; e < SK * NCOLW; e += blockDim.x) {
-            int i = e / NCOLW, j = e % NCOLW;
-            float s = S[e] * lC;
-            for (int t = 0; t < rows; t++)
-                s += __ldg(convT + (size_t)(t0 + t) * GDN_CH + 2048 + qk * SK + i) * wv[t] *
-                     rhat[t * NCOLW + j];
-            S[e] = s;
+        // blocked forward substitution: 8-row diagonal blocks. Warp 0
+        // solves the block serially (columns = lanes; each lane touches only
+        // its own column, so no intra-warp sync), then all 8 warps apply the
+        // rank-8 rhs update to the remaining rows -- the O(t) serial sums of
+        // the flat solve were the kernel's dominant stall
+        for (int tb = 0; tb + 1 < rows; tb += 8) {
+            if (tid < 32) {
+                // register triangular solve: solved rows stay in rc[] so the
+                // chain never round-trips smem (full 8-row band unrolled)
+                if (tb + 8 <= rows) {
+                    float rc[8];
+                    rc[0] = rhat[tb * NCOLW + tid];
+#pragma unroll
+                    for (int r = 1; r < 8; r++) {
+                        const float* Ar = A + (tb + r) * (tb + r - 1) / 2 + tb;
+                        float acc = 0.f;
+#pragma unroll
+                        for (int i = 0; i < r; i++) acc = fmaf(Ar[i], rc[i], acc);
+                        rc[r] = rhat[(tb + r) * NCOLW + tid] - acc;
+                        rhat[(tb + r) * NCOLW + tid] = rc[r];
+                    }
+                } else {
+                    for (int t = tb + 1; t < rows; t++) {
+                        const float* Ar = A + t * (t - 1) / 2;
+                        float acc = 0.f;
+                        for (int s = tb; s < t; s++)
+                            acc = fmaf(Ar[s], rhat[s * NCOLW + tid], acc);
+                        rhat[t * NCOLW + tid] -= acc;
+                    }
+                }
+            }
+            __syncthreads();
+            // rank-8 rhs update of the remaining rows: the solved band is
+            // loop-invariant, so it rides in registers; A row segments are
+            // warp-broadcast loads feeding 4 independent chains
+            float rr[8];
+#pragma unroll
+            for (int s = 0; s < 8; s++) rr[s] = rhat[(tb + s) * NCOLW + lane];
+            for (int t = tb + 8 + warp; t < rows; t += 8) {
+                const float* Ar = A + t * (t - 1) / 2 + tb;
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                a0 = fmaf(Ar[0], rr[0], a0);
+                a1 = fmaf(Ar[1], rr[1], a1);
+                a2 = fmaf(Ar[2], rr[2], a2);
+                a3 = fmaf(Ar[3], rr[3], a3);
+                a0 = fmaf(Ar[4], rr[4], a0);
+                a1 = fmaf(Ar[5], rr[5], a1);
+                a2 = fmaf(Ar[6], rr[6], a2);
+                a3 = fmaf(Ar[7], rr[7], a3);
+                rhat[t * NCOLW + lane] -= (a0 + a1) + (a2 + a3);
+            }
+            __syncthreads();
+        }
+
+        // outputs: lam_t qscale (Q.S, still in registers) + tril(R.QKt) rhat;
+        // the s-loop runs the warp's full 8-row band -- s > t terms hit
+        // R == 0 and contribute exact zeros
+        {
+            float accT[8];
+#pragma unroll
+            for (int r = 0; r < 8; r++) accT[r] = lamv[tw + r] * accQ[r] * qscale;
+            for (int s4 = 0; s4 < (tw + 8) / 4; s4++) {
+                const float r0 = rhat[(4 * s4) * NCOLW + lane];
+                const float r1 = rhat[(4 * s4 + 1) * NCOLW + lane];
+                const float r2 = rhat[(4 * s4 + 2) * NCOLW + lane];
+                const float r3 = rhat[(4 * s4 + 3) * NCOLW + lane];
+#pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float4 a = *(const float4*)(R + (tw + r) * WY_C + 4 * s4);
+                    accT[r] = fmaf(a.x, r0, accT[r]);
+                    accT[r] = fmaf(a.y, r1, accT[r]);
+                    accT[r] = fmaf(a.z, r2, accT[r]);
+                    accT[r] = fmaf(a.w, r3, accT[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const int t = tw + r;
+                if (t < rows)
+                    oT[(size_t)(t0 + t) * (NH * SK) + h * SK + j0 + lane] = accT[r];
+            }
+        }
+
+        // state: S = lam_C S + K^T (wv rhat); warp w owns state rows
+        // 16w..16w+15. Same barrier region as the outputs: nothing above
+        // reads S anymore, both only read post-substitution rhat
+        {
+            const float lC = wv[0] * lamv[0]; // = expf(ll_{rows-1})
+            const int i0 = warp * 16;
+            float acc[16];
+#pragma unroll
+            for (int r = 0; r < 16; r++) acc[r] = S[(i0 + r) * NCOLW + lane] * lC;
+            const float* kr = convT + (size_t)t0 * GDN_CH + 2048 + qk * SK;
+            for (int t = 0; t < rows; t++, kr += GDN_CH) {
+                const float wr = wv[t] * rhat[t * NCOLW + lane];
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    float4 kv = __ldg((const float4*)kr + (i0 >> 2) + q);
+                    acc[4 * q] = fmaf(kv.x, wr, acc[4 * q]);
+                    acc[4 * q + 1] = fmaf(kv.y, wr, acc[4 * q + 1]);
+                    acc[4 * q + 2] = fmaf(kv.z, wr, acc[4 * q + 2]);
+                    acc[4 * q + 3] = fmaf(kv.w, wr, acc[4 * q + 3]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 16; r++) S[(i0 + r) * NCOLW + lane] = acc[r];
         }
     }
     __syncthreads();
@@ -1534,7 +1694,8 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
     {
         dim3 g(128 / NCOLW, 48);
         const size_t sm = ((size_t)128 * NCOLW + (size_t)WY_C * NCOLW +
-                           (size_t)WY_C * WY_C + 4 * WY_C) * 4;
+                           (size_t)WY_C * WY_C + 4 * WY_C +
+                           (size_t)WY_C * (WY_C - 1) / 2) * 4;
         static bool attr = false;
         if (!attr) {
             CUDA_CHECK(cudaFuncSetAttribute(k_delta_wy,
