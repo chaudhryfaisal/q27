@@ -192,7 +192,10 @@ template <bool Q4IN>
 __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                              const int8_t* __restrict__ nat, const float* __restrict__ xs,
                              float* __restrict__ y, int64_t rows, int64_t cols, int T) {
-    constexpr int MR = 64, NT = 64, KS = 128;   // block tile: rows, tokens, staged K
+    constexpr int MR = 64, NT = 128, KS = 128;  // block tile: rows, tokens, staged K
+    // NT=128 (was 64): doubles A-fragment reuse per staged weight byte at
+    // T=1024 chunks -- measured 242 -> ? TOPS on the 16K pf bench. Same
+    // per-output FP order (bitwise vs NT=64).
     constexpr int TS = NT / 16;                 // token subtiles per warp (x2 warps)
     constexpr int LDW = KS + 16, LDX = KS + 16; // padded smem strides (bytes)
     // (double-buffered stages and __launch_bounds__ occupancy forcing both
@@ -229,10 +232,11 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
     // nibble unpack happens at the reg->smem store, off the load path.
     constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : MR * KS / 4 / 256;
     constexpr int XLD = NT * KS / 4 / 256;
+    constexpr int XSL = (NT * 4 + 255) / 256; // x-scale slices (NT*4 can exceed 256 threads)
     const int tid = threadIdx.x;
     const int nws = Q4IN ? MR * 2 : MR;
     uint32_t rw[WLD], rx[XLD];
-    float rws = 0.f, rxs = 0.f;
+    float rws = 0.f, rxs[XSL];
 
     auto load_stage = [&](int st) {
         const int64_t k0 = (int64_t)st * KS;
@@ -275,9 +279,13 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
                           : 0.f;
             }
         }
-        if (tid < NT * 4) {
-            int tt = tid / 4, cc = tid % 4;
-            rxs = t0 + tt < T ? __ldg(xs + (size_t)(t0 + tt) * (cols / 32) + k0 / 32 + cc) : 0.f;
+#pragma unroll
+        for (int i = 0; i < XSL; i++) {
+            int idx = i * 256 + tid;
+            int tt = idx / 4, cc = idx % 4;
+            rxs[i] = (idx < NT * 4 && t0 + tt < T)
+                         ? __ldg(xs + (size_t)(t0 + tt) * (cols / 32) + k0 / 32 + cc)
+                         : 0.f;
         }
     };
     auto store_stage = [&]() {
@@ -311,7 +319,11 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
             *(uint32_t*)(s_x + tt * LDX + u * 4) = rx[i];
         }
         if (tid < nws) s_ws[tid] = rws;
-        if (tid < NT * 4) s_xs[tid] = rxs;
+#pragma unroll
+        for (int i = 0; i < XSL; i++) {
+            int idx = i * 256 + tid;
+            if (idx < NT * 4) s_xs[idx] = rxs[i];
+        }
     };
 
     load_stage(0);
@@ -373,7 +385,7 @@ static bool prefill_use_mma() {
 template <bool Q4IN>
 static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                             int64_t rows, int64_t cols, int T, cudaStream_t st) {
-    constexpr int MR = 64, NT = 64, KS = 128, LDW = KS + 16, LDX = KS + 16;
+    constexpr int MR = 64, NT = 128, KS = 128, LDW = KS + 16, LDX = KS + 16;
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * 4) * 4;
     if (cols % KS) {
         fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);

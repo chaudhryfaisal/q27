@@ -727,8 +727,16 @@ int main(int argc, char** argv) {
             return ttft;
         };
         std::vector<int> a, b;
-        double ts = run(false, a);
+        // Q27_PF_NOSERIAL=1 skips the serial leg (and the identity gate) for
+        // fast batched-rate iteration; the gate still runs by default.
+        const bool noserial = getenv("Q27_PF_NOSERIAL") != nullptr;
+        double ts = noserial ? 0 : run(false, a);
         double tb = run(true, b);
+        if (noserial) {
+            printf("prefill %d tokens: batched TTFT %.3fs (%.1f t/s) [serial skipped]\n", pf_n,
+                   tb, pf_n / tb);
+            return 0;
+        }
         printf("prefill %d tokens: serial TTFT %.2fs (%.1f t/s) | batched TTFT %.3fs "
                "(%.1f t/s) | speedup %.1fx\n",
                pf_n, ts, pf_n / ts, tb, pf_n / tb, ts / tb);

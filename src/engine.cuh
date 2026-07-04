@@ -104,7 +104,10 @@ struct Engine {
     bool batched_prefill = true;
 
     // ---- batched prefill (M6) ----
-    static constexpr int PF_T = 256;  // chunk size
+    // Prefill chunk size. 256 left GEMM launches at ~320 blocks on 170 SMs
+    // (27% of int8 peak) and re-read all 17.7GB of weights T/256 times; 1024
+    // fills the machine and cuts weight re-reads 4x. Costs ~0.8GB scratch.
+    static constexpr int PF_T = 1024;
     static constexpr int PF_SB = 32;  // attention sub-batch (scratch rows)
     int* d_prompt = nullptr;          // whole prompt on device
     int d_prompt_cap = 0;
