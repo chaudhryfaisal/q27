@@ -293,6 +293,13 @@ int main(int argc, char** argv) {
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", ms_since(srv_t0));
     };
+    // Serialize with invalid-UTF-8 replacement: json::dump's strict default
+    // throws type_error.316, and an uncaught throw here is std::terminate.
+    // The Utf8Gate on every generation pipeline keeps split characters intact;
+    // this is the backstop for anything else.
+    auto jdump = [](const json& j) {
+        return j.dump(-1, ' ', false, json::error_handler_t::replace);
+    };
 
     httplib::Server srv;
     srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
@@ -367,8 +374,12 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lk(gpu);
             double qw = ms_since(rt.t0);
             std::string text;
-            int n = eng.generate(prompt, n_max, EOS,
-                                 [&](int id) { text += tok.decode_one(id); return true; });
+            q27::Utf8Gate ugate;
+            int n = eng.generate(prompt, n_max, EOS, [&](int id) {
+                text += ugate.feed(tok.decode_one(id));
+                return true;
+            });
+            text += ugate.flush();
             req_log(rt, qw);
             json choice;
             if (chat)
@@ -382,7 +393,7 @@ int main(int argc, char** argv) {
                         {"usage", {{"prompt_tokens", (int)prompt.size()},
                                    {"completion_tokens", n},
                                    {"total_tokens", (int)prompt.size() + n}}}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(jdump(out), "application/json");
             return;
         }
 
@@ -393,19 +404,25 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lk(gpu);
                 double qw = ms_since(rt.t0);
                 auto send = [&](const json& j) {
-                    std::string s = "data: " + j.dump() + "\n\n";
+                    std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
-                eng.generate(prompt, n_max, EOS, [&](int id) {
-                    std::string piece = tok.decode_one(id);
+                q27::Utf8Gate ugate;
+                auto piece_chunk = [&](const std::string& piece) {
                     json delta = chat ? json{{"content", piece}} : json{};
                     json choice = chat
                         ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
                         : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
-                    json chunk = {{"id", "q27-0"}, {"object", objd}, {"created", created},
-                                  {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})}};
-                    return send(chunk);
+                    return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})}};
+                };
+                eng.generate(prompt, n_max, EOS, [&](int id) {
+                    std::string piece = ugate.feed(tok.decode_one(id));
+                    if (piece.empty()) return true;
+                    return send(piece_chunk(piece));
                 });
+                std::string tailp = ugate.flush();
+                if (!tailp.empty()) send(piece_chunk(tailp));
                 req_log(rt, qw);
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
@@ -518,6 +535,7 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lk(gpu);
             double qw = ms_since(rt.t0);
             StreamSplitter sp;
+            q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
@@ -537,13 +555,14 @@ int main(int argc, char** argv) {
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
                 tc.on_id(id);
-                for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             }, stable_len);
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
             req_log(rt, qw);
+            for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
                 calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
@@ -586,7 +605,7 @@ int main(int argc, char** argv) {
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", n}}}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(jdump(out), "application/json");
             return;
         }
 
@@ -606,7 +625,7 @@ int main(int argc, char** argv) {
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 auto ev = [&](const char* name, const json& j) {
-                    std::string s = std::string("event: ") + name + "\ndata: " + j.dump() + "\n\n";
+                    std::string s = std::string("event: ") + name + "\ndata: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
                 json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
@@ -617,6 +636,7 @@ int main(int argc, char** argv) {
 
                 StreamSplitter sp;
                 std::string tool_buf, text_accum;
+                q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
                 bool any = false;
@@ -685,13 +705,14 @@ int main(int argc, char** argv) {
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
                 int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
                     tc.on_id(id);
-                    for (auto& [ch, t] : sp.feed(tok.decode_one(id))) emit_seg(ch, t);
+                    for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
                     return true;
                 }, stable_len);
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
                 req_log(rt, qw);
+                for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
                 if (has_tools) {
@@ -940,11 +961,13 @@ int main(int argc, char** argv) {
                     ctx->text += t;
                 }
             };
+            q27::Utf8Gate ugate;
             int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
-                for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             });
             req_log(rt, qw);
+            for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) flush_tool();
             flush_think();
@@ -954,7 +977,7 @@ int main(int argc, char** argv) {
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", produced},
                                    {"total_tokens", (int)prompt.size() + produced}}}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(jdump(out), "application/json");
             return;
         }
 
@@ -967,7 +990,7 @@ int main(int argc, char** argv) {
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
-                                    "\ndata: " + j.dump() + "\n\n";
+                                    "\ndata: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
                 ev({{"type", "response.created"},
@@ -1043,11 +1066,13 @@ int main(int argc, char** argv) {
                         {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
+                q27::Utf8Gate ugate;
                 int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
-                    for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
+                    for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                     return true;
                 });
                 req_log(rt, qw);
+                for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) flush_tool();
                 flush_think();

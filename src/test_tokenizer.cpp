@@ -13,7 +13,69 @@
 #include "tokenizer.h"
 #include "toolgram.h"
 
+// Self-test for the streaming UTF-8 boundary gate (no data files needed).
+// BPE token boundaries can split a multi-byte character; the raw piece is
+// invalid UTF-8 and nlohmann json::dump throws type_error.316 on it (took
+// q27-server down mid-generation under Claude Code, R0 2026-07-04).
+static int utf8gate_selftest() {
+    int fail = 0;
+    auto expect = [&](const std::string& got, const std::string& want, const char* name) {
+        if (got != want) {
+            printf("utf8gate FAIL %s: got %zu bytes, want %zu\n", name, got.size(),
+                   want.size());
+            fail++;
+        }
+    };
+    {   // ascii passthrough
+        q27::Utf8Gate g;
+        expect(g.feed("abc"), "abc", "ascii");
+        expect(g.flush(), "", "ascii-flush");
+    }
+    {   // em dash E2 80 94 split 2+1
+        q27::Utf8Gate g;
+        expect(g.feed("\xE2\x80"), "", "emdash-2+1 hold");
+        expect(g.feed("\x94"), "\xE2\x80\x94", "emdash-2+1 release");
+        expect(g.flush(), "", "emdash-2+1 flush");
+    }
+    {   // em dash split 1+2
+        q27::Utf8Gate g;
+        expect(g.feed("\xE2"), "", "emdash-1+2 hold");
+        expect(g.feed("\x80\x94"), "\xE2\x80\x94", "emdash-1+2 release");
+    }
+    {   // 4-byte emoji F0 9F 98 80 split 2+2
+        q27::Utf8Gate g;
+        expect(g.feed("\xF0\x9F"), "", "emoji-2+2 hold");
+        expect(g.feed("\x98\x80"), "\xF0\x9F\x98\x80", "emoji-2+2 release");
+    }
+    {   // text then partial tail in one piece
+        q27::Utf8Gate g;
+        expect(g.feed("ok\xE2\x80"), "ok", "mixed hold");
+        expect(g.feed("\x94x"), "\xE2\x80\x94x", "mixed release");
+    }
+    {   // complete char + new partial in one piece
+        q27::Utf8Gate g;
+        expect(g.feed("\xE2\x80\x94\xE2"), "\xE2\x80\x94", "chain hold");
+        expect(g.feed("\x80\x94"), "\xE2\x80\x94", "chain release");
+    }
+    {   // dangling partial at end of generation -> U+FFFD
+        q27::Utf8Gate g;
+        expect(g.feed("\xF0\x9F"), "", "dangle hold");
+        expect(g.flush(), "\xEF\xBF\xBD", "dangle flush");
+    }
+    {   // lone continuation byte: pass through (dump-replace is the backstop)
+        q27::Utf8Gate g;
+        expect(g.feed("\x80"), "\x80", "invalid passthrough");
+    }
+    {   // two complete chars in one piece
+        q27::Utf8Gate g;
+        expect(g.feed("\xE2\x80\x94\xE2\x80\x94"), "\xE2\x80\x94\xE2\x80\x94", "two chars");
+    }
+    printf("utf8gate self-test: %s\n", fail ? "FAIL" : "PASS");
+    return fail;
+}
+
 int main(int argc, char** argv) {
+    if (utf8gate_selftest()) return 2;
     if (argc != 3) { fprintf(stderr, "usage: %s q27.tok cases.txt\n", argv[0]); return 1; }
     q27::Tokenizer tok(argv[1]);
     std::ifstream in(argv[2]);
