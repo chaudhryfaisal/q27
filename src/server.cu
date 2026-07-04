@@ -278,16 +278,20 @@ int main(int argc, char** argv) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
             .count();
     };
+    // t= is ms since server start (line printed when generate returns), so
+    // inter-request GPU idle -- tool execution, client think time -- is
+    // recoverable from the log alone: idle = t[n]-(qw+pf_ms+dec_ms)[n] - t[n-1].
+    const auto srv_t0 = std::chrono::steady_clock::now();
     auto req_log = [&](const ReqTrace& rt, double qw_ms) {
         const auto& g = eng.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s\n",
+                "end=%s t=%.0f\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
-                (g.end && g.end[0]) ? g.end : "?");
+                (g.end && g.end[0]) ? g.end : "?", ms_since(srv_t0));
     };
 
     httplib::Server srv;
