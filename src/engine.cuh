@@ -2,6 +2,7 @@
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
 #include <algorithm>
+#include <memory>
 #include <chrono>
 #include <functional>
 #include <cstdio>
@@ -32,8 +33,14 @@ static constexpr int VOCAB = 248320;
 static constexpr int MAX_GEN_TRACK = 65536;
 
 struct Engine {
-    q27::Model model;
-    q27::DeviceModel dm;
+    // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
+    // The owning ctor keeps them in owned_*; the borrowing ctor binds refs to
+    // a caller-owned pair so two Engines share one 17.7 GB weight set. All
+    // per-slot mutable state below stays per-Engine.
+    std::unique_ptr<q27::Model> owned_model;
+    std::unique_ptr<q27::DeviceModel> owned_dm;
+    q27::Model& model;
+    q27::DeviceModel& dm;
     int max_ctx;
     bool attn_layer[N_LAYER + 1] = {false};
     cudaStream_t stm;
@@ -148,8 +155,22 @@ struct Engine {
     std::vector<void*> kcache, vcache;
     std::vector<int> attn_cache_idx;
 
+    // Owning: self-loads weights (CLI, single-slot).
     Engine(const std::string& path, int ctx)
-        : model(q27::Model::open(path)), dm(model), max_ctx(ctx) {
+        : owned_model(std::make_unique<q27::Model>(q27::Model::open(path))),
+          owned_dm(std::make_unique<q27::DeviceModel>(*owned_model)),
+          model(*owned_model), dm(*owned_dm), max_ctx(ctx) {
+        init(ctx, /*own_weights=*/true);
+    }
+    // Borrowing: shares a caller-owned Model+DeviceModel (weights already
+    // uploaded by the caller). Multi-slot serving builds N of these.
+    Engine(q27::Model& m, q27::DeviceModel& d, int ctx)
+        : model(m), dm(d), max_ctx(ctx) {
+        init(ctx, /*own_weights=*/false);
+    }
+
+  private:
+    void init(int ctx, bool own_weights) {
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");
         kv_fp8 = kve && !strcmp(kve, "fp8");
@@ -308,12 +329,15 @@ struct Engine {
                 attn_cache_idx.push_back(-1);
             }
         }
-        fprintf(stderr, "uploading weights...\n");
-        dm.upload_all();
-        dm.checksum_baseline();
-        fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
+        if (own_weights) {
+            fprintf(stderr, "uploading weights...\n");
+            dm.upload_all();
+            dm.checksum_baseline();
+            fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
+        }
     }
 
+  public:
     const DevTensor& T(int il, const char* leaf) {
         char buf[96];
         snprintf(buf, sizeof buf, "blk.%d.%s", il, leaf);

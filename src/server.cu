@@ -197,7 +197,16 @@ int main(int argc, char** argv) {
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
     fprintf(stderr, "loading model...\n");
-    Engine eng(model, ctx);
+    // P10-A1: weights owned here and shared into the Engine(s) by reference.
+    // Upload once; borrowing engines skip the 17.7 GB weight copy. (Multi-slot
+    // will construct N engines from this same pair.)
+    q27::Model shared_model = q27::Model::open(model);
+    q27::DeviceModel shared_dm(shared_model);
+    fprintf(stderr, "uploading weights...\n");
+    shared_dm.upload_all();
+    shared_dm.checksum_baseline();
+    fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
+    Engine eng(shared_model, shared_dm, ctx);
     eng.fast_head = fast;
     eng.build_graph();
     eng.build_spec_graphs();
