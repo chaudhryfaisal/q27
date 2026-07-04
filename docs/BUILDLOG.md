@@ -492,3 +492,41 @@ on / at 99% (6.9G free) -- single trials fit (~2-100MB persisted) but the
 runs in ~/thunderdome/results/runs is the obvious reclaim, needs Gabe's
 call. 3090 is occupied by vox-transcriber (20.4GB) -- P10-decision's
 "vLLM on 3090" fallback is not currently viable.
+
+## 2026-07-04 (late night) -- R1 LANDED: multi-slot serving; -34% real Claude Code session wall
+
+**R1 (e8f71fd + hardening c618c91, pushed): `--slots N --slot1-ctx M`.**
+N engines borrow the one uploaded weight set (P10-A1a ctor); each slot owns
+its GDN snapshot, ckpt ring, KV, and P7 mask-pool ids. Routing under the gpu
+mutex via Engine::reuse_len (have_snap-gated strict snapshot extension, else
+best P9 checkpoint -- the same predicate generate() honors) > empty slot >
+LRU; per-slot n_max re-clamp; largest-slot no-fit fallback. Rounds still
+serialize (R1b later); the win is that interleaved conversations stop
+destroying each other's prefix caches.
+
+**Acceptance (same task, prompt, greedy, same day):** the R0 Claude Code
+session (claude -p + Explore subagent, tinylog RFC3339 task) rerun against
+--slots 2: **178.3s -> 118.3s wall (-33.7%)**; avoidable re-prefill 44.3s ->
+0.0s; total prefill 79.9 -> 31.4s; queue wait 54.5 -> 24.4s; task succeeded
+both runs (12/12 and 14/14 tests). Main pinned slot 0, subagent slot 1,
+every interleaved turn warm (e.g. main turn 2: pf 1.6s vs 11.8s single-slot).
+
+**Review (10-angle finder pass + sweep, 12 findings filed, all fix-class
+CONFIRMED items landed in c618c91):** worst finds -- serial-path (<32-tok)
+requests left stale snap_toks + a retained ckpt ring whose KV rows the short
+request had overwritten (silent-corruption path, PRE-EXISTING since P9,
+now cleared); n_max clamped against slot-0 ctx not the routed slot (ctx-guard
+truncation surfaced as end_turn on the deployed 131K/32K config); the OAI
+stream empty-piece skip had disabled per-token disconnect probing. Deferred,
+documented: per-slot mask-pool mapping split-brain (latent while
+constrain-tools is off), [req] schema triplication + six-site handler
+boilerplate, gate python dedup, Utf8Gate per-site wiring.
+
+**Serving:** q27-eval now runs `--slots 2` (slot 0 = 131072, slot 1 = 32768
+fp8; ~27.7 GB resident, ~5 GB headroom). Subagent conversations larger than
+~32K route to slot 0 by eligibility (logged, acceptable; raise --slot1-ctx
+if telemetry shows it).
+
+Gates at HEAD: reqlog two-phase PASS (interleave-warm C12 a/b hit=115/74),
+canonical md5 58b6ae85 EXACT, --pf 200 seq+32 IDENTICAL, test_kernels ALL
+PASS, utf8 self-test PASS.
