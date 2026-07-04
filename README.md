@@ -482,14 +482,15 @@ input contracts before a tolerance FAIL means anything. Prefill cost order
    (llama.cpp PR #24785 / commit b9180 n_rs_seq is the reference design).
    State is ~28 MB/layer-set snapshot.
 3. Sampling (temperature/top-p vs spec-verify acceptance).
-4. Depth-5 UPGRADED from "likely marginal" (measured 2026-07-03): the
-   conditional chain barely decays (98.1/94.5/97.4% at d2/d3/d4 on the soak)
-   and 71% of rounds accept all 5 -- extrapolated p(d5|chain-4) ~97% projects
-   ~+5-6% net after the ~7% round tax. Next: extend the --stats rig with a
-   pass-5 evaluation (same pattern as P3's pass-4) to measure instead of
-   extrapolate. CAVEAT the margin bins confirm: low-margin chains are much
-   weaker, so think-heavy/high-entropy traffic needs its own measurement --
-   entropy/margin-gated adaptive depth remains the robustness play.
+4. Depth-5 MEASURED (pass-5 stats rig, 2026-07-03): **p(d5|prefix4) = 96.8%**,
+   p(prefix4) = 89.0%, +0.862 t/round ungated per-position. Applying the
+   stats-vs-live discount P3 exhibited (+0.890 projected -> +3.9% live),
+   depth-5 nets **~+2-4% @2K** against ~+12-14% round cost (5th sequential
+   MTP head pass + 6-lane verify) and a 6th GDN buffer set (-610MB fp8 ctx
+   ceiling). Real but modest -- build only if decode t/s becomes the
+   priority again. Margin-gating buys little on the soak (ungated chains
+   already clean); the think-heavy/high-entropy acceptance measurement
+   remains the open question before ANY depth change ships.
 5. Known stale claim: "128K prefill ~57s" (P5 note) does not reconcile with
    the direct fp16-KV kvstats measurement (117.6s post-P6); the ~57s was a
    P5-era extrapolation on what were likely fp8-KV runs. Re-measure 128K
