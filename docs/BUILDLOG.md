@@ -286,3 +286,53 @@ ceiling). Real but modest -- build only if decode t/s becomes the
 priority again. Margin-gating buys little on the soak (ungated chains
 already clean); the think-heavy/high-entropy acceptance measurement
 remains the open question before ANY depth change ships.
+
+## 2026-07-04 -- the llama.cpp wall-clock chase (bench-time-tracker)
+
+Goal: beat llama.cpp Q5_K_M wall-to-wall on Thunderdome bench-time-tracker at
+equal-or-better score. Same-day bar (basins reroll daily -- prompts embed
+dates; llama's basin is day-stable): q5km 19/19/20s @ 0.856. q27 start of
+day: 96-138s with one score-0 day; end: 23/24/24s @ 0.849.
+
+Landed:
+- `--constrain-tools` OFF for serving. The capped grammar path has an
+  engage-lag hole: the first post-engage token samples unmasked, a
+  hallucinated tool name gets one grammar-forced char spliced in
+  (`getg_project`), the grammar disengages on the next illegal byte, greedy
+  loops on "tool not found" -> score 0. The bare-call parser chain alone
+  matches llama.cpp behavior at 3.7x less wall (107s -> 29s).
+- Prefill 1990 -> 2614 t/s @16K, bitwise: PF_T 256->1024 + GEMM NT 64->128
+  (b1d7d88); attn ldmatrix.trans V-frags + vectorized KV staging (a7d209e,
+  1.31x on that kernel). Note: chunking changes attention nsplit boundaries,
+  so long-prompt greedy basins reroll even when canonical stays bitwise.
+- Chunked-WY delta scan, DEFAULT OFF (76b524d, Q27_DS_MODE=wy): GDN
+  recurrence as 64-token-chunk products + warp-private forward substitution,
+  log-space decay ratios (lambda underflows f32 over a chunk). Derivation
+  1e-15 in f64; 16-case tolerance test at 1e-7 incl. underflow regime;
+  continuations IDENTICAL. Perf round pending: scalar phases run
+  latency-bound (2.51 vs 1.67 ms/call) -- warp-tiling next.
+
+Measured-dead (don't retry without new facts):
+- Fixed depth-5/6 spec: built fully (7b25921, 871c852; canonical bitwise),
+  -3 to -12% everywhere, reverted (79ff1e5, 27b663a).
+- ADAPTIVE depth-4/5: built, all gates passed, still net-negative -- at 16K a
+  d4 round is 26.7ms and a d5 round 33.4ms, so a 100%-accepted d5 round
+  (6/33.4 = 180 t/s) loses to a full d4 round (5/26.7 = 187 t/s). No trigger
+  can beat that inequality; work stashed. Reopen only if the d5 round delta
+  drops under ~+5ms (suspects: nb=6 gemv template register cliff, 5th MTP
+  pass attention).
+- f16-GEMM tile restructure (-1.5%); 5-lane GEMV smem staging (-4% in-engine
+  despite +6-11% in an isolated micro -- isolated micros lie for smem-hungry
+  kernels, in-graph occupancy dominates); GEMM ldmatrix (+3%, not ported);
+  PF_T 2048 / fp16-KV / PF_SPLIT basin tickets (0.836-0.85).
+
+Profiling: decode profiling REQUIRES `nsys --cuda-graph-trace=node` (default
+kern_sum silently omits graph-launched kernels). Round anatomy @2K: verify
+batch-5 GEMVs 51% at ~60% DRAM BW; drafts 4-5ms of ~23ms. Q4 prefill GEMM
+244 TOPS = 29% int8 peak; int-accumulate ceiling probe 312 TOPS.
+
+The residual 4.2s vs llama decomposes ~2.2s engine + ~2.3s trajectory (their
+basin writes 26% fewer output chars across 6 turns vs our 8 -- same model,
+quant numerics pick the basin). Open: delta-WY tiling, activation regroup
+32->64 (breaks the serial-vs-batched identity gate BY DESIGN -- policy
+decision), basin lottery for the last stretch.
