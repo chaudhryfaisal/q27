@@ -398,3 +398,97 @@ not, despite outstanding deep acceptance. The acceptance data is the
 durable asset: if drafting were ~free (parallel draft backbone a la
 DSpark -- needs training, not portable), the ceiling is large. Decode
 stays at the d4 local optimum. Rig kept (--burst-stats N / --burst-out).
+
+## 2026-07-04 (night) -- R0: real-work telemetry + anatomy; goal reframed to real agentic wall-clock
+
+Gabe reframed the goal: optimize wall-to-wall for REAL agentic work (Claude
+Code + subagents, long CRUSH tasks), not the bench-time-tracker sprint. R0 =
+instrument, measure, rank levers. Codex-suggested improvements evaluated
+against measurements below.
+
+**Shipped (commits 8b73164, 1f5480e-region, 60bc172):**
+- `[req]` per-request stderr line, all six API call sites: conv fingerprint
+  (fnv1a64 system+first-user), qw_ms queue wait, tok_ms render+encode,
+  prompt/hit/ckpt/pf tokens, pf_ms, dec/dec_ms, cb_ms (client-write time
+  inside on_token), rounds, tps, end reason, t= ms since server start.
+  Engine::GenStats fills from generate() -- host-side only, no new syncs.
+  Server-level gate tools/reqlog_gate.sh (11 asserts, RED watched at HEAD).
+- UTF-8 crash fix: the FIRST real Claude Code session killed the server --
+  BPE split an em dash across tokens, the per-token SSE delta was invalid
+  UTF-8, nlohmann dump() threw type_error.316, uncaught -> std::terminate.
+  ~100s of CRUSH trials never tripped it; Claude-flavored output did in
+  minutes. Fix: q27::Utf8Gate (api_common.h) buffers incomplete trailing
+  sequences on all 6 generation text pipelines, flush() -> U+FFFD; plus
+  dump-time error_handler_t::replace on all response serialization.
+  Self-test (9 cases) in test_tokenizer.
+- Gates: canonical md5 58b6ae85 EXACT, --pf 200 seq+32 IDENTICAL,
+  test_kernels ALL PASS, reqlog 11/11, utf8 self-test PASS.
+
+**Finding -- pf-identity gate is N-sensitive (pre-existing, stash-verified
+at HEAD):** --pf 64 seq+32 MISMATCHES (divergence past ~16 continuation
+tokens) while the documented --pf 200 passes. Full exact pins
+(PREFILL=dp4a ATTN_PF=lite DS_SPLIT=1 PF_SPLIT=1) restore identity at 64.
+Read: the degenerate 5-token-cycle prompt sits on argmax near-ties that flip
+on 1e-7 reorder noise from the auto-split/mma paths; the gate is
+"argmax-stable at N=200", not "bitwise at all N". Gate invocations should
+pin N=200 (or the full exact env set).
+
+**Anatomy A -- real Claude Code session (claude -p + Explore subagent,
+tinylog task; SUCCESS 12/12 tests, 178s wall, 35 reqs, 2 convs):**
+- GPU 99% busy: prefill 79.9s (45%) + decode 95.5s (54%); idle 1%.
+- Interleave phase: main (28-33K) x subagent (11-18K) strictly alternate,
+  EVERY request hit=0 (each conv switch does reset()+ckpt_clear()).
+  44.3s = 25% OF SESSION WALL was re-prefill of already-served context;
+  queue waits up to 14s (client parallelizes, single slot serializes).
+- Solo phase: near-perfect reuse to 60.6K (warm turns 0.2-2.8s). P8 holds
+  on real Claude Code re-rendering traffic.
+- Decode vs depth: ~130 t/s @30K -> 73-105 @55-61K.
+- tok_ms 8-26ms even at 61K prompts; cb_ms ~0. Codex items "tokenizer BPE
+  rewrite" and "decouple SSE writes" are MEASURED DEAD for real work.
+
+**Anatomy B -- CRUSH long tasks, same-day q27 vs llama (n=1 each; q27
+serving stack: fast-head, fp8 KV, no-think, PF_XG=32, constraint OFF):**
+- collab-server: q27 223s @ 0.840 (98% prefix reuse, prefill 28.4s, decode
+  145.4s = 65% of wall, 16.4K tok @ 113 t/s avg, ctx to 65K, idle 19%)
+  vs llama 112s @ 0.844. First q27 attempt was a 20s score-0 one-shot-quit
+  basin (2 turns, 3.9K diff, ended without tool calls) -- retry normal.
+- analytics-dashboard: q27 257s @ 0.847 (decode 195.6s = 76% of wall,
+  20.2K tok @ 103 t/s, ctx to 83K, 97% reuse, idle 31%) vs llama 132s @
+  0.481 (llama's greedy basin FAILED hidden tests today, 0.000 subscore).
+- Late-leg llama per-request decode: 104-153 t/s at comparable depth --
+  q27's decode-rate gap at depth is ~1.2-1.4x, NOT 2x. The 2x wall gap is
+  mostly OUTPUT TOKEN VOLUME (llama basins write roughly half the tokens;
+  the time-tracker "26% fewer chars" pattern generalizes) on top of that
+  1.2-1.4x. Old "3-4x multipliers" (constraint-era) are obsolete.
+
+**Lever ranking for real-work wall (post-R0):**
+1. P10-A1 per-slot engine state + longest-stable-prefix routing: kills the
+   25%-of-wall interleave re-prefill class + subagent queue serialization.
+   Asymmetric slots (main full-fat 131K; 1-2 light utility slots, no-spec,
+   ~1.2GB each) fit VRAM; A1a landed, WY scratch must become per-engine
+   first (prefill.cu:1749 process-global statics -- codex #5 confirmed).
+2. Decode at depth (30-83K = where real sessions live; 65-76% of long-task
+   wall): FIRST an nsys decode-slice at ~60K fp8 (the 16K attribution may
+   not transfer -- attention share grows with depth), THEN pick between
+   batch-verify tensor-core GEMV (codex #1; test_kernels gemv10 already
+   shows 1x10 = 0.94x cost of 2x5 at kernel level) and quant-for-acceptance
+   v1.5. Ceiling vs llama-at-depth ~1.2-1.4x.
+3. Sampling (greedy loop escape; analytics/collab one-shot-quit and
+   getg_project-class basins are all greedy pathologies) -- per
+   docs/sampling-design.md; also caps worst-case wall on real tasks.
+4. Output-volume basin gap vs llama: NOT engine-actionable (quant numerics
+   lottery); for real use a terse-style system prompt is free wall time.
+   For the bench goal it remains the binding ~2x.
+- Parked with data: P11 (constraint off), SSE decouple, tokenizer rewrite,
+  ckpt arena (minor; revisit when per-slot rings multiply the footprint),
+  ldmatrix port (+1-3% prefill on a non-bottleneck).
+
+Ops notes: q27-eval and llama-q5km-eval are TRANSIENT systemd-run units --
+`systemctl --user stop` deletes them; recreate with systemd-run (specs in
+this entry's session; q27-eval: Q27_PF_XG=32, --port 8081 --ctx 131072
+--no-think --fast-head). reset-failed before recreate after a crash. Disk
+on / at 99% (6.9G free) -- single trials fit (~2-100MB persisted) but the
+07-02 full-suite no-space incident will recur on any big run; 23G of old
+runs in ~/thunderdome/results/runs is the obvious reclaim, needs Gabe's
+call. 3090 is occupied by vox-transcriber (20.4GB) -- P10-decision's
+"vLLM on 3090" fallback is not currently viable.
