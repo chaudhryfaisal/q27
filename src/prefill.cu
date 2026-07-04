@@ -1790,9 +1790,13 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st) {
     // re-read per call (getenv is noise next to a launch) so tests can flip
-    // paths in-process via setenv, same policy as prefill_use_mma
+    // paths in-process via setenv, same policy as prefill_use_mma.
+    // wy DEFAULT since 2026-07-04 (2913 vs 2560 t/s @16K post-tiling; own
+    // tolerance suite + canonical/pf gates). Q27_DS_MODE=seq restores the
+    // sequential scan -- the full exact/identity configuration is
+    // Q27_DS_MODE=seq Q27_PF_XG=32.
     const char* mode = getenv("Q27_DS_MODE");
-    if (mode && !strcmp(mode, "wy")) {
+    if (!(mode && !strcmp(mode, "seq"))) {
         delta_scan_wy(S_global, convT, gT, betaT, oT, T, st);
         return;
     }

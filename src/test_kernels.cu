@@ -762,7 +762,7 @@ static void test_delta_wy() {
         // T=1 (no recurrence: index bugs undamped), 64 (single chunk),
         // 200 (ragged tail), 256 (full multi-chunk)
         for (int Tn : {1, 64, 200, 256}) {
-            unsetenv("Q27_DS_MODE");
+            setenv("Q27_DS_MODE", "seq", 1); // wy is default since 2026-07-04
             setenv("Q27_DS_SPLIT", "1", 1);
             CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
             q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
@@ -824,6 +824,9 @@ static void test_delta_split() {
     CUDA_CHECK(cudaMemcpy(d_g, g.data(), g.size() * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_beta, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice));
 
+    // this whole test exercises the sequential/split path; wy is the
+    // delta_scan_T default since 2026-07-04, so pin seq for the duration
+    setenv("Q27_DS_MODE", "seq", 1);
     setenv("Q27_DS_SPLIT", "1", 1);
     check("ds nsplit env=1", std::fabs((double)q27k::delta_scan_nsplit(T) - 1), 0.5);
     setenv("Q27_DS_SPLIT", "4", 1);
@@ -904,6 +907,7 @@ static void test_delta_split() {
         CUDA_CHECK(cudaFree(d_bB)); CUDA_CHECK(cudaFree(d_oB));
     }
     unsetenv("Q27_DS_SPLIT");
+    unsetenv("Q27_DS_MODE");
     CUDA_CHECK(cudaFree(d_S)); CUDA_CHECK(cudaFree(d_conv)); CUDA_CHECK(cudaFree(d_g));
     CUDA_CHECK(cudaFree(d_beta)); CUDA_CHECK(cudaFree(d_o));
 }
