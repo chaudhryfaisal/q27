@@ -18,7 +18,12 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Active: P10-A fused 2-slot serving, decided 2026-07-03
   (docs/P10-decision.md). A0 go/no-go PASSED same day: 10-lane verify-head
   GEMV costs 0.52x of 2x5 -- the weight stream fully amortizes across slots.
-  Next: A1 per-slot state + interleaved scheduler, then A2 fusion
+  A1 SHIPPED in two stages: R1 per-slot state + routing (2026-07-04, real
+  Claude Code session 178.3 -> 118.3s), R1b round-granularity interleaved
+  scheduling (2026-07-04, docs/R1b-design.md: FIFO GPU gate + engine yield
+  hooks; same-day A/B on a claude-p + 2-subagent workload: queue-wait class
+  killed, 114.7s vs 129-142s controls, outputs byte-identical solo vs
+  interleaved). Next: A2 fusion
 
 ## Why this model is a good target
 
@@ -269,8 +274,10 @@ step:
 - A0 go/no-go microbench: does one weight stream feed 10 verify lanes at
   ~2x aggregate? Kill the plan if the 5 -> 10 lane scaling doesn't hold
   (the 4 -> 5 step cost +14% round tax, P3).
-- A1 per-slot state + interleaved scheduling -- useful alone for agentic
-  tool-wait overlap, and a prerequisite for fusion either way.
+- A1 per-slot state + interleaved scheduling -- SHIPPED (R1 e8f71fd/c618c91
+  + R1b 3568823/c615d8f/0449131): whole-generation queue waits are gone;
+  the remaining head-of-line is engine-claim when conversations outnumber
+  --slots (light utility slots are the lever if telemetry demands it).
 - A2 fused batch-10 verify (graph indirection + 10-lane GEMVs + per-lane KV).
 Prerequisite already shipped: server defaults to fp8 KV (2026-07-03).
 

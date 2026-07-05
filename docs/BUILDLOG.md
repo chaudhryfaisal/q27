@@ -596,3 +596,67 @@ device buffers (house lifetime model, panels included, 8 MiB/engine).
 Hardening gates: test_kernels ALL PASS (isolation bitwise both ctx),
 canonical md5 58b6ae85 EXACT, --pf 200 seq+32 IDENTICAL, q27-eval recreated,
 health ok.
+
+## 2026-07-04 (late) -- R1b: round-granularity interleaved scheduling
+
+Design docs/R1b-design.md; commits 3568823 + c615d8f + 0449131. R1 left
+rounds serialized behind a whole-generation mutex: a request arriving
+mid-generation waited for the other conversation's ENTIRE generation (R1
+acceptance: 24.4s residual queue wait). R1b time-slices the GPU at the two
+boundaries where engine device state is coherent -- decode rounds (~27ms,
+spec_round host-syncs each) and prefill chunks (PF_T=1024, ~320ms).
+
+**Mechanism.** q27::GpuGate (api_common.h): FIFO ticket lock; maybe_yield()
+takes the re-enqueue ticket INSIDE the handover critical section (naive
+release+acquire loses queue position to the next yielder when descheduled
+-- caught RED by the C1 self-test, sequence 0,1,2,...,0,2,1). Solo path =
+one relaxed atomic load per round. Engine::on_round_gap hook called between
+rounds/chunks; the server's lambda drains the engine stream BEFORE
+maybe_yield so handovers are real (prefill loop runs host-ahead). CLI never
+sets the hook: canonical bitwise untouched (md5 EXACT, 177.5 t/s short
+bench). Slot claiming: Slot::busy under route_m -- routing reads only
+settled engines; all-busy waiters block on route_cv (barging accepted,
+documented). LRU stamped at FREE (completion recency), not claim -- R1's
+serialization made those equivalent, R1b doesn't; refused-class claims keep
+their old stamp. Q27_NO_INTERLEAVE=1 = exact R1 serialization (flake-class
+debug lever). Telemetry: gs.gw_ms/gs.yields, printed as gw=/yields= after
+end= ([req] parse regexes stop there); pf_ms/dec_ms stay wall-inclusive, so
+GPU-busy = pf+dec-gw; [gen-done] prints decode-phase parks only (pass-2
+review fix: request-total gw over decode-only dt over-corrects).
+
+**Gates (all green at 0449131).** tools/interleave_gate.sh NEW: overlap
+(short B completes while long A streams, 400 deltas after), byte-identity
+solo-vs-interleaved for both A and B, chunk-granularity admission proven
+schedule-wise (B fully served 0.95s BEFORE cold-A's first delta), third
+request queues and completes, kill switch serializes with yields=0. RED
+against R1 build failed exactly on overlap+telemetry. GpuGate 4-case
+self-test in test_tokenizer (FIFO rotation, solo fast path, 8x200 stress
+exclusion). reqlog_gate PASS both phases; test_kernels ALL PASS; --pf 200
+seq+32 IDENTICAL; 10x concurrent soak (alternating cold/warm A) byte-stable,
+21 yielding requests. Two review passes (first: approve, 9 findings, LRU
+stamp + S6b strengthening + stale-port guard landed; second adversarial
+state-lifecycle pass: approve, 0 blockers, [gen-done] phase fix landed).
+Deferred, documented: P7 hook-leak-on-throw class now includes on_round_gap
+(harmless: every claim site reinstalls); same-conversation duplicate
+requests fork to a second slot (cache-efficiency delta only, greedy output
+unchanged); /health?verify comment corrected (default-stream xsum BARRIERS
+engine streams briefly -- pre-existing).
+
+**Acceptance A/B (same day, same workload, fresh server per leg): tinylog
+RFC3339 task, claude -p + TWO parallel Explore subagents, --slots 2 prod
+config.** No-interleave legs (=R1): 142.2s and 129.0s wall, qw_sum
+105.1/69.1s, qw_max 17.3/15.1s, 34/25 reqs. R1b leg: **114.7s wall (beats
+both controls), qw_sum 19.4s, 1024 yields, gw_sum 79.2s** -- and 18.3s of
+that 19.4 is TWO engine-claim waits (big prompts needing busy slot 0:
+13.5s + 4.8s); gate-level waits across the other 20 requests total ~1.1s.
+Task success 14/14 tests all three legs. Per-request GPU work identical
+across legs (4.1 vs 4.2s/req) -- the delta is scheduling, not workload
+luck. READ: the R1 whole-generation queue-wait class is dead; what remains
+is ENGINE-claim head-of-line when conversations outnumber slots (3 convs on
+2 slots here) -- that is the --slots ceiling / light-utility-slot lever
+(P10 asymmetric-slots note), not a gate problem.
+
+Ops: acceptance legs ran claude -p with ANTHROPIC_BASE_URL at a local
+server on 8082; leg driver + workspace seed rebuildable in minutes (tinylog
+package, 8 logger tests + 6 RFC3339 contract tests incl. millis rounding
+carry). q27-eval recreated on the new binary after the GPU window.
