@@ -130,14 +130,18 @@ the t/s-vs-temp curve.
   kernels, param block, API plumbing, seeded-identity + chi-square gates,
   greedy canonicals re-verified untouched. Validates the samplers without
   spec complexity.
-  - **KERNELS LANDED 2026-07-05** (blocks.cu q27k::sample; k_nucleus +
-    k_gumbel + Philox4x32-10; test_kernels test_sample: seeded identity,
-    tiny-top_p==argmax, nucleus enough+minimal, chi2=1.06/df=1 vs analytic
-    truncated softmax, temp-widens-nucleus -- all PASS). Greedy untouched
-    (temp>0 only; no decode-path/graph edit, canonical not re-derived).
-    STILL TODO in Phase 1: param block + graph capture of a plain sampled
-    step + server API plumbing (temperature/top_p/seed through all 3 shapes).
-    The kernels are correctness-proven; wiring is the next commit.
+  - **DONE 2026-07-05.** Kernels (blocks.cu q27k::sample_g; k_nucleus_d +
+    k_gumbel_d reading a device SampleParams block + *d_pos; Philox4x32-10).
+    Sampled graph: token_launches_sampled + sample_graph captured in
+    build_graph. Decode: sample_round plugs into generate()'s loop (eager
+    first token from retained prefill logits kind 0, graph tokens kind 1 --
+    no counter collision, no GDN double-update). Server: parse_sample maps
+    temperature/top_p/seed -> SampleParams across all 3 API shapes (streaming
+    captures params by value), tool constraining disabled under sampling.
+    Gates: canonical greedy md5 4c4120c7 BITWISE OK after the build_graph/
+    generate edits; test_sample all PASS; live seeded-identity + seed-varies
+    + sampled!=greedy + streaming, end-to-end. Limitation: sampled decode is
+    the slow plain path (no MTP) -- Phase 2 restores spec speed.
 - **Phase 2 -- spec rejection sampling**: k_spec_accept + k_sample_stop in a
   second 5-perm graph set, greedy drafts, --stats acceptance-vs-temp
   telemetry, spec==non-spec distribution gate.

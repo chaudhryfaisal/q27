@@ -1085,3 +1085,55 @@ graph set (greedy drafts + target-dist rejection acceptance), --stats
 acceptance-vs-temp telemetry, spec==non-spec distribution gate. Then the
 param-block + server plumbing that lets a request actually set temperature,
 and the exit-criterion quality A/B under production sampling.
+
+## 2026-07-05 (night) -- Sampling Phase 1 COMPLETE: param block + sampled graph + server plumbing
+
+Wired the Phase-1 sampler kernels into an end-to-end sampled decode path. A
+request that sets temperature>0 now samples; temperature==0/absent stays on the
+greedy spec path, bitwise (canonical re-verified 4c4120c7 AFTER the build_graph
+and generate() edits -- proof the greedy path did not move).
+
+Param block: kernels refactored to read {inv_temp, top_p, seed} from a device
+q27k::SampleParams* (was host scalars). One captured graph serves every request
+-- the host rewrites *d_samp before the decode loop, the pointer is fixed at
+capture. k_gumbel_d reads the key position from *d_pos (device), so graph replay
+/ prefix restore / ckpt stay consistent with nothing mutable to advance.
+
+Sampled graph: token_launches_sampled() = the plain forward with sample_g at the
+tail instead of argmax; captured as a second graph (sample_graph) in build_graph
+after a warm+reset, alongside (not replacing) the greedy token graph.
+
+Decode integration (engine.cuh): sample_round() produces exactly one token so it
+drops into generate()'s existing decode loop in place of spec_round (reusing its
+ctx-guard / eos / on_token / round-gap logic -- minimal new loop code). First
+token is an EAGER sample_g from the retained prefill logits (kind 0, no
+forward -- re-forwarding the last prompt token would double-apply its GDN
+recurrent update); later tokens replay sample_graph (kind 1). Eager-kind-0 vs
+graph-kind-1 keying means the two never share a Philox counter even at the same
+*d_pos. No MTP, no spec -- one token/round, correctness-first (Phase 2 adds spec
+rejection sampling for speed). samp is an Engine member the server sets per
+request, so generate()'s signature is unchanged across all 6 call sites.
+
+Server plumbing (all 3 API shapes): parse_sample(body) maps
+temperature/top_p/seed -> SampleParams (temp<=0 => greedy; top_p default 1; seed
+honored for reproducible A/B). Set on eng before generate at every site; the 3
+streaming providers capture the parsed params by value (body is out of scope in
+the post-return chunked callback). Tool constraining is disabled under sampling
+(tc.enabled &= inv_temp<=0; generate() also guards on_pending) -- constrained
++sampled is Phase 3.
+
+Verification: canonical greedy md5 4c4120c72056... BITWISE OK; test_kernels
+test_sample ALL PASS through the device-param sample_g (seeded identity,
+tiny-top_p==argmax, nucleus 0.9532, chi2=0.34/df1, temp widens 1->31); full make
+clean sm_120; live /v1/messages (throwaway --ctx 4096): greedy deterministic,
+sampled seeded-identity (same seed -> byte-identical output), seed 123 vs 456
+diverge coherently ("expanse of water..." vs "expanse of saltwater..."),
+default-seed deterministic, sampled != greedy, high-temp terminates, streaming
++temperature emits deltas and stops. q27-eval recreated on the fresh binary
+(CC path unchanged -- CC sends no temperature, so it stays greedy/bitwise).
+
+Phase 1 DONE. Next: Phase 2 spec rejection sampling (k_spec_accept + k_sample_stop,
+2nd 5-perm graph set, greedy drafts, --stats accept-vs-temp) for sampled decode
+at spec speed; then the exit-criterion quality A/B + drift catalog under
+production sampling. Open Phase-1 limitation: sampled decode is the slow plain
+path (no MTP) -- fine for correctness/A-B, Phase 2 restores throughput.

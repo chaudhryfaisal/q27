@@ -1229,20 +1229,31 @@ static void test_sample() {
         return p;
     };
 
-    float* d_x; int* d_out; unsigned long long* d_scr; float* d_nuc;
+    // device param block + pos, exactly as the engine drives sample_g (the
+    // captured-graph path). pos varies the Philox counter across draws.
+    float* d_x; int* d_out; unsigned long long* d_scr; float* d_nuc; int* d_pos;
+    q27k::SampleParams* d_sp;
     CUDA_CHECK(cudaMalloc(&d_x, n * 4));
     CUDA_CHECK(cudaMalloc(&d_out, 4));
     CUDA_CHECK(cudaMalloc(&d_scr, 8));
     CUDA_CHECK(cudaMalloc(&d_nuc, 3 * 4));
+    CUDA_CHECK(cudaMalloc(&d_pos, 4));
+    CUDA_CHECK(cudaMalloc(&d_sp, sizeof(q27k::SampleParams)));
     CUDA_CHECK(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice));
 
     auto draw = [&](float invT, float topp, unsigned long long seed, int pos) {
-        q27k::sample(d_x, n, invT, topp, seed, pos, 0, d_out, d_scr, d_nuc, 0);
+        q27k::SampleParams sp{invT, topp, seed};
+        CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
+        q27k::sample_g(d_x, n, d_sp, d_nuc, d_pos, 1, d_out, d_scr, 0);
         int out; CUDA_CHECK(cudaMemcpy(&out, d_out, 4, cudaMemcpyDeviceToHost));
         return out;
     };
     auto nuc_thresh = [&](float invT, float topp) {
-        q27k::sample(d_x, n, invT, topp, 1, 0, 0, d_out, d_scr, d_nuc, 0);
+        q27k::SampleParams sp{invT, topp, 1};
+        CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
+        int z = 0; CUDA_CHECK(cudaMemcpy(d_pos, &z, 4, cudaMemcpyHostToDevice));
+        q27k::sample_g(d_x, n, d_sp, d_nuc, d_pos, 1, d_out, d_scr, 0);
         float nuc[3]; CUDA_CHECK(cudaMemcpy(nuc, d_nuc, 12, cudaMemcpyDeviceToHost));
         return nuc[0];
     };
@@ -1306,6 +1317,7 @@ static void test_sample() {
 
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_out));
     CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_nuc));
+    CUDA_CHECK(cudaFree(d_pos)); CUDA_CHECK(cudaFree(d_sp));
 }
 
 int main(int argc, char** argv) {

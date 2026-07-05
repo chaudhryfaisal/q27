@@ -379,11 +379,13 @@ __device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigne
 
 // Single block: max M, logsumexp logZ at inv_temp, and the top-p logit
 // threshold via a fixed 12-iteration bisection on a prob cutoff (no sort, no
-// atomics -> deterministic, and graph-capturable at fixed geometry). Writes
-// out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh is clamped <= M so the
-// argmax token is always in the nucleus (guards degenerate/tiny top_p).
-__global__ void k_nucleus(const float* __restrict__ x, int n, float inv_temp, float top_p,
-                          float* __restrict__ out) {
+// atomics -> deterministic, and graph-capturable at fixed geometry). Reads
+// inv_temp/top_p from the device param block (graph-fixed pointer). Writes
+// out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh clamped <= M so the argmax
+// token is always in the nucleus (guards degenerate/tiny top_p).
+__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
+                            float* __restrict__ out) {
+    const float inv_temp = sp->inv_temp, top_p = sp->top_p;
     __shared__ float sh[1024];
     __shared__ float s_M, s_logZ, s_lo, s_hi;
     const int t = threadIdx.x, B = blockDim.x;
@@ -435,11 +437,15 @@ __global__ void k_nucleus(const float* __restrict__ x, int n, float inv_temp, fl
 }
 
 // Gumbel-max over the nucleus: argmax_i (inv_temp*x_i + G_i), G_i from Philox,
-// restricted to x_i >= nuc[0]. Same am_pack+atomicMax reduction as k_argmax
-// (order-independent -> deterministic token).
-__global__ void k_gumbel(const float* __restrict__ x, int n, float inv_temp,
-                         const float* __restrict__ nuc, unsigned long long seed, unsigned pos,
-                         unsigned kind, unsigned long long* __restrict__ best) {
+// restricted to x_i >= nuc[0]. Reads inv_temp/seed from the param block and the
+// key position from *d_pos (device). Same am_pack+atomicMax reduction as
+// k_argmax (order-independent -> deterministic token).
+__global__ void k_gumbel_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
+                           const float* __restrict__ nuc, const int* __restrict__ d_pos,
+                           unsigned kind, unsigned long long* __restrict__ best) {
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*d_pos;
     const float thresh = nuc[0];
     float bv = -FLT_MAX;
     int bi = 0;
@@ -461,13 +467,12 @@ __global__ void k_gumbel(const float* __restrict__ x, int n, float inv_temp,
     if (threadIdx.x == 0) atomicMax(best, sh[0]);
 }
 
-void sample(const float* logits, int n, float inv_temp, float top_p, unsigned long long seed,
-            int pos, int draw_kind, int* d_out, unsigned long long* d_scratch, float* d_nuc,
-            cudaStream_t st) {
-    k_nucleus<<<1, 1024, 0, st>>>(logits, n, inv_temp, top_p, d_nuc);
+void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
+              const int* d_pos, unsigned draw_kind, int* d_out, unsigned long long* d_scratch,
+              cudaStream_t st) {
+    k_nucleus_d<<<1, 1024, 0, st>>>(logits, n, d_sp, d_nuc);
     k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
-    k_gumbel<<<128, 256, 0, st>>>(logits, n, inv_temp, d_nuc, seed, (unsigned)pos,
-                                  (unsigned)draw_kind, d_scratch);
+    k_gumbel_d<<<128, 256, 0, st>>>(logits, n, d_sp, d_nuc, d_pos, draw_kind, d_scratch);
     k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
     CUDA_CHECK(cudaGetLastError());
 }

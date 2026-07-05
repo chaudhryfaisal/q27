@@ -1,5 +1,6 @@
 // q27 HTTP server. Multi-slot (--slots N), R1b round-granularity GPU
-// time-slicing across slots, greedy only.
+// time-slicing across slots. Greedy by default (spec decode); temperature>0
+// routes to the sampled plain path (roadmap #2, Phase 1).
 // Endpoints:
 //   GET  /health, /v1/models
 //   POST /v1/chat/completions, /v1/completions        (OpenAI)
@@ -38,6 +39,23 @@ using q27::StreamSplitter;
 // File-scope on purpose -- helpers with explicit capture lists use it too.
 static std::string jdump(const json& j) {
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+// Sampling params (roadmap #2) shared across all 3 API shapes. temperature<=0
+// or absent -> greedy (inv_temp 0 routes generate() to the bitwise spec path).
+// top_p defaults to 1 (full vocab). seed is honored for reproducible A/B; the
+// OpenAI shapes carry it natively, and it is read harmlessly on the others.
+static q27k::SampleParams parse_sample(const json& body) {
+    q27k::SampleParams s{0.f, 1.f, 0ull};
+    double temp = body.value("temperature", 0.0);
+    if (temp > 0.0) {
+        s.inv_temp = (float)(1.0 / temp);
+        double tp = body.value("top_p", 1.0);
+        s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
+        if (body.contains("seed") && body["seed"].is_number())
+            s.seed = (unsigned long long)body["seed"].get<long long>();
+    }
+    return s;
 }
 
 // P7: per-request constrained tool decoding. Watches emitted token ids;
@@ -520,6 +538,7 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            eng.samp = parse_sample(body);
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
@@ -551,12 +570,14 @@ int main(int argc, char** argv) {
         }
 
         res.set_header("Content-Type", "text/event-stream");
+        q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                eng.samp = samp;
                 q27::GpuGate::Lease lk(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
@@ -677,6 +698,7 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            eng.samp = parse_sample(body);
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
@@ -696,7 +718,7 @@ int main(int argc, char** argv) {
             ToolConstrainer tc;
             tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
             tc.host2dev = &sl.tool_mask_host2dev;
-            tc.enabled = constrain_tools;
+            tc.enabled = constrain_tools && eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
             tc.begin(tool_names_v);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -759,13 +781,15 @@ int main(int argc, char** argv) {
 
         res.set_header("Content-Type", "text/event-stream");
         const bool has_tools = tools.is_array() && !tools.empty();
+        q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len, rt](
+            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len, rt](
                 size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                eng.samp = samp;
                 q27::GpuGate::Lease lk(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
@@ -774,7 +798,7 @@ int main(int argc, char** argv) {
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
-                tc.enabled = constrain_tools;
+                tc.enabled = constrain_tools && eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
                 tc.begin(tool_names_v);
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
@@ -1089,6 +1113,7 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            eng.samp = parse_sample(body);
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
@@ -1134,12 +1159,14 @@ int main(int argc, char** argv) {
         }
 
         res.set_header("Content-Type", "text/event-stream");
+        q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                eng.samp = samp;
                 q27::GpuGate::Lease lk(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);

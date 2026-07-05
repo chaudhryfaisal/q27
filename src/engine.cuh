@@ -47,6 +47,7 @@ struct Engine {
     bool attn_layer[N_LAYER + 1] = {false};
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
+    cudaGraphExec_t sample_graph = nullptr; // plain forward + sample (temp>0)
     q27k::WyScratch wy_scratch; // per-engine WY prefill panels (R1b prereq)
 
     // activations (device)
@@ -56,6 +57,14 @@ struct Engine {
     // device decode state
     int *d_pos, *d_token, *d_step, *d_gen;
     unsigned long long* d_amax;
+    // Sampling (roadmap #2). samp is the per-request config the server sets
+    // before generate(); inv_temp<=0 => greedy (spec path, bitwise). d_samp is
+    // the device param block read by the captured sample_graph; d_nuc holds the
+    // per-step {thresh,M,logZ}. All idle for greedy requests.
+    q27k::SampleParams samp{0.f, 1.f, 0ull};
+    q27k::SampleParams* d_samp = nullptr;
+    float* d_nuc = nullptr;
+    bool samp_first = false; // first sampled token comes from the retained prefill logits
     // MTP draft head state (stage 1: host-driven acceptance measurement)
     float *h_next, *e_hn, *x_mtp, *mtp_logits;
     void *mtp_k, *mtp_v;
@@ -210,6 +219,7 @@ struct Engine {
         A((void**)&d_pos, 4); A((void**)&d_token, 4); A((void**)&d_step, 4);
         A((void**)&d_gen, MAX_GEN_TRACK * 4);
         A((void**)&d_amax, 8);
+        A((void**)&d_samp, sizeof(q27k::SampleParams)); A((void**)&d_nuc, 3 * 4);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
         A(&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
@@ -448,6 +458,33 @@ struct Engine {
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_token, d_amax, stm); // d_token becomes NEXT token
         q27k::advance(d_pos, d_step, d_gen, d_token, stm); // record + pos++
+    }
+
+    // Sampled plain step (temp>0): identical forward to token_launches, but the
+    // tail samples from the served distribution instead of argmax. Reads params
+    // from d_samp and the key position from *d_pos (both device -> one captured
+    // graph serves every request). draw_kind=1 (graph draws); the eager first
+    // token uses kind 0 so the two never share a Philox counter. Greedy path is
+    // untouched -- this is a SEPARATE graph, never on the canonical-gated path.
+    void token_launches_sampled() {
+        const DevTensor& emb = dm.get("token_embd.weight");
+        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
+                           stm);
+        for (int il = 0; il < N_LAYER; il++) {
+            q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
+            if (attn_layer[il]) attn_block(il, x1, y);
+            else gdn_block(il, x1, y);
+            q27k::add_inplace(h, y, N_EMBD, stm);
+            q27k::rmsnorm(h, (const float*)T(il, "post_attention_norm.weight").data, x1, N_EMBD,
+                          EPS, stm);
+            ffn(il, x1, y);
+            q27k::add_inplace(h, y, N_EMBD, stm);
+        }
+        q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
+        qx(x1, N_EMBD);
+        mm(dm.get("output.weight"), x1, logits);
+        q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 1, d_token, d_amax, stm);
+        q27k::advance(d_pos, d_step, d_gen, d_token, stm);
     }
 
     // MTP draft head (blk.64, SPEC.md): draft the token AFTER d_token, given
@@ -753,6 +790,28 @@ struct Engine {
         last_pending = oc[6];
         perm = (perm + (n - 1)) % 5;
         return n;
+    }
+
+    // Sampled decode round (temp>0): produces exactly one token, so it plugs
+    // into generate()'s decode loop in place of spec_round (n=1), reusing its
+    // ctx-guard / eos / on_token / round-gap logic. The first call samples from
+    // the retained prefill logits (kind 0, no forward -- the last prompt token's
+    // GDN update already ran; re-forwarding would double-apply it); later calls
+    // replay sample_graph, which forwards the just-emitted token and samples the
+    // next. No MTP, no spec: correctness-first per the design (Phase 2 adds spec
+    // rejection sampling for speed).
+    int sample_round(int* emit) {
+        if (samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(sample_graph, stm));
+        }
+        int tok;
+        CUDA_CHECK(cudaMemcpyAsync(&tok, d_token, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        emit[0] = tok;
+        return 1;
     }
     int last_pending = -1;
     // P11: called mid-round in the constrained path with the 4 draft tokens;
@@ -1241,6 +1300,16 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
+        // Sampling (temp>0): upload request params once; the sampled path
+        // (sample_round, one token/round, no spec) replaces spec_round in the
+        // loop. Greedy (inv_temp<=0) leaves d_samp untouched and runs the spec
+        // path bitwise. d_pos is NP here (prefill's last advance), so the first
+        // eager draw keys the token at position NP with kind 0.
+        const bool sampling = samp.inv_temp > 0.f;
+        if (sampling) {
+            CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
+            samp_first = true;
+        }
         int emitted = 0, rounds = 0;
         auto g0 = std::chrono::steady_clock::now();
         // decode-phase park baseline: dt below covers decode only, so the
@@ -1291,7 +1360,7 @@ struct Engine {
         while (emitted < n_max) {
             if (Ph + 6 > max_ctx) { done("ctx-guard"); return emitted; }
             int em[5];
-            int n = spec_round(em);
+            int n = sampling ? sample_round(em) : spec_round(em);
             rounds++;
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {
@@ -1304,7 +1373,7 @@ struct Engine {
                 if (!cont) { done("client-stop"); return emitted; }
                 emitted++;
             }
-            if (on_pending) on_pending(last_pending);
+            if (!sampling && on_pending) on_pending(last_pending);
             round_gap();
         }
         done("n_max");
@@ -1333,6 +1402,31 @@ struct Engine {
         CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphDestroy(graph));
         fprintf(stderr, "token graph captured\n");
+
+        // Sampled sibling graph (roadmap #2): same forward, sampled tail. Warm
+        // once (init lazy state for the new sampler kernels), reset, capture.
+        // Never used by greedy requests -> greedy graph + canonical untouched.
+        q27k::SampleParams warm{1.f, 1.f, 0ull};
+        CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_token, &zero, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemset(d_pos, 0, 4));
+        CUDA_CHECK(cudaMemset(d_step, 0, 4));
+        token_launches_sampled();
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        CUDA_CHECK(cudaMemset(d_pos, 0, 4));
+        CUDA_CHECK(cudaMemset(d_step, 0, 4));
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(S[il], 0, (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
+            }
+        cudaGraph_t sgraph;
+        CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+        token_launches_sampled();
+        CUDA_CHECK(cudaStreamEndCapture(stm, &sgraph));
+        CUDA_CHECK(cudaGraphInstantiate(&sample_graph, sgraph, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(sgraph));
+        fprintf(stderr, "sample graph captured\n");
     }
 
     // feed one known token (prompt phase): set d_token, replay graph
