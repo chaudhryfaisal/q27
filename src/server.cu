@@ -1,4 +1,5 @@
-// q27 HTTP server. Single slot (MTP spec decode is 1-stream), greedy only.
+// q27 HTTP server. Multi-slot (--slots N), R1b round-granularity GPU
+// time-slicing across slots, greedy only.
 // Endpoints:
 //   GET  /health, /v1/models
 //   POST /v1/chat/completions, /v1/completions        (OpenAI)
@@ -9,6 +10,7 @@
 // usage: q27-server model.q27 model.tok [--port 8080] [--host 0.0.0.0]
 //                   [--ctx 8192] [--fast-head] [--slots N] [--slot1-ctx M]
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <set>
@@ -220,14 +222,18 @@ int main(int argc, char** argv) {
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
     // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
     // gets --ctx; slots 1+ get --slot1-ctx (subagent/background conversations
-    // measured 11-18K in R0). Rounds stay serialized behind the gpu mutex --
-    // the win is per-slot GDN snapshot + ckpt ring + KV, so an interleaved
-    // second conversation no longer destroys the first one's prefix cache
-    // (R0: that re-prefill class alone was 25% of a Claude Code session).
+    // measured 11-18K in R0). Per-slot GDN snapshot + ckpt ring + KV means an
+    // interleaved second conversation no longer destroys the first one's
+    // prefix cache (R0: that re-prefill class alone was 25% of a Claude Code
+    // session). R1b: generations TIME-SLICE the GPU at round/chunk
+    // granularity behind a FIFO gate instead of serializing whole requests
+    // (R1's 24.4s residual queue wait); `busy` marks an engine claimed by an
+    // in-flight (possibly yielded) generation.
     struct Slot {
         std::unique_ptr<Engine> eng;
         long last_used = 0;
         int id = 0;
+        bool busy = false;                   // R1b: claimed by a generation
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
     n_slots = std::max(1, std::min(4, n_slots));
@@ -262,7 +268,8 @@ int main(int argc, char** argv) {
     int max_slot_ctx = 0;
     for (auto& s : slots) max_slot_ctx = std::max(max_slot_ctx, s.eng->max_ctx);
     const int EOS = tok.eos();
-    // P7 shared mask cache (guarded by the gpu mutex; pool ids are per-slot)
+    // P7 shared mask cache (mutated only from generation callbacks, which
+    // run while holding the GPU gate; pool ids are per-slot)
     std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
     q27::ToolMaskCache tool_mask_cache;
     tool_mask_cache.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
@@ -270,7 +277,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
                 tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
 
-    std::mutex gpu; // single slot: serialize requests
+    // R1b: FIFO ticket gate time-slices the GPU across concurrent
+    // generations (q27::GpuGate). Engines are claimed via Slot::busy under
+    // route_m before entering the gate, so routing only ever reads settled
+    // engine state. Q27_NO_INTERLEAVE restores R1 whole-request
+    // serialization (the yield hook is simply never installed) -- debug
+    // lever for the rare mid-round host-interaction flake class.
+    q27::GpuGate gpu_gate;
+    std::mutex route_m;
+    std::condition_variable route_cv;
+    const bool no_interleave = getenv("Q27_NO_INTERLEAVE") != nullptr;
+    fprintf(stderr, "interleave: %s\n",
+            no_interleave ? "OFF (Q27_NO_INTERLEAVE)" : "round-granularity");
     std::atomic<long> req_counter{0};
 
     // R0 telemetry: one [req] stderr line per generation request, self-contained
@@ -332,47 +350,86 @@ int main(int argc, char** argv) {
     // inter-request GPU idle -- tool execution, client think time -- is
     // recoverable from the log alone: idle = t[n]-(qw+pf_ms+dec_ms)[n] - t[n-1].
     const auto srv_t0 = std::chrono::steady_clock::now();
+    // gw/yields (R1b): time this request spent parked in GPU handovers and
+    // how many happened. pf_ms/dec_ms are wall-inclusive of those parks, so
+    // GPU-busy accounting is (pf_ms + dec_ms - gw); tps likewise understates
+    // raw decode rate under contention. New fields sit after end= -- the
+    // reqlog_gate parse regex stops there.
     auto req_log = [&](const ReqTrace& rt, double qw_ms, const Engine& e, int slot_id) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s slot=%d t=%.0f\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
-                (g.end && g.end[0]) ? g.end : "?", slot_id, ms_since(srv_t0));
+                (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
+                ms_since(srv_t0));
     };
-    // R1 routing (call under the gpu lock). Tiers: a slot that can actually
-    // restore a prefix of this prompt (Engine::reuse_len -- snapshot extension
-    // or a P9 checkpoint, the same predicate generate() honors) > an empty
-    // slot (never evict a live conversation when a free one exists) > LRU
-    // eviction. Slots that cannot hold the prompt are ineligible; if none
-    // fits, the LARGEST slot takes it -- generate() refuses NP > max_ctx
-    // cleanly with state untouched, so no LRU stamp for that case.
+    // R1b routing: claim a FREE engine (Slot::busy=false) that can take the
+    // prompt, or block until one frees. Tiers among free engines unchanged
+    // from R1: a slot that can actually restore a prefix of this prompt
+    // (Engine::reuse_len -- snapshot extension or a P9 checkpoint, the same
+    // predicate generate() honors) > an empty slot (never evict a live
+    // conversation when a free one exists) > LRU eviction. Busy engines are
+    // skipped outright -- reuse_len against a mid-generation engine reads
+    // moving state. If the prompt fits NO slot even when all are free, the
+    // largest free slot takes it and generate() refuses cleanly (no LRU
+    // stamp, as before). Condvar wakeups barge (no ticket order here);
+    // bounded by <=4 slots and self-limiting clients -- the GPU gate is the
+    // fair one.
     long slot_use_counter = 0;
-    auto pick_slot = [&](const std::vector<int>& prompt) -> Slot& {
-        Slot* best = nullptr;
-        int best_tier = -1, best_key = 0;
-        for (auto& s : slots) {
-            if ((int)prompt.size() > s.eng->max_ctx) continue;
-            int rl = s.eng->reuse_len(prompt);
-            int tier = rl > 0 ? 2 : s.eng->cache_empty() ? 1 : 0;
-            bool better;
-            if (!best) better = true;
-            else if (tier != best_tier) better = tier > best_tier;
-            else if (tier == 2) better = rl > best_key;
-            else better = s.last_used < best->last_used;
-            if (better) { best = &s; best_tier = tier; best_key = rl; }
+    auto claim_slot = [&](const std::vector<int>& prompt) -> Slot& {
+        std::unique_lock<std::mutex> lk(route_m);
+        const bool fits_any = (int)prompt.size() <= max_slot_ctx;
+        for (;;) {
+            Slot* best = nullptr;
+            int best_tier = -1, best_key = 0;
+            for (auto& s : slots) {
+                if (s.busy) continue;
+                if (!fits_any) { // doomed prompt: largest free slot refuses it
+                    if (!best || s.eng->max_ctx > best->eng->max_ctx) best = &s;
+                    continue;
+                }
+                if ((int)prompt.size() > s.eng->max_ctx) continue;
+                int rl = s.eng->reuse_len(prompt);
+                int tier = rl > 0 ? 2 : s.eng->cache_empty() ? 1 : 0;
+                bool better;
+                if (!best) better = true;
+                else if (tier != best_tier) better = tier > best_tier;
+                else if (tier == 2) better = rl > best_key;
+                else better = s.last_used < best->last_used;
+                if (better) { best = &s; best_tier = tier; best_key = rl; }
+            }
+            if (best) {
+                best->busy = true;
+                if (fits_any) best->last_used = ++slot_use_counter;
+                return *best;
+            }
+            route_cv.wait(lk);
         }
-        if (!best) {
-            Slot* big = &slots[0];
-            for (auto& s : slots)
-                if (s.eng->max_ctx > big->eng->max_ctx) big = &s;
-            return *big;
-        }
-        best->last_used = ++slot_use_counter;
-        return *best;
+    };
+    auto free_slot = [&](Slot& s) {
+        { std::lock_guard<std::mutex> lk(route_m); s.busy = false; }
+        route_cv.notify_all();
+    };
+    // scope guard so the claim is released on every exit path
+    auto slot_guard = [&free_slot](Slot& s) {
+        return std::shared_ptr<Slot>(&s, [&free_slot](Slot* p) { free_slot(*p); });
+    };
+    // Per-request yield hook: hand the GPU to a queued request at round /
+    // chunk boundaries, draining OUR stream first so the handover is real.
+    // Captures only stable objects (engine lives in `slots`, gate in main),
+    // so a hook left installed on an engine is harmless, not dangling.
+    auto make_yield = [&gpu_gate, no_interleave](Engine& e) -> std::function<bool()> {
+        if (no_interleave) return nullptr;
+        Engine* ep = &e;
+        return [ep, &gpu_gate] {
+            if (!gpu_gate.contended()) return false;
+            CUDA_CHECK(cudaStreamSynchronize(ep->stm));
+            return gpu_gate.maybe_yield();
+        };
     };
 
     httplib::Server srv;
@@ -446,10 +503,12 @@ int main(int argc, char** argv) {
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            std::lock_guard<std::mutex> lk(gpu);
-            double qw = ms_since(rt.t0);
-            Slot& sl = pick_slot(prompt);
+            Slot& sl = claim_slot(prompt); // may wait for a free engine
+            auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            q27::GpuGate::Lease lk(gpu_gate);
+            double qw = ms_since(rt.t0);
+            eng.on_round_gap = make_yield(eng);
             // re-clamp to the routed slot (rows P+1..P+6 must stay in ctx)
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             std::string text;
@@ -458,6 +517,7 @@ int main(int argc, char** argv) {
                 text += ugate.feed(tok.decode_one(id));
                 return true;
             });
+            eng.on_round_gap = nullptr;
             text += ugate.flush();
             req_log(rt, qw, eng, sl.id);
             json choice;
@@ -480,10 +540,12 @@ int main(int argc, char** argv) {
         res.set_chunked_content_provider(
             "text/event-stream",
             [&, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
-                std::lock_guard<std::mutex> lk(gpu);
-                double qw = ms_since(rt.t0);
-                Slot& sl = pick_slot(prompt);
+                Slot& sl = claim_slot(prompt);
+                auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                q27::GpuGate::Lease lk(gpu_gate);
+                double qw = ms_since(rt.t0);
+                eng.on_round_gap = make_yield(eng);
                 const int nm =
                     std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 auto send = [&](const json& j) {
@@ -504,6 +566,7 @@ int main(int argc, char** argv) {
                     // the socket so a disconnected client stops generation
                     return send(piece_chunk(ugate.feed(tok.decode_one(id))));
                 });
+                eng.on_round_gap = nullptr;
                 std::string tailp = ugate.flush();
                 if (!tailp.empty()) send(piece_chunk(tailp));
                 req_log(rt, qw, eng, sl.id);
@@ -616,10 +679,12 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double, std::milli>(tk2 - tk0).count()};
 
         if (!stream) {
-            std::lock_guard<std::mutex> lk(gpu);
-            double qw = ms_since(rt.t0);
-            Slot& sl = pick_slot(prompt);
+            Slot& sl = claim_slot(prompt);
+            auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            q27::GpuGate::Lease lk(gpu_gate);
+            double qw = ms_since(rt.t0);
+            eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             StreamSplitter sp;
             q27::Utf8Gate ugate;
@@ -648,6 +713,7 @@ int main(int argc, char** argv) {
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
+            eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id);
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
@@ -702,10 +768,12 @@ int main(int argc, char** argv) {
             "text/event-stream",
             [&, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len, rt](
                 size_t, httplib::DataSink& sink) {
-                std::lock_guard<std::mutex> lk(gpu);
-                double qw = ms_since(rt.t0);
-                Slot& sl = pick_slot(prompt);
+                Slot& sl = claim_slot(prompt);
+                auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                q27::GpuGate::Lease lk(gpu_gate);
+                double qw = ms_since(rt.t0);
+                eng.on_round_gap = make_yield(eng);
                 const int nm =
                     std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 ToolConstrainer tc;
@@ -802,6 +870,7 @@ int main(int argc, char** argv) {
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
+                eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id);
                 for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
@@ -1022,10 +1091,12 @@ int main(int argc, char** argv) {
         };
 
         if (!stream) {
-            std::lock_guard<std::mutex> lk(gpu);
-            double qw = ms_since(rt.t0);
-            Slot& sl = pick_slot(prompt);
+            Slot& sl = claim_slot(prompt);
+            auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            q27::GpuGate::Lease lk(gpu_gate);
+            double qw = ms_since(rt.t0);
+            eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             json items = json::array();
             int tool_counter = 0;
@@ -1051,6 +1122,7 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             });
+            eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id);
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
@@ -1070,10 +1142,12 @@ int main(int argc, char** argv) {
         res.set_chunked_content_provider(
             "text/event-stream",
             [&, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
-                std::lock_guard<std::mutex> lk(gpu);
-                double qw = ms_since(rt.t0);
-                Slot& sl = pick_slot(prompt);
+                Slot& sl = claim_slot(prompt);
+                auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                q27::GpuGate::Lease lk(gpu_gate);
+                double qw = ms_since(rt.t0);
+                eng.on_round_gap = make_yield(eng);
                 const int nm =
                     std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 auto ev = [&](const json& j) {
@@ -1160,6 +1234,7 @@ int main(int argc, char** argv) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                     return true;
                 });
+                eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id);
                 for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);

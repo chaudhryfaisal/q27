@@ -4,6 +4,10 @@
 //   model emits  <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
 //   results go back as user content wrapped in <tool_response>...</tool_response>
 #pragma once
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -55,6 +59,62 @@ struct Utf8Gate {
         pend.clear();
         return out;
     }
+};
+
+// R1b: FIFO ticket lock time-slicing the GPU across concurrent generations.
+// Replaces the server's whole-generation mutex. The holder calls
+// maybe_yield() at round/chunk boundaries: if anyone is queued it releases
+// and re-acquires -- the fresh ticket lands at the TAIL, so contended
+// requests round-robin at round granularity instead of head-of-line
+// blocking for a whole generation. Solo path: one relaxed atomic load per
+// call, no syscalls. contended() can miss a waiter arriving in the same
+// instant (nwait is read unlocked); it is caught one round (~27ms) later.
+struct GpuGate {
+    void acquire() {
+        std::unique_lock<std::mutex> lk(m);
+        uint64_t t = next++;
+        if (t != serving) {
+            nwait.fetch_add(1, std::memory_order_relaxed);
+            cv.wait(lk, [&] { return serving == t; });
+            nwait.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lk(m); serving++; }
+        cv.notify_all();
+    }
+    int contended() const { return nwait.load(std::memory_order_relaxed); }
+    // RAII whole-hold (the R1-equivalent region): exception-safe release,
+    // same role the old lock_guard played at the server call sites.
+    struct Lease {
+        explicit Lease(GpuGate& gg) : g(gg) { g.acquire(); }
+        ~Lease() { g.release(); }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        GpuGate& g;
+    };
+    // Yield the GPU to queued waiters; true if a handover actually happened.
+    // The new ticket is taken in the SAME critical section as the handover:
+    // release();acquire() would let a descheduled yielder lose its queue
+    // position to the next yielder (caught by the C1 self-test), breaking
+    // strict rotation.
+    bool maybe_yield() {
+        if (!contended()) return false;
+        std::unique_lock<std::mutex> lk(m);
+        if (next - serving <= 1) return false; // raced: waiter already gone
+        uint64_t t = next++;
+        serving++;
+        cv.notify_all();
+        nwait.fetch_add(1, std::memory_order_relaxed);
+        cv.wait(lk, [&] { return serving == t; });
+        nwait.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+    }
+private:
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t next = 0, serving = 0;
+    std::atomic<int> nwait{0};
 };
 
 struct Msg {

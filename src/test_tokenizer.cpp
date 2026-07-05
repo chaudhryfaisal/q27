@@ -2,11 +2,13 @@
 // Usage: test_tokenizer q27.tok cases.txt
 // cases.txt: alternating lines — text line, then space-separated reference ids.
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "api_common.h"
@@ -74,8 +76,94 @@ static int utf8gate_selftest() {
     return fail;
 }
 
+// Self-test for the R1b GPU gate (host-only; no CUDA, no data files).
+// The gate replaces the server's whole-generation mutex: FIFO tickets,
+// maybe_yield() re-enqueues at the tail so contended requests round-robin
+// at round granularity, and the solo path is one relaxed atomic load.
+static int gpu_gate_selftest() {
+    int fail = 0;
+    auto expect = [&](bool ok, const char* name) {
+        if (!ok) { printf("gpugate FAIL %s\n", name); fail++; }
+    };
+    {   // C2: solo fast path -- no waiters, maybe_yield declines every time
+        q27::GpuGate g;
+        g.acquire();
+        bool any = false;
+        for (int i = 0; i < 1000; i++) any |= g.maybe_yield();
+        g.release();
+        expect(!any, "solo maybe_yield stays false");
+        expect(!g.contended(), "solo never contended");
+    }
+    {   // C4: contended() sees a queued waiter, clears when it drains
+        q27::GpuGate g;
+        g.acquire();
+        std::thread w([&] { g.acquire(); g.release(); });
+        while (!g.contended()) std::this_thread::yield();
+        expect(g.contended(), "waiter visible");
+        g.release();
+        w.join();
+        expect(!g.contended(), "drained");
+    }
+    {   // C1: strict FIFO round-robin under 3-way contention. Admission
+        // order is forced by polling contended() between spawns, so the
+        // ticket order is T0 < T1 < T2 and the record sequence must be
+        // exactly 0,1,2 repeated K times (maybe_yield re-enqueues at tail).
+        q27::GpuGate g;
+        const int K = 3;
+        std::vector<int> seq;
+        g.acquire(); // hold so spawned threads queue up in order
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 3; i++) {
+            ts.emplace_back([&, i] {
+                g.acquire();
+                for (int k = 0; k < K; k++) {
+                    seq.push_back(i); // guarded by gate ownership
+                    g.maybe_yield();
+                }
+                g.release();
+            });
+            while (g.contended() < i + 1) std::this_thread::yield();
+        }
+        g.release();
+        for (auto& t : ts) t.join();
+        bool ok = seq.size() == 3 * K;
+        for (size_t j = 0; ok && j < seq.size(); j++) ok = seq[j] == (int)(j % 3);
+        if (!ok) {
+            printf("gpugate C1 sequence:");
+            for (int v : seq) printf(" %d", v);
+            printf("\n");
+        }
+        expect(ok, "FIFO round-robin order");
+    }
+    {   // C3: stress -- mutual exclusion holds and nothing deadlocks
+        q27::GpuGate g;
+        std::atomic<int> overlap{0};
+        int inside = 0; // guarded by the gate; >1 means exclusion broke
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 8; i++)
+            ts.emplace_back([&] {
+                g.acquire();
+                for (int k = 0; k < 200; k++) {
+                    if (++inside != 1) overlap++;
+                    --inside;
+                    g.maybe_yield();
+                }
+                g.release();
+            });
+        for (auto& t : ts) t.join();
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                       .count();
+        expect(overlap.load() == 0, "mutual exclusion");
+        expect(s < 30.0, "stress completes");
+    }
+    printf("gpugate self-test: %s\n", fail ? "FAIL" : "PASS");
+    return fail;
+}
+
 int main(int argc, char** argv) {
     if (utf8gate_selftest()) return 2;
+    if (gpu_gate_selftest()) return 3;
     if (argc != 3) { fprintf(stderr, "usage: %s q27.tok cases.txt\n", argv[0]); return 1; }
     q27::Tokenizer tok(argv[1]);
     std::ifstream in(argv[2]);

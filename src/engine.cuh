@@ -761,6 +761,13 @@ struct Engine {
     // host grammar can stage next round's slot-0 mask (state must include
     // the pending token -- masks lag one token otherwise).
     std::function<void(int)> on_pending;
+    // R1b: optional preemption hook, called between decode rounds and
+    // between prefill chunks -- the two boundaries where this engine's
+    // device state is coherent. Returns true if the GPU was actually
+    // handed to another request. The server wires it to
+    // GpuGate::maybe_yield behind a drain of THIS engine's stream; the
+    // CLI never sets it, so the canonical paths execute no new code.
+    std::function<bool()> on_round_gap;
 
     // ---- P7 constrained tool decoding API ----
     // Upload a vocab bitmask into the resident pool; returns its stable
@@ -1096,7 +1103,12 @@ struct Engine {
     struct GenStats {
         int prompt = 0, hit = 0, ckpt = -1, pf = 0; // tokens
         double pf_ms = 0, dec_ms = 0, cb_ms = 0;    // cb = time inside on_token
-        int dec = 0, rounds = 0;
+        // R1b: time parked in on_round_gap calls that actually handed the
+        // GPU over (includes the pre-yield drain of our own in-flight
+        // chunks), and how many handovers. pf_ms/dec_ms stay wall-inclusive
+        // of yields; analyzers subtract gw_ms for GPU-busy accounting.
+        double gw_ms = 0;
+        int dec = 0, rounds = 0, yields = 0;
         const char* end = "";
     };
     GenStats gs;
@@ -1123,6 +1135,17 @@ struct Engine {
             gs.end = "refused";
             return 0;
         }
+        // R1b preemption point (no-op when the hook is unset or nobody waits)
+        auto round_gap = [&] {
+            if (!on_round_gap) return;
+            auto y0 = std::chrono::steady_clock::now();
+            if (on_round_gap()) {
+                gs.gw_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - y0)
+                                .count();
+                gs.yields++;
+            }
+        };
         if (batched_prefill && NP >= 32) {
             // prefix-cache hit: prompt extends the snapshotted prefix -> restore
             // recurrent state and prefill only the new suffix
@@ -1165,6 +1188,7 @@ struct Engine {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
                 }
+                round_gap();
             }
             snap_save(prompt, snap_upto);
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
@@ -1176,6 +1200,7 @@ struct Engine {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
                 }
+                round_gap();
             }
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
@@ -1249,6 +1274,7 @@ struct Engine {
                 emitted++;
             }
             if (on_pending) on_pending(last_pending);
+            round_gap();
         }
         done("n_max");
         return emitted;
