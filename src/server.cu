@@ -450,7 +450,10 @@ int main(int argc, char** argv) {
 
     srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
         // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
-        // safe concurrently with generation -- read-only, separate stream).
+        // read-only, so safe concurrently with generation -- but it launches
+        // on the legacy default stream, which BARRIERS against in-flight
+        // kernels on the blocking engine streams: expect a multi-ms stall
+        // injected into whoever holds the GPU gate, not true overlap).
         if (req.has_param("verify")) {
             int bad = shared_dm.checksum_verify(true);
             res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +

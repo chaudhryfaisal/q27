@@ -1241,6 +1241,11 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
         int emitted = 0, rounds = 0;
         auto g0 = std::chrono::steady_clock::now();
+        // decode-phase park baseline: dt below covers decode only, so the
+        // contended-print suffix must use decode-phase gw, not request-total
+        // (prefill parks belong to pf_ms; mixing them over-corrects t/s)
+        const double gw_pf = gs.gw_ms;
+        const int yields_pf = gs.yields;
         auto done = [&](const char* why) {
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
                             .count();
@@ -1248,14 +1253,14 @@ struct Engine {
             gs.dec_ms = dt * 1000.0;
             gs.rounds = rounds;
             gs.end = why;
-            // wall-inclusive of yield parks; the gw suffix keeps a contended
+            // wall-inclusive of yield parks; the suffix keeps a contended
             // print from reading as a decode regression
-            if (gs.yields)
+            if (gs.yields > yields_pf)
                 fprintf(stderr,
-                        "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; gw %.0fms/%d yields), "
-                        "n_max=%d\n",
-                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), gs.gw_ms, gs.yields,
-                        n_max);
+                        "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; parked %.0fms/%d "
+                        "yields in decode), n_max=%d\n",
+                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), gs.gw_ms - gw_pf,
+                        gs.yields - yields_pf, n_max);
             else
                 fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n",
                         why, emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
