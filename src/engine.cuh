@@ -1248,8 +1248,17 @@ struct Engine {
             gs.dec_ms = dt * 1000.0;
             gs.rounds = rounds;
             gs.end = why;
-            fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
-                    emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
+            // wall-inclusive of yield parks; the gw suffix keeps a contended
+            // print from reading as a decode regression
+            if (gs.yields)
+                fprintf(stderr,
+                        "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; gw %.0fms/%d yields), "
+                        "n_max=%d\n",
+                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), gs.gw_ms, gs.yields,
+                        n_max);
+            else
+                fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n",
+                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
         };
         // ctx guard: a round writes attention-KV rows P+1..P+5 (and MTP rows
         // P+1..P+4); launching with P > max_ctx-6 would write past the caches

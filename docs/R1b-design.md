@@ -63,7 +63,11 @@ today's behavior. Flow per request:
 qw keeps its meaning: time from request arrival to generate() start (now =
 engine-claim wait + first gate acquire). New telemetry after `end=` (the
 reqlog_gate regex stops there): `gw=%.0f yields=%d`. pf_ms/dec_ms remain
-wall-inclusive of yield waits; the analyzer subtracts gw_ms.
+wall-inclusive of yield waits; session-side anatomy analyzers (req_anatomy
+class, rewritten ad hoc) subtract gw_ms -- no repo tool parses it yet.
+The LRU stamp moves to slot FREE time (eviction preference tracks
+completion recency; claim-time stamps are invisible to routing since busy
+slots are never scanned); refused-class claims keep their old stamp.
 
 **Escape hatch.** `Q27_NO_INTERLEAVE=1` skips installing the hook: exact
 R1 whole-request serialization behind the gate. Debug lever for the known

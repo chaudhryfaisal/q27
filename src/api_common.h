@@ -86,6 +86,12 @@ struct GpuGate {
     int contended() const { return nwait.load(std::memory_order_relaxed); }
     // RAII whole-hold (the R1-equivalent region): exception-safe release,
     // same role the old lock_guard played at the server call sites.
+    // Exemption to the drained-handover invariant: microsecond-scale async
+    // copies queued AFTER the last yield point (tool-constraint clears,
+    // n_max==0 tails) may still be in flight at ~Lease. All target
+    // per-engine buffers and are stream-ordered ahead of that engine's next
+    // work, so no cross-engine hazard exists; the GPU is "idle" at release
+    // only up to those copies.
     struct Lease {
         explicit Lease(GpuGate& gg) : g(gg) { g.acquire(); }
         ~Lease() { g.release(); }

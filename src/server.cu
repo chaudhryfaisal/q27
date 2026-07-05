@@ -234,6 +234,7 @@ int main(int argc, char** argv) {
         long last_used = 0;
         int id = 0;
         bool busy = false;                   // R1b: claimed by a generation
+        bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
     n_slots = std::max(1, std::min(4, n_slots));
@@ -404,14 +405,23 @@ int main(int argc, char** argv) {
             }
             if (best) {
                 best->busy = true;
-                if (fits_any) best->last_used = ++slot_use_counter;
+                // LRU is stamped at FREE, not here: eviction preference must
+                // track completion recency (a slot claimed early but finishing
+                // last is the likeliest to continue). Claim-time stamps are
+                // invisible to routing anyway -- busy slots are never scanned.
+                // Refused-class claims (fits nowhere) keep the old stamp.
+                best->stamp_on_free = fits_any;
                 return *best;
             }
             route_cv.wait(lk);
         }
     };
     auto free_slot = [&](Slot& s) {
-        { std::lock_guard<std::mutex> lk(route_m); s.busy = false; }
+        {
+            std::lock_guard<std::mutex> lk(route_m);
+            s.busy = false;
+            if (s.stamp_on_free) s.last_used = ++slot_use_counter;
+        }
         route_cv.notify_all();
     };
     // scope guard so the claim is released on every exit path

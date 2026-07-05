@@ -23,6 +23,10 @@ SRV=""
 
 start_server() { # args: logfile, extra flags...
     local log=$1; shift
+    # a stale listener would make the whole phase test the wrong binary
+    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        echo "[gate] FAIL: port $PORT already serving -- stop it first"; return 1
+    fi
     CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
       "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 8192 --no-think "$@" >"$log" 2>&1 &
     SRV=$!
@@ -175,8 +179,14 @@ if len(recs) == 6:
               f"S4 third request served (end={rc['end']})")
     ok &= chk(ra["hit"] == 0 and ra["pf"] > 3000,
               f"S6a A cold multi-chunk prefill (hit={ra['hit']} pf={ra['pf']})")
-    ok &= chk(rb["qw"] < 1000,
-              f"S6b B admitted at chunk granularity mid-prefill (qw={rb['qw']:.0f}ms)")
+    # schedule-based, not threshold-based: B fully served before A's FIRST
+    # delta proves B ran inside A's prefill window at chunk granularity. If
+    # a future prefill speedup shrinks that window below B's runtime, this
+    # fails LOUDLY -- restage with a bigger PAD rather than weakening it.
+    a_first = a_run["delta_ts"][0] if a_run.get("delta_ts") else 0
+    ok &= chk(b_run["done"] < a_first,
+              f"S6b B served entirely inside A's prefill "
+              f"(B done {a_first - b_run['done']:.2f}s before A's first delta)")
 sys.exit(0 if ok else 1)
 PYEOF
 RC1=$?
