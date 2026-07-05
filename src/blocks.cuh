@@ -87,4 +87,21 @@ void argmax_masked(const float* x, int n, const unsigned* pool, int words, const
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
             cudaStream_t st = 0);
 
+// Sampling (roadmap #2, docs/sampling-design.md Phase 1). temp>0 ONLY: greedy
+// stays on argmax/argmax_masked (bitwise, canonical-gated) via a host branch.
+// Gumbel-max over the top-p nucleus S={i: x_i>=logit_thresh} draws exactly
+// softmax(inv_temp*x) renormalized over S. Deterministic given
+// (seed,pos,draw_kind,logits,inv_temp,top_p): nucleus stats+top-p threshold are
+// one single-block tree reduction (no float atomics); Gumbel-max reuses
+// argmax's am_pack+atomicMax (order-independent). Philox4x32-10 is stateless
+// (counter = pos,draw_kind,vocab_index; key = seed) so graph replay / prefix
+// restore / ckpt stay consistent with nothing mutable to advance.
+//   inv_temp = 1/T (>0). top_p in (0,1]; >=1 => full vocab.
+//   d_nuc: caller-allocated [3] floats, receives {logit_thresh, M, logZ}
+//   (M/logZ are the temp-scaled softmax stats, kept for the Phase-2 accept
+//   test); must not be null. d_scratch: one u64, as argmax.
+void sample(const float* logits, int n, float inv_temp, float top_p,
+            unsigned long long seed, int pos, int draw_kind, int* d_out,
+            unsigned long long* d_scratch, float* d_nuc, cudaStream_t st = 0);
+
 } // namespace q27k

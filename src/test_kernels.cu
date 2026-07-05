@@ -1208,6 +1208,106 @@ static void test_wy_stream_isolation() {
     unsetenv("Q27_DS_MODE");
 }
 
+// Sampling Phase 1: nucleus stats + top-p threshold + Gumbel-max, on synthetic
+// logits (no model). Greedy argmax is untouched by construction -- this only
+// exercises the new sample() path (temp>0). Determinism lets every check use a
+// fixed seed, so the chi-square bound is tuned once and never flakes.
+static void test_sample() {
+    const int n = 64;
+    // spread logits so a few tokens dominate (realistic nucleus shapes)
+    std::vector<float> x = rand_vec(n, 4242);
+    for (auto& v : x) v *= 2.5f;
+    // CPU argmax + full-softmax probs at a given inv_temp
+    auto cpu_argmax = [&]() {
+        int bi = 0; for (int i = 1; i < n; i++) if (x[i] > x[bi]) bi = i; return bi;
+    };
+    auto cpu_softmax = [&](float invT) {
+        double M = x[0]; for (int i = 1; i < n; i++) M = std::max(M, (double)x[i]);
+        std::vector<double> p(n); double Z = 0;
+        for (int i = 0; i < n; i++) { p[i] = std::exp(invT * (x[i] - M)); Z += p[i]; }
+        for (int i = 0; i < n; i++) p[i] /= Z;
+        return p;
+    };
+
+    float* d_x; int* d_out; unsigned long long* d_scr; float* d_nuc;
+    CUDA_CHECK(cudaMalloc(&d_x, n * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, 8));
+    CUDA_CHECK(cudaMalloc(&d_nuc, 3 * 4));
+    CUDA_CHECK(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice));
+
+    auto draw = [&](float invT, float topp, unsigned long long seed, int pos) {
+        q27k::sample(d_x, n, invT, topp, seed, pos, 0, d_out, d_scr, d_nuc, 0);
+        int out; CUDA_CHECK(cudaMemcpy(&out, d_out, 4, cudaMemcpyDeviceToHost));
+        return out;
+    };
+    auto nuc_thresh = [&](float invT, float topp) {
+        q27k::sample(d_x, n, invT, topp, 1, 0, 0, d_out, d_scr, d_nuc, 0);
+        float nuc[3]; CUDA_CHECK(cudaMemcpy(nuc, d_nuc, 12, cudaMemcpyDeviceToHost));
+        return nuc[0];
+    };
+
+    // 1. seeded identity: same (seed,pos) -> identical token
+    int a = draw(1.25f, 0.95f, 777, 5), b = draw(1.25f, 0.95f, 777, 5);
+    check("sample seeded identity", std::fabs((double)(a - b)), 0.5);
+
+    // 2. tiny top_p collapses the nucleus to {argmax}: every draw == argmax
+    int am = cpu_argmax();
+    int bad = 0;
+    for (int pos = 0; pos < 32; pos++) if (draw(1.0f, 1e-4f, 55, pos) != am) bad++;
+    check("sample tiny-top_p == argmax", (double)bad, 0.5);
+
+    // 3. nucleus mass: full-softmax mass over S>=top_p, near-minimal
+    {
+        float invT = 1.25f, topp = 0.95f;
+        float th = nuc_thresh(invT, topp);
+        auto p = cpu_softmax(invT);
+        double mass = 0, mmin = 1e9; int cnt = 0;
+        for (int i = 0; i < n; i++) if (x[i] >= th) { mass += p[i]; mmin = std::min(mmin, p[i]); cnt++; }
+        // enough mass, and dropping the smallest member would fall below top_p
+        bool enough = mass >= topp - 0.03;
+        bool minimal = (mass - mmin) <= topp + 0.03;
+        printf("    [nucleus mass=%.4f cnt=%d min=%.4f]\n", mass, cnt, mmin);
+        check("sample nucleus enough+minimal", (enough && minimal) ? 0.0 : 1.0, 0.5);
+    }
+
+    // 4. chi-square vs analytic renormalized truncated softmax over the SAME
+    //    GPU nucleus. Deterministic (fixed seed, pos=0..N-1).
+    {
+        const int N = 8192; float invT = 1.25f, topp = 0.95f;
+        float th = nuc_thresh(invT, topp);
+        auto p = cpu_softmax(invT);
+        double Zn = 0; for (int i = 0; i < n; i++) if (x[i] >= th) Zn += p[i];
+        std::vector<int> obs(n, 0);
+        for (int pos = 0; pos < N; pos++) obs[draw(invT, topp, 12345, pos)]++;
+        double chi2 = 0; int df = -1;
+        for (int i = 0; i < n; i++) {
+            if (x[i] < th) { if (obs[i]) chi2 = 1e9; continue; } // out-of-nucleus draw = fatal
+            double exp = N * (p[i] / Zn);
+            if (exp < 5) continue;                              // chi-square validity
+            chi2 += (obs[i] - exp) * (obs[i] - exp) / exp; df++;
+        }
+        // generous bound: mean(chi2)=df, ~ (df + 8*sqrt(2*df) + 40) is >>5 sigma
+        double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
+        printf("    [chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
+        check("sample chi-square vs softmax", chi2 < bound ? 0.0 : 1.0, 0.5);
+    }
+
+    // 5. temperature effect: higher T (lower inv_temp) => wider nucleus
+    {
+        auto count = [&](float invT) {
+            float th = nuc_thresh(invT, 0.95f);
+            int c = 0; for (int i = 0; i < n; i++) if (x[i] >= th) c++; return c;
+        };
+        int hot = count(1.0f / 1.5f), cold = count(1.0f / 0.5f);
+        printf("    [nucleus T=1.5:%d T=0.5:%d]\n", hot, cold);
+        check("sample temp widens nucleus", hot >= cold ? 0.0 : 1.0, 0.5);
+    }
+
+    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_nuc));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -1235,6 +1335,7 @@ int main(int argc, char** argv) {
     test_delta_wy();
     test_wy_stream_isolation();
     test_masked_argmax();
+    test_sample();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();

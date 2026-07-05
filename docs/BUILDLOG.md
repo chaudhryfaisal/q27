@@ -1034,3 +1034,54 @@ change, 400 fires before generate(), decode path untouched.
 
 CC-level effect (compaction actually triggering instead of the retry loop)
 gets validated the next time a deep-context trial runs -- queue: sampling.
+
+## 2026-07-05 (night) -- Sampling Phase 1: plain-path sampler kernels (roadmap #2)
+
+First increment of the sampling feature (docs/sampling-design.md). Phase 1 =
+the three sampler primitives validated on-device in isolation, greedy path
+bitwise-untouched. Spec rejection sampling (Phase 2), constrained+sampled
+(Phase 3), graph capture, and server plumbing compose on top once the
+numerics are proven -- this is the correctness foundation, nothing wired into
+the decode loop yet.
+
+New q27k::sample(logits, n, inv_temp, top_p, seed, pos, draw_kind, d_out,
+d_scratch, d_nuc) in blocks.cu (temp>0 only; greedy stays on argmax via a host
+branch, so canonical md5 is definitionally unchanged -- no edit touches the
+greedy path):
+- k_nucleus (single block, no atomics): max M, logsumexp logZ at inv_temp,
+  and the top-p logit threshold via a fixed 12-iteration bisection on a prob
+  cutoff (no sort). Single-block tree reduction = deterministic; fixed
+  geometry = graph-capturable later. thresh clamped <= M so the argmax token
+  is always in the nucleus (guards tiny/degenerate top_p).
+- k_gumbel: argmax_i(inv_temp*x_i + G_i) over {x_i >= thresh}, G_i Gumbel from
+  Philox4x32-10. Reuses argmax's am_pack+atomicMax (integer, order-independent
+  -> deterministic token). Gumbel-max over the nucleus samples EXACTLY
+  softmax(inv_temp*x) renormalized over the nucleus (Leviathan identity), so
+  the sampler needs no CDF scan and no float-atomic nondeterminism.
+- Philox stateless: counter=(pos,draw_kind,vocab_i), key=seed. Nothing mutable
+  advances -> graph replay / prefix-cache restore / ckpt all stay consistent
+  for free when this wires into the engine (design section 5).
+
+test_kernels test_sample (synthetic 64-logit vectors, no model), all PASS:
+- seeded identity: same (seed,pos) -> byte-identical token id.
+- tiny top_p (1e-4) collapses nucleus to {argmax}; 32 draws all == argmax
+  (ties the sampler to the greedy token, validates threshold+gumbel jointly).
+- nucleus mass=0.9532 at top_p=0.95 (cnt=2): enough AND near-minimal (dropping
+  the min member falls below top_p).
+- chi-square vs analytic renormalized-truncated-softmax over the SAME GPU
+  nucleus, 8192 deterministic draws (T=0.8, top_p=0.95): chi2=1.06, df=1,
+  bound=52.3 -- near-perfect fit, and the test is deterministic so the bound
+  never flakes. Any out-of-nucleus draw is a fatal (chi2=1e9) guard.
+- temperature effect: nucleus 1 token at T=0.5 -> 31 at T=1.5.
+
+Full test_kernels ALL PASS (existing dequant/gemv/mma/attn/fd2/wy/fp8 suite
+unchanged); full make clean sm_120; test_tokenizer unaffected; q27-eval
+recreated on the fresh binary (sample() is linked but never called by the
+server yet, so serving behavior is byte-identical). Canonical md5 not
+re-derived: no model/decode-path/graph edit.
+
+Next (Phase 2, per design): k_spec_accept + k_sample_stop in a second 5-perm
+graph set (greedy drafts + target-dist rejection acceptance), --stats
+acceptance-vs-temp telemetry, spec==non-spec distribution gate. Then the
+param-block + server plumbing that lets a request actually set temperature,
+and the exit-criterion quality A/B under production sampling.

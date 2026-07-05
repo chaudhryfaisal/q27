@@ -348,6 +348,130 @@ void argmax_masked(const float* x, int n, const unsigned* pool, int words, const
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---------------- sampling (roadmap #2, temp>0) ----------------
+// Greedy is NOT here -- it stays on k_argmax/k_argmax_masked (bitwise). These
+// kernels run only when a request sets temperature>0.
+
+// Philox4x32-10 (Salmon et al. 2011): counter-based, stateless. One uniform
+// in (0,1) from counter word 0. key = 64-bit seed; counter = (c0,c1,c2,0).
+__device__ __forceinline__ unsigned am_mulhi(unsigned a, unsigned b, unsigned& lo) {
+    unsigned long long p = (unsigned long long)a * b;
+    lo = (unsigned)p;
+    return (unsigned)(p >> 32);
+}
+__device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigned c0,
+                                                 unsigned c1, unsigned c2) {
+    unsigned k0 = (unsigned)seed, k1 = (unsigned)(seed >> 32);
+    unsigned x0 = c0, x1 = c1, x2 = c2, x3 = 0u;
+    const unsigned M0 = 0xD2511F53u, M1 = 0xCD9E8D57u, W0 = 0x9E3779B9u, W1 = 0xBB67AE85u;
+#pragma unroll
+    for (int r = 0; r < 10; r++) {
+        unsigned lo0, lo1;
+        unsigned hi0 = am_mulhi(M0, x0, lo0);
+        unsigned hi1 = am_mulhi(M1, x2, lo1);
+        unsigned n0 = hi1 ^ x1 ^ k0, n1 = lo1, n2 = hi0 ^ x3 ^ k1, n3 = lo0;
+        x0 = n0; x1 = n1; x2 = n2; x3 = n3;
+        k0 += W0; k1 += W1;
+    }
+    // (0,1): never exactly 0 or 1, so -log(-log(u)) is finite
+    return ((float)x0 + 0.5f) * (1.0f / 4294967296.0f);
+}
+
+// Single block: max M, logsumexp logZ at inv_temp, and the top-p logit
+// threshold via a fixed 12-iteration bisection on a prob cutoff (no sort, no
+// atomics -> deterministic, and graph-capturable at fixed geometry). Writes
+// out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh is clamped <= M so the
+// argmax token is always in the nucleus (guards degenerate/tiny top_p).
+__global__ void k_nucleus(const float* __restrict__ x, int n, float inv_temp, float top_p,
+                          float* __restrict__ out) {
+    __shared__ float sh[1024];
+    __shared__ float s_M, s_logZ, s_lo, s_hi;
+    const int t = threadIdx.x, B = blockDim.x;
+    float v = -FLT_MAX;
+    for (int i = t; i < n; i += B) v = fmaxf(v, x[i]);
+    sh[t] = v; __syncthreads();
+    for (int s = B / 2; s > 0; s >>= 1) {
+        if (t < s) sh[t] = fmaxf(sh[t], sh[t + s]);
+        __syncthreads();
+    }
+    if (t == 0) s_M = sh[0];
+    __syncthreads();
+    const float M = s_M;
+    float se = 0.f;
+    for (int i = t; i < n; i += B) se += expf(inv_temp * (x[i] - M));
+    sh[t] = se; __syncthreads();
+    for (int s = B / 2; s > 0; s >>= 1) {
+        if (t < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    if (t == 0) { s_logZ = logf(sh[0]); s_lo = 0.f; s_hi = 1.f; }
+    __syncthreads();
+    const float logZ = s_logZ;
+    if (top_p < 1.0f) {
+        for (int it = 0; it < 12; it++) {
+            const float tau = 0.5f * (s_lo + s_hi); // s_lo/s_hi settled by prior __syncthreads
+            float mass = 0.f;
+            for (int i = t; i < n; i += B) {
+                float p = expf(inv_temp * (x[i] - M) - logZ);
+                if (p >= tau) mass += p;
+            }
+            sh[t] = mass; __syncthreads();
+            for (int s = B / 2; s > 0; s >>= 1) {
+                if (t < s) sh[t] += sh[t + s];
+                __syncthreads();
+            }
+            if (t == 0) { if (sh[0] >= top_p) s_lo = tau; else s_hi = tau; } // mass decreasing in tau
+            __syncthreads();
+        }
+    }
+    if (t == 0) {
+        float thresh;
+        if (top_p >= 1.0f) thresh = -FLT_MAX;
+        else { float tau = s_lo; thresh = (tau <= 0.f) ? -FLT_MAX : M + (logf(tau) + logZ) / inv_temp; }
+        out[0] = fminf(thresh, M); // argmax token always in nucleus
+        out[1] = M;
+        out[2] = logZ;
+    }
+}
+
+// Gumbel-max over the nucleus: argmax_i (inv_temp*x_i + G_i), G_i from Philox,
+// restricted to x_i >= nuc[0]. Same am_pack+atomicMax reduction as k_argmax
+// (order-independent -> deterministic token).
+__global__ void k_gumbel(const float* __restrict__ x, int n, float inv_temp,
+                         const float* __restrict__ nuc, unsigned long long seed, unsigned pos,
+                         unsigned kind, unsigned long long* __restrict__ best) {
+    const float thresh = nuc[0];
+    float bv = -FLT_MAX;
+    int bi = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        if (x[i] < thresh) continue;
+        float u = philox_uniform(seed, pos, kind, (unsigned)i);
+        float g = -logf(-logf(u));
+        float key = inv_temp * x[i] + g;
+        if (key > bv) { bv = key; bi = i; }
+    }
+    unsigned long long p = am_pack(bv, bi);
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = p;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(best, sh[0]);
+}
+
+void sample(const float* logits, int n, float inv_temp, float top_p, unsigned long long seed,
+            int pos, int draw_kind, int* d_out, unsigned long long* d_scratch, float* d_nuc,
+            cudaStream_t st) {
+    k_nucleus<<<1, 1024, 0, st>>>(logits, n, inv_temp, top_p, d_nuc);
+    k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
+    k_gumbel<<<128, 256, 0, st>>>(logits, n, inv_temp, d_nuc, seed, (unsigned)pos,
+                                  (unsigned)draw_kind, d_scratch);
+    k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---------------- teacher-forced NLL (P0 quality gate) ----------------
 
 // nll[r] = logsumexp(logits[r, :]) - logits[r, tgt[r]] over a [nrows, vocab]

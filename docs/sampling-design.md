@@ -130,6 +130,14 @@ the t/s-vs-temp curve.
   kernels, param block, API plumbing, seeded-identity + chi-square gates,
   greedy canonicals re-verified untouched. Validates the samplers without
   spec complexity.
+  - **KERNELS LANDED 2026-07-05** (blocks.cu q27k::sample; k_nucleus +
+    k_gumbel + Philox4x32-10; test_kernels test_sample: seeded identity,
+    tiny-top_p==argmax, nucleus enough+minimal, chi2=1.06/df=1 vs analytic
+    truncated softmax, temp-widens-nucleus -- all PASS). Greedy untouched
+    (temp>0 only; no decode-path/graph edit, canonical not re-derived).
+    STILL TODO in Phase 1: param block + graph capture of a plain sampled
+    step + server API plumbing (temperature/top_p/seed through all 3 shapes).
+    The kernels are correctness-proven; wiring is the next commit.
 - **Phase 2 -- spec rejection sampling**: k_spec_accept + k_sample_stop in a
   second 5-perm graph set, greedy drafts, --stats acceptance-vs-temp
   telemetry, spec==non-spec distribution gate.
