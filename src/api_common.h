@@ -130,6 +130,26 @@ struct Msg {
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
 // must already be in {"type":"function","function":{...}} shape.
+// Claude Code (<= 2.1.1xx era) prefixes its system prompt with
+//   x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=a5145;You are...
+// The cch stamp is an integrity hint that CHANGES ON EVERY REQUEST, so the
+// first bytes of the prompt mutate per turn -- which voids the P8 stable-prefix
+// snapshot and P9 checkpoint routing for the entire conversation (measured
+// under Claude Code: 126K-token full re-prefill, ~72s, on every turn). Pin the
+// stamp to 'f's, mirroring llama.cpp's normalize_anthropic_billing_header
+// (ggml-org/llama.cpp#21793), so both engines canonicalize to the same bytes.
+// Only a header at the very start of the system text is touched, and the stamp
+// is only looked for inside the short header segment.
+inline void normalize_cc_billing_header(std::string& sys) {
+    static const char* PFX = "x-anthropic-billing-header:";
+    if (sys.rfind(PFX, 0) != 0) return;
+    size_t cch = sys.find("cch=", 27);
+    if (cch == std::string::npos || cch > 160) return;  // header segment only
+    size_t v = cch + 4, end = sys.find(';', v);
+    if (end == std::string::npos || end == v || end - v > 16) return;
+    for (size_t i = v; i < end; ++i) sys[i] = 'f';
+}
+
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (auto& t : tools) s += "\n" + t.dump();

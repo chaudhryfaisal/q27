@@ -886,3 +886,38 @@ Strategic read accepted: the defensible claim is "fastest agentic wall
 clock at depth with quality parity" (prefix cache + depth-4 + fd2 +
 interleaving), not "fastest short-context decode" -- items 1-3 above are
 what stood between that claim and being airtight.
+
+## 2026-07-05 (evening) -- Claude Code head-mutation fix: billing-header cch normalization
+
+First real Claude-Code-as-harness leg (thunderdome claude-code-q27-haight,
+CC 2.1.119 in-container) exposed a P8-class hole: EVERY request logged
+hit=0 ckpt=-1 with a per-request conv fingerprint, full 126K-token cold
+prefill (~72s) per turn, ~50 turns/hour. Root cause: CC (<= 2.1.1xx era)
+prefixes its system prompt with "x-anthropic-billing-header: cc_version=...;
+cc_entrypoint=cli; cch=a5145;You are Claude Code..." and the cch stamp
+CHANGES ON EVERY REQUEST -- the prompt HEAD mutates, so no token-level
+prefix survives and both the P8 stable-prefix snapshot and P9 checkpoint
+routing are voided for the entire conversation. P8 was built for volatile
+TAILS; this is the volatile-HEAD dual. llama.cpp already ships the
+countermeasure (normalize_anthropic_billing_header, ggml-org/llama.cpp
+PR #21793) -- their Anthropic path was more Claude-Code-hardened than ours.
+Host CC 2.1.200 (cc_entrypoint=sdk-cli) no longer sends cch -- verified by
+tapping two sessions (byte-identical system, md5 5a18db38) -- so the class
+is version-scoped but MUST be normalized to serve pinned/older CCs.
+
+Fix: q27::normalize_cc_billing_header (api_common.h) pins the stamp bytes
+to 'f' (same canonical bytes as llama's normalizer; tolerant of 1-16-char
+stamps, header-segment-bounded, non-CC prompts untouched), applied in the
+Anthropic anthropic_msgs system assembly AND in conv_fp so telemetry hashes
+what the engine actually prefills. Self-test block in test_tokenizer
+(mutating stamps normalize equal + cch=fffff; no-cch 2.1.200 header
+untouched; stray body cch= untouched; long stamp pinned). Gates:
+test_tokenizer 9/9 PASS; live pair A/B on the serving stack: two requests
+differing only in cch -> conv IDENTICAL (c50bc714984869c1), turn 2
+hit=376/397 pf=21 (was: hit=0 pf=full-context). CLI/decode paths untouched
+(server-only), canonical unaffected.
+
+Ops note: the failed leg also showed CC driving the T2 conversation to
+126K+ tokens (slot-0 ctx is 131072) -- watch end= reasons near the ctx
+ceiling on the rerun; CC's own compaction assumptions target Anthropic
+model context windows, not ours.

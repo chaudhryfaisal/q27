@@ -362,6 +362,36 @@ int main(int argc, char** argv) {
         if (!ok) return 1;
     }
 
+    // Claude Code billing-header cch stamp: it mutates on every request, so it
+    // must normalize to a constant or the P8 prefix cache never holds under
+    // Claude Code (mirrors llama.cpp #21793).
+    {
+        std::string a = "x-anthropic-billing-header: cc_version=2.1.101.e51; "
+                        "cc_entrypoint=cli; cch=a5145;You are Claude Code.";
+        std::string b = "x-anthropic-billing-header: cc_version=2.1.101.e51; "
+                        "cc_entrypoint=cli; cch=b9997;You are Claude Code.";
+        q27::normalize_cc_billing_header(a);
+        q27::normalize_cc_billing_header(b);
+        bool ok = a == b && a.find("cch=fffff;") != std::string::npos;
+        // 2.1.200-era header carries no cch -> untouched
+        std::string c = "x-anthropic-billing-header: cc_version=2.1.200.77d; "
+                        "cc_entrypoint=sdk-cli;You are a Claude agent.";
+        std::string c0 = c;
+        q27::normalize_cc_billing_header(c);
+        ok = ok && c == c0;
+        // non-CC prompt with a stray cch= in the body -> untouched
+        std::string d = "You are a bot. Config: cch=zzzzz; end.";
+        std::string d0 = d;
+        q27::normalize_cc_billing_header(d);
+        ok = ok && d == d0;
+        // longer stamp still pinned, shape preserved
+        std::string e = "x-anthropic-billing-header: cch=deadbeef01;You are Claude Code.";
+        q27::normalize_cc_billing_header(e);
+        ok = ok && e.find("cch=ffffffffff;") != std::string::npos;
+        printf("billing-header cch normalize: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
     // P7: ToolMaskCache -- exact lazy vocab-legality bitmasks keyed by
     // grammar-state signature. Synthetic vocab for logic; real vocab for a
     // sweep-cost measurement (design viability: a miss must be low-ms).

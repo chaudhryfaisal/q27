@@ -334,6 +334,7 @@ int main(int argc, char** argv) {
         } else if (body.contains("prompt") && body["prompt"].is_string()) {
             fu = body["prompt"].get<std::string>();
         }
+        q27::normalize_cc_billing_header(sys);  // hash what the engine prefills, not the raw stamp
         return fnv1a(fu, fnv1a(sys) ^ 0x9e3779b97f4a7c15ULL);
     };
     struct ReqTrace {
@@ -618,7 +619,10 @@ int main(int argc, char** argv) {
             else if (body["system"].is_array())
                 for (auto& b : body["system"])
                     if (b.value("type", "") == "text") sys += b.value("text", "");
-            if (!sys.empty()) msgs.push_back({"system", sys});
+            if (!sys.empty()) {
+                q27::normalize_cc_billing_header(sys);
+                msgs.push_back({"system", sys});
+            }
         }
         for (auto& m : body["messages"]) {
             std::string role = m.value("role", "user"), think, content;
