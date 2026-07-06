@@ -1175,3 +1175,47 @@ Phase-2 binary (greedy unchanged so CC/eval traffic identical; gains the
 sampled-spec path; log shows "5 greedy + 5 sampled perms"). See
 docs/sampling-phase2-impl.md. NEXT: the exit-criterion Thunderdome quality A/B +
 drift catalog under production sampling before sampling defaults on anywhere.
+
+## 2026-07-06 -- sampling exit gate PASSED; tool-call PARSING was the agentic ceiling
+
+Ran the exit gate (docs/sampling-exit-gate.md). Prereqs: **P1** `Q27_FORCE_TEMP`/
+`Q27_FORCE_TOP_P` server default so CC/CRUSH (which send no temperature) exercise the
+sampled path -- explicit request temp still wins; forced req draws a distinct LOGGED seed;
+env-unset is byte-identical greedy (canonical 4c4120c7 is CLI-generated, untouched). **P2**
+per-mode `[drift]` logging in parse_bare_tool_calls (modes 1-5 tag; UN-RESCUED flags an
+intended call the chain couldn't recover). Both verified by standalone header tests + live.
+
+The gate immediately surfaced the real story: **q27's low agentic scores were the
+SERVING-LAYER tool-call parser, not quant or sampling.** Batch-1 (T8 n=5 CRUSH) scored
+sampled 0.356 vs greedy 0.095 with BOTH legs dominated by un-rescued tool calls; the CC
+harness one-shot-quit (7s, 1 turn, score 0). Three parser drifts, each root-caused from
+REAL captured bytes and fixed in api_common.h (greedy canonical untouched throughout):
+- **write-content**: file writes are `"content": "CODE</content>` -- JSON-quote-open value,
+  stray `</content>` tag-close, unescaped quotes/newlines/braces in the body break the
+  string and the code's braces corrupt the depth scan. escape_content_tags only fired on a
+  `<content>` OPENING tag; extended it to the quote-open/tag-close shape (anchor `"content":`,
+  rewrite the raw span). 6/6 of the batch-1 CRUSH failures.
+- **CC mode-6**: `{"name":\n{ARGS}}` -- name string AND "arguments" key both absent. Added
+  infer_tool_name (match orphaned arg-keys to a tool schema; exact required-set wins; refuse
+  on tie) + scan_namedropped for the unbalanced `{"name":{ARGS}{"name":{ARGS}` batch. Tools
+  JSON plumbed to parse_bare_tool_calls (streaming provider captures `tools` by value).
+- **dangling-prefix hybrid** ("read all files in parallel"): a bare `{"name":\n` prepended to
+  a batch of VALID calls; the dangling opener sent the scan into the truncated path whose
+  `break` discarded the valid calls after it. Fixed: break only when the repair actually
+  recovered a call, else advance-and-continue. `[drift] UN-RESCUED` gained `(ntools=N)` to
+  separate plumbing (<=0) from schema-miss (>0) -- the diagnostic that pinned this one.
+
+Live effect (fixed server, greedy T8): **CC 0.00 -> 0.466-0.553** (one-shot-quit -> 65-92
+turn full trajectories, writes the whole project), **CRUSH greedy 0.095 -> 0.484**.
+
+**Gate verdict -- PASS.** Fixed-path re-gate (T8 n=5/leg, same-day, greedy vs sampled-T0.7):
+CC 0.466->0.553 (+.087), CRUSH 0.484->0.510 (+.026). Sampled >= greedy on BOTH harnesses;
+no new drift mode; sampled:CC had FEWER un-rescued than greedy:CC (sampling's variation
+escapes greedy's DETERMINISTIC failure basins). n=5 high-variance so "no regression detected,
+plausible small benefit", not a nailed win. Speed neutral (T<=0.7 is the flat accept-vs-temp
+region). **Sampling cleared to default at T<=0.7 / top_p 0.95.** The T8 bimodality (score
+~0.48 vs ~0.85; hidden_tests ~0.04 usual vs 0.92-0.96 occasional) is MODEL quality --
+structurally-complete but behaviorally-imperfect code -- orthogonal to the serving gate and
+a separate thread. Residual un-rescued after all three fixes: a small non-fatal mode-6 tail.
+Tree UNCOMMITTED (P1/P2 + three fixes + docs). Harnesses: claude-code-q27-haight (mode-6
+exhibit), crush-q27-greedy-haight (the 0.786 baseline).

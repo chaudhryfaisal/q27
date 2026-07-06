@@ -45,15 +45,32 @@ static std::string jdump(const json& j) {
 // or absent -> greedy (inv_temp 0 routes generate() to the bitwise spec path).
 // top_p defaults to 1 (full vocab). seed is honored for reproducible A/B; the
 // OpenAI shapes carry it natively, and it is read harmlessly on the others.
+// Q27_FORCE_TEMP / Q27_FORCE_TOP_P let the server apply sampling to clients that
+// send NO temperature (CC/CRUSH) -- the exit-gate "default on" config
+// (docs/sampling-exit-gate.md). An explicit request temperature still wins: the
+// body.value default only fires when the key is absent. Env unset -> force_temp 0
+// -> byte-identical to the old greedy path (canonical 4c4120c7 is CLI-generated and
+// untouched regardless). A forced request with no client seed draws a distinct
+// atomic-counter seed, LOGGED, so each trial is an independent sample yet reproducible
+// by replaying that seed as an explicit request field.
 static q27k::SampleParams parse_sample(const json& body) {
+    static const double force_temp = []{ const char* e = getenv("Q27_FORCE_TEMP"); return e ? atof(e) : 0.0; }();
+    static const double force_tp   = []{ const char* e = getenv("Q27_FORCE_TOP_P"); return e ? atof(e) : 1.0; }();
+    static std::atomic<unsigned long long> force_seed_ctr{0};
+
     q27k::SampleParams s{0.f, 1.f, 0ull};
-    double temp = body.value("temperature", 0.0);
+    double temp = body.value("temperature", force_temp);
     if (temp > 0.0) {
         s.inv_temp = (float)(1.0 / temp);
-        double tp = body.value("top_p", 1.0);
+        double tp = body.value("top_p", force_tp);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
+        else if (force_temp > 0.0) {
+            s.seed = ++force_seed_ctr;   // distinct independent draw per forced request
+            fprintf(stderr, "[force-sample] temp=%.3f top_p=%.3f seed=%llu\n",
+                    temp, (double)s.top_p, s.seed);
+        }
     }
     return s;
 }
@@ -752,7 +769,7 @@ int main(int argc, char** argv) {
             if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
-                auto bcs = q27::parse_bare_tool_calls(tx, &pre);
+                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
                 if (!bcs.empty()) {
                     fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (nonstream)\n",
                             bcs.size());
@@ -784,7 +801,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len, rt](
+            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt](
                 size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
@@ -898,7 +915,7 @@ int main(int argc, char** argv) {
                     // wrapper-less call recovery: text already streamed as
                     // text_delta (cosmetic); the tool_use blocks still fire
                     std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre);
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
                     if (!bcs.empty()) {
                         fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (stream)\n",
                                 bcs.size());

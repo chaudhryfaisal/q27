@@ -7,7 +7,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -326,17 +328,9 @@ inline std::string strip_ws2(const std::string& s) {
 // <content>...</content> tags (the fine-tune's SFT file format leaking into
 // arguments). Rewrite `: <content>RAW</content>` spans into proper JSON
 // strings so the call parses. Returns the input unchanged if no tag pair.
-inline std::string escape_content_tags(const std::string& text) {
-    size_t a = text.find("<content>");
-    if (a == std::string::npos) return text;
-    size_t v = a + 9;
-    size_t b = text.rfind("</content>");
-    if (b == std::string::npos || b < v) return text;
-    // only rewrite when the tag sits in value position (": <content>")
-    size_t k = text.find_last_not_of(" \t\r\n", a - 1);
-    if (k == std::string::npos || text[k] != ':') return text;
+inline std::string escape_json_interior(const std::string& s) {
     std::string esc;
-    for (char c : text.substr(v, b - v)) {
+    for (char c : s) {
         switch (c) {
             case '"': esc += "\\\""; break;
             case '\\': esc += "\\\\"; break;
@@ -346,7 +340,122 @@ inline std::string escape_content_tags(const std::string& text) {
             default: esc += c;
         }
     }
-    return text.substr(0, a) + "\"" + esc + "\"" + text.substr(b + 10);
+    return esc;
+}
+
+// Rewrite a raw code/text value the fine-tune delimited with <content> tags into a
+// proper JSON string so the call parses. Two observed shapes:
+//   (1) "key": <content>RAW</content>   -- both angle tags in value position.
+//   (2) "content": "RAW</content>       -- JSON-quote OPEN, tag CLOSE. The file-write
+//       drift: RAW is a multi-line file body with unescaped quotes/newlines/braces
+//       that break the JSON string; the model terminates it with a stray </content>
+//       (SFT format leak) instead of a closing quote, then continues ", "file_path":...".
+//       Verified 6/6 on the failing writes in the 2026-07-06 CRUSH A/B batch.
+inline std::string escape_content_tags(const std::string& text) {
+    size_t a = text.find("<content>");
+    if (a != std::string::npos) {                    // shape 1
+        size_t v = a + 9;
+        size_t b = text.rfind("</content>");
+        if (b == std::string::npos || b < v) return text;
+        size_t k = text.find_last_not_of(" \t\r\n", a - 1);
+        if (k == std::string::npos || text[k] != ':') return text;
+        return text.substr(0, a) + "\"" + escape_json_interior(text.substr(v, b - v)) +
+               "\"" + text.substr(b + 10);
+    }
+    // shape 2: "content": "RAW</content>  (no opening <content> tag)
+    size_t close = text.find("</content>");
+    if (close == std::string::npos) return text;
+    size_t key = text.rfind("\"content\":", close); // nearest content key before the tag
+    if (key == std::string::npos) return text;
+    size_t q = text.find('"', key + 10);            // value-open quote after "content":
+    if (q == std::string::npos || q > close) return text;
+    return text.substr(0, q) + "\"" +
+           escape_json_interior(text.substr(q + 1, close - q - 1)) + "\"" +
+           text.substr(close + 10);
+}
+
+// Infer a tool name from an orphaned arguments object (drift mode 6: the model emits
+// {"name": {ARGS}} with the name STRING value and the "arguments" key both absent from
+// the bytes -- observed on the Claude Code tool schema). Match ARGS's keys against each
+// tool's schema: an exact required-set match wins outright; else the highest
+// (2*overlap - foreign) score, refusing on a tie (a wrong tool is worse than leaving it
+// un-rescued). Needs the request's anthropic_tools_json; nullptr/no-match -> "".
+inline std::string infer_tool_name(const json& tools, const json& args) {
+    if (!tools.is_array() || !args.is_object()) return "";
+    std::set<std::string> ak;
+    for (auto it = args.begin(); it != args.end(); ++it) ak.insert(it.key());
+    if (ak.empty()) return "";
+    std::string best; int best_score = 0; bool tie = false;
+    for (const auto& t : tools) {
+        if (!t.contains("function")) continue;
+        const json& fn = t["function"];
+        std::string name = fn.value("name", std::string());
+        if (name.empty()) continue;
+        std::set<std::string> props, req;
+        if (fn.contains("parameters") && fn["parameters"].is_object()) {
+            const json& p = fn["parameters"];
+            if (p.contains("properties") && p["properties"].is_object())
+                for (auto it = p["properties"].begin(); it != p["properties"].end(); ++it) props.insert(it.key());
+            if (p.contains("required") && p["required"].is_array())
+                for (const auto& r : p["required"]) if (r.is_string()) req.insert(r.get<std::string>());
+        }
+        if (!req.empty() && req == ak) return name;   // exact required-set match: decisive
+        int overlap = 0, foreign = 0;
+        for (const auto& k : ak) (props.count(k) ? overlap : foreign)++;
+        int score = 2 * overlap - foreign;
+        if (overlap > 0) {
+            if (score > best_score) { best_score = score; best = name; tie = false; }
+            else if (score == best_score) tie = true;
+        }
+    }
+    return tie ? "" : best;
+}
+
+// Recover a name-dropped mode-6 BATCH: {"name":<ws>{ARGS}[ {"name":<ws>{ARGS}]... where
+// each outer {"name": never closes (net +1 depth per unit) so the main balanced scan
+// misses the whole run (observed on CC greedy: six {"name":\n{"file_path":...} Read calls).
+// For each unit, extract the balanced ARGS object (control-chars sanitized) and infer the
+// tool from its key signature. Appends recovered calls; sets *first to the earliest hit.
+inline void scan_namedropped(const std::string& text, const json* tools,
+                             std::vector<ToolCall>& out, size_t* first) {
+    if (!tools) return;
+    size_t p = 0;
+    while ((p = text.find("{\"name\":", p)) != std::string::npos) {
+        size_t q = p + 8;
+        while (q < text.size() && (text[q]==' '||text[q]=='\t'||text[q]=='\r'||text[q]=='\n')) q++;
+        if (q >= text.size() || text[q] != '{') { p += 8; continue; }
+        int depth = 0; bool in_str = false, esc = false; size_t e = std::string::npos;
+        std::string san;
+        for (size_t j = q; j < text.size(); j++) {
+            char ch = text[j];
+            if (esc) { esc = false; san += ch; continue; }
+            if (in_str) {
+                if (ch == '\\') { esc = true; san += ch; continue; }
+                if (ch == '"') { in_str = false; san += ch; continue; }
+                if (ch == '\n') { san += "\\n"; continue; }
+                if (ch == '\r') { san += "\\r"; continue; }
+                if (ch == '\t') { san += "\\t"; continue; }
+                san += ch; continue;
+            }
+            san += ch;
+            if (ch == '"') in_str = true;
+            else if (ch == '{') depth++;
+            else if (ch == '}' && --depth == 0) { e = j; break; }
+        }
+        if (e == std::string::npos) break;   // truncated final unit
+        try {
+            json args = json::parse(san);
+            if (args.is_object()) {
+                std::string nm = infer_tool_name(*tools, args);
+                if (!nm.empty()) {
+                    ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(args);
+                    if (*first == std::string::npos) *first = p;
+                    out.push_back(std::move(tc));
+                }
+            }
+        } catch (...) {}
+        p = e + 1;
+    }
 }
 
 // Scan for ALL recoverable bare calls. Balanced {"name":...,"arguments":...}
@@ -354,11 +463,15 @@ inline std::string escape_content_tags(const std::string& text) {
 // like the literal {"tool_call": opener, which nets +1 depth per blob and
 // never closes); a trailing truncated {"name" candidate gets framing repair
 // (close open string, strip junk tags, close braces). prefix = text before
-// the first recovered call.
+// the first recovered call. `tools` (optional) enables mode-6 name inference.
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
-                                                   std::string* prefix) {
+                                                   std::string* prefix,
+                                                   const json* tools = nullptr) {
     std::vector<ToolCall> out;
+    bool m2 = false, m5 = false, m6 = false;        // drift-mode flags (exit-gate catalog)
     const std::string text = escape_content_tags(text_in);
+    const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
+    const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
     size_t first = std::string::npos;
     size_t i = text.find('{');
     while (i != std::string::npos) {
@@ -373,9 +486,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (ch == '\\') { esc = true; san += ch; continue; }
                 if (ch == '"') { in_str = false; san += ch; continue; }
                 // fifth drift mode: literal newlines/tabs inside the string
-                if (ch == '\n') { san += "\\n"; continue; }
-                if (ch == '\r') { san += "\\r"; continue; }
-                if (ch == '\t') { san += "\\t"; continue; }
+                if (ch == '\n') { san += "\\n"; m5 = true; continue; }
+                if (ch == '\r') { san += "\\r"; m5 = true; continue; }
+                if (ch == '\t') { san += "\\t"; m5 = true; continue; }
                 san += ch;
                 continue;
             }
@@ -418,20 +531,34 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 json j = json::parse(r);
                 shaped = j.is_object() && j.contains("name") && j.contains("arguments");
             } catch (...) {}
+            bool recovered_here = false;
             if (shaped) {
                 ToolCall tc = parse_tool_call(r);
                 if (tc.ok) {
                     if (first == std::string::npos) first = i;
                     out.push_back(tc);
+                    m2 = true;   // mode 2: truncated/unterminated JSON repaired
+                    recovered_here = true;
                 }
             }
-            break; // candidate consumed the rest of the text either way
+            if (recovered_here) break;   // genuine truncated FINAL call consumed the rest
+            // else: a dangling/failed {"name": opener -- e.g. the mode-6 HYBRID where the
+            // model prepends a bare {"name": before a batch of VALID calls ("read all files
+            // in parallel"). Don't discard the rest: advance past the opener and keep scanning
+            // so the real calls after it recover normally.
+            i = text.find('{', i + 1);
+            continue;
         }
         const std::string& seg = san;
-        bool shaped = false;
+        bool shaped = false, m6cand = false;
+        json j6;
         try {
             json j = json::parse(seg);
             shaped = j.is_object() && j.contains("name") && j.contains("arguments");
+            if (!shaped && j.is_object() && j.contains("name") &&
+                j["name"].is_object() && !j.contains("arguments")) {
+                m6cand = true; j6 = std::move(j);
+            }
         } catch (...) {}
         if (shaped) {
             ToolCall tc = parse_tool_call(seg);
@@ -441,8 +568,26 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 i = text.find('{', end + 1);
                 continue;
             }
+        } else if (m6cand && tools) {
+            // mode 6: {"name": {ARGS}} -- name string + "arguments" key both dropped.
+            // Infer the tool from the orphaned args' key signature.
+            std::string nm = infer_tool_name(*tools, j6["name"]);
+            if (!nm.empty()) {
+                ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = j6["name"];
+                if (first == std::string::npos) first = i;
+                out.push_back(std::move(tc));
+                m6 = true;
+                i = text.find('{', end + 1);
+                continue;
+            }
         }
         i = text.find('{', i + 1);
+    }
+    // Fallback: name-dropped mode-6 BATCH (the main scan can't segment it). Only when the
+    // standard scan found nothing, so normal calls are never double-counted.
+    if (out.empty() && tools && text.find("{\"name\":") != std::string::npos) {
+        scan_namedropped(text, tools, out, &first);
+        if (!out.empty()) m6 = true;
     }
     if (prefix) {
         std::string p = first == std::string::npos ? "" : strip_ws2(text.substr(0, first));
@@ -451,14 +596,35 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             p = strip_ws2(p.substr(0, p.size() - 13));
         *prefix = p;
     }
+    // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
+    // drift mode(s) the fallback chain rescued, or flag an intended call it could
+    // NOT recover. Log-only; the parse result is unchanged.
+    if (!out.empty()) {
+        char modes[8]; int mi = 0;
+        modes[mi++] = '1';               // baseline: dropped-<tool_call>-wrapper recovery
+        if (m2) modes[mi++] = '2';
+        if (m3) modes[mi++] = '3';
+        if (m4) modes[mi++] = '4';
+        if (m5) modes[mi++] = '5';
+        if (m6) modes[mi++] = '6';
+        modes[mi] = 0;
+        fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
+    } else if (text_in.find("{\"name\"") != std::string::npos ||
+               text_in.find("{\"tool_call\"") != std::string::npos) {
+        // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
+        // mode-6 args didn't confidently match any tool). Longer window so the call
+        // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
+        fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
+                tools ? (int)tools->size() : -1, text_in.c_str());
+    }
     return out;
 }
 
 // Single-call convenience wrapper (first recovered call). suffix retained for
 // callers that trim trailing junk; multi-call callers use the vector form.
 inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
-                                     std::string* suffix) {
-    auto v = parse_bare_tool_calls(text_in, prefix);
+                                     std::string* suffix, const json* tools = nullptr) {
+    auto v = parse_bare_tool_calls(text_in, prefix, tools);
     if (v.empty()) return ToolCall{};
     if (suffix) *suffix = "";
     return v.front();
