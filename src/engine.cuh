@@ -160,6 +160,11 @@ struct Engine {
     float* d_draft_margin = nullptr; // [5] drafter top1-top2 margins (device)
     float h_draft_margin[5] = {};
     float pmin_theta = 0.f; // Q27_PMIN; <=0 => gating off (always full width 5)
+    // gate_maxd = deepest draft the gate may reach (Q27_MAXD, 4 or 5). Default 4:
+    // the robust win on all traffic (depth-4 gate = +10.8% @60K). maxd=5 draws 5
+    // MTP passes/round and only pays off on high-acceptance (agentic) traffic
+    // (+2.6% agentic, -8% docs), so it is opt-in.
+    int gate_maxd = 4;
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
@@ -821,6 +826,12 @@ struct Engine {
         // one warm (executing) round to initialize lazy CUDA state, then reset.
         // seed + reset are factored so the Phase-2 sampled graph set warms the
         // same way (its verify tail launches new kernels that also need warming).
+        // P12b: Q27_MAXD (4 or 5) picks the deepest gated draft. Read here (not
+        // with Q27_PMIN below) because it shapes capture: draft depth, warm
+        // width, and how many per-width verify graphs to build.
+        if (const char* md = getenv("Q27_MAXD")) { gate_maxd = atoi(md); }
+        if (gate_maxd < 4) gate_maxd = 4;
+        if (gate_maxd > 5) gate_maxd = 5;
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5;
         auto seed_positions = [&]() {
             CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
@@ -860,7 +871,7 @@ struct Engine {
         // P12b: warm the WIDEST kernels (6-lane verify + 5th draft = distinct
         // gemv<6>/ntok=6 instantiations) so graph capture never triggers a lazy
         // module load. Output is discarded and reset below.
-        perm = 0; dmax = 5; vw = 6;
+        perm = 0; dmax = gate_maxd; vw = gate_maxd + 1;
         seed_positions();
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -876,8 +887,8 @@ struct Engine {
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
             CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gr));
-            // P12b: the gated draft graph produces 5 drafts + 5 margins.
-            dmax = 5;
+            // P12b: the gated draft graph produces gate_maxd drafts + margins.
+            dmax = gate_maxd;
             // P11: same round, split at the draft/verify boundary. The two
             // halves reference the identical buffers, so launching D then V
             // back-to-back on stm equals the monolithic graph; the host reads
@@ -898,7 +909,7 @@ struct Engine {
             // at W-1, so committed state and emitted tokens are width-invariant.
             // W>=2: the batched gemv (gemv_q?_n) has no nbatch=1 kernel, so the
             // shallowest gated round verifies {pending, d1} (width 2), not 1.
-            for (int W = 2; W <= 6; W++) {
+            for (int W = 2; W <= gate_maxd + 1; W++) {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -935,9 +946,9 @@ struct Engine {
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
         fprintf(stderr,
-                "spec graphs captured (6 greedy + 6 sampled perms, depth-4; +split D/V; "
-                "+P12b per-width verify 2..6, gated depth-5); Q27_PMIN=%.3f (%s)\n",
-                pmin_theta, pmin_theta > 0 ? "gated" : "off");
+                "spec graphs captured (6 perms, depth-4; +split D/V; +P12b per-width verify "
+                "2..%d); Q27_PMIN=%.3f (%s), gate_maxd=%d\n",
+                gate_maxd + 1, pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd);
     }
 
     // one speculative round (depth 4); returns tokens emitted (1..5).
@@ -967,7 +978,7 @@ struct Engine {
                                        cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaStreamSynchronize(stm));
             int cap = 0;
-            while (cap < 5 && h_draft_margin[cap] >= pmin_theta) cap++;
+            while (cap < gate_maxd && h_draft_margin[cap] >= pmin_theta) cap++;
             int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
             CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
         } else {
