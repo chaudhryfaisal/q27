@@ -5,7 +5,9 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s model.q27 --tokens \"1,2,3\" [-n N] [--ctx C] [--dump-logits f]\n",
+        fprintf(stderr,
+                "usage: %s model.q27 --tokens \"1,2,3\" [-n N] [--ctx C] [--dump-logits f]\n"
+                "       [--spec] [--temp T --top-p P --seed S]  (temp>0 = sampled spec decode)\n",
                 argv[0]);
         return 1;
     }
@@ -32,6 +34,10 @@ int main(int argc, char** argv) {
     std::string nll_path;
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
+    // Sampling (roadmap #2). temp>0 routes the --spec loop to the sampled spec
+    // path (Phase 2); Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B.
+    double temp = 0.0, top_p = 1.0;
+    unsigned long long seed = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
@@ -49,6 +55,9 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
         if (!strcmp(argv[i], "--verify-weights")) verify_weights = true;
         if (!strcmp(argv[i], "--kvstats") && i + 1 < argc) kvstats_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
+        if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
+        if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
@@ -893,11 +902,27 @@ int main(int argc, char** argv) {
         std::vector<int> out;
         int P = (int)toks.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
+        // Sampling (Phase 2): temp>0 resamples the pending token + rejection-
+        // accepts drafts. Same bootstrap as Engine::generate -- e.logits holds
+        // the last prompt token's logits and h_next/d_P/d_pos are set, so the
+        // first eager draw keys at d_pos with kind 0. Q27_SAMPLE_PLAIN=1 forces
+        // the plain sampler (no spec) for the spec==non-spec distribution A/B.
+        const bool sampling = temp > 0.0;
+        const bool plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
+        if (sampling) {
+            e.samp = {(float)(1.0 / temp), (float)top_p, seed};
+            CUDA_CHECK(cudaMemcpyAsync(e.d_samp, &e.samp, sizeof e.samp, cudaMemcpyHostToDevice,
+                                       e.stm));
+            e.samp_first = true;
+            fprintf(stderr, "sampling: T=%.3f top_p=%.3f seed=%llu path=%s\n", temp, top_p, seed,
+                    plain_sample ? "plain" : "spec");
+        }
         int total_emitted = 0, rounds = 0, hist[5] = {0, 0, 0, 0, 0};
         while ((int)out.size() < n_gen) {
             if (P + 6 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
             int em[5];
-            int n = e.spec_round(em);
+            int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
+                             : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
             total_emitted += n;

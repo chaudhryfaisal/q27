@@ -1236,7 +1236,7 @@ static void test_sample() {
     CUDA_CHECK(cudaMalloc(&d_x, n * 4));
     CUDA_CHECK(cudaMalloc(&d_out, 4));
     CUDA_CHECK(cudaMalloc(&d_scr, 8));
-    CUDA_CHECK(cudaMalloc(&d_nuc, 3 * 4));
+    CUDA_CHECK(cudaMalloc(&d_nuc, 4 * 4)); // {thresh,M,logZ,mass}
     CUDA_CHECK(cudaMalloc(&d_pos, 4));
     CUDA_CHECK(cudaMalloc(&d_sp, sizeof(q27k::SampleParams)));
     CUDA_CHECK(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice));
@@ -1320,7 +1320,133 @@ static void test_sample() {
     CUDA_CHECK(cudaFree(d_pos)); CUDA_CHECK(cudaFree(d_sp));
 }
 
+// Phase 2: spec rejection sampling (k_spec_accept + k_sample_stop). Synthetic
+// 5-lane logits + greedy drafts, no model. The token committed at lane 0's
+// position is dr1 when accepted, else the exclude-masked resample -- and the
+// rejection-sampling theorem says that composition reproduces p_served(lane0)
+// EXACTLY, with P(accept dr1) = p_served(dr1) = softmax_full(dr1)/nucleus_mass.
+// So this gates: the mass-correct accept prob, the served-target distribution,
+// determinism, and that a rejected draft is never re-emitted.
+static void test_spec_sample() {
+    const int V = 64;
+    const float invT = 1.0f / 0.85f;      // T=0.85
+    const float topp = 0.9f;              // <1 -> nucleus mass < 1 exercises the accept path
+    const unsigned long long seed = 20260705ull;
+
+    std::vector<float> flat(5 * V);
+    std::vector<std::vector<float>> L(5);
+    for (int k = 0; k < 5; k++) {
+        L[k] = rand_vec(V, 100 + k * 7);
+        for (auto& v : L[k]) v *= 2.2f;
+        for (int i = 0; i < V; i++) flat[k * V + i] = L[k][i];
+    }
+    auto argmax = [&](int k) {
+        int b = 0; for (int i = 1; i < V; i++) if (L[k][i] > L[k][b]) b = i; return b;
+    };
+    int drafts[4] = {argmax(0), argmax(1), argmax(2), argmax(3)};
+
+    float *d_logits2, *d_nuc5; int *d_spec, *d_out, *d_P, *d_drafts, *d_cap;
+    unsigned long long* d_scr; q27k::SampleParams* d_sp;
+    CUDA_CHECK(cudaMalloc(&d_logits2, 5 * V * 4));
+    CUDA_CHECK(cudaMalloc(&d_nuc5, 5 * 4 * 4));
+    CUDA_CHECK(cudaMalloc(&d_spec, 3 * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, 4));
+    CUDA_CHECK(cudaMalloc(&d_P, 4));
+    CUDA_CHECK(cudaMalloc(&d_drafts, 4 * 4));
+    CUDA_CHECK(cudaMalloc(&d_cap, 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, 8));
+    CUDA_CHECK(cudaMalloc(&d_sp, sizeof(q27k::SampleParams)));
+    CUDA_CHECK(cudaMemcpy(d_logits2, flat.data(), 5 * V * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_drafts, drafts, 4 * 4, cudaMemcpyHostToDevice));
+    int zero = 0; CUDA_CHECK(cudaMemcpy(d_cap, &zero, 4, cudaMemcpyHostToDevice));
+    q27k::SampleParams sp{invT, topp, seed};
+    CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
+
+    for (int k = 0; k < 5; k++)
+        q27k::nucleus(d_logits2 + k * V, V, d_sp, d_nuc5 + k * 4, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float nuc[5 * 4]; CUDA_CHECK(cudaMemcpy(nuc, d_nuc5, 5 * 4 * 4, cudaMemcpyDeviceToHost));
+
+    // (a) nucleus mass for lane 0 vs a CPU sum over the GPU threshold.
+    const float thr0 = nuc[0], mass0 = nuc[3];
+    std::vector<double> ps(V, 0.0); double cpu_mass = 0;
+    {
+        double Mx = L[0][0]; for (int i = 1; i < V; i++) Mx = std::max(Mx, (double)L[0][i]);
+        double Z = 0; std::vector<double> sf(V);
+        for (int i = 0; i < V; i++) { sf[i] = std::exp((double)invT * (L[0][i] - Mx)); Z += sf[i]; }
+        for (int i = 0; i < V; i++) sf[i] /= Z;
+        for (int i = 0; i < V; i++) if (L[0][i] >= thr0) cpu_mass += sf[i];
+        for (int i = 0; i < V; i++) if (L[0][i] >= thr0) ps[i] = sf[i] / cpu_mass;
+    }
+    printf("    [lane0 thr=%.3f mass_gpu=%.4f mass_cpu=%.4f]\n", thr0, mass0, cpu_mass);
+    check("spec nucleus mass vs CPU", std::fabs(mass0 - cpu_mass), 2e-3);
+
+    auto round = [&](int P, int& n_out, int& nt_out) {
+        CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
+        q27k::spec_accept(d_logits2, d_nuc5, d_drafts, d_drafts + 1, d_drafts + 2, d_drafts + 3,
+                          d_sp, d_P, d_cap, V, d_spec, 0);
+        q27k::sample_stop(d_logits2, d_nuc5, d_spec, d_sp, d_P, V, d_out, d_scr, 0);
+        int spec[3], nt;
+        CUDA_CHECK(cudaMemcpy(spec, d_spec, 3 * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&nt, d_out, 4, cudaMemcpyDeviceToHost));
+        n_out = spec[0]; nt_out = nt;
+    };
+
+    // (b) seeded identity: same (seed, P) -> identical n and nt.
+    {
+        int n1, nt1, n2, nt2;
+        round(555, n1, nt1); round(555, n2, nt2);
+        check("spec seeded identity", (double)((n1 != n2) || (nt1 != nt2)), 0.5);
+    }
+
+    // (c,d,e) committed@lane0 distribution + accept rate + exclude respected.
+    const int N = 8192;
+    std::vector<int> obs(V, 0);
+    int accepts = 0, excl_viol = 0, oob = 0;
+    for (int t = 0; t < N; t++) {
+        int n, nt; round(t, n, nt);
+        if (n >= 2) accepts++;                       // lane 0 accepted dr1
+        int commit = (n == 1) ? nt : drafts[0];      // token committed at lane 0's position
+        if (n == 1 && nt == drafts[0]) excl_viol++;  // rejected draft must not reappear
+        if (L[0][commit] < thr0) oob++;              // committed token must be in-nucleus
+        obs[commit]++;
+    }
+    double emp_accept = (double)accepts / N;
+    printf("    [spec accept(dr1) emp=%.4f p_served=%.4f]\n", emp_accept, ps[drafts[0]]);
+    check("spec accept rate == p_served(dr1)", std::fabs(emp_accept - ps[drafts[0]]), 0.03);
+    check("spec reject excludes draft", (double)excl_viol, 0.5);
+    check("spec commit in-nucleus", (double)oob, 0.5);
+    double chi2 = 0; int df = -1;
+    for (int i = 0; i < V; i++) {
+        if (L[0][i] < thr0) { if (obs[i]) chi2 = 1e9; continue; }
+        double e = N * ps[i];
+        if (e < 5) continue;
+        chi2 += (obs[i] - e) * (obs[i] - e) / e; df++;
+    }
+    double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
+    printf("    [spec chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
+    check("spec rejection-sampling vs served target", chi2 < bound ? 0.0 : 1.0, 0.5);
+
+    CUDA_CHECK(cudaFree(d_logits2)); CUDA_CHECK(cudaFree(d_nuc5)); CUDA_CHECK(cudaFree(d_spec));
+    CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_P)); CUDA_CHECK(cudaFree(d_drafts));
+    CUDA_CHECK(cudaFree(d_cap)); CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_sp));
+}
+
 int main(int argc, char** argv) {
+    // The sampler kernels are synthetic (no weights). --sampling-only runs just
+    // them, skipping the 17.7GB model load, so they can be validated while a
+    // server holds most of the GPU (only ~KB of scratch is needed here).
+    bool sampling_only = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--sampling-only")) sampling_only = true;
+    if (sampling_only) {
+        printf("q27 sampling-only kernel tests (no model)\n");
+        test_masked_argmax();
+        test_sample();
+        test_spec_sample();
+        printf("%s\n", g_fail ? "FAILED" : "ALL PASS");
+        return g_fail ? 1 : 0;
+    }
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
     q27::DeviceModel dm(m);
@@ -1348,6 +1474,7 @@ int main(int argc, char** argv) {
     test_wy_stream_isolation();
     test_masked_argmax();
     test_sample();
+    test_spec_sample();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();

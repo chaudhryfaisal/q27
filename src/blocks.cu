@@ -387,7 +387,7 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
                             float* __restrict__ out) {
     const float inv_temp = sp->inv_temp, top_p = sp->top_p;
     __shared__ float sh[1024];
-    __shared__ float s_M, s_logZ, s_lo, s_hi;
+    __shared__ float s_M, s_logZ, s_lo, s_hi, s_thresh;
     const int t = threadIdx.x, B = blockDim.x;
     float v = -FLT_MAX;
     for (int i = t; i < n; i += B) v = fmaxf(v, x[i]);
@@ -430,9 +430,27 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
         float thresh;
         if (top_p >= 1.0f) thresh = -FLT_MAX;
         else { float tau = s_lo; thresh = (tau <= 0.f) ? -FLT_MAX : M + (logf(tau) + logZ) / inv_temp; }
-        out[0] = fminf(thresh, M); // argmax token always in nucleus
+        s_thresh = fminf(thresh, M); // argmax token always in nucleus
+    }
+    __syncthreads();
+    // out[3] = nucleus mass = sum_{x_i >= thresh} softmax_full(i) (Phase 2 accept
+    // test needs the RENORMALIZED served prob p(dr)=softmax_full(dr)/mass, not
+    // softmax_full(dr); mass==1 when top_p>=1 so the plain path is unaffected).
+    // One extra grid-stride pass over the just-fixed threshold (argmax cost class).
+    const float thr = s_thresh;
+    float ms = 0.f;
+    for (int i = t; i < n; i += B)
+        if (x[i] >= thr) ms += expf(inv_temp * (x[i] - M) - logZ);
+    sh[t] = ms; __syncthreads();
+    for (int s = B / 2; s > 0; s >>= 1) {
+        if (t < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    if (t == 0) {
+        out[0] = thr;
         out[1] = M;
         out[2] = logZ;
+        out[3] = sh[0]; // nucleus mass
     }
 }
 
@@ -474,6 +492,151 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
     k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
     k_gumbel_d<<<128, 256, 0, st>>>(logits, n, d_sp, d_nuc, d_pos, draw_kind, d_scratch);
     k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// nucleus stats for one lane (Phase 2 spec path calls this 5x, one per verify
+// lane, into d_nuc + lane*4). Same kernel the plain path uses -> spec and plain
+// sample the identical served distribution (the spec==non-spec gate relies on it).
+void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
+             cudaStream_t st) {
+    k_nucleus_d<<<1, 1024, 0, st>>>(logits, n, d_sp, d_nuc);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------- spec rejection sampling (roadmap #2 Phase 2, temp>0) --------
+// Greedy spec (k_finish_round equality chain) is untouched; these run only in
+// the sampled 2nd graph set. Philox draw kinds (counter word c1) are disjoint
+// so no two draw sites ever share a counter: 0/1 = plain eager/graph (Phase 1),
+// 2 = spec accept uniforms, 3 = spec stop Gumbel. All key on *d_P (the committed
+// position at round start; strictly increasing -> no cross-round collision).
+static constexpr unsigned KIND_SPEC_ACCEPT = 2u;
+static constexpr unsigned KIND_SPEC_STOP = 3u;
+
+// Serial accept walk (1 thread, like k_prep_round). For lane k (0..3), the draft
+// dr_{k+1} is accepted with prob p_served(dr) = softmax_full(dr)/mass restricted
+// to the nucleus (0 if the draft fell outside it). q is a delta at the greedy
+// draft, so min(1,p/q) = p (rejection sampling, Leviathan/Chen 2023). First
+// reject stops the chain; all-accept leaves stop_lane=4 for the free bonus draw.
+// out[3] = {n, stop_lane, exclude_token}. *cap forces n=1 (in-grammar; Phase-3
+// hook, never set on the sampled path today since tools are off under sampling).
+__global__ void k_spec_accept(const float* __restrict__ logits2,
+                              const float* __restrict__ nuc5, const int* __restrict__ dr1p,
+                              const int* __restrict__ dr2p, const int* __restrict__ dr3p,
+                              const int* __restrict__ dr4p, const SampleParams* __restrict__ sp,
+                              const int* __restrict__ dP, const int* __restrict__ cap,
+                              int vocab, int* __restrict__ out) {
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*dP;
+    const int dr[4] = {*dr1p, *dr2p, *dr3p, *dr4p};
+    int stop_lane = 4, exclude = -1;
+    if (*cap) {
+        stop_lane = 0; // n=1: commit only the pending, resample lane 0 fresh
+    } else {
+        for (int k = 0; k < 4; k++) {
+            const float* nl = nuc5 + (size_t)k * 4;
+            const float thr = nl[0], M = nl[1], logZ = nl[2], mass = nl[3];
+            const int d = dr[k];
+            const float xd = logits2[(size_t)k * vocab + d];
+            const float p = (xd >= thr) ? expf(inv_temp * (xd - M) - logZ) / mass : 0.f;
+            const float u = philox_uniform(seed, pos, KIND_SPEC_ACCEPT, (unsigned)k);
+            if (u < p) continue;        // accept draft k, extend the chain
+            stop_lane = k; exclude = d; // first reject: resample this lane sans d
+            break;
+        }
+    }
+    out[0] = stop_lane + 1; // n committed (pending + accepted drafts)
+    out[1] = stop_lane;
+    out[2] = exclude;
+}
+void spec_accept(const float* logits2, const float* nuc5, const int* dr1, const int* dr2,
+                 const int* dr3, const int* dr4, const SampleParams* d_sp, const int* d_P,
+                 const int* cap, int vocab, int* d_spec, cudaStream_t st) {
+    k_spec_accept<<<1, 1, 0, st>>>(logits2, nuc5, dr1, dr2, dr3, dr4, d_sp, d_P, cap, vocab,
+                                   d_spec);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Gumbel-max over the STOP lane's nucleus, excluding the rejected draft: the
+// residual resample norm(max(0,p-q)). Clone of k_gumbel_d with the logit base
+// (logits2 + stop*vocab) and nucleus (nuc5 + stop*4) selected on-device from
+// d_spec -- fixed base pointers, graph-safe. stop_lane==4 => exclude==-1, a
+// plain nucleus draw (the bonus). Same order-independent am_pack+atomicMax as
+// k_argmax -> deterministic token.
+__global__ void k_sample_stop(const float* __restrict__ logits2, const float* __restrict__ nuc5,
+                              const int* __restrict__ spec, const SampleParams* __restrict__ sp,
+                              const int* __restrict__ dP, int vocab,
+                              unsigned long long* __restrict__ best) {
+    const int stop_lane = spec[1];
+    const int exclude = spec[2];
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*dP;
+    const float* x = logits2 + (size_t)stop_lane * vocab;
+    const float thresh = nuc5[(size_t)stop_lane * 4];
+    float bv = -FLT_MAX;
+    int bi = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x) {
+        if (x[i] < thresh || i == exclude) continue;
+        float u = philox_uniform(seed, pos, KIND_SPEC_STOP, (unsigned)i);
+        float g = -logf(-logf(u));
+        float key = inv_temp * x[i] + g;
+        if (key > bv) { bv = key; bi = i; }
+    }
+    unsigned long long p = am_pack(bv, bi);
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = p;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(best, sh[0]);
+}
+// draws the new pending token into d_out (= d_token), mirroring sample_g's tail.
+void sample_stop(const float* logits2, const float* nuc5, const int* d_spec,
+                 const SampleParams* d_sp, const int* d_P, int vocab, int* d_out,
+                 unsigned long long* d_scratch, cudaStream_t st) {
+    k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
+    k_sample_stop<<<128, 256, 0, st>>>(logits2, nuc5, d_spec, d_sp, d_P, vocab, d_scratch);
+    k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Finish bookkeeping keyed on n from k_spec_accept (mirror of k_finish_round,
+// which keys on the equality chain). h_next = the stop lane's hidden x1[n-1]
+// (the position that predicted the new pending nt); *dP += n; outcome carries
+// n, the drafts, and nt (already in dtok from k_sample_stop). outcome[1] (the
+// pre-round pending t1) was snapshotted by k_prep_round.
+__global__ void k_finish_sampled(int* __restrict__ dP, const int* __restrict__ dtok,
+                                 const int* __restrict__ spec, const int* __restrict__ dr1p,
+                                 const int* __restrict__ dr2p, const int* __restrict__ dr3p,
+                                 const int* __restrict__ dr4p, const float* __restrict__ x1a,
+                                 const float* __restrict__ x1b, const float* __restrict__ x1c,
+                                 const float* __restrict__ x1d, const float* __restrict__ x1e,
+                                 float* __restrict__ h_next, int* __restrict__ outcome,
+                                 int n_embd) {
+    int n = spec[0];
+    const float* src = n == 5 ? x1e : n == 4 ? x1d : n == 3 ? x1c : n == 2 ? x1b : x1a;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
+        h_next[i] = src[i];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *dP += n;
+        outcome[0] = n;
+        outcome[6] = *dtok; // new pending token nt
+        outcome[2] = *dr1p;
+        outcome[3] = *dr2p;
+        outcome[4] = *dr3p;
+        outcome[5] = *dr4p;
+    }
+}
+void finish_sampled(int* d_P, const int* d_token, const int* d_spec, const int* dr1,
+                    const int* dr2, const int* dr3, const int* dr4, const float* x1a,
+                    const float* x1b, const float* x1c, const float* x1d, const float* x1e,
+                    float* h_next, int* outcome, int n_embd, cudaStream_t st) {
+    k_finish_sampled<<<4, 256, 0, st>>>(d_P, d_token, d_spec, dr1, dr2, dr3, dr4, x1a, x1b, x1c,
+                                        x1d, x1e, h_next, outcome, n_embd);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -63,7 +63,8 @@ struct Engine {
     // per-step {thresh,M,logZ}. All idle for greedy requests.
     q27k::SampleParams samp{0.f, 1.f, 0ull};
     q27k::SampleParams* d_samp = nullptr;
-    float* d_nuc = nullptr;
+    float* d_nuc = nullptr;  // [5][4]: {thresh,M,logZ,mass} per verify lane
+    int* d_spec = nullptr;   // [3]: {n, stop_lane, exclude_token} (Phase-2 verdict)
     bool samp_first = false; // first sampled token comes from the retained prefill logits
     // MTP draft head state (stage 1: host-driven acceptance measurement)
     float *h_next, *e_hn, *x_mtp, *mtp_logits;
@@ -141,6 +142,9 @@ struct Engine {
     // P11: split draft/verify graphs for the constrained tool path
     cudaGraphExec_t draft_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     cudaGraphExec_t verify_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
+    // (rejection) verify tail. Captured only when the sampler kernels are warm.
+    cudaGraphExec_t spec_sample_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 5;
@@ -219,7 +223,12 @@ struct Engine {
         A((void**)&d_pos, 4); A((void**)&d_token, 4); A((void**)&d_step, 4);
         A((void**)&d_gen, MAX_GEN_TRACK * 4);
         A((void**)&d_amax, 8);
-        A((void**)&d_samp, sizeof(q27k::SampleParams)); A((void**)&d_nuc, 3 * 4);
+        A((void**)&d_samp, sizeof(q27k::SampleParams));
+        // d_nuc: 5 lanes x {thresh,M,logZ,mass}. Plain path uses lane 0; the
+        // sampled spec round (Phase 2) fills all 5 verify lanes. d_spec holds the
+        // rejection-sampling verdict {n, stop_lane, exclude_token}.
+        A((void**)&d_nuc, 5 * 4 * 4);
+        A((void**)&d_spec, 3 * 4);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
         A(&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
@@ -654,7 +663,10 @@ struct Engine {
     // P11: verify half -- batch-5 forward of {pending, d1..d4}, masked argmax
     // per lane, finish_round. Reads d_draft..d_draft4 (set by the draft half)
     // and d_mask_ids/d_accept_cap (staged by the host between halves).
-    void spec_verify_launches() {
+    // batch-5 forward of {pending, d1..d4} -> logits2[5*VOCAB]. Shared verbatim
+    // by the greedy verify tail and the Phase-2 sampled tail (so the two never
+    // drift; the sampled path samples the identical logits the greedy path argmaxes).
+    void spec_verify_forward() {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
                      {{d_token, d_draft, d_draft2, d_draft3, d_draft4}}, N_EMBD,
@@ -679,6 +691,11 @@ struct Engine {
                                                                           : "output.weight";
         mm5(dm.get(vh), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
             logits2 + 3 * (size_t)VOCAB, logits2 + 4 * (size_t)VOCAB);
+    }
+
+    // P11: verify half -- batch-5 forward, masked argmax per lane, finish_round.
+    void spec_verify_launches() {
+        spec_verify_forward();
         // P7: slot 0 (the post-pending lane) is the constrained one; slots
         // 1-4 keep id -1 (v1 caps acceptance in-grammar instead of chasing
         // draft-dependent states the host cannot know pre-launch)
@@ -697,43 +714,72 @@ struct Engine {
                            N_EMBD, d_accept_cap, stm);
     }
 
+    // Phase 2: sampled verify tail. Same forward; replace the 5 argmax lanes +
+    // equality-chain finish with per-lane nucleus stats, rejection-sampling
+    // acceptance (k_spec_accept), a resample of the new pending from the stop
+    // lane (k_sample_stop -> d_token), and finish keyed on the accepted count n.
+    // Draws key Philox on *d_P; greedy graphs stay bitwise (separate graph set).
+    void spec_verify_launches_sampled() {
+        spec_verify_forward();
+        for (int k = 0; k < 5; k++)
+            q27k::nucleus(logits2 + (size_t)k * VOCAB, VOCAB, d_samp, d_nuc + k * 4, stm);
+        q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
+                          d_accept_cap, VOCAB, d_spec, stm);
+        q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
+        q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
+                             x1_b, x1_c, x1_d, x1_e, h_next, d_outcome, N_EMBD, stm);
+    }
+
     void spec_round_launches() {
         spec_draft_launches();
         spec_verify_launches();
     }
 
+    void spec_sample_round_launches() {
+        spec_draft_launches();
+        spec_verify_launches_sampled();
+    }
+
     void build_spec_graphs() {
-        // one warm (executing) round to initialize lazy CUDA state, then reset
+        // one warm (executing) round to initialize lazy CUDA state, then reset.
+        // seed + reset are factored so the Phase-2 sampled graph set warms the
+        // same way (its verify tail launches new kernels that also need warming).
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4;
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &z2, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_d, &z3, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_e, &z4, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m3, &z2, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m4, &z3, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemset(d_P, 0, 4));
+        auto seed_positions = [&]() {
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &z2, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_d, &z3, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_e, &z4, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_m3, &z2, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_m4, &z3, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemset(d_P, 0, 4));
+        };
+        auto reset_gdn_mtp = [&]() {
+            for (int il = 0; il < N_LAYER; il++)
+                if (!attn_layer[il]) {
+                    size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
+                    CUDA_CHECK(cudaMemset(S[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
+                    CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
+                    CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
+                    CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
+                    CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
+                }
+            CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+            CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+        };
+        seed_positions();
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
-        for (int il = 0; il < N_LAYER; il++)
-            if (!attn_layer[il]) {
-                size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
-                CUDA_CHECK(cudaMemset(S[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
-                CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
-                CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
-                CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
-                CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
-            }
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+        reset_gdn_mtp();
         // capture all 5 cyclic permutations (capture records; does not execute)
         for (int p = 0; p < 5; p++) {
             perm = p;
@@ -759,8 +805,26 @@ struct Engine {
             CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gv));
         }
+        // Phase 2: sampled graph set -- identical draft half, rejection-sampling
+        // verify tail. Warm with dummy params (the greedy graphs above are
+        // already instantiated and independent of the device state churned here).
+        q27k::SampleParams warm{1.f, 1.f, 0ull};
+        CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
+        seed_positions();
+        spec_sample_round_launches();
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        reset_gdn_mtp();
+        for (int p = 0; p < 5; p++) {
+            perm = p;
+            cudaGraph_t gr;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_sample_round_launches();
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
+            CUDA_CHECK(cudaGraphInstantiate(&spec_sample_graph[p], gr, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gr));
+        }
         perm = 0;
-        fprintf(stderr, "spec graphs captured (5 perms, depth-4; +split D/V)\n");
+        fprintf(stderr, "spec graphs captured (5 greedy + 5 sampled perms, depth-4; +split D/V)\n");
     }
 
     // one speculative round (depth 4); returns tokens emitted (1..5).
@@ -812,6 +876,28 @@ struct Engine {
         CUDA_CHECK(cudaStreamSynchronize(stm));
         emit[0] = tok;
         return 1;
+    }
+
+    // Phase 2 sampled spec round (temp>0): the sampled 2nd graph set restores
+    // spec speed under sampling. Like spec_round, but the pending token is
+    // resampled (not argmax'd) and the accept chain is rejection sampling. The
+    // first call samples the pending from the retained prefill logits (kind 0,
+    // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
+    // h_next is the prefill hidden. Tools are off under sampling, so no split path.
+    int spec_sample_round(int* emit) {
+        if (samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+        }
+        CUDA_CHECK(cudaGraphLaunch(spec_sample_graph[perm], stm));
+        int oc[7];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        int n = oc[0];
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        last_pending = oc[6];
+        perm = (perm + (n - 1)) % 5;
+        return n;
     }
     int last_pending = -1;
     // P11: called mid-round in the constrained path with the 4 draft tokens;
@@ -1301,11 +1387,16 @@ struct Engine {
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
         // Sampling (temp>0): upload request params once; the sampled path
-        // (sample_round, one token/round, no spec) replaces spec_round in the
-        // loop. Greedy (inv_temp<=0) leaves d_samp untouched and runs the spec
-        // path bitwise. d_pos is NP here (prefill's last advance), so the first
-        // eager draw keys the token at position NP with kind 0.
+        // replaces the greedy spec_round in the loop. Default = spec_sample_round
+        // (Phase 2: sampled depth-4 speculation, fast). Greedy (inv_temp<=0)
+        // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
+        // here (prefill's last advance), so the first eager draw keys the token
+        // at position NP with kind 0.
         const bool sampling = samp.inv_temp > 0.f;
+        // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
+        // spec) even under sampling -- the A/B lever for the spec==non-spec
+        // distribution gate (docs/sampling-design.md sec 4).
+        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
         if (sampling) {
             CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
             samp_first = true;
@@ -1350,6 +1441,14 @@ struct Engine {
             else
                 fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n",
                         why, emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
+            // Phase 2 acceptance-vs-temp telemetry (sampled path only; keeps the
+            // greedy [gen-done] line shortbench_suite parses untouched). tokens/
+            // round is the sampled spec acceptance -- it sags as temperature rises.
+            if (sampling && !force_plain_sample)
+                fprintf(stderr,
+                        "[sample-stats] T=%.3f top_p=%.3f: %.3f tokens/round (%d tok/%d rounds)\n",
+                        samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
+                        rounds > 0 ? (double)emitted / rounds : 0.0, emitted, rounds);
         };
         // ctx guard: a round writes attention-KV rows P+1..P+5 (and MTP rows
         // P+1..P+4); launching with P > max_ctx-6 would write past the caches
@@ -1360,7 +1459,8 @@ struct Engine {
         while (emitted < n_max) {
             if (Ph + 6 > max_ctx) { done("ctx-guard"); return emitted; }
             int em[5];
-            int n = sampling ? sample_round(em) : spec_round(em);
+            int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
+                             : spec_round(em);
             rounds++;
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {

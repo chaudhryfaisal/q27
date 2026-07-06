@@ -145,6 +145,31 @@ the t/s-vs-temp curve.
 - **Phase 2 -- spec rejection sampling**: k_spec_accept + k_sample_stop in a
   second 5-perm graph set, greedy drafts, --stats acceptance-vs-temp
   telemetry, spec==non-spec distribution gate.
+  - **DONE 2026-07-05 (all gates pass).** Kernels
+    in blocks.cu: k_nucleus_d extended with out[3]=nucleus_mass (the accept test
+    needs the RENORMALIZED served prob p(dr)=softmax_full(dr)/mass, not
+    softmax_full -- else top_p<1 under-accepts by 1/mass); k_spec_accept (serial
+    rejection walk over the 4 greedy drafts, Philox kind 2 keyed on *d_P);
+    k_sample_stop (device-indirected nucleus Gumbel-max over the stop lane,
+    exclude-masked, kind 3); k_finish_sampled (h_next=x1[n-1], *d_P+=n, keyed on
+    n not the equality chain). Engine: spec_verify_forward factored out and
+    shared; spec_verify_launches_sampled + spec_sample_round + 2nd captured perm
+    set spec_sample_graph[5]; generate() and the CLI --spec loop route temp>0 to
+    spec_sample_round (Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B).
+    CLI gained --temp/--top-p/--seed. Kernel gates (test_kernels --sampling-only)
+    PASS: nucleus mass vs CPU 6e-8; empirical accept rate 0.4333 vs p_served
+    0.4215 (softmax_full 0.388 would be ~8sigma off -> confirms the mass fix);
+    rejection-sampling committed-token chi2 5.9/df4; seeded identity; rejected
+    draft never re-emitted. Full build (CLI+server) clean, sm_86+sm_120, no new
+    warnings. Live gates (tools/sampling_gate.sh, q27-eval briefly stopped) ALL
+    PASS: greedy canonical md5 4c4120c7 UNCHANGED (greedy bitwise -- the
+    spec_verify_forward extraction + build_spec_graphs lambda refactor were
+    inert), sampled seeded identity, seed-varies, sampled!=greedy, spec/plain
+    both valid. Acceptance-vs-temp (tokens/round): greedy 3.43, T=0.3 3.59,
+    T=0.7 3.45, T=1.0 1.90, T=1.5 1.00 -- holds near greedy through T<=0.7 (sharp
+    draft head), sags at high temp (distribution-fidelity cost, as designed).
+    See docs/sampling-phase2-impl.md. NEXT: the exit-criterion quality A/B +
+    drift catalog under production sampling before it defaults on anywhere.
 - **Phase 3 -- constrained + sampled**: -inf mask pre-softmax, single-sample
   cap path; gate = zero grammar violations over N sampled tool calls plus
   chi-square vs a masked-renormalized HF reference.

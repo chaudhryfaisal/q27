@@ -1137,3 +1137,41 @@ Phase 1 DONE. Next: Phase 2 spec rejection sampling (k_spec_accept + k_sample_st
 at spec speed; then the exit-criterion quality A/B + drift catalog under
 production sampling. Open Phase-1 limitation: sampled decode is the slow plain
 path (no MTP) -- fine for correctness/A-B, Phase 2 restores throughput.
+
+**Sampling Phase 2 -- DONE 2026-07-05 (all gates pass).**
+Sampled decode now rides the depth-4 speculative round instead of the slow plain
+path. Draft half is byte-identical (greedy drafts); only the verify TAIL forks
+into a 2nd captured 5-perm set (spec_sample_graph[]), so greedy stays bitwise.
+New kernels (blocks.cu, launched only under temp>0): k_spec_accept walks the
+Leviathan/Chen rejection test over the 4 greedy drafts -- accept dr_k with prob
+p_served(dr)=softmax_full(dr)/nucleus_mass (q is a delta at the greedy draft, so
+min(1,p/q)=p), first reject stops the chain; k_sample_stop resamples the new
+pending from the stop lane's nucleus (exclude the rejected draft) via a
+device-indirected Gumbel-max; k_finish_sampled does the h_next/d_P/outcome
+bookkeeping keyed on the accepted count n. Refinement over the sec-1 sketch:
+k_nucleus_d gained out[3]=nucleus_mass -- the accept prob is the RENORMALIZED
+served prob, and using softmax_full(dr) under-accepts by 1/mass at top_p<1
+(mass==1 when top_p>=1, so temp-only is unaffected). Philox: accept draws kind 2,
+stop draws kind 3, both keyed on *d_P (round-start committed pos, strictly
+increasing -> no cross-round collision; disjoint from the plain path's kinds 0/1).
+Engine: spec_verify_forward factored out and shared by the greedy and sampled
+tails; generate() + the CLI --spec loop route temp>0 to spec_sample_round
+(Q27_SAMPLE_PLAIN=1 forces the plain sampler for the spec==non-spec A/B). CLI
+gained --temp/--top-p/--seed. Acceptance-vs-temp telemetry on the [sample-stats]
+line. Kernel gates (test_kernels --sampling-only, runs with no model resident):
+nucleus mass vs CPU 6e-8; empirical accept rate 0.4333 vs p_served 0.4215
+(softmax_full 0.388 would miss by ~8 sigma -> the mass fix is load-bearing);
+rejection-sampling committed-token chi2 5.9/df4; seeded identity; rejected draft
+never re-emitted -- ALL PASS. Build clean sm_86+sm_120, no new warnings. LIVE
+GATES ALL PASS (tools/sampling_gate.sh, q27-eval briefly stopped for GPU 0):
+greedy canonical md5 4c4120c7 UNCHANGED (greedy bitwise -- the spec_verify_forward
+extraction + build_spec_graphs lambda refactor were inert), sampled seeded
+identity, seed-varies, sampled!=greedy, spec/plain both valid. Acceptance-vs-temp
+(tokens/round): greedy 3.43, T=0.3 3.59, T=0.7 3.45, T=1.0 1.90, T=1.5 1.00 --
+holds near greedy through T<=0.7 (sharp draft head, E3's 98.1% agreement), sags
+at high temp as the served target flattens (distribution-fidelity cost, as the
+design predicted -- NOT an implementation cost). q27-eval restarted on the
+Phase-2 binary (greedy unchanged so CC/eval traffic identical; gains the
+sampled-spec path; log shows "5 greedy + 5 sampled perms"). See
+docs/sampling-phase2-impl.md. NEXT: the exit-criterion Thunderdome quality A/B +
+drift catalog under production sampling before sampling defaults on anywhere.
