@@ -940,6 +940,11 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, 6-tok %d\n",
                 hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+        if (e.maxd_auto)
+            fprintf(stderr,
+                    "P13 adaptive maxd: %ld rounds @depth-4, %ld @depth-5 (%ld promotes, "
+                    "%ld demotes); final ceiling=%d\n",
+                    e.maxd_rounds4, e.maxd_rounds5, e.maxd_promotes, e.maxd_demotes, e.cur_maxd);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

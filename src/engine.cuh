@@ -165,6 +165,24 @@ struct Engine {
     // MTP passes/round and only pays off on high-acceptance (agentic) traffic
     // (+2.6% agentic, -8% docs), so it is opt-in.
     int gate_maxd = 4;
+    // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
+    // between 4 and 5 from realized acceptance, so agentic streaks get depth-5
+    // (+2.6%) while prose stays depth-4 (no -8% draft tax) -- automatically, per
+    // stream, with no env retune. Sits on the Q27_PMIN gate (no-op without it).
+    // Start shallow; promote 4->5 when depth-4 rounds saturate the ceiling often
+    // enough (sat_ema), demote 5->4 when the 5th lane stops paying (yield_ema).
+    // The ceiling changes round grouping / draft depth / verify width only -- never
+    // the emitted sequence (greedy is width-invariant), so decode stays bitwise.
+    bool maxd_auto = false;
+    int cur_maxd = 4;                       // live ceiling (starts shallow)
+    cudaGraphExec_t draft_graph_lo[6] = {}; // depth-4 draft (auto mode only)
+    float sat_ema = 0.f;                    // depth-4: EMA of (n reached ceiling)
+    float yield_ema = 1.f;                  // depth-5: EMA of (5th lane accepted)
+    float maxd_ema_a = 1.f / 16.f;          // EMA weight (~11-round half-life)
+    float maxd_hi = 0.50f;                  // promote 4->5 when sat_ema >= hi
+    float maxd_lo = 0.10f;                  // demote 5->4 when yield_ema < lo
+    long maxd_rounds4 = 0, maxd_rounds5 = 0; // gated rounds run at each ceiling
+    long maxd_promotes = 0, maxd_demotes = 0; // 4->5 / 5->4 transitions
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
@@ -829,9 +847,16 @@ struct Engine {
         // P12b: Q27_MAXD (4 or 5) picks the deepest gated draft. Read here (not
         // with Q27_PMIN below) because it shapes capture: draft depth, warm
         // width, and how many per-width verify graphs to build.
-        if (const char* md = getenv("Q27_MAXD")) { gate_maxd = atoi(md); }
+        if (const char* md = getenv("Q27_MAXD")) {
+            if (!strcmp(md, "auto")) { maxd_auto = true; gate_maxd = 5; }
+            else gate_maxd = atoi(md);
+        }
         if (gate_maxd < 4) gate_maxd = 4;
         if (gate_maxd > 5) gate_maxd = 5;
+        // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
+        if (const char* e = getenv("Q27_MAXD_EMA")) maxd_ema_a = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_HI")) maxd_hi = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_LO")) maxd_lo = (float)atof(e);
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5;
         auto seed_positions = [&]() {
             CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
@@ -899,6 +924,19 @@ struct Engine {
             CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
             CUDA_CHECK(cudaGraphInstantiate(&draft_graph[p], gd, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gd));
+            // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
+            // so spec_round can pick draft depth per round. gate_maxd is forced to
+            // 5 under auto, so draft_graph[p] above is the depth-5 (hi) graph.
+            if (maxd_auto) {
+                dmax = 4;
+                cudaGraph_t gdl;
+                CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+                spec_draft_launches();
+                CUDA_CHECK(cudaStreamEndCapture(stm, &gdl));
+                CUDA_CHECK(cudaGraphInstantiate(&draft_graph_lo[p], gdl, nullptr, nullptr, 0));
+                CUDA_CHECK(cudaGraphDestroy(gdl));
+                dmax = gate_maxd;
+            }
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
@@ -947,18 +985,24 @@ struct Engine {
         if (pm) pmin_theta = (float)atof(pm);
         fprintf(stderr,
                 "spec graphs captured (6 perms, depth-4; +split D/V; +P12b per-width verify "
-                "2..%d); Q27_PMIN=%.3f (%s), gate_maxd=%d\n",
-                gate_maxd + 1, pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd);
+                "2..%d%s); Q27_PMIN=%.3f (%s), gate_maxd=%d%s\n",
+                gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", pmin_theta,
+                pmin_theta > 0 ? "gated" : "off", gate_maxd,
+                maxd_auto ? " (auto: floats 4..5)" : "");
     }
 
     // one speculative round (depth 4); returns tokens emitted (1..5).
     // All position math + acceptance runs on device; host reads 24 bytes.
     int spec_round(int* emit) {
+        int md_used = -1; // P13: draft-depth ceiling actually used this round
         if (tool_split_active && on_drafts) {
             // P11 constrained path: run drafts, read them back, let the host
             // stage per-lane grammar masks (uncapped), then verify. Full spec
             // acceptance survives inside tool-call bodies (vs the cap=1 hack).
-            CUDA_CHECK(cudaGraphLaunch(draft_graph[perm], stm));
+            // P13: under auto, draft_graph[perm] is depth-5; the constrained
+            // verify is width-5 (reads 4 drafts), so draft the depth-4 graph.
+            CUDA_CHECK(
+                cudaGraphLaunch(maxd_auto ? draft_graph_lo[perm] : draft_graph[perm], stm));
             int dr[4];
             CUDA_CHECK(cudaMemcpyAsync(&dr[0], d_draft, 4, cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaMemcpyAsync(&dr[1], d_draft2, 4, cudaMemcpyDeviceToHost, stm));
@@ -968,17 +1012,23 @@ struct Engine {
             on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
             CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
         } else if (pmin_theta > 0.f && h_mask_id0 < 0) {
-            // P12/P12b confidence-gated depth (unconstrained decode only): draft
-            // depth-5 + 5 margins (draft_graph, dmax=5), cap depth at the leading
-            // run with margin >= theta, and verify only cap+1 lanes -- skipping
-            // the deep-KV verify when the drafter is unconfident. Emitted tokens
-            // are width-invariant vs spec_graph (only round count changes).
-            CUDA_CHECK(cudaGraphLaunch(draft_graph[perm], stm));
+            // P12/P12b confidence-gated depth (unconstrained decode only): draft to
+            // the ceiling + per-draft margins, cap depth at the leading run with
+            // margin >= theta, and verify only cap+1 lanes -- skipping the deep-KV
+            // verify when the drafter is unconfident. Emitted tokens are
+            // width-invariant vs spec_graph (only round count changes).
+            // P13 adaptive maxd: the ceiling floats between 4 and 5 per stream
+            // (cur_maxd); pick the matching draft graph. draft_graph[perm] is
+            // depth-5 under auto (gate_maxd forced 5), draft_graph_lo is depth-4.
+            md_used = maxd_auto ? cur_maxd : gate_maxd;
+            cudaGraphExec_t dg =
+                (maxd_auto && md_used == 4) ? draft_graph_lo[perm] : draft_graph[perm];
+            CUDA_CHECK(cudaGraphLaunch(dg, stm));
             CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, 5 * 4,
                                        cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaStreamSynchronize(stm));
             int cap = 0;
-            while (cap < gate_maxd && h_draft_margin[cap] >= pmin_theta) cap++;
+            while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
             int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
             CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
         } else {
@@ -989,6 +1039,27 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 32, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
+        // P13 adaptive maxd: fold this round's realized accept into the ceiling.
+        // At depth-4, promote when the ceiling saturates (n==maxd+1) often enough;
+        // at depth-5, demote when the 5th lane stops paying (n<6). On a switch,
+        // seed the opposite EMA to open an observation window (hysteresis). The
+        // ceiling changes only round grouping -- the token sequence is invariant.
+        if (maxd_auto && md_used >= 0) {
+            if (md_used < 5) {
+                maxd_rounds4++;
+                float hit = (n >= md_used + 1) ? 1.f : 0.f;
+                sat_ema += maxd_ema_a * (hit - sat_ema);
+                // promote: seed yield_ema just above the demote line so depth-5
+                // gets a bounded grace window (~1/alpha rounds) to prove itself
+                // before it can be demoted, rather than an all-1.0 sticky window.
+                if (sat_ema >= maxd_hi) { cur_maxd = 5; yield_ema = 2.f * maxd_lo; maxd_promotes++; }
+            } else {
+                maxd_rounds5++;
+                float hit = (n >= 6) ? 1.f : 0.f;
+                yield_ema += maxd_ema_a * (hit - yield_ema);
+                if (yield_ema < maxd_lo) { cur_maxd = 4; sat_ema = 0.f; maxd_demotes++; }
+            }
+        }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[7];
         perm = (perm + (n - 1)) % 6;
