@@ -1282,3 +1282,57 @@ Consequence: **confidence-gated depth (q27's p_min equivalent) is now the clear 
 decode lever** -- the roadmap reopen candidate is empirically the way to close the depth gap.
 README State/Why-this-model/measurement-debts/roadmap all corrected to the honest depth-matched
 numbers; the "beats llama at depth" claim is retired.
+
+## 2026-07-06 (P12) -- confidence-gated depth SHIPPED (branch p12-confidence-gated-depth)
+
+The lever the depth-match called for. Per-step drafter-margin gate (the top1-top2 margin = the
+p_min analog): cap the verify to only the lanes the drafter is confident about, skipping the
+expensive deep-KV verify when it is not. `Q27_PMIN=theta` engages it; unset = the canonical
+depth-4 round. Greedy output stays **bitwise-identical** -- each verify lane is an independent
+grid index, so narrowing the batch changes only round count + verify width, never which token
+emits (the same property that made the batch-5 verify match the serial path).
+
+**Phase 0/0b (gate measurement first, per the roadmap).** `--stats`/`--burst-stats` margin bins
+on think-heavy + real thunderdome CC agentic traffic. Findings: the winning mechanism is a
+per-step p_min early-stop (dominates single-signal m1/m2 gates); agentic decode is FAR more
+draftable than math (mean accept-len 6.2 vs 3.9), so depth is traffic-dependent. Offline
+throughput bounds predicted a context-adaptive theta (short-ctx neutral, long-ctx wins, higher
+theta at longer ctx) -- all confirmed live below. (FINDINGS.md + analyze.py in the session
+scratchpad, not the repo.)
+
+**P12 depth-4 gate (the robust win, DEFAULT).** draft width-5 + `k_margin` (top1-top2, a
+SEPARATE pass that never touches the canonical k_argmax) -> read 4 margins -> cap at the leading
+run >= theta -> launch a pre-captured `verify_graph_w[cap+1][perm]` (per-width verify graphs,
+widths 2..5). `finish_round` gained a `max_draft` cap so a narrow verify never commits an
+uncomputed lane. Measured decode t/s (`--tokens-file` added to get long prompts past the 128KB
+single-arg limit):
+
+    ctx   OFF     theta 0.5       theta 1.0
+    2K    167.4   167.4 (neutral) --
+    16K   122.8   129.4 (+5.4%)   129.9 (+5.8%)
+    60K   90.05   96.31 (+7.0%)   99.76 (+10.8%)
+
+Token-identity gated==ungated verified at 2K/16K/60K; test_kernels ALL PASS; k_margin exact vs CPU.
+
+**P12b depth-5 (opt-in, `Q27_MAXD=5`).** Adds the 6th verify lane: perm goes mod-5 -> mod-6 with a
+6th GDN state buffer (S_spare5); depth-4 rounds stay a bitwise-identical subset. Correct
+(token-identity, test_kernels PASS, 6-tok rounds fire) but **traffic-dependent**: agentic 3.6K
++2.6% (fires heavily) vs docs 60K depth-5 91.66 < depth-4-gate 99.76 = -8%. Path C always drafts
+to gate_maxd, so the 5th MTP pass is pure cost when acceptance is low -> depth-4 is the default,
+depth-5 is opt-in. This is the "tok/round overstates deep-maxd" caveat from Phase 0b, now
+confirmed on real t/s. Follow-on: ADAPTIVE maxd (key draft depth to recent acceptance) would make
+deep drafting a universal win; a long-ctx AGENTIC A/B is the untested regime where depth-5 should
+win biggest.
+
+**The bug that cost the session (worth remembering).** Depth-5 first diverged, and
+compute-sanitizer memcheck was CLEAN. Root cause: `quantize3` (qx5) was the ONE batched verify
+kernel that selects its per-lane output by EXPLICIT pointers (`t==3?n3:n4`) instead of CP3 struct
+indexing -- at ntok=6 lane 5 fell through to n4 and OVERWROTE lane 4's quantized activation
+(a valid buffer, wrong lane, so memcheck was blind). Bisect trail: theta=100 (width-2) PASS,
+cap<=4 (width<=5) PASS -> width-6 only; `Q27_FD=v1` also failed -> not attention -> a shared
+kernel -> quantize3. Also sized-for-6: the flash-decode scratch and logits2. **Lesson: any
+batched kernel using explicit per-lane pointers instead of the CP3/P3 struct is a lane-count
+landmine.**
+
+Commits (branch): e80cd59 P12 gate; 339e9df structs->6 + gemv width-6; f5b4dac mod-6 perm + 6th
+GDN buffer; bea6833 6th-lane wiring + quantize3 fix; edc3250 default depth-4 / Q27_MAXD=5 opt-in.

@@ -308,6 +308,7 @@ live in "Decode methodology" above.
 | P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [re-measured 2026-07-06: current 128K prefill is ~71-80s (fp8 g64 71.5 / fp16 exact 80.4); both this 57s and P6's 117.6s superseded]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
 | P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method) [superseded 2026-07-06: current 128K prefill ~71-80s after g64 regroup + delta-WY tiling]; split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
 | fd2: register-accumulator flash-decode (SM-starvation/occupancy fix #3, attn was 99% of depth cost at 5% DRAM BW) | 61K depth **78.0 -> 126.2 t/s** (+62%, 47.2 -> 29.2 ms/round); 16K **-18%/round**; instance 0.768 -> 0.156 ms @61K (45% DRAM BW); 2K +1.3%/round; acceptance parity exact; PPL in noise both KV modes; nll-long 160K bucket-identical; CANONICAL RE-DERIVED 4c4120c7 (old 58b6ae85 under Q27_FD=v1) |
+| P12: confidence-gated depth (`p_min` equiv; `Q27_PMIN=theta`) -- gate verify width on the drafter's top1-top2 margin, skip the deep-KV verify when unconfident | decode **grows with ctx: 2K neutral / 16K +5.8% / 60K +10.8%** (theta 1.0; +7.0% theta 0.5); greedy output BITWISE-IDENTICAL (lanes are independent grid indices -> only round count + verify width change); higher theta wins at longer ctx (context-adaptive theta confirmed). P12b depth-5 (`Q27_MAXD=5`, opt-in): agentic +2.6% but docs -8% (always drafts to max, so the 5th MTP pass is pure cost at low acceptance) -> depth-4 stays default; adaptive maxd is the follow-on |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -367,10 +368,10 @@ required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 **Recently shipped (2026-07-05 -> 06):** `/v1/messages/count_tokens` and the
 Anthropic-shaped context-limit error (both surfaced by the CC-harness A/B);
-sampling Phases 1-2 + the exit-gate A/B (passed); and the tool-call parser drift
-fixes that unblocked agentic Claude Code (CC 0.00 -> 0.55 on analytics-dashboard).
-Next priorities are the measurement debts and the confidence-gated-depth reopen
-below.
+sampling Phases 1-2 + the exit-gate A/B (passed); the tool-call parser drift
+fixes that unblocked agentic Claude Code (CC 0.00 -> 0.55 on analytics-dashboard);
+and **P12 confidence-gated depth (`Q27_PMIN`), the measured top decode lever --
++10.8% @60K, bitwise-identical greedy** (see the depth-match motivation below).
 
 **P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
 interleaving; whole-generation queue waits gone; analysis in
@@ -411,14 +412,24 @@ the output-volume wall gap.
   +8.8% and delta-WY tiling); P5's ~57s was optimistic. Honest current
   128K prefill: **~71-80s**.
 
-**Highest-value decode lever now -- confidence-gated depth (q27's `p_min`
-equivalent), empirically motivated by the 2026-07-06 depth-match.** llama's
-p_min 0.5 is worth **+36% at ~75K** (139.5 -> 190.3 t/s) and is exactly why the
-tuned llama BEATS q27 at depth -- gating the round (skip the expensive deep-KV
-verify when the draft head's margin is low) is the lever to close that gap. The
-fixed-depth (P3), adaptive-depth, and burst-depth negatives all measured UNGATED
-or accept-count-gated schemes; a confidence/margin-gated scheme is not covered by
-them. Gate measurement first: --stats margin bins on think-heavy traffic.
+**Confidence-gated depth (q27's `p_min` equivalent) -- SHIPPED (P12, 2026-07-06).**
+Empirically motivated by the depth-match (llama's p_min 0.5 is worth +36% at ~75K,
+exactly why tuned llama beat q27 at depth). Mechanism: per-step drafter-margin gate
+(the top1-top2 margin, the p_min analog) caps the verify width, skipping the
+expensive deep-KV verify when the draft head is unconfident. `Q27_PMIN=theta`
+engages it (unset = off = the canonical depth-4 round); greedy output stays
+bitwise-identical (lanes are independent grid indices, so only round count + verify
+width change). **Measured decode: 2K neutral, 16K +5.8%, 60K +10.8%** (theta 1.0),
+growing with context, higher theta winning at longer ctx -- the context-adaptive
+theta the offline margin bins predicted. The prior fixed-depth (P3), adaptive-depth,
+and burst-depth negatives were all UNGATED or accept-count-gated and did not cover
+this. **P12b depth-5** (`Q27_MAXD=5`, opt-in) works but is traffic-dependent
+(+2.6% agentic vs -8% docs -- Path C always drafts to gate_maxd, so the 5th MTP
+pass is pure cost at low acceptance), so depth-4 is the default. FOLLOW-ON:
+adaptive maxd (key draft depth to recent acceptance) would make deep drafting a
+universal win; long-ctx agentic A/B is the untested regime where depth-5 should
+win biggest. On branch `p12-confidence-gated-depth` (Phase-0/0b margin
+measurement + implementation; see BUILDLOG).
 
 **Open quality gates (red-team pass 2026-07-05):**
 - strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,
