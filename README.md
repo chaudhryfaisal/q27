@@ -2,8 +2,24 @@
 
 A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
-## State of the engine (2026-07-05)
+## State of the engine (2026-07-06)
 
+- **Agentic serving unblocked (2026-07-06):** the SERVING-layer tool-call parser
+  -- not the quant, not sampling -- was the ceiling on agentic scores. Three
+  drift-mode fixes took Claude Code from one-shot-quit basins (score 0, the model
+  emits a malformed tool call, gets no tool_use, and ends the turn) to full 65-92
+  turn trajectories: **CC 0.00 -> 0.55, CRUSH greedy 0.095 -> 0.48** on the
+  analytics-dashboard task. Fixes (docs/BUILDLOG.md 2026-07-06): write-content
+  (`"content": "CODE</content>` -- unescaped multi-line bodies), mode-6
+  name-dropped calls (`{"name":\n{args}}` with the name string absent; the tool is
+  inferred from the arg-key signature), and a dangling `{"name":` prefix before a
+  batch of valid calls. Greedy canonical 4c4120c7 untouched throughout.
+- **Sampling shipped end-to-end and cleared to default (2026-07-06):** Phase 2
+  (spec rejection sampling) brings `temperature>0` up to spec speed on the depth-4
+  round; the exit-gate A/B **PASSED** -- sampled T=0.7 >= greedy on both harnesses,
+  no regression, no new drift mode -- so sampling is cleared to default at
+  T<=0.7 / top_p 0.95 (server `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P`; explicit request
+  temperature still wins). Greedy stays bitwise. docs/sampling-exit-gate.md.
 - Decode at depth (the metric that matters for agentic work): **126.2 t/s at
   61K ctx** (was 78.0 pre-fd2), **156-164 t/s effective across real CRUSH
   trials to 74K ctx** (was 103-113). attn-fd2 register-accumulator
@@ -53,17 +69,20 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   engines, no proxy either leg -- build log): T8 q27 **167s @ 0.82** vs
   llama 222s @ 0.50, the day's only matched-basin pair; first real-client
   P9 checkpoint restore; 2.47M tokens served from prefix cache in that one
-  trial. T2 drew a deterministic one-shot-quit greedy basin (byte-identical
-  retry cannot reroll it -- sampling's case). Load-bearing fix: cch
+  trial. T2 drew a deterministic one-shot-quit basin -- since ROOT-CAUSED to
+  mode-6 tool-call drift (the model emits `{"name":\n{args}}`, the parser can't
+  recover it, CC gets text-only and ends the turn) and FIXED 2026-07-06, so that
+  basin no longer costs the turn. Load-bearing fix: cch
   billing-header normalization (2026-07-05) -- without it Claude Code's
   mutating prompt head forces a full re-prefill every turn
 - P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
   attributed and fixed (fd2, 2026-07-05). Claude-Code robustness shipped
   (`/v1/messages/count_tokens` + context-limit error shape, 2026-07-05).
-  Sampling Phase 1 shipped (plain-path top-p + Gumbel-max, greedy bitwise;
-  docs/sampling-design.md) -- Phase 2 (spec rejection sampling) is next, to
-  bring sampled decode up to spec speed. A2 fusion / light utility slots only
-  if telemetry shows engine-claim waits dominating
+  Sampling Phases 1+2 shipped (plain-path top-p + Gumbel-max, then spec rejection
+  sampling at spec speed; greedy bitwise) and the exit-gate A/B PASSED
+  (docs/sampling-exit-gate.md). Tool-call parser drift fixes unblocked agentic CC
+  (2026-07-06). A2 fusion / light utility slots only if telemetry shows
+  engine-claim waits dominating
 
 ## Why this model is a good target
 
@@ -229,11 +248,19 @@ Model tool protocol: tools rendered as JSON in the system `<tools>` block per
 the qwen35 chat template; `<tool_call>` output parsed by a streaming splitter
 (src/stream_split.h) that also routes `<think>`. Multi-slot (`--slots N`) with
 R1b round-granularity GPU time-slicing (FIFO gate + yield hooks; byte-identical
-solo vs interleaved). Greedy (spec decode) by default; `temperature>0` routes
-to a sampled plain path -- top-p nucleus + Gumbel-max, seeded and reproducible,
-with greedy left bitwise-unchanged (docs/sampling-design.md Phase 1). That path
-has no MTP yet, so sampled decode is slow; Phase 2 (spec rejection sampling)
-restores spec speed. `--fast-head` trades output exactness for ~7% more t/s.
+solo vs interleaved). Greedy (spec decode) by default; `temperature>0` routes to
+sampled SPEC decode -- top-p nucleus + Gumbel-max with rejection-sampled spec
+acceptance (Phase 2, at spec speed), seeded and reproducible, greedy left
+bitwise-unchanged (docs/sampling-design.md, Phases 1-2). The exit-gate A/B passed
+(docs/sampling-exit-gate.md), so the server can default sampling on for clients
+that send no temperature via `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P` (an explicit
+request temperature still wins; a forced request gets a distinct logged seed).
+The tolerant tool-call parser recovers six observed drift modes -- dropped
+`<tool_call>` wrapper, truncated JSON, `<content>`-tagged and
+quote-open/`</content>` bodies, `{"tool_call":` openers, in-string control chars,
+and name-dropped `{"name":\n{args}}` calls (tool inferred from the arg-key
+signature) -- logging each recovery for the drift catalog. `--fast-head` trades
+output exactness for ~7% more t/s.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
@@ -329,14 +356,12 @@ required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Now -- serve the Claude Code harness properly** (both surfaced by the
-CC-harness A/B, build log 2026-07-05; both cheap):
-- `/v1/messages/count_tokens`: not implemented (404s in the CC legs). CC
-  times its auto-compaction with it; without it CC flies blind on context
-  and runs into the ctx ceiling. llama.cpp implements it.
-- Anthropic-shaped context-limit error on ctx-ceiling refusal: today a
-  prompt past slot capacity gets `end=refused`, which CC treats as
-  retryable (it re-sends until it gives up) instead of compact-now.
+**Recently shipped (2026-07-05 -> 06):** `/v1/messages/count_tokens` and the
+Anthropic-shaped context-limit error (both surfaced by the CC-harness A/B);
+sampling Phases 1-2 + the exit-gate A/B (passed); and the tool-call parser drift
+fixes that unblocked agentic Claude Code (CC 0.00 -> 0.55 on analytics-dashboard).
+Next priorities are the measurement debts and the confidence-gated-depth reopen
+below.
 
 **P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
 interleaving; whole-generation queue waits gone; analysis in
@@ -344,16 +369,15 @@ docs/P10-decision.md). A2 fused batch-10 verify stays CONDITIONAL: build
 only if engine-claim telemetry says conversations outnumber slots in real
 use (light no-spec utility slots are the smaller lever first).
 
-**Next: sampling** -- temperature/top-p with rejection-sampled spec
-acceptance; the greedy path stays bitwise untouched. Design:
-docs/sampling-design.md. Exit criterion (in the design doc): the quality
-A/B and drift catalog re-run under the production sampling config --
-every quality number in this README is greedy-no-think scoped. Greedy
-pathology now has two live Claude-Code exhibits (build log 2026-07-05): a
-DETERMINISTIC one-shot-quit basin on T2 (model answers the task prompt
-conversationally, zero tool calls; retry is byte-identical so it cannot
-reroll) and a 32K-token mega-generation that blew CC's output cap. Both
-are sampling's case, as is the output-volume wall gap.
+**Sampling -- DONE (2026-07-06).** temperature/top-p with rejection-sampled spec
+acceptance (Phases 1-2, at spec speed); greedy stays bitwise. The exit-gate A/B
+PASSED under the production sampling config (docs/sampling-exit-gate.md): sampled
+T=0.7 >= greedy on both harnesses, no regression, no new drift mode -- cleared to
+default at T<=0.7 / top_p 0.95. Reattribution: the "deterministic one-shot-quit
+T2 basin" once filed here as sampling's case was ROOT-CAUSED to mode-6 tool-call
+drift and fixed at the PARSER -- not a sampling problem. The 32K-token
+mega-generation that blew CC's output cap remains a prompt/sampling lever, as is
+the output-volume wall gap.
 
 **Measurement debts (before headline cross-engine claims):**
 - Strongest-opponent llama sweep: draft=10 + p_min 0.5 per the r/LocalLLM
