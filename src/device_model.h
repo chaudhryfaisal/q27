@@ -22,6 +22,9 @@ class DeviceModel {
   public:
     explicit DeviceModel(const Model& m) : model_(m) {}
     ~DeviceModel();
+    // owns raw CUDA pointers in dev_; a copy would double-free on destruction.
+    DeviceModel(const DeviceModel&) = delete;
+    DeviceModel& operator=(const DeviceModel&) = delete;
 
     // Upload one tensor (no-op if already resident). Returns the device tensor.
     const DevTensor& upload(const std::string& name);

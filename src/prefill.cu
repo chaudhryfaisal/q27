@@ -52,13 +52,13 @@ __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restr
         for (int idx = threadIdx.x; idx < CS * TB * 4; idx += blockDim.x) {
             int u = idx & 3, r = idx >> 2, tt = r % TB, cc = r / TB;
             s_eo[cc * EOP + tt * 4 + u] =
-                c0 + cc < n_chunks
+                (c0 + cc < n_chunks && tt < nt)  // tt<nt guards the OOB read past T (CUDA-review #5)
                     ? __ldg(eo + (size_t)(t0 + tt) * ept + (size_t)(c0 + cc) * 4 + u)
                     : make_uint2(0, 0);
         }
         for (int idx = threadIdx.x; idx < CS * TB; idx += blockDim.x) {
             int tt = idx % TB, cc = idx / TB;
-            bool ok = c0 + cc < n_chunks;
+            bool ok = c0 + cc < n_chunks && tt < nt;
             s_xs[cc * XSP + tt] =
                 ok ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
             s_is[cc * XSP + tt] =
@@ -121,14 +121,14 @@ __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restri
         for (int idx = threadIdx.x; idx < CS * TB * 2; idx += blockDim.x) {
             int u = idx & 1, r = idx >> 1, tt = r % TB, cc = r / TB;
             s_x[cc * XP + tt * 2 + u] =
-                c0 + cc < n_chunks
+                (c0 + cc < n_chunks && tt < nt)  // tt<nt guards the OOB read past T (CUDA-review #5)
                     ? __ldg((const uint4*)(nat + (size_t)(t0 + tt) * cols) + 2 * (c0 + cc) + u)
                     : make_uint4(0, 0, 0, 0);
         }
         for (int idx = threadIdx.x; idx < CS * TB; idx += blockDim.x) {
             int tt = idx % TB, cc = idx / TB;
             s_xs[cc * XSP + tt] =
-                c0 + cc < n_chunks ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
+                (c0 + cc < n_chunks && tt < nt) ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
         }
         __syncthreads();
         if (!wr) continue;
@@ -641,7 +641,10 @@ __global__ void k_l2norm_heads_T(float* __restrict__ x, int head_dim, int row_el
         if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
         __syncthreads();
     }
-    float inv = rsqrtf(fmaxf(sh[0], eps));
+    // ggml semantics: y = x / max(sqrt(sum), eps) == x * rsqrt(max(sum, eps^2)).
+    // Was max(sum, eps) here -- diverged from the decode/spec paths (blocks.cu:44,
+    // spec3.cu:26) by up to 1000x on near-zero heads (CUDA-review #6).
+    float inv = rsqrtf(fmaxf(sh[0], eps * eps));
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) xh[i] *= inv;
 }
 
@@ -1286,7 +1289,10 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         // SMs; add splits once the context is deep enough to amortize the
         // combine. Q27_PF_SPLIT=N forces N (1 = pre-split behavior).
         int nsplit = 1;
-        if (part) {
+        // split path only when t0==0: its partial writes use absolute t0+row
+        // while the combine reads relative rows, so t0>0 corrupts (CUDA-review
+        // #4). The non-split path handles any t0 correctly.
+        if (part && t0 == 0) {
             const char* se = getenv("Q27_PF_SPLIT");
             nsplit = se ? atoi(se) : (base_pos + t0 + SB) / 4096;
             nsplit = nsplit < 1 ? 1 : nsplit > PF_SPLIT_MAX ? PF_SPLIT_MAX : nsplit;

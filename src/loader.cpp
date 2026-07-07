@@ -46,7 +46,9 @@ const Tensor& Model::get(const std::string& name) const {
 Model::Model(Model&& o) noexcept { *this = std::move(o); }
 Model& Model::operator=(Model&& o) noexcept {
     if (this != &o) {
-        this->~Model();
+        // release our mmap; do NOT call ~Model() -- that ends the lifetimes of
+        // meta_json/tensors/index, which the moves below then write into (UB).
+        if (map_base_) munmap(map_base_, map_size_);
         meta_json = std::move(o.meta_json);
         tensors = std::move(o.tensors);
         index = std::move(o.index);

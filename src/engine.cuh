@@ -290,13 +290,13 @@ struct Engine {
     Engine(const std::string& path, int ctx)
         : owned_model(std::make_unique<q27::Model>(q27::Model::open(path))),
           owned_dm(std::make_unique<q27::DeviceModel>(*owned_model)),
-          model(*owned_model), dm(*owned_dm), max_ctx(ctx) {
+          model(*owned_model), dm(*owned_dm), max_ctx(ctx < 32 ? 32 : ctx) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/true);
     }
     // Borrowing: shares a caller-owned Model+DeviceModel (weights already
     // uploaded by the caller). Multi-slot serving builds N of these.
     Engine(q27::Model& m, q27::DeviceModel& d, int ctx)
-        : model(m), dm(d), max_ctx(ctx) {
+        : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/false);
     }
 
@@ -1703,8 +1703,10 @@ struct Engine {
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
         // instead of corrupting adjacent buffers
-        if (NP > max_ctx) {
-            fprintf(stderr, "[gen] prompt %d exceeds ctx %d -- refusing\n", NP, max_ctx);
+        if (NP < 1 || NP > max_ctx) {
+            // NP==0 would decode from stale d_token/recurrent state and echo the
+            // prior request's token (Security #2); NP>max_ctx overruns the cache.
+            fprintf(stderr, "[gen] prompt %d out of range (1..%d) -- refusing\n", NP, max_ctx);
             gs.end = "refused";
             return 0;
         }

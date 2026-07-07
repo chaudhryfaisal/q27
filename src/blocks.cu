@@ -487,8 +487,10 @@ __device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigne
         x0 = n0; x1 = n1; x2 = n2; x3 = n3;
         k0 += W0; k1 += W1;
     }
-    // (0,1): never exactly 0 or 1, so -log(-log(u)) is finite
-    return ((float)x0 + 0.5f) * (1.0f / 4294967296.0f);
+    // map to (0,1): the top ~128 x0 values round to 2^32 in fp32, giving u==1 ->
+    // -log(-log(u)) = +inf (CUDA-review #2). Clamp to the largest float below 1.
+    float u = ((float)x0 + 0.5f) * (1.0f / 4294967296.0f);
+    return fminf(u, 0x1.fffffep-1f);
 }
 
 // Single block: max M, logsumexp logZ at inv_temp, and the top-p logit

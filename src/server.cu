@@ -533,10 +533,16 @@ int main(int argc, char** argv) {
             for (auto& m : body["messages"]) {
                 std::string role = m.value("role", "user");
                 std::string content;
-                if (m["content"].is_string()) content = m["content"];
-                else if (m["content"].is_array())
-                    for (auto& part : m["content"])
-                        if (part.value("type", "") == "text") content += part.value("text", "");
+                // const operator[] on a missing key aborts (json.hpp assertion) --
+                // a content-less message must not kill the server (Security #1;
+                // mirrors the Anthropic-path guard in api_common.h).
+                if (m.is_object() && m.contains("content")) {
+                    if (m["content"].is_string()) content = m["content"];
+                    else if (m["content"].is_array())
+                        for (auto& part : m["content"])
+                            if (part.value("type", "") == "text")
+                                content += part.value("text", "");
+                }
                 msgs.push_back({role, content});
             }
             // enable_thinking=false: top-level (Qwen-style clients) or nested
