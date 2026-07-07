@@ -314,3 +314,33 @@ Rationale, in order:
   the P13 EMA demotes fast enough to keep the docs -3.3% off the mixed stream at
   depth-6; only tested at 4..5 today. Settle with an `Q27_MAXD=auto` docs vs
   agentic A/B once the depth-6 ceiling exists.
+
+## 2026-07-07 MEASURED -- GO-IF evaluated: **NO-GO**
+
+The UNMEASURED numbers above were taken same-day (telemetry 42ccf6d: `gch`/`gnh`
+gated-round histograms in the `[req]` log; full data in BUILDLOG "maxd6 GO-IF
+measurement" + results/q27-maxd6-*.log).
+
+- **X PASS**: cap>=5 on **79.3%** of 5336 gated rounds (one full T8 trial, real CC
+  traffic, ctx to 81K, score 0.796).
+- **Y saturation PASS**: depth-5 n=6 on **65.2%** (>=0.50); p(5th lane | fired) 82.2%;
+  5.03 tok/round.
+- **Y throughput FAIL**: identical-request 26K replay A/B, d5 vs d4 (theta 0.5, dexit1):
+  repro +2.9% (97.6% fired), T8-style codegen **-5.4%** (56% fired), fresh testgen
+  **-3.9%** (52% fired). Interpolated at the live operating point (79% fired / 82%
+  yield): **-0.8%..+0.1%**. Depth-5 is breakeven at best on live-matched agentic
+  traffic; it wins only in near-verbatim (>~90% fired) regimes.
+
+**The breakeven model in this brief is refuted by the measurement.** The ~2.0 ms
+fired-round marginal understated true cost 1.5-2x (measured +2.1..+3.8 ms/round
+d4->d5 across all rounds): the theta gate predicts drafter CONFIDENCE, not verifier
+ACCEPTANCE -- on codegen traffic 44% of fired rounds waste the deep lanes. The 0.46
+tok/ms "strongly positive" agentic estimate does not survive contact with served
+traffic; the measured net at 79%/82% is ~0.
+
+**Decision: NO-GO on extending the auto ceiling to 6.** With depth-5 at breakeven on
+the very traffic that fires it hardest, a strictly-deeper lane on a smaller fired
+fraction cannot pay for the P12b-class 6->7 widening + 157 MB. Ceiling stays 4/5-auto.
+Retry bar: a gate that predicts acceptance rather than confidence, or a materially
+cheaper verify lane. Side finding: P13's HI=0.5 promote threshold lands exactly at the
+measured win/loss crossover (45%-sat traffic loses -5.4%, 96%-sat wins +2.9%).

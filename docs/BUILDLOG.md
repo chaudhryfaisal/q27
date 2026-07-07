@@ -1644,3 +1644,54 @@ tip (7c2ff95) BEFORE this commit; full `make` rebuilt; test_kernels ALL PASS and
 EXACT re-verified on the reverted tree. This commit lands docs only.
 
 Files: docs/attn-fd3-design.md (new, design + post-mortem), docs/BUILDLOG.md.
+
+## 2026-07-07 (maxd6 GO-IF measurement) -- VERDICT: NO-GO on auto-ceiling-6; depth stays 4/5-auto
+
+The docs/maxd6-decision.md GO-IF gates, measured on real agentic serving traffic. Telemetry
+commit 42ccf6d (host-side gated-round histograms: margin-run depth `gch` cap 0..gate_maxd,
+accepted length `gnh` n 1..gate_maxd+1, cumulative per engine, appended to `[req]` after
+`end=`; canonical 4c4120c7 EXACT ungated AND gated depth-5; test_kernels ALL PASS).
+
+**Rig.** Server `Q27_PMIN=0.5 Q27_MAXD=5` (dexit=1, greedy), one full thunderdome T8 trial
+via claude-code-q27-haight (67 reqs, ctx to 81K, score 0.796 -- high basin, hidden 0.906;
+logs results/q27-maxd6-server.log, runs/2026-07-07T15-50-33). A/B = identical-request
+26K-deep replay (P13 methodology; live-agent A/B diverges), fresh server per leg, 1 prefill
++ 3 replays, medians (spread <=0.3%); three payloads spanning the saturation axis
+(logs results/q27-maxd6-ab-{d5,d4,d5mid}.log).
+
+**X + Y1 (live T8, 5336 gated rounds): BOTH PASS.**
+gch=[148,189,259,239,268,4233] gnh=[193,427,444,384,408,3480].
+X: cap>=5 fired on **79.3%** of gated rounds (gate >=30%). Y1: depth-5 saturation (n=6)
+**65.2%** (gate >=0.50), grew 45%->65% as ctx deepened; p(5th lane accepted | fired)
+**82.2%**; mean **5.03 tok/round** -- real CC traffic is far more repro-flavored than fresh
+codegen (tool-call bodies echo file content).
+
+**Y2 (d5-vs-d4 replay A/B): FAIL.**
+| payload | d4 t/s (tok/rnd) | d5 t/s (tok/rnd) | d5 net | d5 fired | p(5th|fired) |
+|---|---|---|---|---|---|
+| code-repro | 205.2 (4.93) | 211.2 (5.88) | **+2.9%** | 97.6% | 95.2% |
+| T8-style codegen | 169.8 (3.70) | 160.6 (3.98) | **-5.4%** | 56.3% | 56.2% |
+| fresh unit-test gen | 152.6 (3.34) | 146.7 (3.53) | **-3.9%** | 51.9% | 48.6% |
+Interpolated at the live-T8 operating point (79.3% fired / 82.2% yield): **-0.8%..+0.1% --
+breakeven at best.** Fixed depth-5 wins ONLY in near-verbatim regimes (>~90% fired).
+
+**The brief's fired-round model is REFUTED.** Predicted ~2.0 ms marginal on fired rounds
+only ("cost correlated with payoff", 0.46 tok/ms -> strongly positive); measured ms/round
+d4->d5 grew +2.1..+3.8 across ALL rounds (repro 23.99->27.80, mid 21.73->24.72, fresh
+21.90->24.05) -- ~1.5-2x the model. Mechanism: **theta gates on drafter confidence, not
+verifier acceptance** -- at mid, 44% of fired rounds wasted the deep draft+verify anyway
+(p|fired 56%). The correlation the model assumed only tightens in repro-like traffic.
+
+**Verdict: NO-GO.** Depth-6 is the same structure one lane deeper on a strictly smaller
+fired fraction, against a P12b-class 6->7 widening + quantize3-landmine audit + 157 MB.
+With depth-5 at breakeven on live-matched agentic traffic, the ceiling stays at the
+d4/d5-auto optimum. Do-not-retry without new facts (cheaper verify lane or a gate that
+predicts ACCEPTANCE, not confidence -- e.g. margin-calibrated accept prob).
+
+**Bonus validation: P13's HI=0.5 promote threshold is empirically well-placed.** It
+excludes exactly the regimes where d5 measured negative (mid 45% d4-sat -> stays 4,
+avoiding -5.4%; fresh 37% -> stays 4, avoiding -3.9%) and admits the winners (repro 96% ->
+promotes, +2.9%; live T8 ~73% d4-sat -> promotes, ~breakeven).
+
+Files: docs/maxd6-decision.md (verdict appended), src/engine.cuh + src/server.cu (42ccf6d).
+Next per queue: prefill-attn O(N^2) (54% of prefill @128K).
