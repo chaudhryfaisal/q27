@@ -1923,3 +1923,16 @@ strict-parser A/B (zero rescues both legs) -- the latter needs a strict-parser k
 (tolerant rescues are currently unconditional). Q27_TOOL_SPLIT stays forbidden under
 --slots (P11 race, unchanged). Constrained+sampled remains Phase 3 (tc.enabled gates
 on greedy).
+
+**Constraint-cost soak (same session).** Identical-request replay at 75.7K depth
+(p1-transcript payload + write_note tool, response = one ~195-token tool call, 1 cold +
+3 replays/leg, gated production config): OFF 102.2 t/s (2.67 tok/rnd, 1.9s warm turn)
+vs ON 33.0 t/s (1.02 tok/rnd -- the in-grammar cap=1 -- 5.9s warm turn). Both legs
+emitted byte-identical calls (the model was emitting a valid call anyway), so this is a
+clean cost read: **the capped grammar is 3.1x slower inside call bodies at depth**
+(+4s per call-turn at 75K; in-call rate 33 t/s, better than the old ~22 estimate but
+still the dominant cost). Default-on verdict: keep OFF for speed-sensitive eval
+serving; the flag is now SAFE (no score-0 basins) and buys structural validity when
+robustness matters -- the strict-parser A/B can run with it on. The known speed fix
+remains the P11 split path (proven token-identical, 4.2x in-call) blocked on its
+orchestration race.

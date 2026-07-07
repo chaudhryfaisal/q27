@@ -96,8 +96,12 @@ real Engine/Tokenizer; tests drive a FakeEngine/FakeTok -- api_common.h pattern)
 
 ## Measurement (after the fix lands)
 
-- Constraint-cost soak: identical-request tool-heavy replay, --constrain-tools on vs
-  off (wall + t/s + in-call fraction). The in-call cap is 1/round (~22 t/s in bodies).
-- Strict-parser A/B: tolerant-parser rescues disabled (env), grammar ON both q27 legs
-  vs llama grammar leg; gate = zero rescues both legs at non-degraded score.
+- Constraint-cost soak: DONE 2026-07-07 -- 75.7K-depth call-dominated replay, byte-
+  identical outputs both legs: OFF 102.2 t/s (2.67 tok/rnd) vs ON 33.0 t/s (1.02
+  tok/rnd) = 3.1x in-call cost, +4s per call-turn at depth. Verdict: flag stays
+  opt-in for speed-sensitive serving; safe (no score-0) when robustness matters.
+- Strict-parser A/B: UNBLOCKED, not yet run -- needs a strict-parser knob first
+  (tolerant rescues in api_common.h are unconditional today) + thunderdome campaign;
+  grammar ON both q27 legs vs llama grammar leg; gate = zero rescues both legs at
+  non-degraded score.
 - Q27_TOOL_SPLIT stays forbidden under --slots (P11 race, unchanged).
