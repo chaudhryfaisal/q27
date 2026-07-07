@@ -233,6 +233,13 @@ struct Engine {
     float maxd_lo = 0.10f;                  // demote 5->4 when yield_ema < lo
     long maxd_rounds4 = 0, maxd_rounds5 = 0; // gated rounds run at each ceiling
     long maxd_promotes = 0, maxd_demotes = 0; // 4->5 / 5->4 transitions
+    // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
+    // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
+    // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
+    // fired fraction = cap_hist[5]/sum(cap_hist), depth-5 saturation =
+    // n_hist[6]/sum(n_hist), p(5th lane accepted | fired) = n_hist[6]/cap_hist[5].
+    long gate_cap_hist[6] = {}; // [cap]
+    long gate_n_hist[7] = {};   // [n]; index 0 unused
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
@@ -1112,7 +1119,8 @@ struct Engine {
     // one speculative round (depth 4); returns tokens emitted (1..5).
     // All position math + acceptance runs on device; host reads 24 bytes.
     int spec_round(int* emit) {
-        int md_used = -1; // P13: draft-depth ceiling actually used this round
+        int md_used = -1;  // P13: draft-depth ceiling actually used this round
+        int gate_cap = -1; // this round's margin-run depth (gated branches only)
         if (tool_split_active && on_drafts) {
             // P11 constrained path: run drafts, read them back, let the host
             // stage per-lane grammar masks (uncapped), then verify. Full spec
@@ -1165,6 +1173,7 @@ struct Engine {
                 for (int k = launched; k < W && k < md_used; k++)
                     CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
                 CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                gate_cap = cap;
             } else {
                 // Q27_DEXIT=0: monolithic gated draft (the pre-P14 A/B baseline).
                 cudaGraphExec_t dg =
@@ -1177,6 +1186,7 @@ struct Engine {
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                gate_cap = cap;
             }
         } else {
             CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
@@ -1186,6 +1196,7 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 32, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
+        if (gate_cap >= 0) { gate_cap_hist[gate_cap]++; gate_n_hist[n]++; }
         // P13 adaptive maxd: fold this round's realized accept into the ceiling.
         // At depth-4, promote when the ceiling saturates (n==maxd+1) often enough;
         // at depth-5, demote when the 5th lane stops paying (n<6). On a switch,
