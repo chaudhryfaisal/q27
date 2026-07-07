@@ -522,30 +522,30 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
         if (t < s) sh[t] += sh[t + s];
         __syncthreads();
     }
-    if (t == 0) { s_logZ = logf(sh[0]); s_lo = 0.f; s_hi = 1.f; }
+    // Bisect on the LOGIT threshold directly (unbounded below), not a prob cutoff
+    // in [0,1]: the old 12-step tau bisection could not resolve cutoffs < 2^-12, so
+    // a diffuse distribution fell through to thresh=-FLT_MAX = full vocab (CUDA
+    // review #3). A 40-logit window below M covers all non-negligible mass.
+    if (t == 0) { s_logZ = logf(sh[0]); s_lo = M - 40.0f; s_hi = M; }
     __syncthreads();
     const float logZ = s_logZ;
     if (top_p < 1.0f) {
-        for (int it = 0; it < 12; it++) {
-            const float tau = 0.5f * (s_lo + s_hi); // s_lo/s_hi settled by prior __syncthreads
+        for (int it = 0; it < 16; it++) {
+            const float thr = 0.5f * (s_lo + s_hi); // s_lo/s_hi settled by prior __syncthreads
             float mass = 0.f;
-            for (int i = t; i < n; i += B) {
-                float p = expf(inv_temp * (x[i] - M) - logZ);
-                if (p >= tau) mass += p;
-            }
+            for (int i = t; i < n; i += B)
+                if (x[i] >= thr) mass += expf(inv_temp * (x[i] - M) - logZ);
             sh[t] = mass; __syncthreads();
             for (int s = B / 2; s > 0; s >>= 1) {
                 if (t < s) sh[t] += sh[t + s];
                 __syncthreads();
             }
-            if (t == 0) { if (sh[0] >= top_p) s_lo = tau; else s_hi = tau; } // mass decreasing in tau
+            if (t == 0) { if (sh[0] >= top_p) s_lo = thr; else s_hi = thr; } // mass decreasing in thr
             __syncthreads();
         }
     }
     if (t == 0) {
-        float thresh;
-        if (top_p >= 1.0f) thresh = -FLT_MAX;
-        else { float tau = s_lo; thresh = (tau <= 0.f) ? -FLT_MAX : M + (logf(tau) + logZ) / inv_temp; }
+        float thresh = (top_p >= 1.0f) ? -FLT_MAX : s_lo; // s_lo is now the logit threshold
         s_thresh = fminf(thresh, M); // argmax token always in nucleus
     }
     __syncthreads();

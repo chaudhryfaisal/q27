@@ -171,12 +171,23 @@ inline std::string tools_preamble(const json& tools) {
 // stable_off (P8): char offset where the trailing assistant-open begins.
 // Everything before it re-renders identically next turn (snapshot-safe);
 // everything after (assistant open + think prefill) is per-turn volatile.
+// Strip ChatML role delimiters from untrusted content/roles so they can't forge
+// prompt structure (Security #7): the tokenizer matches <|im_start|>/<|im_end|>
+// as control tokens anywhere, so a document or tool result containing them would
+// otherwise become real role boundaries. Operator content that legitimately
+// includes the literal markers loses them -- the safe tradeoff vs injection.
+inline std::string strip_ctrl(std::string s) {
+    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
+        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+    return s;
+}
+
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
                                  bool think = true, size_t* stable_off = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
-    if (!msgs.empty() && msgs[0].role == "system") { sys = msgs[0].content; start = 1; }
+    if (!msgs.empty() && msgs[0].role == "system") { sys = strip_ctrl(msgs[0].content); start = 1; }
     if (tools.is_array() && !tools.empty()) {
         p += "<|im_start|>system\n" + tools_preamble(tools);
         if (!sys.empty()) p += "\n\n" + sys;
@@ -185,7 +196,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_start|>system\n" + sys + "<|im_end|>\n";
     }
     for (size_t i = start; i < msgs.size(); i++)
-        p += "<|im_start|>" + msgs[i].role + "\n" + msgs[i].content + "<|im_end|>\n";
+        p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
+             "<|im_end|>\n";
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
     if (!think) p += "<think>\n\n</think>\n\n";
