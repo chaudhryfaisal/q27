@@ -260,10 +260,10 @@ llama's p_min stops DRAFTING (llama.cpp common/speculative.cpp:332); q27's gate 
 **Step 1: Verify the staleness proof against the code (proof already derived; re-check, don't re-derive).** The concern: skipped drafts skip their mtp_k/mtp_v row writes. The proof that this is safe, from k_prep_round (spec3.cu:511-527) and mtp_forward/attn_block (engine.cuh:562-596, 475-500):
 
 1. Draft k's position is `pos_m{k} = P + k` (prep_round), its input token OCCUPIES row P+k, and inside `attn_block` the `kv_store` at that row executes BEFORE `attn_decode` reads rows 0..P+k (engine.cuh:493-494). So within a round, every draft writes its own row before attending it, and attends no row beyond its own.
-2. Early-exit runs drafts 1..cap+1 (the FIRST FAILING draft still runs -- its margin is what stops the loop -- and therefore still writes row P+cap+1). Rows written this round: P+1..P+cap+1. The verify commits n <= cap+1 tokens, so the new base P' = P+n <= P+cap+1: **every committed position's row is written**.
+2. Early-exit runs drafts 1..cap+1 (the FIRST FAILING draft still runs -- its margin is what stops the loop -- and therefore still writes row P+cap+1). Rows written this round: P+1..P+cap+1. **[CORRECTED by the Task-4 Step-1 re-check]** The verify does NOT commit n <= cap+1: it runs at width W = max(2, cap+1) (the no-width-1-gemv floor) and finish walks max_draft = W-1 drafts, so **n <= W**. For cap >= 1, W = cap+1 and the bound above holds as written. At **cap == 0**, W = 2 and n can reach 2 while only draft 1 ran -- row P+2 is unwritten under naive early-exit but written by the monolithic path (verifier can accept a sub-theta draft: margin gates the DRAFTER's confidence, not the verifier's verdict), so the next round's draft 1 (pos P+3) attends a stale row P+2 and identity breaks (round-count for greedy, bytes for sampled). Fix: **top up draft-step launches to min(W, md_used) before the verify** -- only ever one extra step, only at cap==0; its inputs (d_draft, x1 after step 0) are final at that point, so it writes exactly what monolithic step 1 writes. With the top-up, drafts_launched = min(W, md_used) >= n in every case except the pre-existing full-accept bonus (point 4), and **every committed position's row is written**.
 3. The rows early-exit skips (P+cap+2..P+dmax) are exactly rows > P'+1's predecessors... more precisely: next round's draft j sits at P'+j and attends rows 0..P'+j; rows P'+1..P'+j are freshly written by that round's drafts 1..j (point 1) BEFORE any read, and rows <= P' are committed rows covered by induction. The monolithic path's "extra" rows P+cap+2..P+dmax hold speculative K/V that verify rejected -- they are likewise overwritten by a future draft before any draft attends them. So the read-set of every future attention is IDENTICAL under early-exit and monolithic. No new staleness class exists.
 4. The one pre-existing gap class (full-accept bonus: n = W commits position P+W whose row no draft wrote, dmax=4 path) is UNCHANGED by this task -- it happens only when cap==dmax, where early-exit and monolithic are the same.
-5. Corollary: draft token streams, caps, round grouping, and emitted tokens are all EXACTLY identical to the monolithic gated path -- which is why Step 5 gates round-COUNT identity, not just token identity, and why any round-count divergence means the implementation (not the design) is wrong.
+5. Corollary: with the top-up, draft token streams, caps, round grouping, and emitted tokens are all EXACTLY identical to the monolithic gated path -- which is why Step 5 gates round-COUNT identity, not just token identity, and why any round-count divergence means the implementation (not the design) is wrong. (The Step-1 re-check caught the cap==0 hole in the original proof before any code was written -- that is exactly what this step is for.)
 
 Re-check each cited line against HEAD before coding; if any indexing differs from the above (e.g. kv_store ordering, pos_m derivation), STOP and report rather than adapting the design silently.
 
@@ -271,19 +271,25 @@ Re-check each cited line against HEAD before coding; if any indexing differs fro
 
 **Step 3: Capture per-step graphs.** In the perm loop of `build_spec_graphs`: `draft_step_graph[k][p]` for k=0..gate_maxd-1 (capture each step alone). Under `maxd_auto`, steps 0..4 exist; `draft_graph_lo` becomes redundant for the gated path but LEAVE IT (constrained path + non-early-exit fallback use it).
 
-**Step 4: Early-exit loop.** In both gated branches (Q27_DEXIT env, default ON when pmin_theta>0; `Q27_DEXIT=0` restores the monolithic-draft behavior for A/B):
+**Step 4: Early-exit loop.** In both gated branches (Q27_DEXIT env, default ON when pmin_theta>0; `Q27_DEXIT=0` restores the monolithic-draft behavior for A/B). **[CORRECTED per the Step-1 re-check]** -- the width-2 floor means a cap==0 verify can commit n=2, so top up draft launches to min(W, md_used) before the verify:
 ```cpp
-int cap = 0;
+int cap = 0, launched = 0;
 for (int k = 0; k < md_used; k++) {
     CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+    launched++;
     CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
                                cudaMemcpyDeviceToHost, stm));
     CUDA_CHECK(cudaStreamSynchronize(stm));
     if (h_draft_margin[k] < pmin_theta) break;
     cap++;
 }
+int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+// width-floor top-up: a width-W verify commits up to n=W tokens, so W draft
+// rows must exist for identity with the monolithic path. Fires only at cap==0.
+for (int k = launched; k < W && k < md_used; k++)
+    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
 ```
-then the existing W floor + per-width verify launch. Worst case adds md_used-1 extra syncs/round (~15us each) vs one -- noise against a >=20ms round; each skipped draft saves ~1.5ms.
+then the per-width verify launch. Worst case adds md_used-1 extra syncs/round (~15us each) vs one -- noise against a >=20ms round; each skipped draft saves ~1.5ms (cap==0 rounds save md_used-2 drafts instead of md_used-1 -- still the bulk).
 
 **Step 5: Identity gates.** For theta in {0.5, 1.0} x ctx {2K, 16K, 60K} x {greedy, sampled seed 42}: `Q27_DEXIT=1` vs `Q27_DEXIT=0` -> emitted bytes identical AND round counts identical (round count printed in CLI stats / server req_log). Canonical EXACT (ungated path never enters the loop).
 

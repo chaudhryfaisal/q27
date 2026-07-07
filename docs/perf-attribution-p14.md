@@ -283,3 +283,96 @@ sub-theta margin, saving ~1.5 ms/draft-pass regardless of whether the verify wou
 accepted -- a cost the verify-only gate cannot touch. Task 3 is the necessary substrate
 (per-width sampled verify graphs + capped accept walk) for that. Default remains ungated
 (`Q27_PMIN` unset), so this change is zero-risk to production sampled traffic.
+
+---
+
+## Task 4 -- draft early-exit (margin-gated per-step draft graphs, `Q27_DEXIT`)
+
+Same harness as Task 3 (same server template, same docs prompts, `/v1/completions`
+`max_tokens=384`, 1 warmup + n=3 medians, sampled = `temperature=0.7, top_p=0.95, seed=42`,
+fields from the `[req]` log). Binary = branch tip with Task 4 (per-step draft graphs +
+early-exit loop in both gated branches). A/B lever: `Q27_DEXIT=1` (early-exit, default when
+gated) vs `Q27_DEXIT=0` (monolithic gated draft = the Task-3 behavior) -- one server restart
+per (theta, dexit) config. Baselines re-measured on THIS binary per the plan's measurement
+rigor (see the session-drift footnote below).
+
+### Identity gate (plan Step 5) -- ALL IDENTICAL
+
+For every cell of theta {0.5, 1.0} x ctx {2K, 61K} x {greedy, sampled seed 42}, 3 runs each:
+`Q27_DEXIT=1` vs `Q27_DEXIT=0` emitted bytes IDENTICAL and round counts IDENTICAL
+(rounds: 61K g 131/121, s 180/152; 2K g 176/167, s 173/167 for theta 1.0/0.5). The sampled
+identity is exact as predicted (same drafts, same caps, same Philox keys). A `Q27_MAXD=auto`
+greedy CLI smoke (2K, theta=1.0) is also byte-identical at 46 rounds both -- the P13 EMA sees
+identical n and md_used per round on both settings (caps identical), so adaptive-maxd
+trajectories cannot diverge.
+
+### Perf: Q27_DEXIT=1 vs =0 (n=3 medians, docs prompts)
+
+| theta | ctx | mode | DEXIT=1 t/s | DEXIT=0 t/s | delta | ms/round (1 vs 0) | tok/round | rounds |
+|------:|----:|------|------------:|------------:|------:|-------------------|----------:|-------:|
+| 1.0 | 61K | greedy  | **122.1** | 118.3 | **+3.2%** | 24.02 vs 24.79 (-0.77) | 2.931 | 131 |
+| 1.0 | 61K | sampled | **95.0**  | 90.1  | **+5.4%** | 22.46 vs 23.69 (-1.23) | 2.133 | 180 |
+| 1.0 | 2K  | greedy  | 130.6 | 123.3 | +5.9% | 16.70 vs 17.69 (-0.99) | 2.182 | 176 |
+| 1.0 | 2K  | sampled | 125.5 | 119.5 | +5.0% | 17.69 vs 18.58 (-0.89) | 2.220 | 173 |
+| 0.5 | 61K | greedy  | 121.1 | 119.4 | +1.4% | 26.21 vs 26.58 (-0.37) | 3.174 | 121 |
+| 0.5 | 61K | sampled | **100.5** | 97.6 | **+3.0%** | 25.13 vs 25.89 (-0.76) | 2.526 | 152 |
+| 0.5 | 2K  | greedy  | 129.2 | 124.3 | +3.9% | 17.80 vs 18.50 (-0.70) | 2.299 | 167 |
+| 0.5 | 2K  | sampled | 122.6 | 118.5 | +3.5% | 18.75 vs 19.40 (-0.65) | 2.299 | 167 |
+
+**Plan gates:** greedy 61K theta=1.0 **+3.2% >= +3% MET**; theta=0.5 positive (+1.4%) MET.
+tok/round and rounds are IDENTICAL between DEXIT settings in every cell (cap semantics
+unchanged) -- the entire delta is per-round draft cost, exactly the design.
+
+**2K note (positive surprise, not a gate miss):** the plan expected 2K "neutral (+-1.5%)"
+on the nothing-to-skip assumption, but the docs 2K prompt is LOW-acceptance at these thetas
+(tok/round 2.18-2.30 => many cap-0/1 rounds => 2-3 drafts skipped/round of a ~18 ms round),
+so early-exit pays +3.9..+5.9%. The honest "nothing to skip" neutrality check is the
+worst-case probe below.
+
+### Worst-case sync-overhead probe (`Q27_PMIN=0.01`, greedy)
+
+Every margin passes theta => the loop always runs all md_used steps with md_used
+D2H+syncs/round vs the monolithic's one -- pure added-overhead measurement, nothing skipped:
+
+| ctx | DEXIT=1 | DEXIT=0 | delta |
+|----:|--------:|--------:|------:|
+| 61K | 115.4 t/s (29.43 ms/r) | 116.0 t/s (29.31 ms/r) | -0.5% |
+| 2K  | 115.6 t/s (20.76 ms/r) | 116.1 t/s (20.67 ms/r) | -0.4% |
+
++0.09-0.12 ms/round = the 3 extra 4-byte D2H+sync round-trips (~30-40 us each). Within the
++-1.5% band -- high-acceptance traffic pays only this. Sync-count delta per round:
+monolithic gated = 1 margin sync; early-exit = min(cap+1, md_used) margin syncs (cap=0 pays
+1, the top-up adds launches but no sync; worst case md_used = +3 syncs).
+
+### Gated-vs-ungated on this binary (the production question)
+
+Ungated reference re-measured on this binary: 61K greedy 116.4 / sampled 97.0;
+2K greedy 115.5 / sampled 116.5 t/s.
+
+| vs ungated | greedy | sampled |
+|---|---|---|
+| 61K theta=1.0 + dexit | **+4.9%** | -2.1% |
+| 61K theta=0.5 + dexit | +4.0% | **+3.6%** |
+| 2K theta=1.0 + dexit | +13.1% | +7.7% |
+| 2K theta=0.5 + dexit | +11.9% | +5.2% |
+
+**Task 3's sampled wash is resolved:** verify-narrowing alone was +0.0% @61K theta=0.5;
+adding draft-side early-exit at the SAME acceptance cost (caps unchanged, tok/round 2.526
+either way) takes it to **+3.6% over ungated**. Recommendation: gate ON for both paths with
+**theta=0.5 as the cross-path default** (sampled theta=1.0 still nets negative vs ungated
+at 61K: the acceptance loss from aggressive narrowing exceeds the draft savings); greedy
+tolerates/prefers theta=1.0 at depth (+4.9%). `Q27_DEXIT` should stay default-ON: it is
+positive or neutral in every measured cell.
+
+### Session-drift footnote (measurement hygiene)
+
+Round counts for the SAME prompt+theta drift across sessions/binaries (61K greedy theta=1.0:
+Task 1 = 134, Task 3 = 127, this session = 131) while each session's A/B cells are internally
+exact. The drift pre-dates Task 4 (it exists between Task 1 and Task 3) and correlates with
+prefix-cache state (`hit=61002` here), not with any code change -- every comparison in this
+section is same-server-config A/B, so it cancels. Do not compare tok/round across sessions;
+compare only within a table row.
+
+Commands: `scratchpad/task4_matrix.sh` (identity + perf matrix), `task4_extra.sh` (overhead
+probe + auto smoke), `task4_ungated.sh` (ungated reference), all driving
+`srv4.sh`/`measure4.py`; per-run texts + rounds in `scratchpad/id_*` for the identity diffs.

@@ -195,6 +195,14 @@ struct Engine {
     // [W=2..5][perm=0..5]; the sampled+gated round drafts depth-4, reads the 4
     // draft margins, caps the accept walk at W-1, and launches this at width W.
     cudaGraphExec_t verify_sample_graph_w[6][6] = {}; // [W][perm]
+    // P14 draft early-exit: one graph per draft STEP (k=0..gate_maxd-1), so the
+    // gated rounds can stop drafting at the first sub-theta margin (llama's
+    // p_min stops DRAFTING; the P12 gate only narrowed verify). Steps 0..k
+    // launched back-to-back on stm reproduce the monolithic draft graph's
+    // kernel sequence exactly (see spec_draft_step_launches). Q27_DEXIT=0
+    // restores the monolithic draft (A/B lever); default ON when gated.
+    cudaGraphExec_t draft_step_graph[5][6] = {}; // [step][perm]
+    bool dexit_on = true; // Q27_DEXIT (only reached when pmin_theta > 0)
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 6;
@@ -741,30 +749,38 @@ struct Engine {
     // P11: draft half -- prep + the 4 sequential MTP passes producing
     // d_draft..d_draft4. Split out so the constrained path can read the
     // drafts back and stage per-lane grammar masks before the verify half.
-    void spec_draft_launches() {
-        q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_f,
-                         d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_outcome, stm);
-        // draft 1: (h_next, embed(t1)) at pos_m -> d_draft; MTP's own post-head-norm
-        // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2, draft 3 at
-        // pos_m3 -> d_draft3, and draft 4 at pos_m4 -> d_draft4 (each pass
-        // also fills its MTP KV row)
-        // P12: each draft's top1-top2 margin (the drafter's confidence) lands in
-        // d_draft_margin[k]. P14: FUSED into the draft's argmax -- one full-vocab
-        // pass per draft (was argmax + a separate k_margin scan). Value-identical
-        // to the old pair (same token, same margin), so every existing graph stays
-        // token-identical and the margin slot mapping (0..4 for drafts 1..5) is
-        // unchanged. Margins are write-only scratch, read only by the gated round.
-        mtp_forward(h_next, d_token, d_draft, d_pos_m, d_draft_margin + 0);
-        CUDA_CHECK(cudaMemcpyAsync(h_next2, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2, d_draft_margin + 1);
-        CUDA_CHECK(cudaMemcpyAsync(h_next3, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next3, d_draft2, d_draft3, d_pos_m3, d_draft_margin + 2);
-        CUDA_CHECK(cudaMemcpyAsync(h_next4, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next4, d_draft3, d_draft4, d_pos_m4, d_draft_margin + 3);
-        if (dmax > 4) { // P12b: 5th draft + margin for gated depth-5
-            CUDA_CHECK(cudaMemcpyAsync(h_next5, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-            mtp_forward(h_next5, d_draft4, d_draft5, d_pos_m5, d_draft_margin + 4);
+    // P14 early-exit: one draft step. k==0 is prep_round + draft 1 (h_next,
+    // embed(t1)) at pos_m -> d_draft; k>0 chains MTP's own post-head-norm hidden
+    // (x1) via the h_next{k+1} D2D into draft k+1 at pos_m{k+1} -> d_draft{k+1}
+    // (each pass also fills its MTP KV row).
+    // P12: each draft's top1-top2 margin (the drafter's confidence) lands in
+    // d_draft_margin[k]. P14: FUSED into the draft's argmax -- one full-vocab
+    // pass per draft (was argmax + a separate k_margin scan). Value-identical
+    // to the old pair (same token, same margin), so every existing graph stays
+    // token-identical and the margin slot mapping (0..4 for drafts 1..5) is
+    // unchanged. Margins are write-only scratch, read only by the gated round.
+    // Concatenating steps 0..dmax-1 reproduces the pre-refactor monolithic
+    // kernel sequence byte-for-byte (the D2D that used to trail step k now
+    // leads step k+1 -- same stream order), so every existing graph capture is
+    // unchanged; the gated rounds additionally capture each step alone
+    // (draft_step_graph) to stop drafting at the first sub-theta margin.
+    void spec_draft_step_launches(int k) {
+        if (k == 0) {
+            q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_f,
+                             d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_outcome, stm);
+            mtp_forward(h_next, d_token, d_draft, d_pos_m, d_draft_margin + 0);
+            return;
         }
+        float* hs[5] = {h_next, h_next2, h_next3, h_next4, h_next5};
+        const int* ts[5] = {d_token, d_draft, d_draft2, d_draft3, d_draft4};
+        int* ds[5] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5};
+        const int* ps[5] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5};
+        CUDA_CHECK(cudaMemcpyAsync(hs[k], x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
+        mtp_forward(hs[k], ts[k], ds[k], ps[k], d_draft_margin + k);
+    }
+
+    void spec_draft_launches() {
+        for (int k = 0; k < dmax; k++) spec_draft_step_launches(k);
     }
 
     // P11: verify half -- batch-5 forward of {pending, d1..d4}, masked argmax
@@ -963,6 +979,18 @@ struct Engine {
                 CUDA_CHECK(cudaGraphDestroy(gdl));
                 dmax = gate_maxd;
             }
+            // P14 early-exit: capture each draft step alone. Steps don't read
+            // dmax; steps 0..3 are depth-independent and step 4 exists only
+            // when gate_maxd==5. draft_graph/draft_graph_lo stay captured for
+            // the constrained path and the Q27_DEXIT=0 monolithic fallback.
+            for (int k = 0; k < gate_maxd; k++) {
+                cudaGraph_t gs;
+                CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+                spec_draft_step_launches(k);
+                CUDA_CHECK(cudaStreamEndCapture(stm, &gs));
+                CUDA_CHECK(cudaGraphInstantiate(&draft_step_graph[k][p], gs, nullptr, nullptr, 0));
+                CUDA_CHECK(cudaGraphDestroy(gs));
+            }
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
@@ -1024,12 +1052,16 @@ struct Engine {
         // unset = off (always full width 5 = the canonical depth-4 round).
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
+        // P14 draft early-exit: default ON when gated; Q27_DEXIT=0 restores the
+        // monolithic draft (the A/B lever). Ungated rounds never reach either.
+        if (const char* de = getenv("Q27_DEXIT")) dexit_on = atoi(de) != 0;
         fprintf(stderr,
                 "spec graphs captured (6 perms, depth-4; +split D/V; +P12b per-width verify "
-                "2..%d%s; +P14 sampled per-width verify 2..5); Q27_PMIN=%.3f (%s), gate_maxd=%d%s\n",
-                gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", pmin_theta,
-                pmin_theta > 0 ? "gated" : "off", gate_maxd,
-                maxd_auto ? " (auto: floats 4..5)" : "");
+                "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
+                "Q27_PMIN=%.3f (%s), gate_maxd=%d%s, dexit=%d\n",
+                gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", gate_maxd - 1,
+                pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd,
+                maxd_auto ? " (auto: floats 4..5)" : "", dexit_on ? 1 : 0);
     }
 
     // one speculative round (depth 4); returns tokens emitted (1..5).
@@ -1062,16 +1094,45 @@ struct Engine {
             // (cur_maxd); pick the matching draft graph. draft_graph[perm] is
             // depth-5 under auto (gate_maxd forced 5), draft_graph_lo is depth-4.
             md_used = maxd_auto ? cur_maxd : gate_maxd;
-            cudaGraphExec_t dg =
-                (maxd_auto && md_used == 4) ? draft_graph_lo[perm] : draft_graph[perm];
-            CUDA_CHECK(cudaGraphLaunch(dg, stm));
-            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, 5 * 4,
-                                       cudaMemcpyDeviceToHost, stm));
-            CUDA_CHECK(cudaStreamSynchronize(stm));
-            int cap = 0;
-            while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
-            int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
-            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+            if (dexit_on) {
+                // P14 draft early-exit: launch draft steps one at a time and
+                // stop at the first sub-theta margin (that step still ran --
+                // its margin is what stopped the loop, so its MTP KV row and
+                // d_draft slot are written, same as monolithic). cap semantics
+                // are unchanged: leading run of margin >= theta.
+                int cap = 0, launched = 0;
+                for (int k = 0; k < md_used; k++) {
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                    launched++;
+                    CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                               cudaMemcpyDeviceToHost, stm));
+                    CUDA_CHECK(cudaStreamSynchronize(stm));
+                    if (h_draft_margin[k] < pmin_theta) break;
+                    cap++;
+                }
+                int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+                // Width-floor top-up: a width-W verify can commit up to n=W
+                // tokens (finish walks max_draft=W-1 drafts), so W draft rows
+                // must exist for byte/round identity with the monolithic path.
+                // Only fires at cap==0 (W=2 > launched=1): run draft step 1
+                // too. Its inputs (d_draft, x1 after step 0) are final at this
+                // point, so it writes exactly what monolithic step 1 writes.
+                for (int k = launched; k < W && k < md_used; k++)
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+            } else {
+                // Q27_DEXIT=0: monolithic gated draft (the pre-P14 A/B baseline).
+                cudaGraphExec_t dg =
+                    (maxd_auto && md_used == 4) ? draft_graph_lo[perm] : draft_graph[perm];
+                CUDA_CHECK(cudaGraphLaunch(dg, stm));
+                CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, 5 * 4,
+                                           cudaMemcpyDeviceToHost, stm));
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+                int cap = 0;
+                while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
+                int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+            }
         } else {
             CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
         }
@@ -1151,16 +1212,43 @@ struct Engine {
             // draft (captured whenever gate_maxd==5). Cap the accept walk at 4.
             // Tools are off under sampling, so no split path.
             const int md_used = 4; // sampled ceiling is 4; cap <= 4 by construction
-            cudaGraphExec_t dg = (gate_maxd == 5) ? draft_graph_lo[perm] : draft_graph[perm];
-            CUDA_CHECK(cudaGraphLaunch(dg, stm));
-            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
-                                       cudaMemcpyDeviceToHost, stm));
-            CUDA_CHECK(cudaStreamSynchronize(stm));
-            int cap = 0;
-            while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
-            assert(cap <= 4);
-            int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
-            CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+            if (dexit_on) {
+                // P14 draft early-exit, sampled flavor: per-step draft graphs
+                // are depth-independent (steps 0..3 here), margins and caps are
+                // value-identical to the monolithic depth-4 draft, and the
+                // accept walk consumes the identical drafts + Philox keys -- so
+                // emitted bytes and round counts match Q27_DEXIT=0 exactly.
+                int cap = 0, launched = 0;
+                for (int k = 0; k < md_used; k++) {
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                    launched++;
+                    CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                               cudaMemcpyDeviceToHost, stm));
+                    CUDA_CHECK(cudaStreamSynchronize(stm));
+                    if (h_draft_margin[k] < pmin_theta) break;
+                    cap++;
+                }
+                assert(cap <= 4);
+                int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+                // Width-floor top-up (see spec_round): a width-W sampled verify
+                // walks max_draft=W-1 drafts, so W draft rows must exist. Only
+                // fires at cap==0.
+                for (int k = launched; k < W && k < md_used; k++)
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+            } else {
+                // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
+                cudaGraphExec_t dg = (gate_maxd == 5) ? draft_graph_lo[perm] : draft_graph[perm];
+                CUDA_CHECK(cudaGraphLaunch(dg, stm));
+                CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
+                                           cudaMemcpyDeviceToHost, stm));
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+                int cap = 0;
+                while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
+                assert(cap <= 4);
+                int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+            }
             // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
             // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
         } else {

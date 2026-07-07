@@ -1430,3 +1430,64 @@ whenever Q27_PMIN>0 under sampling) and is proven correct by the reproducibility
 gates; it just does not yet pay for itself at 61K on docs traffic.
 
 Files: blocks.cu, blocks.cuh, engine.cuh, test_kernels.cu, docs/perf-attribution-p14.md.
+
+## 2026-07-06 (P14 Task 4) -- draft early-exit: margin-gated per-step draft graphs
+
+**What.** llama's `p_min` stops DRAFTING at the first low-confidence draft
+(common/speculative.cpp:332); q27's P12 gate only narrowed VERIFY while the gated draft
+always ran to gate_maxd. This task splits the draft into per-step CUDA graphs
+(`draft_step_graph[5][6]`, one per draft step per perm) and makes both gated rounds
+(greedy `spec_round`, sampled `spec_sample_round`) launch steps one at a time, D2H the
+4-byte margin, and stop at the first sub-theta margin. `Q27_DEXIT=0` restores the
+monolithic gated draft (A/B lever); default ON when `Q27_PMIN>0`; the ungated/constrained
+paths never touch any of it. CANONICAL-EXACT: **4c4120c72056aba2bc2d2561471eafce** at the
+refactor checkpoint AND the final binary.
+
+**Refactor.** `spec_draft_launches` -> `for (k < dmax) spec_draft_step_launches(k)`; step 0
+= prep_round + draft 1, step k>0 = h_next{k+1} D2D + mtp_forward k+1. The concatenated
+kernel sequence is byte-identical to the old monolithic body (the D2D that used to trail
+step k now leads step k+1 -- same stream order), so every existing graph capture
+(spec/draft/draft_lo/sample) is untouched -- proven by canonical EXACT at the
+refactor-only checkpoint before any behavior change landed.
+
+**The staleness-proof re-check EARNED ITS STEP (paid-for lesson).** The plan's Step-1 proof
+claimed early-exit is safe because "verify commits n <= cap+1". Re-checking each cited
+invariant against HEAD found the fourth one FALSE at one edge: the no-width-1-gemv floor
+(`W = max(2, cap+1)`, engine.cuh) means a cap==0 round runs a width-2 verify whose finish
+walks max_draft=W-1=1 draft, so **n can reach 2 while only draft 1 ran**. Counterexample
+trace: cap==0 (draft-1 margin < theta) but the verifier ACCEPTS d1 (margin gates the
+drafter's confidence, not the verifier's verdict -- common on low-margin docs traffic) =>
+n=2 => base P'=P+2, but naive early-exit never wrote MTP KV row P+2 (monolithic did, via
+draft 2) => next round's draft 1 at P+3 attends a stale row P+2 => round-count divergence
+(greedy) / byte divergence (sampled). **Fix: top up draft-step launches to min(W, md_used)
+before the verify** -- fires only at cap==0, one extra step whose inputs (d_draft, x1 after
+step 0) are final, so it writes exactly what monolithic step 1 writes. With the top-up,
+drafts_launched >= n everywhere except the pre-existing full-accept bonus row (unwritten
+identically on both paths). The other three invariants held as written (kv_store before
+attn_decode in attn_block; pos_m{k}=P+k in k_prep_round; drafts are the sole MTP-KV writers
+during decode). Plan doc amended in this commit to record the corrected proof + loop.
+
+**Gates -- ALL PASS.** (1) Refactor checkpoint canonical EXACT. (2) Identity matrix: theta
+{0.5,1.0} x ctx {2K,61K} x {greedy, sampled T=0.7 seed 42}, 3 runs/cell: DEXIT=1 vs 0
+emitted bytes IDENTICAL and rounds IDENTICAL in all 8 cells; plus Q27_MAXD=auto greedy
+smoke byte-identical (46 rounds both; EMA sees identical n/md_used by construction, caps
+identical). (3) Final canonical EXACT. (4) test_kernels ALL PASS (no kernel changes --
+graph/host restructuring only).
+
+**Perf (server, docs prompts, n=3 medians, DEXIT=1 vs 0 same binary).** 61K greedy
+theta=1.0 **+3.2%** (122.1 vs 118.3, -0.77 ms/round) -- plan gate >=+3% MET; theta=0.5
++1.4%. 61K SAMPLED **+5.4%** (theta 1.0) / **+3.0%** (theta 0.5): tok/round IDENTICAL by
+construction (2.133/2.526), so unlike Task 3's verify-narrowing (a wash at depth from
+acceptance loss) this is pure per-round savings -- sampled gated theta=0.5 is now **+3.6%
+over ungated** on this binary (Task 3's +0.0% resolved). 2K +3.9..+5.9% (docs 2K is
+low-acceptance at these thetas -- lots to skip; NOT the neutral case). Worst-case overhead
+probe `Q27_PMIN=0.01` (nothing ever skipped, md_used syncs vs 1): -0.4/-0.5%, i.e. the +3
+extra 4-byte D2H syncs cost ~0.1 ms/round = noise. Sync delta/round: monolithic 1 margin
+sync; early-exit min(cap+1, md_used). Full tables + gated-vs-ungated matrix + session-drift
+footnote in docs/perf-attribution-p14.md (Task 4 section). Recommendation recorded there:
+gate ON both paths, theta=0.5 cross-path default (sampled theta=1.0 still nets -2.1% vs
+ungated at 61K); Q27_DEXIT default-ON (positive or neutral in every measured cell).
+
+Files: engine.cuh (spec_draft_step_launches + capture + both gated branches),
+docs/plans/2026-07-06-p14-perf-levers.md (corrected Step-1 proof + Step-4 loop),
+docs/perf-attribution-p14.md.
