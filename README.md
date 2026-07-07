@@ -2,7 +2,7 @@
 
 A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
-## State of the engine (2026-07-06)
+## State of the engine (2026-07-07)
 
 - **Agentic serving unblocked (2026-07-06):** the SERVING-layer tool-call parser
   -- not the quant, not sampling -- was the ceiling on agentic scores. Three
@@ -20,6 +20,36 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   no regression, no new drift mode -- so sampling is cleared to default at
   T<=0.7 / top_p 0.95 (server `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P`; explicit request
   temperature still wins). Greedy stays bitwise. docs/sampling-exit-gate.md.
+- **P14 perf-levers bundle landed (2026-07-07, branch `p14-perf-levers`,
+  UNMERGED):** five decode changes, reported as same-prompt A/B t/s deltas only
+  (n=1 t/s is near-deterministic; no cross-prompt or score claims).
+  (1) **Fused draft argmax+margin** (`k_argmax_top2`) folds each draft's argmax
+  and its P12 gate margin into one full-vocab pass, killing the 4-5 dead
+  `k_margin` scans that were baked into the ungated round (-0.545 ms/round).
+  (2) **P12 confidence gate ported to the production SAMPLED spec path** (was
+  greedy-only). (3) **Draft early-exit** (`Q27_DEXIT`, default-ON when
+  `Q27_PMIN` is set) stops DRAFTING at the first sub-theta margin -- llama's
+  p_min draft-stop parity, which the P12 verify-only gate never had -- with a
+  `min(W,md_used)` width-floor top-up that keeps emitted bytes AND round counts
+  bitwise-identical to the monolithic draft. (4) **fd2 lane-innermost grid
+  order** co-schedules the verify lanes onto the same KV chunk for partial
+  cross-lane L2 reuse (**+2.7% @61K ungated, MARGINAL-KEPT** -- in the
+  [+1.5%,+3%) band, above the revert floor but below an unqualified keep; the
+  residual R~4.25 headroom is the deferred lane-pair-fusion target). Greedy
+  stays bitwise throughout (canonical 4c4120c7 unchanged). **Headline
+  same-config @61K docs greedy: ungated 109.9 -> 119.3 t/s across the bundle
+  (Task 2 fusion + Task 5 L2); production gated config (`Q27_PMIN=0.5` +
+  `Q27_DEXIT`) 124-125 t/s.** Sampled @61K gated+dexit **+3.6% over ungated**.
+  Key finding (Task 3): verify-narrowing ALONE is acceptance-NEGATIVE under
+  sampling -- a low-margin draft the sampler might still accept gets skipped, so
+  tok/round drops and the cheaper round only breaks even (+0.0% @61K) -- so it is
+  draft-side early-exit (Task 4), not the verify gate, that makes the sampled
+  gate pay. Production recommendation: gate ON both paths with `Q27_PMIN=0.5` as
+  the cross-path default (greedy also tolerates theta=1.0 for +4.9%, but sampled
+  theta=1.0 nets -2.1% vs ungated @61K, so 0.5 is the safe default). Attribution:
+  docs/perf-attribution-p14.md. The depth-6 (`gate_maxd`) question:
+  docs/maxd6-decision.md (NO-GO on a fixed default; GO-IF adaptive, gated on one
+  unmeasured agentic depth-5 A/B; Task 6 lane-pair fusion recommended first).
 - Decode at depth (the metric that matters for agentic work): **126.2 t/s at
   61K ctx** (was 78.0 pre-fd2), **156-164 t/s effective across real CRUSH
   trials to 74K ctx** (was 103-113). attn-fd2 register-accumulator
@@ -271,6 +301,19 @@ and name-dropped `{"name":\n{args}}` calls (tool inferred from the arg-key
 signature) -- logging each recovery for the drift catalog. `--fast-head` trades
 output exactness for ~7% more t/s.
 
+**Confidence-gated depth (P12 + P14) applies to BOTH greedy and sampled
+decode.** `Q27_PMIN=theta` caps the verify width on the drafter's top1-top2
+margin (skipping the deep-KV verify when the draft head is unconfident), and
+`Q27_DEXIT` (P14, default-ON whenever `Q27_PMIN` is set) additionally stops
+DRAFTING at the first sub-theta margin -- the llama p_min draft-stop that the
+verify-only gate lacked. Recommended production config on long-context traffic:
+`Q27_PMIN=0.5` with `Q27_DEXIT` on for both paths (same-config @61K docs:
+greedy +4.0% / sampled +3.6% vs ungated; greedy also tolerates theta=1.0 for
++4.9%, but sampled theta=1.0 nets -2.1%, so 0.5 is the cross-path default).
+Greedy output stays bitwise-identical under gating (only round count + verify
+width change); sampled output stays seeded-reproducible. Gate OFF by default
+(`Q27_PMIN` unset) -> zero risk to production traffic that does not opt in.
+
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
 Chronological -- each row supersedes the previous. Current canonical numbers
@@ -309,6 +352,10 @@ live in "Decode methodology" above.
 | P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method) [superseded 2026-07-06: current 128K prefill ~71-80s after g64 regroup + delta-WY tiling]; split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
 | fd2: register-accumulator flash-decode (SM-starvation/occupancy fix #3, attn was 99% of depth cost at 5% DRAM BW) | 61K depth **78.0 -> 126.2 t/s** (+62%, 47.2 -> 29.2 ms/round); 16K **-18%/round**; instance 0.768 -> 0.156 ms @61K (45% DRAM BW); 2K +1.3%/round; acceptance parity exact; PPL in noise both KV modes; nll-long 160K bucket-identical; CANONICAL RE-DERIVED 4c4120c7 (old 58b6ae85 under Q27_FD=v1) |
 | P12: confidence-gated depth (`p_min` equiv; `Q27_PMIN=theta`) -- gate verify width on the drafter's top1-top2 margin, skip the deep-KV verify when unconfident | decode **grows with ctx: 2K neutral / 16K +5.8% / 60K +10.8%** (theta 1.0; +7.0% theta 0.5); greedy output BITWISE-IDENTICAL (lanes are independent grid indices -> only round count + verify width change); higher theta wins at longer ctx (context-adaptive theta confirmed). P12b depth-5 (`Q27_MAXD=5`, opt-in): agentic +2.6% but docs -8% (always drafts to max, so the 5th MTP pass is pure cost at low acceptance) -> depth-4 stays default; adaptive maxd is the follow-on |
+| P14 Task 2: fuse draft argmax+margin (`k_argmax_top2`) -- kills the dead ungated `k_margin` scan | -0.545 ms/round @61K (the removed scan); canonical 4c4120c7 EXACT (bitwise); test_kernels +3 fused assertions (token==argmax, margin==CPU top1-top2, all err 0) |
+| P14 Task 3: P12 confidence gate ported to the sampled spec path (per-width sampled verify graphs, capped accept walk) | sampled verify-narrowing ALONE is a wash @61K docs (+0.0% theta0.5 -- a low-margin draft the sampler may accept gets skipped, tok/round drops, extra rounds offset the cheaper round); greedy cross-check healthy on the same binary (+6.6% theta1.0); substrate for Task 4; canonical 4c4120c7 EXACT (greedy untouched) |
+| P14 Task 4: draft early-exit (`Q27_DEXIT`, margin-gated per-step draft graphs, `min(W,md_used)` width-floor top-up) | same-binary A/B @61K docs: greedy **+3.2%** (theta1.0), sampled **+5.4%**; emitted bytes + round counts bitwise-identical to the monolithic draft in all 8 identity cells; sampled gated+dexit now **+3.6% over ungated** (Task 3's sampled wash resolved); canonical 4c4120c7 EXACT |
+| P14 Task 5: fd2 lane-innermost grid order (partial cross-lane KV L2 reuse; R~4.25 measured) | same-session pre/post A/B @61K ungated **116.1 -> 119.3 t/s (+2.7%, MARGINAL-KEPT)**; verify fd2 per-instance -10% toward the draft floor; 2K neutral (+0.0%); canonical 4c4120c7 EXACT (2-line index remap, bitwise on the full fd2 matrix) |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -366,12 +413,16 @@ required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Recently shipped (2026-07-05 -> 06):** `/v1/messages/count_tokens` and the
+**Recently shipped (2026-07-05 -> 07):** `/v1/messages/count_tokens` and the
 Anthropic-shaped context-limit error (both surfaced by the CC-harness A/B);
 sampling Phases 1-2 + the exit-gate A/B (passed); the tool-call parser drift
 fixes that unblocked agentic Claude Code (CC 0.00 -> 0.55 on analytics-dashboard);
-and **P12 confidence-gated depth (`Q27_PMIN`), the measured top decode lever --
-+10.8% @60K, bitwise-identical greedy** (see the depth-match motivation below).
+**P12 confidence-gated depth (`Q27_PMIN`), the measured top decode lever --
++10.8% @60K, bitwise-identical greedy** (see the depth-match motivation below);
+and **the P14 perf-levers bundle (2026-07-07, branch `p14-perf-levers`,
+UNMERGED)** -- fused draft argmax+margin, the P12 gate ported to the sampled
+path, draft early-exit (`Q27_DEXIT`), and the fd2 lane-innermost L2 fix (see the
+State section + docs/perf-attribution-p14.md).
 
 **P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
 interleaving; whole-generation queue waits gone; analysis in
@@ -425,11 +476,40 @@ theta the offline margin bins predicted. The prior fixed-depth (P3), adaptive-de
 and burst-depth negatives were all UNGATED or accept-count-gated and did not cover
 this. **P12b depth-5** (`Q27_MAXD=5`, opt-in) works but is traffic-dependent
 (+2.6% agentic vs -8% docs -- Path C always drafts to gate_maxd, so the 5th MTP
-pass is pure cost at low acceptance), so depth-4 is the default. FOLLOW-ON:
-adaptive maxd (key draft depth to recent acceptance) would make deep drafting a
-universal win; long-ctx agentic A/B is the untested regime where depth-5 should
-win biggest. On branch `p12-confidence-gated-depth` (Phase-0/0b margin
+pass is pure cost at low acceptance), so depth-4 is the default. Adaptive maxd
+(P13, `Q27_MAXD=auto`) floats the ceiling 4..5 per stream from realized
+acceptance. On branch `p12-confidence-gated-depth` (Phase-0/0b margin
 measurement + implementation; see BUILDLOG).
+
+**P14 continuation -- SHIPPED (2026-07-07, branch `p14-perf-levers`, UNMERGED).**
+The P12 gate now runs on the production SAMPLED path too, and draft early-exit
+(`Q27_DEXIT`) closes the other half of llama's p_min -- the P12 gate only
+narrowed VERIFY, while llama's p_min also stops DRAFTING. The Task 3 finding is
+load-bearing: verify-narrowing ALONE is acceptance-NEGATIVE under sampling (a
+low-margin draft the sampler might still accept gets skipped, so tok/round drops
+and the cheaper round only breaks even, +0.0% @61K); it is the draft-side
+early-exit that makes the sampled gate pay (+3.6% over ungated @61K). Fused
+draft argmax+margin (`k_argmax_top2`) and the fd2 lane-innermost L2 fix
+(+2.7% @61K, MARGINAL-KEPT) round out the bundle. Production config:
+`Q27_PMIN=0.5` + `Q27_DEXIT` on both paths. Attribution:
+docs/perf-attribution-p14.md.
+
+**Open decode levers (post-P14):**
+- **maxd6 GO-IF measurement** (docs/maxd6-decision.md): raising `gate_maxd` to 6
+  is NO-GO as a fixed default (docs depth-5 already -3.3% with all P14 machinery;
+  depth-6 is necessarily worse), but GO-IF, narrowly, as an adaptive
+  (`Q27_MAXD=auto`) ceiling bump -- gated on ONE unmeasured agentic measurement:
+  a depth-5 `--stats` run on real agentic serving traffic showing cap>=5 on
+  >=30% of gated rounds AND a net-positive depth-5-vs-depth-4 A/B. Cheapest,
+  highest-information next step; ~1 session on the existing Phase-0 rig, zero
+  engine risk.
+- **Task 6 fd2 lane-pair fusion (requires Gabe's explicit go).** Task 5 captured
+  only ~10% of the R~4.25 cross-lane KV headroom (the L2 fix is partial reuse);
+  the residual ~6 ms/round verify-attention is the lane-pair-fusion target -- it
+  helps every round of every traffic class (not just agentic streaks), costs ~0
+  VRAM, and lowers depth-6's own breakeven. Recommended before any depth-6 build.
+  It is the expensive kernel rewrite (fd3 design doc + occupancy gate), so it is
+  DEFERRED pending explicit approval on the marginal Task 5 result.
 
 **Open quality gates (red-team pass 2026-07-05):**
 - strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,

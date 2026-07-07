@@ -1545,3 +1545,49 @@ Gabe's explicit go (expensive kernel rewrite).
 
 Files: src/spec3.cu (2-line index remap), docs/perf-attribution-p14.md (Task 5 section +
 go/no-go Task 6 row updated).
+
+## 2026-07-07 (P14 Task 8) -- capstone: docs sync + graph-zoo inventory
+
+Wrap-up for the P14 perf-levers bundle (branch `p14-perf-levers`, Tasks 0-5 + 7 landed;
+5b measured-SKIP, 6 deferred pending go). **The bundle:** fused draft argmax+margin
+(Task 2, `k_argmax_top2` -- kills the dead ungated `k_margin` scan, -0.545 ms/round); the
+P12 confidence gate ported to the production SAMPLED spec path (Task 3, per-width sampled
+verify graphs + capped accept walk); draft early-exit (Task 4, `Q27_DEXIT` default-ON when
+`Q27_PMIN` set -- margin-gated per-step draft graphs with the `min(W,md_used)` width-floor
+top-up, llama's p_min draft-stop parity); and the fd2 lane-innermost grid order (Task 5,
+partial cross-lane KV L2 reuse). **Headline same-config @61K docs greedy: ungated 109.9 ->
+119.3 t/s across the bundle (Task 2 fusion + Task 5 L2); production gated config
+(`Q27_PMIN=0.5` + `Q27_DEXIT`) 124-125 t/s. Sampled @61K gated+dexit +3.6% over ungated.**
+Greedy stays bitwise throughout (canonical **4c4120c72056aba2bc2d2561471eafce** unchanged
+end to end). **Task-4 proof-catch (the paid-for step):** the Step-1 re-check of the
+staleness proof found the width-2 floor lets a cap==0 verify commit n=2 while only draft 1
+ran -- a stale-KV-row divergence -- caught before any code was written; the `min(W,md_used)`
+top-up fixes it. Task 5 is MARGINAL-KEPT (+2.7%, in the [+1.5%,+3%) band); it captured only
+~10% of the R~4.25 cross-lane headroom, so the residual is the deferred Task 6 (lane-pair
+fusion) target. See docs/perf-attribution-p14.md (Tasks 1-5 attribution + go/no-go matrix)
+and docs/maxd6-decision.md (gate_maxd=6: NO-GO fixed default, GO-IF adaptive gated on one
+unmeasured agentic depth-5 A/B; Task 6 recommended first).
+
+**This commit (docs-only + comment-only):** (1) README State/serving/roadmap sync -- new
+P14 State bullet, four progress-log rows, a serving-section gated-config block, and roadmap
+open-lever entries (maxd6 GO-IF measurement + Task 6 lane-pair fusion), all framed per the
+red-team precedent (same-prompt A/B t/s deltas only, no cross-prompt/score claims, Task 5
+flagged marginal). (2) A GRAPH-ZOO comment block above the perm-indexed graph members in
+engine.cuh inventorying all nine graph sets (spec_graph, spec_sample_graph, verify_graph_w,
+verify_sample_graph_w, draft_step_graph, draft_graph, draft_graph_lo, verify_graph, plus the
+two non-spec singletons graph_exec/sample_graph) and which decode path launches each --
+comment-only, zero codegen change (canonical EXACT confirms). **Removable-candidate noted,
+NOT removed:** with `Q27_DEXIT` default-ON the gated early-exit path drives
+`draft_step_graph`, so monolithic `draft_graph` / `draft_graph_lo` are redundant FOR THE
+GATED PATH; both stay live for the P11 constrained-tool path and the `Q27_DEXIT=0` A/B
+baseline, so neither is removable. `draft_graph_lo` is the closest to dead (unique callers:
+constrained-tool-under-auto + the DEXIT=0 auto/sampled fallback) -- a future
+graph-pruning pass, not this bundle. `verify_graph` (monolithic width-5) is now used only by
+the constrained-tool path.
+
+**Final gates on the branch tip (engine.cuh touched -> rebuild REQUIRED, not optional):**
+full `make` clean (sm_86+sm_120, only pre-existing tokenizer.cpp warnings); `test_kernels`
+ALL PASS; canonical **4c4120c72056aba2bc2d2561471eafce** EXACT. Branch left UNPUSHED +
+UNMERGED for Gabe (public repo; merge is his call).
+
+Files: README.md, src/engine.cuh (comment-only graph-zoo block), docs/BUILDLOG.md.

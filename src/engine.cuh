@@ -148,6 +148,51 @@ struct Engine {
     std::vector<int> snap_toks;
     bool have_snap = false;
     int perm = 0;
+    // ---- GRAPH ZOO (read before any width/depth change: miss one and a decode
+    // path silently runs a stale graph). perm is mod-6 (6 GDN state buffers), so
+    // every spec/gated set below is [.. ][perm=0..5]. Two NON-spec single-token
+    // graphs live at the top of the struct: `graph_exec` (plain greedy forward,
+    // step_free fallback) and `sample_graph` (plain temp>0 forward+sample, the
+    // non-spec sampled loop). The perm-indexed spec/gated sets and their callers:
+    //
+    //   spec_graph[6]              monolithic UNGATED GREEDY round (draft to
+    //                              gate_maxd + width-5 verify, one graph).
+    //                              -> spec_round, ungated branch (Q27_PMIN unset,
+    //                                 unconstrained). The default greedy path.
+    //   spec_sample_graph[6]       monolithic UNGATED SAMPLED round.
+    //                              -> spec_sample_round, ungated branch. Default
+    //                                 sampled path.
+    //   verify_graph_w[7][6]       per-width GREEDY verify, [W=1..6][perm].
+    //                              -> gated greedy round (spec_round), both
+    //                                 Q27_DEXIT on and off.
+    //   verify_sample_graph_w[6][6] per-width SAMPLED verify, [W=2..5][perm].
+    //                              -> gated sampled round (spec_sample_round),
+    //                                 both Q27_DEXIT on and off.
+    //   draft_step_graph[5][6]     per-draft-STEP graphs, [step=0..gate_maxd-1].
+    //                              -> the early-exit loop in BOTH gated rounds
+    //                                 (default when Q27_DEXIT on). Launched one
+    //                                 step at a time; concatenated back-to-back
+    //                                 they reproduce the monolithic draft exactly.
+    //   draft_graph[6]             monolithic depth-gate_maxd draft (P11 split).
+    //                              -> P11 constrained-tool path; AND the
+    //                                 Q27_DEXIT=0 monolithic-draft A/B fallback
+    //                                 (greedy + sampled).
+    //   draft_graph_lo[6]          monolithic DEPTH-4 draft; captured only when
+    //                              gate_maxd==5 (auto or fixed Q27_MAXD=5).
+    //                              -> constrained-tool path under auto; the
+    //                                 Q27_DEXIT=0 depth-4 fallback (greedy auto
+    //                                 md_used==4; sampled gate_maxd==5).
+    //   verify_graph[6]            monolithic WIDTH-5 verify (P11 split).
+    //                              -> ONLY the P11 constrained-tool path.
+    //
+    // REDUNDANT-BUT-KEPT after P14: with Q27_DEXIT default-ON, the gated
+    // early-exit path drives draft_step_graph, so the monolithic draft_graph /
+    // draft_graph_lo are redundant FOR THE GATED PATH -- but both stay live for
+    // (a) the P11 constrained-tool path and (b) the Q27_DEXIT=0 A/B baseline, so
+    // NEITHER is removable. draft_graph_lo is the closest to dead (its only
+    // unique callers are constrained-tool-under-auto + the DEXIT=0 auto/sampled
+    // fallback); flagged a removable-candidate in the P14 capstone BUILDLOG
+    // entry, deliberately NOT removed here.
     cudaGraphExec_t spec_graph[6] = {}; // P12b: perm is mod-6 (6 GDN state buffers)
     // P11: split draft/verify graphs for the constrained tool path
     cudaGraphExec_t draft_graph[6] = {};
