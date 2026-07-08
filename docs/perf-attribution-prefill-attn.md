@@ -183,7 +183,17 @@ deep prompts" risk is measured and absent. Repro: `Q27_KV=fp8 [Q27_PF_FP8MMA=1]
 Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file scratchpad/pf_toks.txt --pf 131072
 --ctx 133120 --dump-logits <out>`, then scratchpad/cmp_logits.py.
 
-**Opt-in KEEP; quality-gated for default-on.** The one gate not yet run is a needle-retrieval
-sweep (retrieval is more sensitive than a single next-token logit) -- the logit A/B bounds
-per-position drift, a needle would confirm depth-placed recall. Cheap now that the dump path
-exists.
+**Needle-retrieval sweep (fp8q) -- 6/6.** q27-server on the fp8q path (`Q27_KV=fp8
+Q27_PF_FP8MMA=1`, chunked prefill routes through attn_prefill_launch -> fp8q), tools-style
+6-needle W&P sweep (10/35/60/70/78/95% depth). VRAM capped the ctx: fp8 KV at 34KB/tok +
+17.7GB model OOMs above ~330K on the 32GB card (NOT fp8q-specific -- default fp8 OOMs
+identically), so the haystack was trimmed to ~317K (deepest needle ~301K, still beyond the
+262K native limit). **6/6 PASS, verbatim-correct answers at every depth** (e.g. @301K:
+"The calibration constant for the tidal array is 88231."), matching the established default
+6/6. Repro: scratchpad/needle_fp8q.py against the fp8q server.
+
+**Opt-in KEEP -- fully quality-gated.** Perf +11.8% @128K; correctness greedy-identical
+(serial-vs-batched, pfcache); deep logit A/B cosine 0.9999827 / argmax MATCH @131K; needle
+6/6 to ~301K beyond-native. The fp8 QK^T trades no measurable quality for the speedup. The
+one caveat left for default-on is orthogonal to fp8q: fp8 KV at 34KB/tok caps deep-ctx VRAM
+on 32GB (both paths), so 355K+ needs a tighter KV or a bigger card.

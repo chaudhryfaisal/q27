@@ -2009,3 +2009,14 @@ essentially zero quality delta at max depth -- the "silent deep-prompt quality l
 measured and absent. Perf reconfirmed same runs: default 68.00s / fp8q 60.19s = +11.5%.
 Only remaining default-on gate: a needle-retrieval sweep (retrieval > single-logit
 sensitivity), cheap now the dump path exists. Repro in the attribution doc.
+
+**Needle sweep (fp8q) -- 6/6, default-on quality gate CLEARED.** q27-server on the fp8q path
+(Q27_KV=fp8 Q27_PF_FP8MMA=1), 6-needle W&P sweep 10-95% depth. VRAM capped ctx to ~320K on
+the 32GB card (fp8 KV 34KB/tok + 17.7GB model OOMs >~330K -- NOT fp8q-specific, default fp8
+OOMs the same), so haystack trimmed to ~317K; deepest needle ~301K still BEYOND the 262K
+native limit. **6/6 PASS with verbatim-correct sentences at every depth** (@301K: "...tidal
+array is 88231."), matching the established default 6/6. So the full Phase 2 gate battery is
+green: +11.8% @128K, greedy-identical (serial-vs-batched + pfcache), deep logit A/B cosine
+0.9999827 / argmax MATCH @131K, needle 6/6 to 301K. fp8q trades no measurable quality for the
+speedup -- default-on is defensible (the only caveat, VRAM at 34KB/tok on 32GB, is orthogonal
+and hits both paths). Left opt-in pending Gabe's review/push.
