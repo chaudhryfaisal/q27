@@ -1983,5 +1983,18 @@ end-to-end ~= +22% on the attn kernel** (attacks the Phase-0 28% math_pipe_throt
 12.5% occ). Correctness (greedy/identity -- `--nll` is per-token so it does NOT hit this
 kernel; validated via batched-prefill routes): canonical unchanged, serial-vs-batched
 continuation IDENTICAL @ pf=512 AND pf=4096, `--pfcache` warm/cold + mid-divergence
-checkpoint-restore IDENTICAL, all under fp8q. Opt-in KEEP; default-on gated on a
-batched-prefill PPL/needle path (filed). attribution: docs/perf-attribution-prefill-attn.md.
+checkpoint-restore IDENTICAL, all under fp8q. Opt-in KEEP (EXPERIMENTAL until the deep
+battery passes); default-on gated on a batched-prefill PPL/needle path (filed).
+attribution: docs/perf-attribution-prefill-attn.md.
+
+**Consensus review fixes (same session, 1/3 reviewers -- Claude/Gemini timed out, Codex
+landed).** Applied: (#2, the important one) runtime device-capability guard in
+attn_prefill_launch -- `Q27_PF_FP8MMA` now falls back to f16-MMA + warns on <sm_89 instead
+of hitting the mma_e4m3 no-op stub and emitting silent garbage on the 3090; (#3)
+static_assert(LDQ%4==0 && LDK%4==0) so a future stride change can't silently break the
+uint32 fp8-load alignment; (#1) documented the t0==0 split-write contract (rule 6a) in the
+new kernel; (#4) documented that the a/b fragment reads never touch the pad tail [HD,LD).
+Skipped w/ reason: #5 one-time cudaFuncSetAttribute (matches existing code, single-GPU per
+SECURITY-MODEL); #6 grid-remap divergence (Task 1.5 was never adopted -- L2 already 95.6%,
+no default-path remap to diverge from). Re-verified after fixes: canonical 4c4120c7,
+serial-vs-batched IDENTICAL @ pf=512, --pfcache IDENTICAL, fp8q 128K unchanged.

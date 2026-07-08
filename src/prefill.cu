@@ -1186,6 +1186,13 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
     // LDQ/LDK pad s_q/s_kraw so the fp8 QK^T uint32 reads don't 8-way bank-conflict
     // (word stride coprime-ish to 32; the f16 path gets this free via LDH).
     constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8, LDQ = HD + 4, LDK = HD + 16;
+    // The a/b fragment loads read `*(uint32_t*)(base + row*LD? + kb + tg*4[+16])`.
+    // Row strides and every byte offset are multiples of 4, so the uint32 loads
+    // are 4B-aligned -- these static_asserts fail the build if a stride change
+    // breaks that invariant (review finding #3). The reads also never touch the
+    // pad tail [HD, LD?): max offset is (n*8+gid)*LD + 7*32 + 3*4 + 16 + 3 <
+    // row_base + HD, so the uninitialized pad bytes are never consumed (#4).
+    static_assert(LDQ % 4 == 0 && LDK % 4 == 0, "fp8 QK^T uint32 loads must stay 4B-aligned");
     const int kvh = blockIdx.x;
     const int t0 = tile_t0 + blockIdx.y * TT;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -1404,7 +1411,12 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
         if (cpa) cur = 1 - cur;
     }
 
-    // normalize + write (verbatim from k_attn_prefill_mma)
+    // normalize + write (verbatim from k_attn_prefill_mma). The split path (nsp>1)
+    // writes partials at ABSOLUTE row tr0=t0+gid while k_attn_pf_combine reads
+    // RELATIVE rows [0,trows) -- correct ONLY when t0==0 (CUDA-review #4 / rule 6a).
+    // attn_prefill_launch enforces this: nsplit>1 only when `part && t0==0`, so this
+    // kernel is never called with t0>0 and a split simultaneously. Preserve that
+    // gate if this kernel gains a t0>0 sub-batching caller.
     const int tr0 = t0 + gid, tr1 = t0 + gid + 8;
     if (nsp > 1) {
         size_t b0 = ((size_t)(qh * trows + tr0) * nsp + sp) * PF_PART_STRIDE;
@@ -1574,6 +1586,22 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         if (fp8mma_env < 0) {
             const char* fe = getenv("Q27_PF_FP8MMA");
             fp8mma_env = fe ? atoi(fe) : 0;
+            // fp8 m16n8k32 MMA is sm_89+ (Blackwell sm_120 ok); the mma_e4m3
+            // stub NO-OPs on <sm_89 and would silently emit garbage. Gate the
+            // route on a real device-capability check, not just the env var.
+            if (fp8mma_env) {
+                int dev = 0, mj = 0, mn = 0;
+                cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
+                cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
+                if (mj * 10 + mn < 89) {
+                    fprintf(stderr,
+                            "[pfattn] Q27_PF_FP8MMA set but device sm_%d%d < sm_89; "
+                            "falling back to f16-MMA prefill\n",
+                            mj, mn);
+                    fp8mma_env = 0;
+                }
+            }
         }
         if constexpr (sizeof(CT) == 1) {
             if (fp8mma_env) {
