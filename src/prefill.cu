@@ -1585,27 +1585,27 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         // s_kraw, no s_k) in a separate kernel; the fp16 KV path below and the
         // fp16 canonical are untouched. Set Q27_PF_FP8MMA=0 to force the f16-MMA
         // fp8 path (bisection / <sm_89 auto-fallback via the guard below).
-        static int fp8mma_env = -1;
-        if (fp8mma_env < 0) {
-            const char* fe = getenv("Q27_PF_FP8MMA");
-            fp8mma_env = fe ? atoi(fe) : 1;  // default ON
-            // fp8 m16n8k32 MMA is sm_89+ (Blackwell sm_120 ok); the mma_e4m3
-            // stub NO-OPs on <sm_89 and would silently emit garbage. Gate the
-            // route on a real device-capability check, not just the env var.
-            if (fp8mma_env) {
-                int dev = 0, mj = 0, mn = 0;
-                cudaGetDevice(&dev);
-                cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
-                cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
-                if (mj * 10 + mn < 89) {
-                    fprintf(stderr,
-                            "[pfattn] Q27_PF_FP8MMA set but device sm_%d%d < sm_89; "
-                            "falling back to f16-MMA prefill\n",
-                            mj, mn);
-                    fp8mma_env = 0;
-                }
-            }
+        // fp8 m16n8k32 MMA is sm_89+ (Blackwell sm_120 ok); the mma_e4m3
+        // stub NO-OPs on <sm_89 and would silently emit garbage. Cache the
+        // device-capability check (device doesn't change) but RE-READ the env
+        // per launch -- test_kernels exercises both the f16-staging bitwise
+        // path (=0) and the fp8q tolerance path (=1) in one process, and a
+        // getenv at launch frequency (once per chunk x layer) is noise.
+        static int fp8mma_arch = -1;
+        if (fp8mma_arch < 0) {
+            int dev = 0, mj = 0, mn = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
+            fp8mma_arch = (mj * 10 + mn >= 89) ? 1 : 0;
+            if (!fp8mma_arch)
+                fprintf(stderr,
+                        "[pfattn] device sm_%d%d < sm_89: fp8-MMA prefill unavailable, "
+                        "using f16-MMA\n",
+                        mj, mn);
         }
+        const char* fe = getenv("Q27_PF_FP8MMA");
+        const int fp8mma_env = (fe ? atoi(fe) : 1) && fp8mma_arch;  // default ON
         if constexpr (sizeof(CT) == 1) {
             if (fp8mma_env) {
                 constexpr int LDQ = 260, LDK = 272;  // match k_attn_prefill_mma_fp8q pads

@@ -2028,3 +2028,17 @@ canonical (4c4120c7) are untouched -- fp8q only ever engages under `Q27_KV=fp8`.
 post-flip: canonical 4c4120c7 unchanged; fp8 default (no env) now runs fp8q -- 128K 59.6s
 (2199 t/s, +12.7% vs the 68.3s f16-MMA fallback), serial-vs-batched IDENTICAL @ pf=512;
 `Q27_PF_FP8MMA=0` restores 68.3s. Branch prefill-attn-fp8mma pushed to origin.
+
+**test_kernels fallout from the default-on flip -- FIXED (caught starting verify-gemv;
+the flip commit skipped the test_kernels gate, own goal).** `fp8 attn prefill mma ==
+fp16(deq) (bitwise)` FAILed (err 4.265e-2 vs tol 1e-30): the mma-mode fp8 leg now routes
+through fp8q, which is tolerance-class BY DESIGN (fp8 QK^T), so the bitwise assertion no
+longer applies to the default path. Fix: (1) `attn_prefill_launch` now caches only the
+ARCH check and re-reads `Q27_PF_FP8MMA` per launch (was a static latch -- one process
+couldn't test both paths; getenv at launch frequency, once per chunk x layer, is noise);
+(2) the bitwise legs pin `Q27_PF_FP8MMA=0` -- they isolate the f16-STAGING invariant
+(fp8 bytes -> half -> same MMA), which still holds bitwise; (3) NEW check `fp8q attn
+prefill vs fp16(deq) (tol)` at bound 1e-1 (observed 4.265e-2; a fragment-layout bug gives
+O(1)+ garbage). The same-err match between the old FAIL and the new tolerance PASS proves
+fp8q engages under =1 and disengages under =0 in one process. test_kernels ALL PASS (225),
+canonical 4c4120c7 holds.

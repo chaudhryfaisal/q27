@@ -735,6 +735,11 @@ static void test_attn_fp8() {
         return m;
     };
     const float scale = 1.0f / sqrtf((float)HD);
+    // bitwise legs pin Q27_PF_FP8MMA=0: they isolate the f16-STAGING invariant
+    // (fp8 bytes -> half convert -> same MMA => bitwise vs fp16(deq)). The
+    // default fp8q path is tolerance-class BY DESIGN (fp8 QK^T; Phase 2) and
+    // gets its own check below.
+    setenv("Q27_PF_FP8MMA", "0", 1);
     for (const char* mode : {"lite", "mma"}) {
         setenv("Q27_ATTN_PF", mode, 1);
         q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
@@ -746,6 +751,19 @@ static void test_attn_fp8() {
         snprintf(label, sizeof label, "fp8 attn prefill %s == fp16(deq) (bitwise)", mode);
         check(label, maxd(), 1e-30);
     }
+    // fp8q (Phase 2, default-on): fp8 QK^T vs the fp16(deq) reference is
+    // tolerance-gated -- the only numeric delta is the Q e4m3 cast + fp8
+    // accumulate (observed max abs ~4.3e-2 at these shapes; a fragment-layout
+    // bug produces O(1)+ garbage, so 0.1 separates cleanly).
+    setenv("Q27_PF_FP8MMA", "1", 1);
+    setenv("Q27_ATTN_PF", "mma", 1);
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
+                         NKV * GQA, NKV, HD, scale, 0, true);
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
+                         NKV * GQA, NKV, HD, scale, 0, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    check("fp8q attn prefill vs fp16(deq) (tol)", maxd(), 1e-1);
+    unsetenv("Q27_PF_FP8MMA");
     unsetenv("Q27_ATTN_PF");
     // flash-decode: one token at position SEQ-1 (reads rows [0, SEQ))
     int pos = SEQ - 1;
