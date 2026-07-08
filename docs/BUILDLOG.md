@@ -2056,3 +2056,17 @@ anchor reproduces: ungated nsys (node-trace, Q27_PROF_DECODE rig, 170 rounds) ke
 = batched verify GEMV **12.38 ms/rnd** (P14 12.24, +1.2%), single/draft **3.11** (exact),
 weight-stream total **15.49 vs 15.4 (+0.6%)** -- Task 0's 5% sanity gate PASS, harness valid.
 test_kernels ALL PASS, canonical 4c4120c7 exact.
+
+**verify-gemv Task 1 (Phase 0 ncu) -- PROCEED.** ncu'd `k_gemv_q4_n<5>` inside the full
+engine (ungated server, 61K request, `--graph-profiling=node -k regex:k_gemv_q4_n
+--launch-skip 2000 --launch-count 4 --kill 1`, root). The verify GEMV is **latency-bound at
+39-47% of DRAM peak**, NOT at the weight roofline: long-scoreboard (L1TEX dependency) is
+**90.4% of the 68.8-cycle inter-issue gap**, issue slots 11-13% busy, occupancy 63-89% (not
+the limiter), L1 hit ~97% (activations resident) / L2 17-29% (weights stream). Smoking gun:
+**global loads use 10.0 of 32 bytes per sector** -- the weight-read pattern wastes ~2/3 of
+each DRAM transaction. ncu's own OPT estimate: 43.9% speedup on the L1TEX stall, consistent
+with the plan's ~37% roofline gap (15.4 vs ~9.7 ms/round floor). Decision matrix row 2 ->
+**Task 2 GO** (bitwise-safe: coalesce/vectorize the weight walk + more loads in flight);
+dp4a issue is NOT the limiter, so Task 3 (tensor-core, canonical-breaking) looks unjustified
+-- revisit only if Task 2 stalls short. Full counters + commands:
+docs/perf-attribution-verify-gemv.md.
