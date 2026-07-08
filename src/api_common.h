@@ -309,9 +309,43 @@ struct ToolCall {
 
 inline std::string escape_content_tags(const std::string& text);
 
+// Q27_TOOL_STRICT=1: disable EVERY tolerant-parser rescue (the strict-parser
+// A/B knob). Wrapped calls must be plain valid JSON (no <content>-tag rewrite,
+// no double-encode unwrap); the wrapper-less bare-scan recovery is suppressed
+// entirely. Suppressed rescues are logged ([q27-strict]) so a campaign can
+// count what the tolerant chain WOULD have carried. Read once (server-lifetime
+// knob, one leg per server run).
+inline bool tool_strict() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("Q27_TOOL_STRICT"); v = e ? atoi(e) : 0; }
+    return v == 1;
+}
+
 inline ToolCall parse_tool_call(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
+    if (tool_strict()) {
+        // strict: the wrapped segment must parse as-is, with a JSON-object
+        // arguments value. Anything else stays text (rescue suppressed).
+        try {
+            json j = json::parse(seg);
+            tc.name = j.value("name", std::string());
+            tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
+            if (tc.arguments.is_string()) {
+                fprintf(stderr, "[q27-strict] rejected double-encoded arguments (tool=%s)\n",
+                        tc.name.c_str());
+                tc.ok = false;
+                return tc;
+            }
+            tc.ok = !tc.name.empty();
+        } catch (...) {
+            tc.ok = false;
+            if (seg.find("<content>") != std::string::npos ||
+                seg.find("</content>") != std::string::npos)
+                fprintf(stderr, "[q27-strict] rejected <content>-tagged call (mode 3)\n");
+        }
+        return tc;
+    }
     try {
         json j = json::parse(escape_content_tags(seg));
         tc.name = j.value("name", std::string());
@@ -480,6 +514,18 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr) {
     std::vector<ToolCall> out;
+    if (tool_strict()) {
+        // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
+        // is OFF. Log when the text plausibly contained an intended call so the
+        // campaign can count suppressed rescues against the tolerant leg.
+        if (prefix) *prefix = "";
+        if (text_in.find("{\"name\"") != std::string::npos ||
+            text_in.find("{\"tool_call\"") != std::string::npos ||
+            text_in.find("</content>") != std::string::npos)
+            fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %.200s\n",
+                    text_in.c_str());
+        return out;
+    }
     bool m2 = false, m5 = false, m6 = false;        // drift-mode flags (exit-gate catalog)
     const std::string text = escape_content_tags(text_in);
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten

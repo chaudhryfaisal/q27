@@ -2095,3 +2095,15 @@ canonical): NOT JUSTIFIED -- killed.** Phase 0 showed dp4a issue was never the l
 the residual gap is L1TEX-latency structure and the remaining safe levers are
 marginal-band with occupancy risk (fd2/smem precedents). verify-gemv plan COMPLETE:
 attribution + verdicts in docs/perf-attribution-verify-gemv.md.
+
+**Strict-parser knob (Q27_TOOL_STRICT=1) -- the strict-parser A/B is now runnable.** The
+tolerant rescues were unconditional; the knob severs ALL of them: parse_tool_call goes
+plain-JSON-only (no <content>-tag rewrite/mode-3, double-encoded arguments REJECTED
+instead of unwrapped) and parse_bare_tool_calls (drift modes 1-6, both server call sites)
+returns empty. Suppressed rescues log `[q27-strict]` so a campaign can count what the
+tolerant chain would have carried; the tolerant leg keeps its existing `[drift]`/
+`[tool-fallback]` counters. Read-once env (one leg per server run). Gates: build clean,
+test_tokenizer PASS both modes, E2E smoke = byte-identical well-formed tool_use in both
+modes on a clean call (no rescue fired, strict did not over-suppress). Default behavior
+byte-unchanged (knob off = old code path).
+
