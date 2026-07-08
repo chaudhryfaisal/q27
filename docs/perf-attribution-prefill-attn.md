@@ -192,7 +192,8 @@ identically), so the haystack was trimmed to ~317K (deepest needle ~301K, still 
 "The calibration constant for the tidal array is 88231."), matching the established default
 6/6. Repro: scratchpad/needle_fp8q.py against the fp8q server.
 
-**Opt-in KEEP -- fully quality-gated.** Perf +11.8% @128K; correctness greedy-identical
+**DEFAULT ON (fp8 KV path) -- fully quality-gated** (`Q27_PF_FP8MMA=0` forces the f16-MMA
+fallback; <sm_89 auto-falls-back). Perf +11.8% @128K; correctness greedy-identical
 (serial-vs-batched, pfcache); deep logit A/B cosine 0.9999827 / argmax MATCH @131K; needle
 6/6 to ~301K beyond-native. The fp8 QK^T trades no measurable quality for the speedup. The
 one caveat left for default-on is orthogonal to fp8q: fp8 KV at 34KB/tok caps deep-ctx VRAM

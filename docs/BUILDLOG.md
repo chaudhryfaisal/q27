@@ -2019,4 +2019,12 @@ array is 88231."), matching the established default 6/6. So the full Phase 2 gat
 green: +11.8% @128K, greedy-identical (serial-vs-batched + pfcache), deep logit A/B cosine
 0.9999827 / argmax MATCH @131K, needle 6/6 to 301K. fp8q trades no measurable quality for the
 speedup -- default-on is defensible (the only caveat, VRAM at 34KB/tok on 32GB, is orthogonal
-and hits both paths). Left opt-in pending Gabe's review/push.
+and hits both paths).
+
+**FLIPPED DEFAULT-ON (Gabe's call, same session).** `Q27_PF_FP8MMA` now defaults to 1 on the
+fp8 KV path -- fp8q is the fp8 prefill kernel by default; `Q27_PF_FP8MMA=0` forces the old
+f16-MMA path (and the <sm_89 guard still auto-falls-back). The fp16 KV path and the fp16
+canonical (4c4120c7) are untouched -- fp8q only ever engages under `Q27_KV=fp8`. Verified
+post-flip: canonical 4c4120c7 unchanged; fp8 default (no env) now runs fp8q -- 128K 59.6s
+(2199 t/s, +12.7% vs the 68.3s f16-MMA fallback), serial-vs-batched IDENTICAL @ pf=512;
+`Q27_PF_FP8MMA=0` restores 68.3s. Branch prefill-attn-fp8mma pushed to origin.

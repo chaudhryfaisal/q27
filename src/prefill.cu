@@ -1579,13 +1579,16 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
             const char* ce = getenv("Q27_PF_CPASYNC");
             cpa_env = ce ? atoi(ce) : 1;  // default ON for the fp8 path
         }
-        // Phase 2: fp8 QK^T MMA (Q27_PF_FP8MMA, fp8 KV only). Own smem relayout
-        // (s_q e4m3 + double-buffered s_kraw, no s_k) -- separate kernel, the
-        // default fp16/fp8 path below is untouched.
+        // Phase 2: fp8 QK^T MMA -- DEFAULT ON for the fp8 KV path (fully gated:
+        // +11.8% @128K, greedy-identical, logit A/B cosine 0.99998 argmax-match
+        // @131K, needle 6/6 @301K). Own smem relayout (s_q e4m3 + double-buffered
+        // s_kraw, no s_k) in a separate kernel; the fp16 KV path below and the
+        // fp16 canonical are untouched. Set Q27_PF_FP8MMA=0 to force the f16-MMA
+        // fp8 path (bisection / <sm_89 auto-fallback via the guard below).
         static int fp8mma_env = -1;
         if (fp8mma_env < 0) {
             const char* fe = getenv("Q27_PF_FP8MMA");
-            fp8mma_env = fe ? atoi(fe) : 0;
+            fp8mma_env = fe ? atoi(fe) : 1;  // default ON
             // fp8 m16n8k32 MMA is sm_89+ (Blackwell sm_120 ok); the mma_e4m3
             // stub NO-OPs on <sm_89 and would silently emit garbage. Gate the
             // route on a real device-capability check, not just the env var.
