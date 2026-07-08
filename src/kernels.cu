@@ -255,14 +255,23 @@ __global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restr
         float wsc = __half2float(__ldg(sr + (ch >> 1)));
 #pragma unroll
         for (int n = 0; n < N; n++) {
-            const uint2* xp = eos[n] + (size_t)ch * 4;
+            // Task 2 (verify-gemv): activation reads as 2x uint4 instead of
+            // 4x uint2 -- same 32 bytes, same component order into the same
+            // dp4a sequence (integer-exact, fp acc order untouched, bitwise),
+            // but half the L1TEX wavefronts. Phase 0 measured these 8B loads
+            // at 32B lane stride as THE stall (long_scoreboard 90%, 10/32
+            // bytes/sector); 16B loads double the per-instruction utilization.
+            const uint4* xp = (const uint4*)(eos[n] + (size_t)ch * 4);
+            const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
             int di = 0;
-#pragma unroll
-            for (int u = 0; u < 4; u++) {
-                uint2 xv = __ldg(xp + u);
-                di = __dp4a((int)(ws[u] & 0x0F0F0F0Fu), (int)xv.x, di);
-                di = __dp4a((int)((ws[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
-            }
+            di = __dp4a((int)(ws[0] & 0x0F0F0F0Fu), (int)xv0.x, di);
+            di = __dp4a((int)((ws[0] >> 4) & 0x0F0F0F0Fu), (int)xv0.y, di);
+            di = __dp4a((int)(ws[1] & 0x0F0F0F0Fu), (int)xv0.z, di);
+            di = __dp4a((int)((ws[1] >> 4) & 0x0F0F0F0Fu), (int)xv0.w, di);
+            di = __dp4a((int)(ws[2] & 0x0F0F0F0Fu), (int)xv1.x, di);
+            di = __dp4a((int)((ws[2] >> 4) & 0x0F0F0F0Fu), (int)xv1.y, di);
+            di = __dp4a((int)(ws[3] & 0x0F0F0F0Fu), (int)xv1.z, di);
+            di = __dp4a((int)((ws[3] >> 4) & 0x0F0F0F0Fu), (int)xv1.w, di);
             acc[n] += wsc * __ldg(xss[n] + ch) * (float)(di - 8 * __ldg(iss[n] + ch));
         }
     }

@@ -2070,3 +2070,17 @@ with the plan's ~37% roofline gap (15.4 vs ~9.7 ms/round floor). Decision matrix
 dp4a issue is NOT the limiter, so Task 3 (tensor-core, canonical-breaking) looks unjustified
 -- revisit only if Task 2 stalls short. Full counters + commands:
 docs/perf-attribution-verify-gemv.md.
+
+**verify-gemv Task 2 (Phase 1, bitwise-safe) -- +5.5% decode @61K, KEEP.** One surgical
+change in `k_gemv_q4_n`: the per-column activation reads go 4x uint2 -> 2x uint4 (same 32
+bytes, same component order into the same dp4a sequence -- integer-exact, fp acc order
+untouched, so greedy is bitwise by construction; alignment holds, eo + 32*ch is a
+16B-multiple into a cudaMalloc base). This halves the L1TEX wavefronts on exactly the loads
+Phase 0 fingered (8B at 32B lane stride = 10/32 bytes/sector, long_scoreboard 90%).
+Deliberately NO smem (the -4% smem-staging lesson: in-graph occupancy dominates). Gates:
+canonical 4c4120c7 EXACT; test_kernels ALL PASS (225); full-engine 61K production-gate
+decode **163.2 -> 172.2 t/s median n=3 (+5.5%, spread 0.1%)**, dec_ms 4901 -> 4645, same
+173 rounds (engine-level bitwise confirmation). Captures ~1.48 ms/round of the ~5.7
+ms/round roofline gap (~26%). NOT applied to k_gemv_q8_n (its activation loads are already
+uint4) or the single-column kernels (draft path, 3.1 ms/round, same pattern applies --
+candidate follow-up).
