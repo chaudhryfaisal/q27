@@ -2355,3 +2355,30 @@ the ladder extends by the same recipe (S_spare7, [8]->[9] arrays, hi7/flo7) IF l
 lane-6 telemetry (glf/gla now report it) shows sustained sat6 >= .6 on real serving;
 the pointer-array lane refactor (maxd6-decision.md) becomes worth it at d7+. (c) The
 P4-echo tail (llama depth-10 +45%) remains open above d6.
+
+## 2026-07-08 (new model onboarded) -- unsloth Qwen3.6-27B-MTP (base) repacked + running
+
+The BASE Qwen3.6-27B-MTP (unsloth/Qwen3.6-27B-MTP-GGUF, BF16 split-GGUF ->
+llama-gguf-split --merge -> tools/repack.py v1.4 `(ssm_out|attn_output)\.`) now
+runs on the maxd6-era engine. Files: /mnt/ai/models/qwen36-27b-mtp/{.q27,.tok}
+(17.73 GB, 867 tensors incl output_q4); merged BF16 kept at
+/mnt/ai/models/qwen36-27b-mtp-gguf/ for future repacks (split shards deleted).
+
+Architecture metadata is an EXACT match to Qwopus (same qwen35 hybrid, 65
+blocks, M-RoPE [11,11,10,0], nextn=1, vocab 248320, 866 GGUF tensors); the
+exported tokenizer is BYTE-IDENTICAL to qwopus-27b-mtp.tok. Quant RMSE profile
+matches the Qwopus repack band (worst ~0.117 Q4 tensors).
+
+Baselines (this model's own -- Qwopus gates do NOT transfer):
+- canonical md5 **a2982c5197c627551b27d76a0a94b220** (128 tok, ctx 2048, --spec;
+  shortbench_suite.sh now takes CANON_MD5 env for non-default models);
+- shortbench suite mean **166.1 t/s** (159.9-173.7, t/round 3.10-3.37) vs
+  Qwopus 179.7 (3.20-3.88) -- same kernels/shapes, the ~8% is pure MTP
+  acceptance, slightly lower on the base model;
+- server smoke: /v1/messages chat coherent (--no-think, fast-head).
+
+Ops notes: hf download stalled twice on the 49.9 GB shard at 160 MB (single
+connection); aria2c -x8 against the resolve URL pulled it at full rate --
+prefer aria2c for multi-GB HF shards on this box. The GGUF repo also carries
+mmproj-* files (the base model is multimodal-capable); q27 uses the text tower
+only.
