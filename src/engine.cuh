@@ -255,10 +255,14 @@ struct Engine {
     bool maxd_auto = false;
     cudaGraphExec_t draft_graph_lo[8] = {}; // depth-4 draft (auto mode only)
     DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
-                   // CPU tests (tools/test_depthctl.cpp). Engine-lifetime
-                   // object, request-lifetime STATE: generate() calls
-                   // dctl.reset() at entry (review 2026-07-09), so each
-                   // request starts at k_min and earns its own depth.
+                   // CPU tests (tools/test_depthctl.cpp). ENGINE-lifetime
+                   // state, deliberately (review 2026-07-09): warm start
+                   // across same-conversation turns beats per-request
+                   // re-earning by a measured 1.6% on short requests, and
+                   // multi-tenant isolation is out of scope
+                   // (SECURITY-MODEL.md). Q27_MAXD_RESET=1 flips to
+                   // per-request reset at generate() entry.
+    bool maxd_reset = false; // Q27_MAXD_RESET=1: reset dctl per request
     // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
     // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
     // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
@@ -1061,6 +1065,7 @@ struct Engine {
         if (gate_maxd > 7) gate_maxd = 7;
         if (maxd_auto) dctl.k_max = gate_maxd;
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
+        if (const char* e = getenv("Q27_MAXD_RESET")) maxd_reset = atoi(e) != 0;
         if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI6")) dctl.hi6 = (float)atof(e);
@@ -1856,9 +1861,14 @@ struct Engine {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
-        // per-request depth-controller isolation (review 2026-07-09): without
-        // this, unrelated requests inherit the previous tenant's ceiling/EMAs
-        if (maxd_auto) dctl.reset();
+        // Depth-controller lifetime (review 2026-07-09): by default the
+        // ladder CARRIES across requests -- this is a single-user rig
+        // (multi-tenant is out of scope per SECURITY-MODEL.md) and
+        // consecutive requests are usually turns of the same conversation,
+        // where re-earning depth from k_min costs a measured -1.6% on
+        // 256-token requests (BUILDLOG 2026-07-09). Q27_MAXD_RESET=1 opts
+        // into per-request isolation (each request starts at k_min).
+        if (maxd_auto && maxd_reset) dctl.reset();
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly

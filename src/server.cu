@@ -307,8 +307,8 @@ int main(int argc, char** argv) {
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
                 ms_since(srv_t0),
-                // P13: adaptive-maxd activity, per request (dctl resets at
-                // generate() entry -- review 2026-07-09 isolation fix)
+                // P13: adaptive-maxd activity, cumulative on this engine
+                // (per-request when Q27_MAXD_RESET=1 -- review 2026-07-09)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
                                         " md4=%ld md5=%ld md6=%ld md7=%ld mprom=%ld"
                                         " mdem=%ld",
