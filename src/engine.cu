@@ -994,7 +994,7 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "P13 adaptive maxd: %ld rounds @depth-4, %ld @depth-5 (%ld promotes, "
                     "%ld demotes); final ceiling=%d\n",
-                    e.dctl.rounds4, e.dctl.rounds5, e.dctl.promotes, e.dctl.demotes, e.dctl.cur);
+                    e.dctl.rounds[4], e.dctl.rounds[5], e.dctl.promotes, e.dctl.demotes, e.dctl.cur);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

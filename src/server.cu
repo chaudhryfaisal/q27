@@ -305,8 +305,8 @@ int main(int argc, char** argv) {
                 ms_since(srv_t0),
                 // P13: cumulative adaptive-maxd activity on this engine (auto only)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
-                                        " md4=%ld md5=%ld mprom=%ld mdem=%ld", e.dctl.rounds4,
-                                        e.dctl.rounds5, e.dctl.promotes, e.dctl.demotes),
+                                        " md4=%ld md5=%ld mprom=%ld mdem=%ld", e.dctl.rounds[4],
+                                        e.dctl.rounds[5], e.dctl.promotes, e.dctl.demotes),
                                p13buf)
                             : "",
                 // maxd6 GO-IF: cumulative gated-round histograms on this engine --
