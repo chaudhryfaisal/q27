@@ -2,8 +2,52 @@
 
 A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
-## State of the engine (2026-07-07)
+## State of the engine (2026-07-08)
 
+- **Adaptive draft-depth ladder 4..6 SHIPPED (2026-07-08, maxd6):** the spec
+  round can now draft/verify to depth 6 (7-lane verify, perm mod-7, +157 MB GDN
+  state), controlled per stream by a 3-bar controller (`src/depthctl.h`, 30 CPU
+  tests): promote 4->5 at sustained ceiling-saturation >= 0.50, promote 5->6 at
+  >= 0.60, demote on conditional top-lane yield < 0.35 (the measured win/loss
+  crossover) or on level-6 margin-run firing < 0.45. Ships ONLY as
+  `Q27_MAXD=auto` (fixed `Q27_MAXD=6` exists for testing); binary defaults
+  untouched. Measured on a real-CC-transcript replay @25.8K (the traffic that
+  fires deep): d4 202.6 / d5 216.1 / d6 222.0 t/s, 7-token rounds on 64% of
+  rounds, **auto 222.6 = +4.7% over d5 -- auto beats even fixed-6** by demoting
+  through weak stretches. Emitted text byte-identical at every ceiling
+  (canonical 4c4120c7 EXACT at d4/5/6/auto). Envelope payloads that don't
+  saturate never promote past 5 (within noise of the 4..5 ladder). This
+  reverses the 07-07 maxd6 NO-GO on refreshed economics -- docs/maxd6-decision.md
+  carries the full audit trail (NO-GO -> GO-IF rerun -> build gates).
+- **Acceptance tuning (2026-07-08, accept-gate Phases 0-1):** re-measured the
+  depth economics post-verify-gemv and found the d5 win/loss crossover at
+  **conditional lane-5 yield ~0.35** -- half the maxd6-era estimate; fixed-d5 is
+  now >= d4 on every 26K payload flavor and loses only at 61K low-yield
+  (-1.7%). Controller fixes that fell out: yield EMA is now CONDITIONAL on the
+  lane firing (the old unconditional EMA sat above the demote bar on traffic
+  where depth-5 measurably lost), promote seed clamped, `maxd_lo` 0.10 -> 0.35.
+  **Production rec is now `Q27_PMIN=0.5 Q27_MAXD=auto`** (+2.7% geomean over
+  the d4-gated rec across the payload envelope, and it beats both fixed
+  ceilings). New telemetry: per-lane fired/accepted counters (`glf=`/`gla=` in
+  `[req]`) -- the conditional yields the gch/gnh marginals cannot reconstruct.
+- **Verify-GEMV latency fix (2026-07-08): +5.9% decode @61K.** ncu attribution
+  showed the batched verify GEMV LATENCY-bound at 39-47% of DRAM peak
+  (long_scoreboard 90% of the inter-issue gap) -- the per-column activation
+  loads, not the weight stream. Widening them (4x uint2 -> 2x uint4) is
+  bitwise by construction: 163.2 -> 172.9 t/s @61K on the current fixtures.
+  Tensor-core verify (canonical-breaking) NOT justified -- dp4a issue was never
+  the limiter. docs/perf-attribution-verify-gemv.md.
+- **fp8 QK^T MMA prefill DEFAULT-ON (2026-07-07/08): +11.8% @128K.** New
+  `mma.sync.m16n8k32.e4m3` prefill-attention kernel consumes fp8 KV directly
+  (Q staged as e4m3, bank-conflict padding load-bearing at +6.9pp). Cold 128K
+  prefill **68.3 -> 59.6s** (~2200 t/s). Quality battery: logit cosine
+  0.9999827 + argmax-match at position 131072, needle **6/6 to ~301K**
+  (beyond the 262K native limit). fp16-KV path and canonical untouched;
+  `Q27_PF_FP8MMA=0` opts out, <sm_89 auto-falls-back.
+- **Strict-parser A/B resolved (2026-07-08):** the tolerant tool-call parser is
+  LOAD-BEARING -- see "Open quality gates" below for the full verdict (T8:
+  tolerant 0.837 / strict 0.000 / strict+constrain 0.549) and the honest
+  system-fairness framing.
 - **Agentic serving unblocked (2026-07-06):** the SERVING-layer tool-call parser
   -- not the quant, not sampling -- was the ceiling on agentic scores. Three
   drift-mode fixes took Claude Code from one-shot-quit basins (score 0, the model
@@ -20,8 +64,8 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   no regression, no new drift mode -- so sampling is cleared to default at
   T<=0.7 / top_p 0.95 (server `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P`; explicit request
   temperature still wins). Greedy stays bitwise. docs/sampling-exit-gate.md.
-- **P14 perf-levers bundle landed (2026-07-07, branch `p14-perf-levers`,
-  UNMERGED):** five decode changes, reported as same-prompt A/B t/s deltas only
+- **P14 perf-levers bundle landed (2026-07-07, merged to master same day):**
+  five decode changes, reported as same-prompt A/B t/s deltas only
   (n=1 t/s is near-deterministic; no cross-prompt or score claims).
   (1) **Fused draft argmax+margin** (`k_argmax_top2`) folds each draft's argmax
   and its P12 gate margin into one full-vocab pass, killing the 4-5 dead
@@ -47,21 +91,30 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   gate pay. Production recommendation: gate ON both paths with `Q27_PMIN=0.5` as
   the cross-path default (greedy also tolerates theta=1.0 for +4.9%, but sampled
   theta=1.0 nets -2.1% vs ungated @61K, so 0.5 is the safe default). Attribution:
-  docs/perf-attribution-p14.md. The depth-6 (`gate_maxd`) question:
-  docs/maxd6-decision.md (NO-GO on a fixed default; GO-IF adaptive, gated on one
-  unmeasured agentic depth-5 A/B; Task 6 lane-pair fusion recommended first).
-- Decode at depth (the metric that matters for agentic work): **126.2 t/s at
-  61K ctx** (was 78.0 pre-fd2), **156-164 t/s effective across real CRUSH
-  trials to 74K ctx** (was 103-113). attn-fd2 register-accumulator
-  flash-decode fixed the third SM-starvation/occupancy disease: attention
-  was 99% of the depth cost at 5% DRAM BW, now 45%
-- Decode short-ctx: **169.4 t/s** short-bench suite mean (5 fixed prompts,
-  `tools/shortbench_suite.sh`; per-prompt spread 157-191 on trajectory
-  alone) / **209.2** stock 2K soak (4.32 t/round). The old single-prompt
-  short-bench number is retired as a benchmark -- it re-rolled 177.5 ->
-  160.2 on one argmax tie while per-round cost moved +1.3%; it survives
-  only as the bitwise gate (see Decode methodology)
-- Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start)
+  docs/perf-attribution-p14.md. The depth-6 (`gate_maxd`) question was
+  answered in three acts -- 07-07 NO-GO, 07-08 GO-IF rerun on refreshed
+  economics, 07-08 build (the 4..6 ladder above); docs/maxd6-decision.md keeps
+  all three verdicts.
+- Decode at depth (the metric that matters for agentic work): **172.9 t/s
+  ungated @61K on the current (2026-07-08) fixtures** after verify-gemv;
+  **202-223 t/s @26K on real-CC-transcript replay** (d4-gated to auto-ladder).
+  Fixture caveat: the docs corpus was regenerated 2026-07-08 and its
+  acceptance is higher than the P14-era corpus, so 172.9 is NOT comparable to
+  the P14-era 119-125 -- the ms/round attribution is the cross-era anchor
+  (reproduced +-0.6%). History: 78.0 pre-fd2 -> 126.2 fd2 -> 119-125 P14-gated
+  (old corpus) -> 163.2 -> 172.9 verify-gemv (new corpus). attn-fd2 fixed the
+  third SM-starvation disease (attention was 99% of depth cost at 5% DRAM BW,
+  now ~45%); verify-gemv fixed the fourth (GEMV latency-bound on activation
+  loads, not weight bandwidth)
+- Decode short-ctx: **179.7 t/s** short-bench suite mean (5 fixed prompts,
+  `tools/shortbench_suite.sh`, 2026-07-08; per-prompt spread 167-202 on
+  trajectory alone) / **209.2** stock 2K soak (4.32 t/round, pre-verify-gemv).
+  The old single-prompt short-bench number is retired as a benchmark -- it
+  re-rolled 177.5 -> 160.2 on one argmax tie while per-round cost moved +1.3%;
+  it survives only as the bitwise gate (see Decode methodology)
+- Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start);
+  cold 128K **59.6s (~2200 t/s)** after the prefill-attn pair (cp.async
+  prefetch +5.4% and fp8 QK^T MMA default-on +11.8%, both 2026-07-07/08)
 - Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
 - Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30
   trials/leg, 2026-07-03); same-day spot A/B 2026-07-05 (n=1/task):
@@ -80,9 +133,11 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   on mixed traffic** (P1-P3 geomean q27 120.6 vs llama 119.6) -- q27 wins
   transcript +10.7% (123.3 vs 111.4), ties repro (153.0 vs 154.4), loses code
   ~7% (93.1 vs 99.5). llama's edge is the NEAR-VERBATIM tail: pure-echo payload
-  229.9 vs 158.0 (+45%) -- its depth-10 drafts beat q27's depth-4/5 ceiling
-  when acceptance saturates (the maxd6 NO-GO regime; ceiling raise needs an
-  acceptance-predicting gate). The 07-06 n=1 "-31%" (q27 145.6 ungated vs
+  229.9 vs 158.0 (+45%) -- its depth-10 drafts beat q27's then-depth-4/5
+  ceiling when acceptance saturates. The 07-08 ladder reaches depth 6 there
+  (7-token rounds on 64% of rounds on CC-flavor traffic), narrowing that tail;
+  no fresh cross-engine echo A/B has been run since, so the +45% stands as the
+  last measured number. The 07-06 n=1 "-31%" (q27 145.6 ungated vs
   190.3) was prompt-specific (repro-flavored slice) AND pre-P12 -- retired.
   The collab wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
   llama's ~11K) -- a prompt/sampling lever, not an engine one. The llama
@@ -202,21 +257,26 @@ These numbers are NOT interchangeable -- each answers a different question:
 
 - **Short-bench suite** (SOTA-comparable): 5 fixed genre-diverse short
   prompts x 128 tokens, `--spec`, STOCK clocks -- `tools/shortbench_suite.sh`.
-  **fd2 era: 169.4 t/s mean** (157.2-190.8 per prompt, t/round 3.20-3.88).
-  The per-prompt spread is trajectory/acceptance variance, which is exactly
-  why no single short prompt may carry a cross-engine number.
+  **verify-gemv era (2026-07-08): 179.7 t/s mean** (fd2 era 169.4; per-prompt
+  spread ~167-202, t/round 3.20-3.88). The per-prompt spread is
+  trajectory/acceptance variance, which is exactly why no single short prompt
+  may carry a cross-engine number.
 - **Canonical prompt** (bitwise gate, NOT a benchmark): 128 tokens from the
-  5-token canonical prompt. fd2 era 160.2 t/s / 3.25 t/round; `Q27_FD=v1`
-  reproduces the pre-fd2 177.5/3.56 bit-for-bit. That 10% swing is one
-  argmax tie re-rolling on a degenerate prompt (per-ROUND cost moved +1.3%)
-  -- tie-lottery sensitivity is why it gates bitwise identity and nothing
-  else. Depth-4 pays on long generations, not here.
+  5-token canonical prompt, md5 4c4120c72056aba2bc2d2561471eafce -- held
+  bitwise through fd2, P12-P15, fp8q prefill, verify-gemv, and the maxd6
+  7-lane widening (and at every gated ceiling 4/5/6/auto). ~168-170 t/s /
+  3.25 t/round on trajectory; `Q27_FD=v1` reproduces the pre-fd2 text
+  bit-for-bit. Tie-lottery sensitivity is why it gates bitwise identity and
+  nothing else.
 - **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
   STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
   short-ctx split tax). Headline for agentic reply-length outputs.
-- **Depth numbers** (fd2, 2026-07-05): **126.2 t/s @61K** single-request
-  ground truth; **156-164 t/s effective** across real CRUSH trials to 74K.
-  These, not the 2K numbers, predict agentic wall time.
+- **Depth numbers**: **172.9 t/s ungated @61K** (verify-gemv, 2026-07-08
+  fixtures -- NOT comparable to the P14-era 119-126 on the old corpus; the
+  ms/round attribution bridges eras); **202-223 t/s @26K real-CC-transcript
+  replay** (d4-gated -> auto-ladder-6); **156-164 t/s effective** across real
+  CRUSH trials to 74K (fd2-era). These, not the 2K numbers, predict agentic
+  wall time.
 
 OC policy: headline + SOTA comparisons are reported STOCK (community numbers
 aren't OC'd; sidesteps the non-ECC tail-risk conversation). +3000 stays a
@@ -310,13 +370,24 @@ decode.** `Q27_PMIN=theta` caps the verify width on the drafter's top1-top2
 margin (skipping the deep-KV verify when the draft head is unconfident), and
 `Q27_DEXIT` (P14, default-ON whenever `Q27_PMIN` is set) additionally stops
 DRAFTING at the first sub-theta margin -- the llama p_min draft-stop that the
-verify-only gate lacked. Recommended production config on long-context traffic:
-`Q27_PMIN=0.5` with `Q27_DEXIT` on for both paths (same-config @61K docs:
-greedy +4.0% / sampled +3.6% vs ungated; greedy also tolerates theta=1.0 for
-+4.9%, but sampled theta=1.0 nets -2.1%, so 0.5 is the cross-path default).
-Greedy output stays bitwise-identical under gating (only round count + verify
-width change); sampled output stays seeded-reproducible. Gate OFF by default
-(`Q27_PMIN` unset) -> zero risk to production traffic that does not opt in.
+verify-only gate lacked. **Recommended production config (2026-07-08):
+`Q27_PMIN=0.5 Q27_MAXD=auto`** -- the adaptive 4..6 depth ladder
+(src/depthctl.h): promote when the current ceiling saturates (sat >= 0.50 for
+4->5, >= 0.60 for 5->6), demote when the top lane's CONDITIONAL yield drops
+below the measured breakeven (0.35) or, at level 6, when margin runs reach
+6-deep too rarely to amortize the 6th draft step (fired < 0.45). Measured:
++2.7% geomean over d4-gated across the payload envelope; +4.7% over fixed-d5
+on real-CC-transcript traffic (222.6 t/s @25.8K); envelope flavors that don't
+saturate never promote and stay within noise of the 4..5 ladder. Knobs:
+`Q27_MAXD_HI/HI6/LO/FLO6/EMA`; greedy also tolerates theta=1.0 for +4.9%, but
+sampled theta=1.0 nets -2.1%, so 0.5 is the cross-path default. The sampled
+path keeps a fixed depth-4 ceiling. Greedy output stays bitwise-identical
+under gating AND under any ceiling (only round count/segmentation + verify
+width change -- canonical 4c4120c7 EXACT at d4/5/6/auto); sampled output stays
+seeded-reproducible. Note: under `auto` the round SEGMENTATION varies with the
+controller's EMA state (e.g. across identical replays on one server), so round
+counts are not replay-deterministic mid-convergence -- tokens always are. Gate
+OFF by default (`Q27_PMIN` unset) -> zero risk to traffic that does not opt in.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
@@ -360,6 +431,11 @@ live in "Decode methodology" above.
 | P14 Task 3: P12 confidence gate ported to the sampled spec path (per-width sampled verify graphs, capped accept walk) | sampled verify-narrowing ALONE is a wash @61K docs (+0.0% theta0.5 -- a low-margin draft the sampler may accept gets skipped, tok/round drops, extra rounds offset the cheaper round); greedy cross-check healthy on the same binary (+6.6% theta1.0); substrate for Task 4; canonical 4c4120c7 EXACT (greedy untouched) |
 | P14 Task 4: draft early-exit (`Q27_DEXIT`, margin-gated per-step draft graphs, `min(W,md_used)` width-floor top-up) | same-binary A/B @61K docs: greedy **+3.2%** (theta1.0), sampled **+5.4%**; emitted bytes + round counts bitwise-identical to the monolithic draft in all 8 identity cells; sampled gated+dexit now **+3.6% over ungated** (Task 3's sampled wash resolved); canonical 4c4120c7 EXACT |
 | P14 Task 5: fd2 lane-innermost grid order (partial cross-lane KV L2 reuse; R~4.25 measured) | same-session pre/post A/B @61K ungated **116.1 -> 119.3 t/s (+2.7%, MARGINAL-KEPT)**; verify fd2 per-instance -10% toward the draft floor; 2K neutral (+0.0%); canonical 4c4120c7 EXACT (2-line index remap, bitwise on the full fd2 matrix) |
+| prefill-attn Phase 1: cp.async K/V double-buffered prefetch (fp8 path) | fp8 128K prefill **72.1 -> 68.2s (+5.4%)**; bitwise (convert-on-consume of identical bytes); first "neutral" reading was an fp16-KV test artifact -- cp.async is dead code off the fp8 path |
+| prefill-attn Phase 2: fp8 QK^T MMA (`mma.sync.e4m3`, Q staged fp8, bank-conflict padding) -- DEFAULT-ON on fp8 KV | 128K prefill **68.3 -> 59.6s (+11.8%**, ~2200 t/s); logit cosine 0.9999827 + argmax MATCH @131K; needle **6/6 to ~301K**; fp16 path + canonical untouched; `Q27_PF_FP8MMA=0` opts out |
+| verify-gemv: activation reads 4x uint2 -> 2x uint4 in `k_gemv_q4_n` (+ single-col) | decode @61K **163.2 -> 172.9 t/s (+5.9%)** on 2026-07-08 fixtures; GEMV was LATENCY-bound (long_scoreboard 90%, 39-47% DRAM peak) -- weights were fine, the per-column activation loads hammered L1TEX; bitwise BY CONSTRUCTION (same bytes, same dp4a order); tensor-core verify NOT justified |
+| accept-gate Phase 1: conditional lane-5 yield + `maxd_lo` 0.10 -> 0.35 (the measured d5 crossover) | `Q27_MAXD=auto` becomes the production rec: **+2.7% geomean over d4-gated** across the 5-payload envelope, beats BOTH fixed ceilings; the old unconditional yield EMA sat above the demote bar on traffic where fixed-d5 measured -1.7% |
+| maxd6: adaptive ladder 4..6 (7-lane verify, perm mod-7, +157 MB; 3-bar depthctl hi/hi6/flo6) | real-CC-transcript @25.8K: d4 202.6 / d5 216.1 / d6 222.0 (7-tok rounds on 64%); **auto 222.6 = +4.7% vs d5**, beats fixed-6; text byte-identical at every ceiling; canonical 4c4120c7 EXACT; non-saturating flavors never promote past 5 |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -412,21 +488,21 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 | + GEMM tuning + FA-lite attention | 61s |
 | turn 2+ with prefix cache | **1.3s** |
 
-[historical -- cold 28.5K TTFT is ~15.0s after P1-P6; the warm-turn number
-required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
+[historical -- cold 28.5K TTFT is ~15.0s after P1-P6 and cold 128K is 59.6s
+after the 2026-07-07/08 prefill-attn pair; the warm-turn number required the
+P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Recently shipped (2026-07-05 -> 07):** `/v1/messages/count_tokens` and the
-Anthropic-shaped context-limit error (both surfaced by the CC-harness A/B);
-sampling Phases 1-2 + the exit-gate A/B (passed); the tool-call parser drift
-fixes that unblocked agentic Claude Code (CC 0.00 -> 0.55 on analytics-dashboard);
-**P12 confidence-gated depth (`Q27_PMIN`), the measured top decode lever --
-+10.8% @60K, bitwise-identical greedy** (see the depth-match motivation below);
-and **the P14 perf-levers bundle (2026-07-07, branch `p14-perf-levers`,
-UNMERGED)** -- fused draft argmax+margin, the P12 gate ported to the sampled
-path, draft early-exit (`Q27_DEXIT`), and the fd2 lane-innermost L2 fix (see the
-State section + docs/perf-attribution-p14.md).
+**Recently shipped (2026-07-05 -> 08):** `/v1/messages/count_tokens` + the
+Anthropic-shaped context-limit error; sampling Phases 1-2 + the exit-gate A/B
+(passed); the tool-call parser drift fixes that unblocked agentic Claude Code;
+P12 confidence-gated depth (`Q27_PMIN`); the P14 perf-levers bundle (merged);
+P15 constrain-tools engage-lag fix + serving-state gates; the prefill-attn
+pair (cp.async +5.4%, fp8 QK^T MMA default-on +11.8% @128K); verify-gemv
+(+5.9% decode @61K); accept-gate Phases 0-1 (conditional yield, measured
+crossover, `Q27_MAXD=auto` production rec); and the **maxd6 adaptive ladder
+4..6** (see the State section).
 
 **P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
 interleaving; whole-generation queue waits gone; analysis in
@@ -487,7 +563,7 @@ pass is pure cost at low acceptance), so depth-4 is the default. Adaptive maxd
 acceptance. On branch `p12-confidence-gated-depth` (Phase-0/0b margin
 measurement + implementation; see BUILDLOG).
 
-**P14 continuation -- SHIPPED (2026-07-07, branch `p14-perf-levers`, UNMERGED).**
+**P14 continuation -- SHIPPED (2026-07-07, merged to master).**
 The P12 gate now runs on the production SAMPLED path too, and draft early-exit
 (`Q27_DEXIT`) closes the other half of llama's p_min -- the P12 gate only
 narrowed VERIFY, while llama's p_min also stops DRAFTING. The Task 3 finding is
@@ -500,22 +576,30 @@ draft argmax+margin (`k_argmax_top2`) and the fd2 lane-innermost L2 fix
 `Q27_PMIN=0.5` + `Q27_DEXIT` on both paths. Attribution:
 docs/perf-attribution-p14.md.
 
-**Open decode levers (post-P14):**
-- **maxd6 GO-IF measurement** (docs/maxd6-decision.md): raising `gate_maxd` to 6
-  is NO-GO as a fixed default (docs depth-5 already -3.3% with all P14 machinery;
-  depth-6 is necessarily worse), but GO-IF, narrowly, as an adaptive
-  (`Q27_MAXD=auto`) ceiling bump -- gated on ONE unmeasured agentic measurement:
-  a depth-5 `--stats` run on real agentic serving traffic showing cap>=5 on
-  >=30% of gated rounds AND a net-positive depth-5-vs-depth-4 A/B. Cheapest,
-  highest-information next step; ~1 session on the existing Phase-0 rig, zero
-  engine risk.
-- **Task 6 fd2 lane-pair fusion (requires Gabe's explicit go).** Task 5 captured
-  only ~10% of the R~4.25 cross-lane KV headroom (the L2 fix is partial reuse);
-  the residual ~6 ms/round verify-attention is the lane-pair-fusion target -- it
-  helps every round of every traffic class (not just agentic streaks), costs ~0
-  VRAM, and lowers depth-6's own breakeven. Recommended before any depth-6 build.
-  It is the expensive kernel rewrite (fd3 design doc + occupancy gate), so it is
-  DEFERRED pending explicit approval on the marginal Task 5 result.
+**Open decode/prefill levers (post-maxd6):**
+- **prefill-attn Phase 3 (occupancy; requires Gabe's explicit go on the
+  smem-relayout).** The prefill-attention kernel is OCCUPANCY-bound (12.5%,
+  dual register+smem limiter, DRAM 2%/tensor 33%); cp.async and fp8-MMA
+  captured the latency-hiding wins available WITHIN 6 warps. A 2-CTA/SM play
+  needs both a register cut (the o[32][4] accumulator = 128 regs) and smem
+  halving -- a from-the-layout rewrite. Attention is still ~half of 128K
+  prefill.
+- **d7/d8 ladder extension, telemetry-gated.** cctx sat6 = 0.64 still
+  saturates at depth 6; live `glf=`/`gla=` now report lane-6 fired/accepted on
+  real serving traffic. Extend by the same recipe (S_spare7, hi7/flo7) IF
+  sustained sat6 >= ~0.6 shows up live; the pointer-array lane refactor
+  (maxd6-decision.md) becomes worth it at d7+. The P4-echo tail (llama
+  depth-10 +45%) is the prize.
+- **Task 6 fd2 lane-pair fusion (requires Gabe's explicit go).** Task 5
+  captured only ~10% of the R~4.25 cross-lane KV headroom; the residual
+  ~6 ms/round verify-attention is the lane-pair-fusion target -- helps every
+  round of every traffic class, ~0 VRAM, and it lowers the ladder's per-lane
+  breakeven (deeper levels get cheaper). The expensive kernel rewrite (fd3
+  design doc + occupancy gate); DEFERRED pending explicit approval.
+- **docs-class promote churn (~1%).** Boundary traffic (bursty sat5 ~0.46-0.5)
+  keeps a ~1% auto-vs-fixed gap from promote exploration, bounded by flo6.
+  Known shave: a demote-count promote-escalator. Not built (YAGNI at 1%,
+  worst flavor only).
 
 **Open quality gates (red-team pass 2026-07-05; P15 status 2026-07-07):**
 - strict-parser A/B -- **DONE 2026-07-08, verdict: NOT engine-true; the mode-1
@@ -532,9 +616,11 @@ docs/perf-attribution-p14.md.
   Follow-up lever (not built): engage the constrain grammar on a bare
   `{"name"` opener too, closing the wrapper-less bypass -- that would make
   strict+constrain the zero-rescue configuration.
-- constraint-cost soak: one agentic soak with `--constrain-tools` on vs
-  off (in-grammar acceptance cap 1/round is ~22 t/s inside call bodies;
-  measure what that does to depth-heavy wall time before it defaults on)
+- constraint-cost soak -- **MEASURED 2026-07-07 (P15 session): in-call cap=1
+  costs 3.1x at 75.7K depth** (33.0 vs 102.2 t/s inside call bodies, ~+4s per
+  call-turn, byte-identical outputs) -> `--constrain-tools` stays OPT-IN for
+  speed; safe (no score-0 basins) when robustness is worth the tax. The in-call
+  speed fix remains the P11 split path (4.2x, blocked on the race below)
 - constrain-tools x serving-state gates: SHIPPED with P15 -- split-brain
   ids are validated + rebound (rebinds counter), pool-full sticky-
   disengages per request (visible in `tg=`), and the device constraint is
