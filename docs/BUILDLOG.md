@@ -2251,3 +2251,42 @@ refreshed economics -- echo/docs flavors sit at y5 .5-.8 with headroom above the
 ceiling, and the depth-match P4 tail (llama +45% at 100% acceptance) is still on the
 table. Cost side unchanged: P12b-class 6->7 widening + quantize3-landmine audit +
 157 MB (maxd6-decision.md items 1-7).
+
+## 2026-07-08 (maxd6 GO-IF RERUN) -- VERDICT FLIPPED: GO on auto-ladder-6 (was NO-GO 07-07)
+
+Rerun of the maxd6-decision.md GO-IF on post-verify-gemv economics + the Phase-1
+acceptance bar; full verdict appended to docs/maxd6-decision.md. Headline: all three
+GO-IF conditions now PASS; depth-6 is worth one P12b-class build session as an auto
+ladder extension (4..6), est +4-5% on CC-flavor traffic, ~0 elsewhere, bar-protected.
+
+**New rig: tools/burst_sim.py** -- exact offline gated-round simulation (any ceiling,
+any theta) from --burst-stats chain CSVs, round-sampled. Validated against CLI spec
+legs on the same trajectory: shallow-round histograms match; deep rounds UNDERCOUNT
+because burst chains seed from serial-path hiddens which differ in ULPs from live
+verify-lane hiddens -- deep chains amplify near-tie flips (echo tok/round -5% vs CLI,
+echo-heavy cctx -27%). Sim = conservative bound; measured-sat extrapolation used
+where the bias bites. En-route finding worth keeping: emitted TOKENS are identical
+across serial/spec/server paths (reconfirmed), but DRAFT CHAINS are not ULP-stable
+across those paths -- any future draft-side instrumentation must seed from the same
+path it models, or eat this bias.
+
+**The payload that settled it: cctx** -- a real CC bench-session transcript replayed
+as a raw 25.8K completion (recipe in decision doc; payload NOT committed, private
+transcript). First constructed payload to reproduce the live-T8 saturation profile
+(sat5 .714 vs live .652; 5.29 tok/round vs 5.03). Measured d4->d5 on it: 204.1 ->
+218.5 t/s = **+7.0%** -- the same replay class that measured breakeven-at-best on
+07-07. Constructed-payload lesson extended: docs/code/echo builds never exceeded
+sat5 ~0.46; only a REAL agent transcript (tool bodies echoing file content) reaches
+the live regime -- keep one on hand for depth work.
+
+Numbers (CLI legs, serial prefill, fp8 KV + fast-head, greedy, theta 0.5):
+cctx d4 4.56 t/r sat4 .807 | d5 5.29 t/r sat5 .714 | sat decay/level .885;
+d4->d5 tok/round gain +0.73 ~= sat5 (model check ~2%). d6 projection +0.63 t/r at
++1.6-1.9 ms/rnd -> +4-5%. Ladder admits only cctx-class traffic to level 6
+(sat5 elsewhere: docs .46, echo .26, testgen .26, codegen .16, docs61k .12).
+
+Build gates (before any default flip): width-7 lane measured via forced-cap sweep;
+canonical + identity + determinism; cctx >= +3% replay A/B with no envelope payload
+below its d5 baseline; glf/gla extended to lane 6. d7/d8 explicitly deferred to
+live lane-6 telemetry. Files: tools/burst_sim.py (new), docs/maxd6-decision.md
+(verdict), scratchpad burst_*.csv + payloads (uncommitted).

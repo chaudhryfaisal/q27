@@ -344,3 +344,61 @@ fraction cannot pay for the P12b-class 6->7 widening + 157 MB. Ceiling stays 4/5
 Retry bar: a gate that predicts acceptance rather than confidence, or a materially
 cheaper verify lane. Side finding: P13's HI=0.5 promote threshold lands exactly at the
 measured win/loss crossover (45%-sat traffic loses -5.4%, 96%-sat wins +2.9%).
+
+## 2026-07-08 RERUN on refreshed economics -- GO-IF conditions now MET: **GO, narrowly (auto-ladder-6)**
+
+Retry bar satisfied on both prongs since the NO-GO: verify-gemv made the lane cheaper
+(+5.9% decode) and accept-gate Phase 1 shipped the acceptance-tracking bar
+(conditional lane-5 yield, lo=0.35 = measured crossover). Full data: BUILDLOG
+2026-07-08 accept-gate Phase 0 + this rerun; rig tools/burst_sim.py + accept_ab.sh.
+
+**New instrument.** --burst-stats CSVs (10-deep chains + margins per free position)
+drive an exact offline ROUND simulation at any ceiling/theta (tools/burst_sim.py) --
+round-sampled, killing the per-position discount. Caveat discovered en route: chains
+seeded from serial-path hiddens differ in ULPs from live verify-lane hiddens; deep
+chains amplify near-tie flips, so the sim UNDERESTIMATES tok/round, mildly on low-sat
+flavors (echo -5% vs CLI ground truth) and severely on echo-heavy ones (cctx -27%).
+Sim positives are trustworthy; sim negatives on high-sat flavors are not
+decision-grade. Emitted-token identity across serial/spec/server paths reconfirmed
+throughout (the divergence lives only in draft chains near theta/argmax ties).
+
+**The missing payload found.** A real CC transcript replayed raw (cctx, 25.8K tok,
+built from a thunderdome bench session transcript; NOT committed -- private) finally
+reproduces the live-T8 profile: sat5 0.714 (live T8 0.652), 5.29 tok/round (5.03).
+Measured CLI legs: d4 204.1 t/s (4.56 t/r, sat4 .807) -> d5 218.5 t/s (5.29 t/r) =
+**+7.0%** -- the leg class that measured -0.8..+0.1% pre-verify-gemv now clearly PASSES Y2.
+
+**GO-IF conditions, re-evaluated:**
+- X (cap>=5 on >=30% of gated rounds): PASS -- live T8 79.3% (07-07 histograms,
+  unchanged) + cctx fired5 >= sat5 .714.
+- Y1 (depth-5 saturation >= 0.50): PASS -- live T8 65.2%; cctx 71.4%.
+- Y2 (d5-vs-d4 net positive at the live point): PASS -- cctx +7.0% measured;
+  26K envelope +0.2..+5.6% (accept-gate Phase 0); only 61K low-yield docs negative
+  (-1.7%), which the Phase-1 bar demotes out of depth-5 anyway.
+
+**Depth-6 estimate (measured-sat extrapolation, cctx):** per-level sat decay
+.885 (=.714/.807); d4->d5 tok/round gain +0.73 ~= sat5 .714 validates the model
+(each new top lane lands a token on rounds that saturate one level deeper).
+d6: +0.63 tok/round at dms +1.6-1.9 (width-7 lane EXTRAPOLATED from the decaying
+fd2 increments; still never instantiated) -> **+4-5% t/s on CC-flavor traffic**.
+Constructed low/mid-sat payloads: ~0 (sim and extrapolation agree; echo +0.7%,
+docs -1.7..testgen +3.7% sim, all inside the bias band). Ladder confinement:
+promote 5->6 at sat5 >= HI=0.5 admits ONLY cctx-class traffic (echo .26, codegen
+.16, testgen .26, docs .46, docs61k .12 all stay at 5); demote on y6 < bar_6
+(~0.35, same breakeven structure) bounds any misfire to a grace window.
+
+**Decision: GO -- as an `auto` ladder extension 4..6 ONLY (never a fixed default),
+one P12b-class build session.** Scope per the 2026-07-07 checklist items 1-7
+(6->7 lane widening, S_spare6 +157 MB, quantize3-landmine audit, gemv case 7,
+perm mod-7) + a level-6 pair in depthctl (unit-testable). Build-phase gates before
+any default: (a) measure the width-7 verify lane via forced-cap sweep (kills the
+last extrapolation), (b) canonical 4c4120c7 EXACT + token identity + round
+determinism, (c) replay A/B on cctx + the 26K envelope: SUCCESS = cctx >= +3% with
+no constructed payload below its d5 baseline; (d) glf/gla extended to lane 6 so the
+live yield is observable from day one. d7/d8: NOT in scope -- re-derive from live
+lane-6 telemetry after d6 ships (sat-decay extrapolation says marginal-positive on
+cctx, but margin-run truncation at depth is the unmodeled term).
+
+Expected value honestly stated: +4-5% on the traffic q27 actually serves (CC
+agentic), ~0 elsewhere, ladder-protected; also the first step toward the P4-echo
++45% tail that llama's depth-10 still owns.
