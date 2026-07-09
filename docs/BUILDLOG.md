@@ -2785,3 +2785,22 @@ Same-day rerun drift vs the morning legs (211.9/220.7): ~1%.
 Shortbench suite (current binary): 161.1 (canonical leg 131, a2982c51
 EXACT). Not run: 100K+ payloads (none exist), concurrency (out of scope for
 the single-stream engine).
+
+## 2026-07-09 (thunderdome validation) -- post-review binary + base model: no agentic regression
+
+Two CC tasks via claude-code-q27-haight (base qwen36 on :8081, production
+config, 131K/32K slots), refs = 2026-07-08 pre-review trials:
+
+- T2 collab-server: 0.851 @138s (ref 0.851 @136s -- identical).
+- T8 analytics-dashboard: trial 1 landed the documented bad auth-chain
+  basin (0.564 @612s, hidden 0.219 / agent 1.000 / metrics 1.000, 134
+  turns); retrial 0.846 @155s, hidden 0.938 (ref 0.842). The bimodality is
+  the known eval artifact, not engine quality; two same-config trials
+  bracketing both basins is the expected signature.
+
+Live ladder on real CC traffic (base model): 66% of gated rounds at depth 6
+(md6 2404 / md5 1008 / md4 239, 15 promotes / 13 demotes) -- live traffic
+saturates far above the cctx replay's fired5 ~.38, re-confirming that only
+real agent transcripts reach the deep regime. Serving-path changes under
+test: ChatML both-boundary strip, ctx preflights, lineage DepthCtl reset,
+strict tool grammar, mask-cache keying.
