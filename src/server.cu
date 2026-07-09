@@ -497,8 +497,9 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            // re-clamp to the routed slot (rows P+1..P+6 must stay in ctx)
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
+            // in ctx; reserve derived from the engine's active max depth)
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             std::string text;
             q27::Utf8Gate ugate;
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
@@ -537,7 +538,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 auto send = [&](const json& j) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -658,7 +659,7 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             StreamSplitter sp;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -754,7 +755,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
@@ -1080,7 +1081,7 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
@@ -1134,7 +1135,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +

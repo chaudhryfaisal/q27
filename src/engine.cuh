@@ -233,6 +233,14 @@ struct Engine {
     // MTP passes/round and only pays off on high-acceptance (agentic) traffic
     // (+2.6% agentic, -8% docs), so it is opt-in.
     int gate_maxd = 4;
+    // Single source for every context guard/clamp (generate() loop, CLI spec
+    // loop, server n_max clamps). A full-width verify round launched at P
+    // writes attention-KV rows P+1..P+gate_maxd+1 and MTP-KV rows
+    // P+1..P+gate_maxd, so a round may only launch while
+    // P + ctx_round_reserve() <= max_ctx. Review 2026-07-09 P0 #1: the
+    // depth-5-era hardcoded 7 (and the servers' -6) overran the caches by up
+    // to 2 rows when gate_maxd reached 6/7.
+    int ctx_round_reserve() const { return gate_maxd + 2; }
     // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
     // between 4 and 5 from realized acceptance, so agentic streaks get depth-5
     // (+2.6%) while prose stays depth-4 (no -8% draft tax) -- automatically, per
@@ -2024,14 +2032,14 @@ struct Engine {
                         samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
                         rounds > 0 ? (double)emitted / rounds : 0.0, emitted, rounds);
         };
-        // ctx guard: a round writes attention-KV rows P+1..P+6 (and MTP rows
-        // P+1..P+5, P12b depth-5); launching with P > max_ctx-7 would write past
-        // the caches and corrupt adjacent allocations (which the prefix cache
-        // would then reuse). Stop instead -- a max-length response ends a few
-        // tokens short of the absolute ceiling rather than corrupting state.
+        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
+        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
+        // beyond the caches and corrupt adjacent allocations (which the prefix
+        // cache would then reuse). Stop instead -- a max-length response ends a
+        // few tokens short of the absolute ceiling rather than corrupting state.
         int Ph = P;
         while (emitted < n_max) {
-            if (Ph + 7 > max_ctx) { done("ctx-guard"); return emitted; }
+            if (Ph + ctx_round_reserve() > max_ctx) { done("ctx-guard"); return emitted; }
             int em[8]; // maxd7: spec_round can emit up to 8 tokens (depth-7)
             int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
                              : spec_round(em);
