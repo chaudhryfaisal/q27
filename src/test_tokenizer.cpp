@@ -340,7 +340,30 @@ int main(int argc, char** argv) {
         bool ok7 = v7.size() == 1 && v7[0].name == "write" &&
                    v7[0].arguments.value("file_path", "") == "/w/s.ts" &&
                    v7[0].arguments.value("content", "").find("interface A {\n  x: number;") == 0;
-        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7;
+        // seventh observed mode (2026-07-08, base Qwen3.6-27B-MTP, CC schema,
+        // first turn, deterministic at greedy): wrapper-less AND name-dropped
+        // AND the orphaned args nested one level deeper under a lone
+        // "function" key -- {"name":\n{"function":{ARGS}}}. Rescue = mode-6
+        // key-signature inference AFTER unwrapping the single-key shell; the
+        // recovered call must carry the INNER args, not the shell.
+        nlohmann::json tools8 = nlohmann::json::parse(R"([{"function":{"name":"Task","parameters":{
+            "properties":{"description":{},"prompt":{},"subagent_type":{}},
+            "required":["description","prompt"]}}},
+            {"function":{"name":"Read","parameters":{"properties":{"file_path":{}},
+            "required":["file_path"]}}}])");
+        auto v8 = q27::parse_bare_tool_calls(
+            "I'll start by examining the project.\n\n{\"name\":\n{\"function\":"
+            "{\"description\":\"Read project structure\",\"prompt\":\"List all files.\"}}",
+            &pre, &tools8);
+        bool ok8 = v8.size() == 1 && v8[0].name == "Task" &&
+                   v8[0].arguments.value("prompt", "") == "List all files." &&
+                   !v8[0].arguments.contains("function") &&
+                   pre == "I'll start by examining the project.";
+        // and the raw (unwrapped) mode-6 path must be unchanged by the fallback
+        auto v9 = q27::parse_bare_tool_calls(
+            "{\"name\":\n{\"file_path\": \"/w/a.md\"}}", &pre, &tools8);
+        bool ok9 = v9.size() == 1 && v9[0].name == "Read";
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }

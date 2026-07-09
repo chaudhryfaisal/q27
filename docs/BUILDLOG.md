@@ -2382,3 +2382,42 @@ connection); aria2c -x8 against the resolve URL pulled it at full rate --
 prefer aria2c for multi-GB HF shards on this box. The GGUF repo also carries
 mmproj-* files (the base model is multimodal-capable); q27 uses the text tower
 only.
+
+## 2026-07-08 (qwen36 base thunderdome) -- T8 0.842 / T2 0.851 after drift-mode-7 parser rescue (was 0.00/one-shot-quit)
+
+First thunderdome trials of the base Qwen3.6-27B-MTP through q27 + Claude Code
+(claude-code-q27-haight, ~/thunderdome rig; server Q27_PMIN=0.5 Q27_MAXD=auto,
+fp8 KV, fast-head, --no-think, ctx 131072).
+
+**The 07-06 lesson repeated verbatim on a new model: tool-call PARSING was the
+whole ceiling.** At greedy the base model deterministically opens its first CC
+tool call as `{"name":\n{"function":{ARGS}}}` -- wrapper-less AND name-dropped
+(mode 6) AND the orphaned args nested under a lone "function" shell. The mode-6
+key-signature rescue could not see through the shell -> CC got text-only ->
+one-shot-quit -> T8 0.00 (84 output tokens, 8s). Thinking mode did NOT help
+(empty think block, identical drift).
+
+**Drift mode 7 rescue shipped** (api_common.h `infer_tool_name_unwrapped`):
+raw mode-6 inference first (existing rescues undisturbed), then peel bounded
+single-key object shells (function/arguments/parameters/input/tool_call) and
+retry; the recovered call carries the INNER args. Gated by 2 new
+test_tokenizer cases (the observed bytes verbatim + a raw-mode-6
+no-regression case); reqlog_gate both phases PASS.
+
+**Scores (1 trial each, greedy):** T8 analytics-dashboard **0.842** (312s,
+hidden 0.938 / agent 1.000 / cov 0.815 / metrics 1.000; Qwopus refs
+0.796-0.837); T2 collab-server **0.851** (136s, hidden+agent 1.000;
+Qwopus refs 0.847-0.848). The base model is AT-OR-ABOVE Qwopus on both
+tasks once the drift mode is rescued -- n=1 greedy, so treat as basin
+samples, not a cross-model verdict.
+
+**maxd6 ladder, first LIVE-CC validation (T8 trial, 77 reqs, 7018 gated
+rounds):** md6 on **84%** of rounds (5865) vs md5 16% / md4 1%; 13 promotes /
+12 demotes (bounded churn); cap=6 fired on 68% of all rounds; live lane
+yields y1..y6 = .985/.957/.917/.869/.817/**.782** -- lane 6 far above both
+bars (yld .35 / fired .45); live sat6 ~.64 = the cctx replay number. The
+d7 headroom signal is now confirmed on real serving traffic.
+
+Ops: ~/thunderdome (NOT /mnt/ai/projects/thunderdome) is the live rig with
+the *-haight adapters; `./thunderdome run --orchestrator claude-code-q27-haight
+--task T8 --trials 1`; adapter expects the engine on host port 8081.

@@ -457,6 +457,33 @@ inline std::string infer_tool_name(const json& tools, const json& args) {
     return tie ? "" : best;
 }
 
+// Drift mode 7 (2026-07-08, base Qwen3.6-27B-MTP on the CC schema, first turn,
+// deterministic at greedy): the mode-6 orphaned args arrive nested one level
+// deeper under a lone shell key -- {"name":\n{"function":{ARGS}}}. Inference on
+// the raw object first (never disturbs a working mode-6 rescue); only when that
+// fails, peel single-key object shells (bounded) and retry. On success the
+// caller gets the INNER args -- the shell must not reach the tool.
+inline std::string infer_tool_name_unwrapped(const json& tools, json& args) {
+    std::string nm = infer_tool_name(tools, args);
+    if (!nm.empty()) return nm;
+    static const char* shells[] = {"function", "arguments", "parameters", "input", "tool_call"};
+    json u = args;
+    for (int hop = 0; hop < 3 && u.is_object() && u.size() == 1; hop++) {
+        bool peeled = false;
+        for (const char* s : shells)
+            if (u.contains(s) && u[s].is_object()) {
+                json inner = u[s];
+                u = std::move(inner);
+                peeled = true;
+                break;
+            }
+        if (!peeled) break;
+        nm = infer_tool_name(tools, u);
+        if (!nm.empty()) { args = std::move(u); return nm; }
+    }
+    return "";
+}
+
 // Recover a name-dropped mode-6 BATCH: {"name":<ws>{ARGS}[ {"name":<ws>{ARGS}]... where
 // each outer {"name": never closes (net +1 depth per unit) so the main balanced scan
 // misses the whole run (observed on CC greedy: six {"name":\n{"file_path":...} Read calls).
@@ -492,7 +519,7 @@ inline void scan_namedropped(const std::string& text, const json* tools,
         try {
             json args = json::parse(san);
             if (args.is_object()) {
-                std::string nm = infer_tool_name(*tools, args);
+                std::string nm = infer_tool_name_unwrapped(*tools, args);
                 if (!nm.empty()) {
                     ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(args);
                     if (*first == std::string::npos) *first = p;
@@ -628,10 +655,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             }
         } else if (m6cand && tools) {
             // mode 6: {"name": {ARGS}} -- name string + "arguments" key both dropped.
-            // Infer the tool from the orphaned args' key signature.
-            std::string nm = infer_tool_name(*tools, j6["name"]);
+            // Infer the tool from the orphaned args' key signature (mode 7:
+            // unwrap a lone shell key first when the raw keys match nothing).
+            json m6args = j6["name"];
+            std::string nm = infer_tool_name_unwrapped(*tools, m6args);
             if (!nm.empty()) {
-                ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = j6["name"];
+                ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(m6args);
                 if (first == std::string::npos) first = i;
                 out.push_back(std::move(tc));
                 m6 = true;
