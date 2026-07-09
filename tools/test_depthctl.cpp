@@ -75,6 +75,44 @@ int main() {
         for (int i = 0; i < 64; i++) c.update(5, 5, 6); // 5th lane accepted
         CHECK(c.cur == 5 && c.yield_ema > 0.9f, "sustained accepts keep depth-5");
     }
+    // ---- accept-gate Phase 1 (BUILDLOG 2026-07-08 Phase 0 measurement) ----
+    { // yield evidence is CONDITIONAL on the 5th lane firing (cap == ceiling);
+      // unfired rounds say nothing about the deep lane and barely pay for it
+      // under early-exit. Unconditional p(n=6) ~ y5*fired sat ABOVE lo on
+      // traffic where depth-5 measured -1.7% (docs61k).
+        DepthCtl c;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5);
+        float y0 = c.yield_ema;
+        for (int i = 0; i < 32; i++) c.update(5, 3, 4); // depth-5, lane 5 unfired
+        CHECK(c.yield_ema == y0 && c.cur == 5, "unfired lane 5: no yield evidence, no demote");
+        c.update(5, 5, 5); // fired, missed
+        CHECK(c.yield_ema < y0, "fired+missed decays yield_ema");
+    }
+    { // promote seed clamps at 1.0 once lo passes 0.5
+        DepthCtl c;
+        c.lo = 0.6f;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5);
+        CHECK(c.cur == 5 && c.yield_ema <= 1.f, "promote seed = min(1, 2*lo)");
+    }
+    { // production bar: a fired stream at ~33% yield (codegen/docs61k flavor)
+      // demotes; the crossover measured y5~0.35 (Phase 0 run 3 + 61K)
+        DepthCtl c;
+        c.lo = 0.35f;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5);
+        int demoted_at = -1;
+        for (int i = 1; i <= 96 && demoted_at < 0; i++) {
+            c.update(5, 5, (i % 3 == 0) ? 6 : 5); // fired every round, hit 1-in-3
+            if (c.cur == 4) demoted_at = i;
+        }
+        CHECK(demoted_at >= 15 && demoted_at <= 64, "33%-yield fired stream demotes (15..64 rounds)");
+    }
+    { // and a 50%-yield fired stream HOLDS at bar 0.35 (winning regime, echo/testgen)
+        DepthCtl c;
+        c.lo = 0.35f;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5);
+        for (int i = 1; i <= 128; i++) c.update(5, 5, (i % 2 == 0) ? 6 : 5);
+        CHECK(c.cur == 5 && c.demotes == 0, "50%-yield fired stream holds depth-5 at bar .35");
+    }
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }
