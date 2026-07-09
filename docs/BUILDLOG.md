@@ -2575,3 +2575,23 @@ per-warp latency chain at the cost of L2-absorbed double weight reads (DRAM
 headroom exists: 43-57%). Medium kernel rework; pairs with the deferred fd3
 lane-pair fusion as the "deep-width machinery" pair. Re-run the d7 A/B when
 either lands. Rig committed: tools/width_bench.cu (+ Makefile target).
+
+## 2026-07-09 (lane-split GEMV) -- NEGATIVE: warp-pair lane split is neutral-to-worse; the width-8 GEMV residual is structural
+
+The named lever from the width-8 attribution, built and measured same-day.
+k_gemv_q4_n2/q8_n2<N>: warp PAIR per row in one block (4 rows x 2 warps),
+lanes split [0,NH)/[NH,N), per-lane chunk order and fp accumulation identical
+to the single-warp kernel (bitwise by construction), dispatch nb>=6 behind
+Q27_GEMV_SPLIT. Micro (L2-rotated q4 ffn): nb=6/7 neutral, **nb=8 WORSE
+(0.0437 vs 0.0411 ms, +6%)**. Mechanism: each warp of the pair still reads
+the row's ENTIRE weight stream, so per-warp weight-load instructions DOUBLE
+-- exactly cancelling the halved per-lane chains; the L1-twin-hit hope buys
+bytes, not issue slots, and this kernel stalls on issue/latency, not bytes.
+Code REVERTED (not kept as dead opt-in); this entry is the record.
+
+Do-not-retry without a design that shares weight LOADS (not just weight
+bytes) across the pair: chunk-split breaks the fp summation tree (bitwise
+-> tolerance-gate territory), smem staging already measured -4% (verify-gemv
+Task 2 era). The surviving width-8 economics: +2.33 ms/round marginal
+(post launch-bounds), structural in equal parts GEMV lane-loop and fd2
+per-lane KV. Depth-7 stays opt-in; the ladder 4..6 remains the optimum.
