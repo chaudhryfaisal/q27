@@ -2833,3 +2833,57 @@ eval-server restart onto the new binary.
 Live throughput across the whole campaign (344 requests): decode 168.0 t/s
 aggregate (179K tokens), 5.29 tok/round, prefix cache serving 95% of prompt
 tokens; per-request median 166 t/s, p75 186, peak 254.
+
+## 2026-07-09 (three-engine thunderdome) -- same model family, same harness: quality converges, prefix-cache architecture decides wall
+
+T1-T10, claude-code-*-haight adapters (byte-identical modulo endpoint),
+greedy + no-think all legs, n=1/task, same day, same binary/build per leg:
+q27 base repack 5.25 bpw | llama.cpp mainline 1491, Q4_K_M 4.98 bpw,
+draft-mtp 10/0.5, q8 KV | vLLM nightly 0.23.1rc1.dev748, PrismaSCOUT NVFP4
+~5.31 bpw, MTP k=3, fp8 KV, native /v1/messages (anthropic router).
+
+    task                q27            llama.cpp      vLLM
+    T1 time-tracker     0.841 @51s     0.843 @57s     0.400 @696s*
+    T2 collab-server    0.851 @138s    0.802 @131s    0.870 @593s
+    T3 fts-search       0.760 @89s     0.970 @104s    0.710 @637s
+    T4 phantom-invoice  0.833 @23s     0.833 @29s     0.833 @92s
+    T5 task-queue       0.789 @155s    0.799 @125s    0.797 @511s
+    T6 monorepo         0.850 @42s     0.850 @56s     0.850 @124s
+    T7 plugin-mkt       0.890 @91s     0.902 @84s     0.903 @485s
+    T8 analytics        0.846 retrial  0.531/0.550    0.549 (bad basin)
+       (bimodal)        (t1 bad .564)  (07-08 good .818)
+    T9 ssg-toolkit      0.850 @97s     0.850 @114s    0.850 @107s
+    T10 ecommerce       parser-quit    0.518 @50s     0.520 @124s
+                        (mode 8 fixed)
+    mean T1-7+T9        0.833          0.856          0.777
+    wall  T1-7+T9       686s           700s           3245s (4.7x)
+
+(*coverage-file crash-class; scored work included. T8 excluded from means:
+the auth-chain basin lottery is engine-independent -- every engine drew the
+bad basin at least once today. T10 excluded: q27's pre-mode-8 parser quit;
+llama/vLLM both scored ~0.52 partials.)
+
+Read: with the tolerant-parser class equalized, SCORES converge to the
+model (T4/T6/T9 three-way identical; T2/T7 within noise; T3 a llama
+outlier win, T1 a vLLM outlier loss). WALL separates on serving
+architecture: q27 and llama both reuse conversation KV across turns (q27
+95% prompt-token cache-hit measured live); vLLM cannot prefix-cache
+hybrid-GDN models (0% reuse, known) and re-prefills every turn -- 4.7x
+wall despite competitive decode (avg generation ~92 t/s reported;
+replay-controlled decode remains q27 162 vs vLLM+MTP 155.5 vs llama 98.4
+on cctx @25.8K).
+
+Live decode aggregates over each leg's own trajectories
+(trajectory-confounded, NOT controlled): q27 168.0 t/s (5.29 tok/round,
+344 reqs) | llama 180.1 t/s (median 182/req, 347 reqs). Live traffic
+feeds llama's n_max-10 chains far better than the cctx replay predicted
+-- same live-vs-replay saturation effect as q27's ladder; the controlled
+same-payload replay stays the rate comparison of record.
+
+Leg gotchas fixed en route (5090-local-llm 82e43fa): prismascout keys had
+the hermes tool parser (qwen3.6 emits qwen3_coder XML function calls ->
+returned as TEXT -> CC one-shot-quit in 6s), 32K max-len, and no
+no-think/greedy defaults; vLLM nightly's --default-chat-template-kwargs +
+--override-generation-config close the parity gap server-side. New
+thunderdome adapter claude-code-vllm-haight (approved) mirrors the other
+legs byte-for-byte.
