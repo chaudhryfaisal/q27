@@ -256,3 +256,33 @@ per-thread state duplication (e.g. __ldcs streaming hints, or a
 persistent-block KV tile walk that shares loads across lanes through
 smem instead of registers -- smem tiles do not double the register
 state but reintroduce the RMW-serialization fd2 removed; measure first).
+
+## fd3-v2 (2026-07-09): unit-per-warp, smem-tiled KV -- the tolerance-class retry
+
+The v1 post-mortem's unlock, taken deliberately: BREAK per-lane fp-order
+parity with fd2 (deterministic NEW order), confine the change to gated widths
+ntok>=6 (canonical + all width<=5 paths stay bitwise-EXACT on fd2), gate like
+fp8q (determinism, logit cosine/argmax at depth, needle) and ship OPT-IN
+(Q27_FD=fd3).
+
+Design:
+- Grid dim3(FD2_NS, n_kv_heads) -- NO lane axis. Block 256 thr = 8 warps.
+- Work units = (lane, head) pairs: ntok*6 <= 48 units, distributed
+  ceil(units/8) <= 6 per warp. Each warp owns its units WHOLLY: per-thread
+  state acc[6][8] + m[6] + l[6] + q[6][8] = fd2's register shape (~122 regs)
+  -> 2 CTAs x 8 warps = 16 warps/SM = fd2 occupancy parity. No cross-warp
+  merge epilogue (a unit's block partial IS its warp partial).
+- Position loop: smem tiles of T=48 rows, K+V staged cooperatively by all
+  256 threads (24 KB smem/block, under the 48KB default cap; 2 CTAs fit).
+  Every unit consumes the tile -> DRAM KV traffic / ntok (v1 halved it and
+  still lost warps; v2 divides by 6-8 at NO warp cost, and converts the
+  ~400-cycle DRAM stalls fd2 eats into ~30-cycle smem loads -- this attacks
+  the LATENCY-bound diagnosis, not just bytes).
+- Per-lane split geometry identical to fd2 (chunk/plo/phi from pos.p[t]);
+  per-unit predicates handle differing p_hi within the tile loop; a unit
+  visits its positions in ascending order (deterministic; different
+  grouping than fd2's 4-warp interleave -- THE tolerance delta).
+- Scratch partial layout and k_attn_fd_combine UNTOUCHED (per (t,kvh,j,sp)
+  cell, m/l/acc[256]); empty-split early-out per unit matches fd2.
+- Economics floor @61K w7: KV slice 31MB once = ~18us DRAM vs fd2's
+  ~0.68ms/instance; realistic target = 2-3x instance win at deep ctx.
