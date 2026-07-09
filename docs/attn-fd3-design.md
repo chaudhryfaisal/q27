@@ -286,3 +286,33 @@ Design:
   cell, m/l/acc[256]); empty-split early-out per unit matches fd2.
 - Economics floor @61K w7: KV slice 31MB once = ~18us DRAM vs fd2's
   ~0.68ms/instance; realistic target = 2-3x instance win at deep ctx.
+
+## fd3-v2/v3 OUTCOME (2026-07-09): KILLED -- the design space is now closed with data
+
+Three same-day variants, all correct, all lost (micro, fp8, verify-shaped
+positions, 28.7K + 61K, ntok 6..8; fd2 baseline 0.29-0.83 ms/instance):
+
+| variant | shape | regs/occupancy | result |
+|---|---|---|---|
+| v2a 256thr, 6 units/warp | smem tiles, sync stage | 128 + 288B STACK SPILL | +115..169% |
+| v2b + cp.async dbl-buffer | same | same | WORSE (+125..169%) -- staging was never the stall |
+| v2c 512thr, 3 units/warp | no spills (119 regs) | 16 warps/SM | +44..109% -- per-warp path 2x fd2 |
+| v3 pair-block + 4-phase split | fd2-parity path, halved traffic | 112-120 regs, 16 warps | **BITWISE vs fd2 (maxerr 0.0) and still +44..61%** |
+
+v3 is the decisive cell: identical per-unit math, identical critical path,
+identical occupancy, HALVED DRAM traffic -- and 1.5x slower. Mechanism: the
+smem tile round-trip (global -> cp.async -> smem -> LDS -> register) is a
+pure EXTRA hop over fd2's direct global->register loads, because Task-5's
+lane-innermost co-scheduling already shares the KV chunk through L2 across
+sibling lane-blocks. Every KV-sharing restructure in this family (v1
+register-pair -4%, v2 tile-share, v3 phase-split) re-buys bytes the L2 was
+already providing and pays issue/latency for the privilege.
+
+**fd2 + Task-5 ordering is a measured local optimum for this GPU's memory
+hierarchy.** Do-not-retry KV-sharing restructures. The residual
+verify-attention cost is addressable only by (a) fd3-mma: tensor-core
+flash-decode -- at ntok>=6 the (units x positions) score matrix is dense
+enough for m16n8k16 MMA, moving the math to IDLE tensor pipes instead of
+re-dividing the same ALU/issue budget (fp-order change, tolerance class,
+real headroom: the fp8q prefill precedent); or (b) fewer positions
+(KV pruning -- quality class). Both are separate projects.
