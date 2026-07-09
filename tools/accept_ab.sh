@@ -16,6 +16,7 @@ cd "$(dirname "$0")/.."
 MODEL=${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}
 TOK=${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}
 PORT=${PORT:-8199}
+CTX=${CTX:-32768}
 LEGS=${LEGS:-"4 5 auto"}
 PAYLOADS=${*:-echo docs codegen testgen}
 SRV=""
@@ -29,7 +30,7 @@ for pay in $PAYLOADS; do
   for leg in $LEGS; do
     LOG=$(mktemp /tmp/accept_ab.XXXXXX.log)
     Q27_KV=fp8 Q27_PMIN=0.5 Q27_MAXD=$leg \
-      build/q27-server "$MODEL" "$TOK" --port "$PORT" --ctx 32768 --no-think \
+      build/q27-server "$MODEL" "$TOK" --port "$PORT" --ctx "$CTX" --no-think \
       --fast-head >"$LOG" 2>&1 &
     SRV=$!
     for i in $(seq 1 120); do
