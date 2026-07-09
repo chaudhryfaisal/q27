@@ -2736,3 +2736,52 @@ Gates: canonical a2982c51 (base, default) + 4c4120c7 (Qwopus, auto7 leg)
 both EXACT; test_kernels/test_depthctl/test_toolconstrain/test_tokenizer
 ALL PASS; F3 server smoke live (400/400/normal). Makefile dep wiring
 (finding 5) pending approval.
+
+## 2026-07-09 (comprehensive baseline campaign) -- vanilla Qwen3.6-27B-MTP reference numbers, master 197d6b6
+
+Full campaign on the new benchmark standard. Production config throughout
+(Q27_KV=fp8, Q27_PMIN=0.5, Q27_DEXIT=1, --fast-head); server-replay legs are
+fresh-server, 1 cold + 3 warm, medians (tools/accept_ab.sh); ran under
+systemd-run (unit qbench-2026-07-09), logs /tmp/qbench.
+
+**Decode envelope @~26K (t/s | tok/round):**
+
+    payload   d4            d5            auto
+    echo      172.4 | 3.88  188.9 | 4.41  184.5 | 4.49
+    docs      171.8 | 3.71  179.0 | 4.06  173.0 | 3.94
+    codegen   177.2 | 3.94  182.1 | 4.27  182.8 | 4.27
+    testgen   160.1 | 3.56  159.0 | 3.61  160.2 | 3.56 (never promotes)
+
+d5 >= d4 on every flavor (echo +9.6%) -- the post-verify-gemv inversion holds
+on the base model; auto tracks the winner and correctly refuses to promote on
+testgen (fired5 = 0).
+
+**cctx (real-CC flavor, 25.8K): d4 157.0 | d5 159.9 | d6 165.7 | auto 162.1
+| auto7 162.5.** Base saturation (y5 .61, fired5 .38-.49) sits UNDER the hi6
+promote bar much of the time, so auto is conservative and fixed d6 leads it
+by +2.2% on this flavor -- but fixed d6 would tax testgen-class traffic
+(y5 .36), so auto stays the production rec. auto7 == auto (level 7 never
+sustained).
+
+**docs61k @61K: d4 133.1 | d5 118.1 | auto 144.7 -- BASIN-CONFOUNDED, do not
+read as config deltas.** d5 took 82 rounds vs d4's 74 for the same 256
+tokens, impossible under width-invariance on a shared trajectory: the
+tie-heavy payload forks into different greedy basins per config (each leg
+internally deterministic, det=OK). Cross-config comparison at this depth
+needs token-file CLI replay, not text-completion replay.
+
+**Prefill (fp8 batched TTFT): 8K 2.35s (3491 t/s) | 32K 10.39s (3155 t/s) |
+128K 59.4s (2206 t/s)** -- 128K matches the Qwopus-era 59.6s (same weights
+shape; the O(N^2) attention share grows with depth as known).
+
+**Sampling tax @8K: greedy 137.7 t/s (2.61 tok/rnd) vs T=0.7/top-p 0.95
+129.3 (2.59) = -6.1%**, acceptance preserved through sampled verify.
+
+**Fine-tune delta, same binary + payload (cctx): Qwopus d5 210.0 / auto
+219.0 (+4.3%) vs base d5 159.9 / auto 162.1 -> +35% at auto, pure
+acceptance (5.82 vs 3.56 tok/round; y5 .81 vs .61, fired5 .79 vs .38).**
+Same-day rerun drift vs the morning legs (211.9/220.7): ~1%.
+
+Shortbench suite (current binary): 161.1 (canonical leg 131, a2982c51
+EXACT). Not run: 100K+ payloads (none exist), concurrency (out of scope for
+the single-stream engine).

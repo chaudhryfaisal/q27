@@ -6,9 +6,19 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate
 scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
 `CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
-Historical numbers in this README were measured on Qwopus unless noted --
-the base model runs ~8% slower at equal settings (pure spec-acceptance gap,
-same weights-shape: shortbench 166.1 vs 179.7).
+Historical numbers in this README were measured on Qwopus unless noted.
+
+**Baseline reference numbers** (2026-07-09 campaign, master 197d6b6,
+production config `Q27_KV=fp8 Q27_PMIN=0.5 Q27_MAXD=auto Q27_DEXIT=1
+--fast-head`, server-replay medians; full tables in BUILDLOG):
+
+- Decode @~26K: 160-185 t/s by flavor at auto (echo 184.5 / codegen 182.8 /
+  docs 173.0 / testgen 160.2); cctx (real-CC) 162.1, fixed d6 165.7.
+- Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (2206 t/s).
+- Sampling tax @8K: -6.1% at T=0.7/top-p 0.95, acceptance preserved.
+- Shortbench suite 161.1; canonical `a2982c51` EXACT.
+- Fine-tune headroom: Qwopus on the same binary/payload runs +35% on cctx
+  (219.0 at auto) -- pure spec-acceptance (5.82 vs 3.56 tok/round).
 
 ## State of the engine (2026-07-08)
 
