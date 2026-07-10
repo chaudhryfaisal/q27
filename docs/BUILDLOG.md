@@ -3275,3 +3275,29 @@ serving; snapshot kept at build/prewiden-b69cbd9/). P1 must pick the
 trial serving shape first: single-slot 131K (fits trivially), or
 131K + smaller slot-1, or reclaim graph memory. Widened binaries at
 build/{q27,q27-server} md5-differ from snapshot as expected.
+
+## 2026-07-10 -- width-12 P0 review pass: 3 real latents fixed (adversarial 4-lens workflow, 11 agents)
+
+Second-pass review of c399d70 (4 lenses: missed-sites / perm-state-machine
+/ memory-safety / graph-zoo, each finding adversarially verified): 7
+confirmed findings deduping to 3 real items, 0 refuted -- ALL latent
+until P1 launches widths > 8, i.e. exactly the class the byte-identity
+gates cannot see:
+1. CLI round-outcome hist[8] (engine.cu, 3 lenses independently): the
+   em[] widening's missed sibling -- hist[n-1] at n=9..12 is a stack OOB
+   in the very replay leg P2 depends on. -> hist[W_MAX] + 12-bucket print.
+2. k_quantize_x3 flat 8-lane arg list (kernels.cu): the terminal ternary
+   fall-through would alias lanes 8..11 onto lane 7's XQuant buffers --
+   the documented P12b "lane-count landmine" reborn at the next width.
+   -> lanes ride the XQ3 struct, one slot per lane by construction.
+3. Q27_PHASE_STATS vw buckets capped <= 8 (engine.cuh): widened to
+   W_MAX+1 mechanically; NOTE the binding gap is that suffix rounds are
+   not phase-stamped at all, so the P2 width curve needs suffix stamping
+   + phwn/phwm print + rig extension (filed in the plan's P1 list).
+Plan doc gained the review addenda: P1 serving-shape blocker (2-slot OOM),
+P1 suffix stamping, P2 fdmma gate+switch co-widen + launch return check,
+P3 gate-hist widening before MTP ceilings 8+.
+Re-gated after fixes: canonical a2982c51 + qwopus 4c4120c7 EXACT, full-CC
+replay leg byte-identical vs pre-widen binary, test_kernels ALL PASS,
+sanitizer memcheck 0 errors. conclave auto-review attempted, hung on
+external CLIs (timed out) -- workflow review is the pass of record.

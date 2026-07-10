@@ -467,27 +467,21 @@ void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st, int ntok) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_quantize_x3(CP3 xp, int8_t* n0, int8_t* n1, int8_t* n2, int8_t* n3, int8_t* n4,
-                              int8_t* n5, int8_t* n6, int8_t* n7, uint2* e0, uint2* e1, uint2* e2,
-                              uint2* e3, uint2* e4, uint2* e5, uint2* e6, uint2* e7, float* s0,
-                              float* s1, float* s2, float* s3, float* s4, float* s5, float* s6,
-                              float* s7, int* i0, int* i1, int* i2, int* i3, int* i4, int* i5,
-                              int* i6, int* i7, int nblocks) {
+__global__ void k_quantize_x3(CP3 xp, XQ3 xq, int nblocks) {
     int b = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (b >= nblocks) return;
     const int t = blockIdx.y;
     const float* x = xp.p[t];
     // P12b lesson (lane-count landmine): every lane must select its OWN
     // buffers -- a fall-through overwrote lane 4's activation at ntok=6 and
-    // corrupted the depth-5 verify (memcheck-blind). maxd6: 7th lane (n6).
-    int8_t* nat = t == 0 ? n0 : t == 1 ? n1 : t == 2 ? n2 : t == 3 ? n3 : t == 4 ? n4
-                                                : t == 5 ? n5 : t == 6 ? n6 : n7;
-    uint2* eo = t == 0 ? e0 : t == 1 ? e1 : t == 2 ? e2 : t == 3 ? e3 : t == 4 ? e4
-                                              : t == 5 ? e5 : t == 6 ? e6 : e7;
-    float* scale = t == 0 ? s0 : t == 1 ? s1 : t == 2 ? s2 : t == 3 ? s3 : t == 4 ? s4
-                                                 : t == 5 ? s5 : t == 6 ? s6 : s7;
-    int* isum = t == 0 ? i0 : t == 1 ? i1 : t == 2 ? i2 : t == 3 ? i3 : t == 4 ? i4
-                                              : t == 5 ? i5 : t == 6 ? i6 : i7;
+    // corrupted the depth-5 verify (memcheck-blind). width-12 review: the
+    // flat 8-pointer arg list was that landmine's descendant (its terminal
+    // fall-through would have aliased lanes 8..11 onto lane 7), so lanes now
+    // ride the XQ3 struct and index their own slot by construction.
+    int8_t* nat = xq.q[t].nat;
+    uint2* eo = xq.q[t].eo;
+    float* scale = xq.q[t].scale;
+    int* isum = xq.q[t].isum;
     int lane = threadIdx.x & 31;
     float v = x[b * 32 + lane];
     float amax = fabsf(v);
@@ -515,13 +509,7 @@ __global__ void k_quantize_x3(CP3 xp, int8_t* n0, int8_t* n1, int8_t* n2, int8_t
 void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st, int ntok) {
     int nblocks = (int)(cols / 32);
     dim3 g((nblocks + 7) / 8, ntok);
-    k_quantize_x3<<<g, 256, 0, st>>>(
-        x, xq.q[0].nat, xq.q[1].nat, xq.q[2].nat, xq.q[3].nat, xq.q[4].nat, xq.q[5].nat,
-        xq.q[6].nat, xq.q[7].nat, xq.q[0].eo, xq.q[1].eo, xq.q[2].eo, xq.q[3].eo, xq.q[4].eo,
-        xq.q[5].eo, xq.q[6].eo, xq.q[7].eo, xq.q[0].scale, xq.q[1].scale, xq.q[2].scale,
-        xq.q[3].scale, xq.q[4].scale, xq.q[5].scale, xq.q[6].scale, xq.q[7].scale,
-        xq.q[0].isum, xq.q[1].isum, xq.q[2].isum, xq.q[3].isum, xq.q[4].isum, xq.q[5].isum,
-        xq.q[6].isum, xq.q[7].isum, nblocks);
+    k_quantize_x3<<<g, 256, 0, st>>>(x, xq, nblocks);
     CUDA_CHECK(cudaGetLastError());
 }
 

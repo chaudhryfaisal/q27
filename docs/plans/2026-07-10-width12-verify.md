@@ -68,11 +68,29 @@ p[8] plumbing caps it).
 - P1 (1 session): gemv N=12 instantiate + MEASURE vs mma16 contingency;
   argmax/logits chains to 12; capture verify_graph_w[9..13]; suffix
   decouple (propose 11, width 12) behind Q27_SUFFIX_W knob.
+  P0-review additions (adversarial workflow over c399d70): (a) SERVING
+  SHAPE FIRST -- the widened 2-slot eval config (131K+32K fp8) OOMs at
+  slot-1 graph instantiation on 32GB (real headroom was ~2.5GB, not
+  ~5GB; +627MB/engine roles x2 + ~1.5x graph memory); the live trial
+  needs single-slot 131K or a smaller slot-1. (b) suffix rounds need
+  their own phase-stats stamping (ph_W/ph_timed or an own stats class)
+  or vw_ms/vw_n buckets 9..12 stay zero and the P2 width curve has no
+  tail; extend server phwn/phwm print + phase_width_run.sh in the same
+  change. (c) CLI hist + quantize3 lane plumbing were widened post-review
+  in P0 (were latent OOB/alias at n>8).
 - P2 (1 session): fdmma_test at W=12; accept_ab replay A/B; live T8
   full-stack trial (does suffix AL reach ~10.7? wall delta?); width-curve
   re-measure at 12.
+  P0-review addition: widen the fdmma dispatch gate (ntok<=8, spec3.cu)
+  and launch_fdmma's switch TOGETHER, and stop ignoring launch_fdmma's
+  unsupported-width return -- under Q27_FD=mma, widths 9..12 fall through
+  to fd2 today (correct but a per-width numerics fork worth documenting
+  in the A/B).
 - P3 (optional): MTP ceilings 8..10 priced via ladder_price.py on the d10
   chains (data exists); GDN deferred-snapshot chunk if curve says so.
+  P0-review addition: gate_cap_hist[8]/gate_n_hist[9] (engine.cuh) are
+  written unguarded on gated rounds and are safe ONLY under the
+  ladder-4..7 policy -- widen them before enabling MTP ceilings 8+.
 
 ## Predicted value (to be re-measured at P2)
 

@@ -1131,7 +1131,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "sampling: T=%.3f top_p=%.3f seed=%llu path=%s\n", temp, top_p, seed,
                     plain_sample ? "plain" : "spec");
         }
-        int total_emitted = 0, rounds = 0, hist[8] = {0}; // maxd7: up to 8-tok rounds
+        int total_emitted = 0, rounds = 0, hist[W_MAX] = {0}; // width-12: up to 12-tok rounds
         while ((int)out.size() < n_gen) {
             if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
             int em[W_MAX]; // width-12: a round emits up to 12 tokens
@@ -1145,8 +1145,9 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr,
                 "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, 6-tok %d, "
-                "7-tok %d, 8-tok %d\n",
-                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+                "7-tok %d, 8-tok %d, 9-tok %d, 10-tok %d, 11-tok %d, 12-tok %d\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8],
+                hist[9], hist[10], hist[11]);
         if (e.maxd_auto)
             fprintf(stderr,
                     "adaptive maxd: %ld rounds @depth-4, %ld @depth-5, %ld @depth-6, "

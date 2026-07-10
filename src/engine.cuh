@@ -1634,7 +1634,7 @@ struct Engine {
                            std::chrono::steady_clock::now() - ph_t1)
                            .count();
             gs.verify_ms += v;
-            if (ph_W >= 2 && ph_W <= 8) { gs.vw_ms[ph_W] += v; gs.vw_n[ph_W]++; }
+            if (ph_W >= 2 && ph_W <= W_MAX) { gs.vw_ms[ph_W] += v; gs.vw_n[ph_W]++; }
         }
         int n = oc[0];
         if (sfx_round) {
@@ -2195,11 +2195,15 @@ struct Engine {
         // host round-gap + any unattributed (constrained/ungated) rounds.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
-        // verify wall bucketed by verify width W=cap+1 (floored 2, <=8) --
-        // the marginal-lane cost curve that prices deep ladders with draft
-        // off the critical path (Saguaro follow-up). Index by W; 0..1 unused.
-        double vw_ms[9] = {};
-        long vw_n[9] = {};
+        // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)
+        // -- the marginal-lane cost curve that prices deep ladders with
+        // draft off the critical path (Saguaro follow-up). Index by W; 0..1
+        // unused. NOTE (width-12 review): buckets 9..12 stay ZERO until
+        // suffix rounds get their own phase stamping (P1) -- gated rounds
+        // cap at W=8 (ladder <=7) and the suffix branch is deliberately not
+        // stamped; server [req] prints phwn/phwm for 2..8 only.
+        double vw_ms[W_MAX + 1] = {};
+        long vw_n[W_MAX + 1] = {};
         int dec = 0, rounds = 0, yields = 0;
         const char* end = "";
     };
