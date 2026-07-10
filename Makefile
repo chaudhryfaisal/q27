@@ -53,3 +53,6 @@ clean:
 
 build/gdn_chunk_bench: tools/gdn_chunk_bench.cu | build
 	$(NVCC) $(NVCCFLAGS) tools/gdn_chunk_bench.cu -o $@
+
+build/attn_fdw_bench: tools/attn_fdw_bench.cu | build
+	$(NVCC) $(NVCCFLAGS) tools/attn_fdw_bench.cu -o $@
