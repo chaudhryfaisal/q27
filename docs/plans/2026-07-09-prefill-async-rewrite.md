@@ -102,3 +102,34 @@ and never see this kernel -- the gate is --pf-side).
 
 f16-MMA kernel, split-KV combine, GDN prefill, decode paths, PP/TT
 geometry changes (PP=32/TT=16 stay until A's attribution says otherwise).
+
+---
+
+## Phase A day-1 gate result (2026-07-09): mechanism GO, Phase-A EV cut -- plan INVERTED
+
+tools/mbar_ring.cu (committed): producer/consumer cuda::pipeline ring at
+the kernel's real stage sizes vs the current CTA-barrier phase structure,
+identical work, MATH_ITERS sweep across load:math balances:
+
+    load-heavy  85: 1.20x | balanced 170: 1.48x GO | 340: 1.23x |
+    680: 1.11x | math-heavy 1360: 1.04x
+
+Mechanism verdict: cuda::pipeline is SOUND on sm_120 (1.48x at balance --
+no CTA-barrier degeneration; the library path is usable).
+
+EV verdict for Phase A proper: the REAL kernel sits near the math-heavy
+end of this curve -- 95.6% L2-hit and the Phase-1 cp.async ping-pong
+already overlap the global loads, so the async rewrite's remaining prey
+is only the V-convert phase + wait granularity: projected +5-10% on the
+attn kernel ~= +3-6% prefill, BELOW the +8% Phase-A GO bar. The 30%
+long_scoreboard stall lives INSIDE the math phase (smem/MMA operand
+latency), which producer/consumer specialization does not touch.
+
+**Plan inversion:** Phase B (fp8 PV: delete s_v + the V-convert phase +
+one sync per tile, tolerance-gated, ~1 session) is now FIRST -- it
+removes the same serialized phase the async structure would have hidden,
+at a fraction of the complexity, and its attribution decides whether any
+mbarrier work remains worth doing. The FlashRT gap beyond that is
+math-phase engineering (MMA operand pipelining, instruction mix), not
+async structure -- a different, register-level project if B's numbers
+say it's still worth chasing.
