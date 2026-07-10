@@ -3380,3 +3380,40 @@ widened single-slot config (27.0/32.6GB). Replay accept_ab deferred --
 live trial is the venue of record (and the CLI can now fire suffix for
 future replay work). P3 (MTP ceilings 8..10 pricing, GDN deferred-
 snapshot) remains optional per plan.
+
+## 2026-07-10 -- fdmma tuning pass: STAGES=1 2-CTA variant DEFAULT (+17-26% kernel at depth, bitwise-identical)
+
+Measure-first (standing 3a rule: eligibility is the metric). ncu on the
+shipped 1-CTA kernel: Eligible Warps 0.11/scheduler, No-Eligible 89.5%,
+DRAM 26%, SM 20% -- severely latency-bound; 6 resident warps and THREE
+full-CTA barriers per tile leave nothing to hide latency with. W=12 also
+broke the flat width curve (+56% over W=8 at 61K: 5 of 6 warps live =
+compute serialization on top of the same stream). Prefetch-reorder
+experiment (issue next tile before the V transpose): WASH -- copies were
+already hidden; reverted.
+
+THE LEVER: k_attn_fdmma<W, STAGES>. STAGES=1 single-buffers K/V (fetch
+tile at loop top; trailing uniform barrier guards buffer reuse) and
+shrinks s_q to live rows (fdmma_qrows -- 96 was a fixed bound nothing
+read past), landing smem 49.1KB@W12 / 40.9@W8 and 168 regs (zero spill
+at W=12) under __launch_bounds__(192, 2): TWO CTAs co-reside and hide
+each other's barrier/memory gaps -- inter-CTA overlap replaces the
+intra-CTA ping-pong. Per-tile arithmetic extracted to a SHARED
+fdmma_tile_compute (both variants compile the same math -- outputs
+bitwise-identical by construction, verified).
+
+MEASURED (attn_fdw_bench, S1 vs S2): 26K W4/8/12 = 1.07/1.05/1.16x;
+61K W4/8/12 = 1.18/1.17/1.26x. 61K W=12: 354.7 -> 282.4us = 4.0x over
+fd2 (was 3.15x). bitwise=OK every leg. Engine share: ~-1.1ms per wide
+round at 61K (attention ~15% of the 39ms wide round) -- real but below
+T8 trajectory noise; kernel bench is the measurement of record.
+
+SHIPPED DEFAULT-ON (bitwise class, same as the P14 grid remap
+precedent): spec3.cu passes stages=1; Q27_FDMMA_STAGES=2 restores the
+old staging for A/B. Gates: fdmma_test 42/42 across BOTH variants
+(modeled-EXACT everywhere), canonical a2982c51 EXACT, S1 engine wide
+leg byte-identical to the S2 binary's, sanitizer memcheck 0,
+test_kernels ALL PASS. q27-eval restarted on the tuned binary.
+Remaining headroom: 282us vs ~130us floor at 61K W12 -- next lever
+would be the d-split O-accumulator halving (warp-pair PV, 3-CTA
+territory) or cross-CTA split-count retune; neither commissioned.

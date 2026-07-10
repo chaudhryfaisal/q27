@@ -120,6 +120,7 @@ int main() {
 
     // seq bases: straddle k*NS so per-lane chunk_t DISAGREE within a block
     // (design risk #1) plus a short-seq case with many empty splits.
+    for (int stages : {2, 1}) // tuning 2026-07-10: gate BOTH staging variants
     for (int W : {4, 5, 6, 8, 9, 11, 12}) { // width-12 P2: the Q27_SUFFIX_W range
         for (int base : {NS * 7 - 2 /*894: straddles 896=7*128*/, 800, 130}) {
             // lane t position = base - 1 + t  (seq_t = base + t)
@@ -144,7 +145,7 @@ int main() {
                 CUDA_CHECK(cudaMemcpy(part, poison.data(), partn * 4, cudaMemcpyHostToDevice));
             }
             bool ok = fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale,
-                                          NS, W, 0);
+                                          NS, W, 0, stages);
             CHECK(ok, "launch W=%d", W);
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<float> hpart(partn);
@@ -168,7 +169,7 @@ int main() {
             }
             // T3: bitwise repeat-run
             std::vector<float> hpart2(partn);
-            fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale, NS, W, 0);
+            fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale, NS, W, 0, stages);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(hpart2.data(), part, partn * 4, cudaMemcpyDeviceToHost));
             // compare only written slots (unwritten hold stale NaN pattern both runs)
@@ -307,9 +308,9 @@ int main() {
             }
             CHECK(wcosM > 0.9999, "modeled cosine W=%d base=%d worst %.7f", W, base, wcosM);
             CHECK(wrelM < 1e-2, "modeled rel W=%d base=%d worst %.3e", W, base, wrelM);
-            printf("W=%d base=%4d: slots OK, bitwise OK | modeled cos %.7f rel %.2e | "
+            printf("S%d W=%d base=%4d: slots OK, bitwise OK | modeled cos %.7f rel %.2e | "
                    "physics cos %.6f rel %.2e\n",
-                   W, base, wcosM, wrelM, wcosX, wrelX);
+                   stages, W, base, wcosM, wrelM, wcosX, wrelX);
         }
     }
     printf(fails ? "fdmma_test: %d FAILURES\n" : "fdmma_test: all tests PASS\n", fails);

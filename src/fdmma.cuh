@@ -67,38 +67,163 @@ constexpr int FDMMA_LDQ = FDMMA_HD + 4, FDMMA_LDK = FDMMA_HD + 16;
 constexpr int FDMMA_ST = 258; // == FD_ST
 static_assert(FDMMA_LDQ % 4 == 0 && FDMMA_LDK % 4 == 0, "u32 fragment loads need 4B alignment");
 
-constexpr size_t fdmma_smem_bytes() {
-    return (size_t)96 * FDMMA_LDQ                 // s_q
-           + 2 * FDMMA_PP * FDMMA_LDK             // s_kraw ping-pong
-           + 2 * FDMMA_PP * FDMMA_HD              // s_vraw ping-pong
+// tuning 2026-07-10: s_q holds only the live-warp rows (LIVE_WARPS*TT --
+// the kernel never touched rows past that; 96 was a fixed upper bound), and
+// K/V staging depth is a template knob. STAGES=2 = the shipped
+// double-buffered 1-CTA kernel; STAGES=1 single-buffers K/V so TWO CTAs
+// co-reside per SM (ncu: 1-CTA kernel idles 89% no-eligible on barriers +
+// memory latency; a second CTA fills those gaps -- inter-CTA overlap
+// replaces the intra-CTA ping-pong).
+__host__ __device__ constexpr int fdmma_qrows(int W) {
+    return ((6 * W + FDMMA_TT - 1) / FDMMA_TT) * FDMMA_TT; // LIVE_WARPS * TT
+}
+constexpr size_t fdmma_smem_bytes(int W, int stages) {
+    return (size_t)fdmma_qrows(W) * FDMMA_LDQ     // s_q (live rows only)
+           + (size_t)stages * FDMMA_PP * FDMMA_LDK // s_kraw x stages
+           + (size_t)stages * FDMMA_PP * FDMMA_HD  // s_vraw x stages
            + (size_t)FDMMA_HD * FDMMA_PP          // s_vt
            + 6 * FDMMA_TT * FDMMA_PP              // s_P
            + 3 * 16 * sizeof(int) + 4 * sizeof(int); // s_geo: lo/hi/seq[16] + {any,beg,end,pad}
 }
 
-template <int W>
-__global__ void __launch_bounds__(192, 1)
+// One tile's per-warp compute: QK^T MMA -> two-sided mask + online softmax
+// -> P relayout through this warp's s_P slab -> PV MMA. Shared VERBATIM by
+// both staging variants (STAGES is pure data movement; the arithmetic must
+// not fork). Mutates the caller's running softmax state and O accumulator.
+static __device__ __forceinline__ void fdmma_tile_compute(
+    const __nv_fp8_e4m3* s_q, const __nv_fp8_e4m3* kbuf, const __nv_fp8_e4m3* s_vt,
+    __nv_fp8_e4m3* s_P, int p0, float scale, int warp, int gid, int tg, int R0, int R1,
+    int lo0, int hi0, int lo1, int hi1, float& m0, float& m1, float& l0, float& l1,
+    float (&o)[32][4]) {
+    constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
+    // ---- QK^T: A = s_q rows R0/R1, B = K natural [key][LDK] col-major
+    float s[4][4];
+#pragma unroll
+    for (int n = 0; n < 4; n++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) s[n][e] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < HD / 32; kk++) {
+        const int kb = kk * 32;
+        uint32_t a0 = *(const uint32_t*)(s_q + (size_t)R0 * LDQ + kb + tg * 4);
+        uint32_t a1 = *(const uint32_t*)(s_q + (size_t)R1 * LDQ + kb + tg * 4);
+        uint32_t a2 = *(const uint32_t*)(s_q + (size_t)R0 * LDQ + kb + tg * 4 + 16);
+        uint32_t a3 = *(const uint32_t*)(s_q + (size_t)R1 * LDQ + kb + tg * 4 + 16);
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            uint32_t b0 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4);
+            uint32_t b1 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4 + 16);
+            mma_e4m3(s[n][0], s[n][1], s[n][2], s[n][3], a0, a1, a2, a3, b0, b1, s[n][0],
+                     s[n][1], s[n][2], s[n][3]);
+        }
+    }
+
+    // ---- mask + online softmax (prefill idiom; bound test TWO-SIDED:
+    // global pos p0+c masked iff outside this row's [lo, hi) window --
+    // the lo side carves per-lane windows out of the shared union stream)
+    const int a0r = lo0 - p0, b0r = hi0 - p0;
+    const int a1r = lo1 - p0, b1r = hi1 - p0;
+    float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+#pragma unroll
+    for (int n = 0; n < 4; n++) {
+        const int c0 = n * 8 + tg * 2, c1 = c0 + 1;
+#pragma unroll
+        for (int e = 0; e < 4; e++) s[n][e] *= scale;
+        if (c0 < a0r || c0 >= b0r) s[n][0] = -FLT_MAX;
+        if (c1 < a0r || c1 >= b0r) s[n][1] = -FLT_MAX;
+        if (c0 < a1r || c0 >= b1r) s[n][2] = -FLT_MAX;
+        if (c1 < a1r || c1 >= b1r) s[n][3] = -FLT_MAX;
+        rmax0 = fmaxf(rmax0, fmaxf(s[n][0], s[n][1]));
+        rmax1 = fmaxf(rmax1, fmaxf(s[n][2], s[n][3]));
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, off));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, off));
+    }
+    const float mn0 = fmaxf(m0, rmax0), mn1 = fmaxf(m1, rmax1);
+    const float sc0 = m0 == -FLT_MAX ? 0.f : expf(m0 - mn0);
+    const float sc1 = m1 == -FLT_MAX ? 0.f : expf(m1 - mn1);
+    float rl0 = 0.f, rl1 = 0.f;
+#pragma unroll
+    for (int n = 0; n < 4; n++) {
+        s[n][0] = s[n][0] == -FLT_MAX ? 0.f : expf(s[n][0] - mn0);
+        s[n][1] = s[n][1] == -FLT_MAX ? 0.f : expf(s[n][1] - mn0);
+        s[n][2] = s[n][2] == -FLT_MAX ? 0.f : expf(s[n][2] - mn1);
+        s[n][3] = s[n][3] == -FLT_MAX ? 0.f : expf(s[n][3] - mn1);
+        rl0 += s[n][0] + s[n][1];
+        rl1 += s[n][2] + s[n][3];
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+        rl0 += __shfl_xor_sync(0xffffffff, rl0, off);
+        rl1 += __shfl_xor_sync(0xffffffff, rl1, off);
+    }
+    l0 = l0 * sc0 + rl0;
+    l1 = l1 * sc1 + rl1;
+    m0 = mn0;
+    m1 = mn1;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+        o[i][0] *= sc0;
+        o[i][1] *= sc0;
+        o[i][2] *= sc1;
+        o[i][3] *= sc1;
+    }
+
+    // ---- P relayout D-frag -> A-frag through s_P: BYTE stores (u32
+    // stores are impossible from the D fragment -- cols {2tg, 2tg+1}
+    // live in different threads than keys {tg*4..+3}), __syncwarp
+    // (same-warp ownership), u32 reads. Donor prefill.cu:1700-1712.
+    __nv_fp8_e4m3* pw = s_P + warp * TT * PP;
+#pragma unroll
+    for (int n = 0; n < 4; n++) {
+        pw[gid * PP + (n * 8 + 2 * tg)] = __nv_fp8_e4m3(s[n][0]);
+        pw[gid * PP + (n * 8 + 2 * tg + 1)] = __nv_fp8_e4m3(s[n][1]);
+        pw[(gid + 8) * PP + (n * 8 + 2 * tg)] = __nv_fp8_e4m3(s[n][2]);
+        pw[(gid + 8) * PP + (n * 8 + 2 * tg + 1)] = __nv_fp8_e4m3(s[n][3]);
+    }
+    __syncwarp();
+    uint32_t a0 = *(const uint32_t*)(pw + gid * PP + tg * 4);
+    uint32_t a1 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4);
+    uint32_t a2 = *(const uint32_t*)(pw + gid * PP + tg * 4 + 16);
+    uint32_t a3 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4 + 16);
+    // ---- PV: B = s_vt[dim][key], 4 consecutive keys = 1 aligned u32
+#pragma unroll
+    for (int nt = 0; nt < 32; nt++) {
+        const int dim = nt * 8 + gid;
+        uint32_t b0 = *(const uint32_t*)(s_vt + dim * PP + tg * 4);
+        uint32_t b1 = *(const uint32_t*)(s_vt + dim * PP + tg * 4 + 16);
+        mma_e4m3(o[nt][0], o[nt][1], o[nt][2], o[nt][3], a0, a1, a2, a3, b0, b1, o[nt][0],
+                 o[nt][1], o[nt][2], o[nt][3]);
+    }
+}
+
+template <int W, int STAGES = 2>
+__global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     k_attn_fdmma(FCP3 qp, int q_stride, const __nv_fp8_e4m3* __restrict__ kc,
                  const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ part, FIP3 pos,
                  int n_kv_heads, int gqa, int head_dim, float scale) {
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
     constexpr int M = 6 * W;                      // live rows (dense r = j*W + t)
     constexpr int LIVE_WARPS = (M + TT - 1) / TT; // W=4 -> 2 .. W=12 -> 5
-    // width-12 P2: geometry is 16-ready (M = 6W <= 96 s_q rows, LIVE_WARPS
+    constexpr int QROWS = fdmma_qrows(W);         // s_q rows actually staged/read
+    // width-12 P2: geometry is 16-ready (M = 6W <= 96 rows, LIVE_WARPS
     // <= 6 = the 192-thread launch); s_geo strides at 16 lanes.
-    static_assert(W >= 2 && W <= 16, "s_q is 96 rows = 6*16 lanes max");
+    static_assert(W >= 2 && W <= 16, "96 rows = 6*16 lanes max");
+    static_assert(STAGES == 1 || STAGES == 2, "K/V staging depth");
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int nsp = gridDim.x; // == ns fed to k_attn_fd_combine (single source, no split-brain)
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     const int gid = lane >> 2, tg = lane & 3;
 
     extern __shared__ unsigned char smem_raw8[];
-    __nv_fp8_e4m3* s_q = (__nv_fp8_e4m3*)smem_raw8;                 // [96][LDQ]
-    __nv_fp8_e4m3* s_kraw = s_q + (size_t)96 * LDQ;                 // [2][PP][LDK]
-    __nv_fp8_e4m3* s_vraw = s_kraw + 2 * PP * LDK;                  // [2][PP][HD]
-    __nv_fp8_e4m3* s_vt = s_vraw + 2 * PP * HD;                     // [HD][PP]
+    __nv_fp8_e4m3* s_q = (__nv_fp8_e4m3*)smem_raw8;                 // [QROWS][LDQ]
+    __nv_fp8_e4m3* s_kraw = s_q + (size_t)QROWS * LDQ;              // [STAGES][PP][LDK]
+    __nv_fp8_e4m3* s_vraw = s_kraw + STAGES * PP * LDK;             // [STAGES][PP][HD]
+    __nv_fp8_e4m3* s_vt = s_vraw + STAGES * PP * HD;                // [HD][PP]
     __nv_fp8_e4m3* s_P = s_vt + (size_t)HD * PP;                    // [6][TT][PP]
-    int* s_geo = (int*)(s_P + 6 * TT * PP); // lo[8] hi[8] seq[8] any beg end
+    int* s_geo = (int*)(s_P + 6 * TT * PP); // lo[16] hi[16] seq[16] any beg end
 
     // ---- per-lane split geometry (combine's own formula, spec3.cu:248-250).
     // Only t < W is ever dereferenced: pos.p/qp.p slots beyond ntok hold
@@ -160,27 +285,43 @@ __global__ void __launch_bounds__(192, 1)
     const int lo0 = R0 < M ? s_geo[R0 % W] : 0, hi0 = R0 < M ? s_geo[16 + R0 % W] : 0;
     const int lo1 = R1 < M ? s_geo[R1 % W] : 0, hi1 = R1 < M ? s_geo[16 + R1 % W] : 0;
 
-    // ---- prologue prefetch (tile p_beg) into buffer 0
+    // ---- prologue prefetch (tile p_beg) into buffer 0 (STAGES=2 only:
+    // the single-buffer variant fetches each tile at its loop top and
+    // leans on the SECOND resident CTA for overlap)
     int cur = 0;
-    for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
-        const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
-        const int gpos = p_beg + pp;
-        const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-        cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
-        cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+    if (STAGES == 2) {
+        for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
+            const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+            const int gpos = p_beg + pp;
+            const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+        }
+        cpasync_commit();
     }
-    cpasync_commit();
 
     for (int p0 = p_beg; p0 < p_end; p0 += PP) {
-        __nv_fp8_e4m3* kbuf = s_kraw + cur * PP * LDK;
-        __nv_fp8_e4m3* vbuf = s_vraw + cur * PP * HD;
+        __nv_fp8_e4m3* kbuf = s_kraw + (STAGES == 2 ? cur : 0) * PP * LDK;
+        __nv_fp8_e4m3* vbuf = s_vraw + (STAGES == 2 ? cur : 0) * PP * HD;
+        if (STAGES == 1) {
+            // fetch THIS tile (prior iteration's trailing barrier proved
+            // every warp is done reading the single buffer)
+            for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
+                const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+                const int gpos = p0 + pp;
+                const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+                cpasync16(kbuf + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
+                cpasync16(vbuf + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+            }
+            cpasync_commit();
+        }
         cpasync_wait_all();
         __syncthreads();
         // transpose V [key][dim] -> s_vt[dim][key] (all 6 warps)
         for (int idx = threadIdx.x; idx < PP * HD; idx += 192)
             s_vt[(idx % HD) * PP + (idx / HD)] = vbuf[idx];
         __syncthreads();
-        if (p0 + PP < p_end) {
+        if (STAGES == 2 && p0 + PP < p_end) {
             __nv_fp8_e4m3* knext = s_kraw + (1 - cur) * PP * LDK;
             __nv_fp8_e4m3* vnext = s_vraw + (1 - cur) * PP * HD;
             for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
@@ -195,110 +336,20 @@ __global__ void __launch_bounds__(192, 1)
         cur = 1 - cur;
         // dead warps: staging + barriers only. BOTH __syncthreads of this
         // iteration are ABOVE this guard -- adding any barrier below it
-        // deadlocks (checked-fragile, keep it that way).
+        // deadlocks (checked-fragile, keep it that way). STAGES=1 replaces
+        // the `continue` with an if-block so its trailing loop barrier
+        // (single-buffer reuse guard) stays uniform across warps.
+        if (STAGES == 1) {
+            if (warp < LIVE_WARPS)
+                fdmma_tile_compute(s_q, kbuf, s_vt, s_P, p0, scale, warp, gid, tg, R0, R1,
+                                   lo0, hi0, lo1, hi1, m0, m1, l0, l1, o);
+            __syncthreads();
+            continue;
+        }
         if (warp >= LIVE_WARPS) continue;
 
-        // ---- QK^T: A = s_q rows R0/R1, B = K natural [key][LDK] col-major
-        float s[4][4];
-#pragma unroll
-        for (int n = 0; n < 4; n++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) s[n][e] = 0.f;
-#pragma unroll
-        for (int kk = 0; kk < HD / 32; kk++) {
-            const int kb = kk * 32;
-            uint32_t a0 = *(const uint32_t*)(s_q + (size_t)R0 * LDQ + kb + tg * 4);
-            uint32_t a1 = *(const uint32_t*)(s_q + (size_t)R1 * LDQ + kb + tg * 4);
-            uint32_t a2 = *(const uint32_t*)(s_q + (size_t)R0 * LDQ + kb + tg * 4 + 16);
-            uint32_t a3 = *(const uint32_t*)(s_q + (size_t)R1 * LDQ + kb + tg * 4 + 16);
-#pragma unroll
-            for (int n = 0; n < 4; n++) {
-                uint32_t b0 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4);
-                uint32_t b1 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4 + 16);
-                mma_e4m3(s[n][0], s[n][1], s[n][2], s[n][3], a0, a1, a2, a3, b0, b1, s[n][0],
-                         s[n][1], s[n][2], s[n][3]);
-            }
-        }
-
-        // ---- mask + online softmax (prefill idiom; bound test TWO-SIDED:
-        // global pos p0+c masked iff outside this row's [lo, hi) window --
-        // the lo side carves per-lane windows out of the shared union stream)
-        const int a0r = lo0 - p0, b0r = hi0 - p0;
-        const int a1r = lo1 - p0, b1r = hi1 - p0;
-        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-#pragma unroll
-        for (int n = 0; n < 4; n++) {
-            const int c0 = n * 8 + tg * 2, c1 = c0 + 1;
-#pragma unroll
-            for (int e = 0; e < 4; e++) s[n][e] *= scale;
-            if (c0 < a0r || c0 >= b0r) s[n][0] = -FLT_MAX;
-            if (c1 < a0r || c1 >= b0r) s[n][1] = -FLT_MAX;
-            if (c0 < a1r || c0 >= b1r) s[n][2] = -FLT_MAX;
-            if (c1 < a1r || c1 >= b1r) s[n][3] = -FLT_MAX;
-            rmax0 = fmaxf(rmax0, fmaxf(s[n][0], s[n][1]));
-            rmax1 = fmaxf(rmax1, fmaxf(s[n][2], s[n][3]));
-        }
-#pragma unroll
-        for (int off = 1; off <= 2; off <<= 1) {
-            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, off));
-            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, off));
-        }
-        const float mn0 = fmaxf(m0, rmax0), mn1 = fmaxf(m1, rmax1);
-        const float sc0 = m0 == -FLT_MAX ? 0.f : expf(m0 - mn0);
-        const float sc1 = m1 == -FLT_MAX ? 0.f : expf(m1 - mn1);
-        float rl0 = 0.f, rl1 = 0.f;
-#pragma unroll
-        for (int n = 0; n < 4; n++) {
-            s[n][0] = s[n][0] == -FLT_MAX ? 0.f : expf(s[n][0] - mn0);
-            s[n][1] = s[n][1] == -FLT_MAX ? 0.f : expf(s[n][1] - mn0);
-            s[n][2] = s[n][2] == -FLT_MAX ? 0.f : expf(s[n][2] - mn1);
-            s[n][3] = s[n][3] == -FLT_MAX ? 0.f : expf(s[n][3] - mn1);
-            rl0 += s[n][0] + s[n][1];
-            rl1 += s[n][2] + s[n][3];
-        }
-#pragma unroll
-        for (int off = 1; off <= 2; off <<= 1) {
-            rl0 += __shfl_xor_sync(0xffffffff, rl0, off);
-            rl1 += __shfl_xor_sync(0xffffffff, rl1, off);
-        }
-        l0 = l0 * sc0 + rl0;
-        l1 = l1 * sc1 + rl1;
-        m0 = mn0;
-        m1 = mn1;
-#pragma unroll
-        for (int i = 0; i < 32; i++) {
-            o[i][0] *= sc0;
-            o[i][1] *= sc0;
-            o[i][2] *= sc1;
-            o[i][3] *= sc1;
-        }
-
-        // ---- P relayout D-frag -> A-frag through s_P: BYTE stores (u32
-        // stores are impossible from the D fragment -- cols {2tg, 2tg+1}
-        // live in different threads than keys {tg*4..+3}), __syncwarp
-        // (same-warp ownership), u32 reads. Donor prefill.cu:1700-1712.
-        __nv_fp8_e4m3* pw = s_P + warp * TT * PP;
-#pragma unroll
-        for (int n = 0; n < 4; n++) {
-            pw[gid * PP + (n * 8 + 2 * tg)] = __nv_fp8_e4m3(s[n][0]);
-            pw[gid * PP + (n * 8 + 2 * tg + 1)] = __nv_fp8_e4m3(s[n][1]);
-            pw[(gid + 8) * PP + (n * 8 + 2 * tg)] = __nv_fp8_e4m3(s[n][2]);
-            pw[(gid + 8) * PP + (n * 8 + 2 * tg + 1)] = __nv_fp8_e4m3(s[n][3]);
-        }
-        __syncwarp();
-        uint32_t a0 = *(const uint32_t*)(pw + gid * PP + tg * 4);
-        uint32_t a1 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4);
-        uint32_t a2 = *(const uint32_t*)(pw + gid * PP + tg * 4 + 16);
-        uint32_t a3 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4 + 16);
-        // ---- PV: B = s_vt[dim][key], 4 consecutive keys = 1 aligned u32
-#pragma unroll
-        for (int nt = 0; nt < 32; nt++) {
-            const int dim = nt * 8 + gid;
-            uint32_t b0 = *(const uint32_t*)(s_vt + dim * PP + tg * 4);
-            uint32_t b1 = *(const uint32_t*)(s_vt + dim * PP + tg * 4 + 16);
-            mma_e4m3(o[nt][0], o[nt][1], o[nt][2], o[nt][3], a0, a1, a2, a3, b0, b1, o[nt][0],
-                     o[nt][1], o[nt][2], o[nt][3]);
-        }
+        fdmma_tile_compute(s_q, kbuf, s_vt, s_P, p0, scale, warp, gid, tg, R0, R1, lo0,
+                           hi0, lo1, hi1, m0, m1, l0, l1, o);
     }
 
     // ---- epilogue: unnormalized partials, fd2's exact layout + write rule.
@@ -327,40 +378,54 @@ __global__ void __launch_bounds__(192, 1)
 
 // launcher: grid (ns, n_kv_heads); ns MUST equal the ns passed to
 // k_attn_fd_combine (128 = FD2_NS in the engine). One-shot smem attr raise.
-template <int W>
+template <int W, int STAGES = 2>
 inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
                            FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
                            cudaStream_t st) {
     static bool attr = false;
-    const size_t sm = fdmma_smem_bytes();
+    const size_t sm = fdmma_smem_bytes(W, STAGES);
     if (!attr) {
-        cudaFuncSetAttribute(k_attn_fdmma<W>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+        cudaFuncSetAttribute(k_attn_fdmma<W, STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
         attr = true;
     }
     dim3 g((unsigned)ns, (unsigned)n_kv_heads);
-    k_attn_fdmma<W><<<g, 192, sm, st>>>(qp, q_stride, (const __nv_fp8_e4m3*)kc,
-                                        (const __nv_fp8_e4m3*)vc, part, pos, n_kv_heads, gqa,
-                                        head_dim, scale);
+    k_attn_fdmma<W, STAGES><<<g, 192, sm, st>>>(qp, q_stride, (const __nv_fp8_e4m3*)kc,
+                                                (const __nv_fp8_e4m3*)vc, part, pos, n_kv_heads,
+                                                gqa, head_dim, scale);
 }
 
+// stages: 2 = shipped double-buffered 1-CTA kernel; 1 = single-buffered
+// 2-CTA occupancy variant (tuning 2026-07-10; bench A/B before any default
+// change). Arithmetic is shared (fdmma_tile_compute) -- staging only.
 inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
                          FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
-                         int ntok, cudaStream_t st) {
+                         int ntok, cudaStream_t st, int stages = 2) {
+#define FDMMA_CASE(N)                                                                        \
+    case N:                                                                                  \
+        if (stages == 1)                                                                     \
+            launch_fdmma_w<N, 1>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, \
+                                 scale, ns, st);                                             \
+        else                                                                                 \
+            launch_fdmma_w<N, 2>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, \
+                                 scale, ns, st);                                             \
+        return true
     switch (ntok) {
-        case 4: launch_fdmma_w<4>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 5: launch_fdmma_w<5>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 6: launch_fdmma_w<6>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 7: launch_fdmma_w<7>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 8: launch_fdmma_w<8>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        FDMMA_CASE(4);
+        FDMMA_CASE(5);
+        FDMMA_CASE(6);
+        FDMMA_CASE(7);
+        FDMMA_CASE(8);
         // width-12 P2: the suffix drafter's wide verify (Q27_SUFFIX_W).
         // 13..16 compile (kernel is 16-ready) but stay uninstantiated until
         // something launches them; caller MUST honor the false return.
-        case 9: launch_fdmma_w<9>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 10: launch_fdmma_w<10>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 11: launch_fdmma_w<11>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        case 12: launch_fdmma_w<12>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        FDMMA_CASE(9);
+        FDMMA_CASE(10);
+        FDMMA_CASE(11);
+        FDMMA_CASE(12);
         default: return false; // W<4 (and 13..16) stay on fd2
     }
+#undef FDMMA_CASE
 }
 
 } // namespace fdmma

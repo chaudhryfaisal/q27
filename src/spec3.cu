@@ -493,9 +493,18 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             // width-12 P2 (review): honor the dispatch's return -- an
             // uninstantiated width must FALL THROUGH to fd2, not silently
             // combine unwritten partials.
+            // tuning 2026-07-10: stages=1 (single-buffered K/V, 2 CTAs/SM,
+            // 168 regs) is the DEFAULT -- bitwise-identical to the shipped
+            // 2-stage kernel (shared fdmma_tile_compute) and +5..26% at
+            // every measured (ctx, W); Q27_FDMMA_STAGES=2 restores the old
+            // staging for A/B. Read once; graphs bake it at capture.
+            static const int fdmma_stages = [] {
+                const char* e = getenv("Q27_FDMMA_STAGES");
+                return e && atoi(e) == 2 ? 2 : 1;
+            }();
             if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
-                                    n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok,
-                                    st)) {
+                                    n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok, st,
+                                    fdmma_stages)) {
                 dim3 g2(n_q_heads, ntok);
                 k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
                                                       FD2_NS, pos);

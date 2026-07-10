@@ -35,9 +35,9 @@
 
 static constexpr int N_KV = 4, GQA = 6, HD = 256, NQH = N_KV * GQA;
 static constexpr int FD2_NS = 128, FD_ST = 258;
-struct CP3 { const float* p[8]; };
-struct P3 { float* p[8]; };
-struct IP3 { const int* p[8]; };
+struct CP3 { const float* p[16]; }; // width-12 tuning
+struct P3 { float* p[16]; };
+struct IP3 { const int* p[16]; };
 
 // ---- fd2 + combine, forked verbatim from src/spec3.cu ----
 template <typename CT>
@@ -551,7 +551,7 @@ int main() {
     for (int CTX : {26000, 61000}) {
         // synthetic fp8 KV + fp32 q; W lanes at positions CTX-1 .. CTX+W-2
         // (consecutive verify rows; equal ceil-div chunks at these seqs)
-        const int MAXW = 8;
+        const int MAXW = 12; // width-12 tuning
         const size_t kvn = (size_t)(CTX + MAXW) * N_KV * HD;
         __nv_fp8_e4m3 *kc, *vc;
         CUDA_CHECK(cudaMalloc(&kc, kvn));
@@ -570,10 +570,10 @@ int main() {
             CUDA_CHECK(cudaMemcpy(kc, h.data(), kvn, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(vc, h2.data(), kvn, cudaMemcpyHostToDevice));
         }
-        float* q[8];
-        float* o2[8];
-        float* ow[8];
-        int* posd[8];
+        float* q[12];
+        float* o2[12];
+        float* ow[12];
+        int* posd[12];
         for (int t = 0; t < MAXW; t++) {
             CUDA_CHECK(cudaMalloc(&q[t], NQH * HD * 4));
             std::vector<float> hq(NQH * HD);
@@ -592,7 +592,7 @@ int main() {
         float* part;
         CUDA_CHECK(cudaMalloc(&part, (size_t)MAXW * NQH * FD2_NS * FD_ST * 4));
         printf("== ctx %d (KV %zu MB all-heads)\n", CTX, 2 * kvn / 1000000);
-        for (int W : {2, 4, 8}) {
+        for (int W : {2, 4, 8, 12}) {
             CP3 qp{};
             P3 o2p{}, owp{};
             IP3 pp{};
@@ -672,6 +672,15 @@ int main() {
             auto fdmma_leg = [&] {
                 fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
                                     FD2_NS, W, 0);
+                dim3 g2(NQH, W);
+                k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, FD2_NS, pp);
+            };
+            // stages=1: single-buffered 2-CTA occupancy variant (tuning
+            // 2026-07-10). Shared arithmetic -> outputs must be BITWISE
+            // identical to stages=2.
+            auto fdmma1_leg = [&] {
+                fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                                    FD2_NS, W, 0, /*stages=*/1);
                 dim3 g2(NQH, W);
                 k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, FD2_NS, pp);
             };
@@ -756,15 +765,40 @@ int main() {
                     }
                 }
             }
+            // stages=1 bitwise gate vs stages=2 (fdmma_leg's outputs are
+            // still resident in ow[] from the correctness block above)
+            int s1_mismatch = -1;
+            if (W >= 4) {
+                std::vector<std::vector<float>> ref(W);
+                for (int t = 0; t < W; t++) {
+                    ref[t].resize(NQH * HD);
+                    CUDA_CHECK(cudaMemcpy(ref[t].data(), ow[t], NQH * HD * 4,
+                                          cudaMemcpyDeviceToHost));
+                }
+                CUDA_CHECK(cudaMemset(part, 0, (size_t)MAXW * NQH * FD2_NS * FD_ST * 4));
+                fdmma1_leg();
+                CUDA_CHECK(cudaDeviceSynchronize());
+                s1_mismatch = 0;
+                for (int t = 0; t < W; t++) {
+                    std::vector<float> b(NQH * HD);
+                    CUDA_CHECK(cudaMemcpy(b.data(), ow[t], NQH * HD * 4,
+                                          cudaMemcpyDeviceToHost));
+                    for (size_t i = 0; i < b.size(); i++)
+                        if (memcmp(&ref[t][i], &b[i], 4) != 0) s1_mismatch++;
+                }
+            }
             double ms2 = timeit(fd2, 100), msw = timeit(fdw, 100), msw2 = timeit(fdw2, 100);
             double msw3 = timeit(fdw3, 100);
             double msm = W >= 4 ? timeit(fdmma_leg, 100) : 0;
+            double msm1 = W >= 4 ? timeit(fdmma1_leg, 100) : 0;
             printf("  W=%d fd2 %7.1f | v1 %7.1f %.2fx | v2 %7.1f %.2fx | v3 %7.1f %.2fx "
                    "rel %.1e",
                    W, ms2 * 1e3, msw * 1e3, ms2 / msw, msw2 * 1e3, ms2 / msw2, msw3 * 1e3,
                    ms2 / msw3, mre3);
             if (W >= 4)
-                printf(" | FDMMA %7.1f %.2fx rel %.1e\n", msm * 1e3, ms2 / msm, mrem);
+                printf(" | FDMMA %7.1f %.2fx rel %.1e | S1 %7.1f %.2fx bitwise=%s\n",
+                       msm * 1e3, ms2 / msm, mrem, msm1 * 1e3, msm / msm1,
+                       s1_mismatch == 0 ? "OK" : "FAIL");
             else
                 printf("\n");
         }
