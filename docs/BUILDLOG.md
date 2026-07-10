@@ -3445,3 +3445,25 @@ to 1f8f3d3 (fdmma.cuh + bench); fdmma_test re-verified ALL PASS on the
 reverted tree. Remaining headroom at 61K W=12: 282.8us vs ~130 floor;
 next candidates: cross-CTA split-count retune (ns as an fdmma-only
 knob), or the full warp-specialized rewrite -- neither commissioned.
+
+## 2026-07-10 -- fdmma split-count retune: ns = SMs*2/kv_heads (85) DEFAULT = -22..-36% kernel, 5.6x fd2 at 61K W12
+
+Wave quantization was the next binding constraint after S1: grid
+(128, 4) = 512 CTAs vs 170 SMs x 2 resident = 340 slots -> a half-empty
+second wave. Bench sweep (S1 kernel): ns=85 (exactly one wave) = 26K
+W8 83.0us (-28%), 61K W8 150.8 (-22%), 61K W12 202.6 (-29%); ns=64
+wins 26K W12 (119.4, -36%); ns=96 shows the textbook overflow-wave
+penalty (WORSE than 128 at 61K W8). 61K W12 is now 202.6us = 5.6x fd2
+(was 3.15x this morning pre-tuning); day total on that cell: 354.7 ->
+202.6 = 1.75x.
+
+SHIPPED: spec3.cu computes fdmma_ns = clamp(SMs*2/n_kv_heads, 16,
+FD_MAXNS) once (85 on the 5090), passes it to launch_fdmma AND the
+combine; Q27_FDMMA_NS pins it for A/B; fd2 keeps FD2_NS=128 (its own
+sweep). NOT bitwise across ns (split boundaries move -> combine fp
+order) -- rebuild-class tie-lottery, the regime the basin matrix
+cleared for mma. Gates: fdmma_test parameterized over ns {128, 85} =
+84 legs ALL PASS (modeled-EXACT at both; ref chunk math had a stale
+NS -- caught by 56 honest failures before the fix); canonical
+a2982c51 EXACT; same-binary repeat identical; Q27_FDMMA_NS=128 escape
+verified; sanitizer 0. q27-eval restarted on the retuned binary.

@@ -120,6 +120,7 @@ int main() {
 
     // seq bases: straddle k*NS so per-lane chunk_t DISAGREE within a block
     // (design risk #1) plus a short-seq case with many empty splits.
+    for (int nsv : {128, 85}) // split-count retune 2026-07-10: gate both ns values
     for (int stages : {2, 1}) // tuning 2026-07-10: gate BOTH staging variants
     for (int W : {4, 5, 6, 8, 9, 11, 12}) { // width-12 P2: the Q27_SUFFIX_W range
         for (int base : {NS * 7 - 2 /*894: straddles 896=7*128*/, 800, 130}) {
@@ -145,31 +146,31 @@ int main() {
                 CUDA_CHECK(cudaMemcpy(part, poison.data(), partn * 4, cudaMemcpyHostToDevice));
             }
             bool ok = fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale,
-                                          NS, W, 0, stages);
+                                          nsv, W, 0, stages);
             CHECK(ok, "launch W=%d", W);
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<float> hpart(partn);
             CUDA_CHECK(cudaMemcpy(hpart.data(), part, partn * 4, cudaMemcpyDeviceToHost));
             for (int t = 0; t < W; t++) {
                 const int seq = base + t;
-                const int chunk = (seq + NS - 1) / NS;
+                const int chunk = (seq + nsv - 1) / nsv;
                 const int used = (seq + chunk - 1) / chunk;
                 for (int h = 0; h < NQH; h++) {
-                    for (int sp = 0; sp < NS; sp++) {
-                        const size_t idx = (((size_t)t * NQH + h) * NS + sp) * ST;
+                    for (int sp = 0; sp < nsv; sp++) {
+                        const size_t idx = (((size_t)t * NQH + h) * nsv + sp) * ST;
                         const bool wrote = !std::isnan(hpart[idx]);
                         const bool expect = sp < used;
                         if (wrote != expect) {
                             CHECK(false, "slot W=%d base=%d t=%d h=%d sp=%d wrote=%d expect=%d",
                                   W, base, t, h, sp, wrote, expect);
-                            sp = NS; h = NQH; // stop flood
+                            sp = nsv; h = NQH; // stop flood
                         }
                     }
                 }
             }
             // T3: bitwise repeat-run
             std::vector<float> hpart2(partn);
-            fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale, NS, W, 0, stages);
+            fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale, nsv, W, 0, stages);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(hpart2.data(), part, partn * 4, cudaMemcpyDeviceToHost));
             // compare only written slots (unwritten hold stale NaN pattern both runs)
@@ -178,7 +179,7 @@ int main() {
 
             // T2: combine -> outputs vs fp64 CPU reference
             dim3 g2(NQH, W);
-            k_attn_fd_combine<<<g2, 256>>>(part, op, NQH, HD, NS, pp);
+            k_attn_fd_combine<<<g2, 256>>>(part, op, NQH, HD, nsv, pp);
             CUDA_CHECK(cudaDeviceSynchronize());
             // Two references, one purpose each:
             // (M) MODELED ref -- replicates the kernel's numerics pipeline in
@@ -197,7 +198,7 @@ int main() {
                 CUDA_CHECK(cudaMemcpy(got.data(), d_out[t], (size_t)NQH * HD * 4,
                                       cudaMemcpyDeviceToHost));
                 const int seq = base + t;
-                const int chunk = (seq + NS - 1) / NS;
+                const int chunk = (seq + nsv - 1) / nsv;
                 const int used = (seq + chunk - 1) / chunk;
                 for (int h = 0; h < NQH; h++) {
                     const int kvh = h / GQA;
@@ -222,7 +223,7 @@ int main() {
                         // block p_beg = min over LIVE lanes' lo at this sp, &~31
                         int beg = INT_MAX, end = 0;
                         for (int u = 0; u < W; u++) {
-                            const int sq = base + u, cu = (sq + NS - 1) / NS;
+                            const int sq = base + u, cu = (sq + nsv - 1) / nsv;
                             const int lu = sp * cu, hu = std::min(sq, lu + cu);
                             if (lu < sq) { beg = std::min(beg, lu); end = std::max(end, hu); }
                         }
@@ -308,9 +309,9 @@ int main() {
             }
             CHECK(wcosM > 0.9999, "modeled cosine W=%d base=%d worst %.7f", W, base, wcosM);
             CHECK(wrelM < 1e-2, "modeled rel W=%d base=%d worst %.3e", W, base, wrelM);
-            printf("S%d W=%d base=%4d: slots OK, bitwise OK | modeled cos %.7f rel %.2e | "
+            printf("ns=%d S%d W=%d base=%4d: slots OK, bitwise OK | modeled cos %.7f rel %.2e | "
                    "physics cos %.6f rel %.2e\n",
-                   stages, W, base, wcosM, wrelM, wcosX, wrelX);
+                   nsv, stages, W, base, wcosM, wrelM, wcosX, wrelX);
         }
     }
     printf(fails ? "fdmma_test: %d FAILURES\n" : "fdmma_test: all tests PASS\n", fails);

@@ -502,12 +502,32 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
                 const char* e = getenv("Q27_FDMMA_STAGES");
                 return e && atoi(e) == 2 ? 2 : 1;
             }();
+            // split-count retune (tuning 2026-07-10): fdmma's grid is
+            // (ns, kv_heads) with 2 CTAs/SM resident -- ns = SMs*2/kv_heads
+            // fills EXACTLY one wave (85 on the 5090; 128 left a half-empty
+            // second wave, +29-40% at 61K). fdmma-only: fd2 keeps FD2_NS
+            // (its splits were swept for its own shape). Capped by
+            // FD_MAXNS (scratch rows). NOT bitwise across ns values (split
+            // boundaries move -> combine fp order) -- rebuild-class
+            // tie-lottery, the regime the mma basin matrix cleared;
+            // Q27_FDMMA_NS pins it for A/B.
+            static const int fdmma_ns = [n_kv_heads] {
+                if (const char* e = getenv("Q27_FDMMA_NS")) {
+                    int v = atoi(e);
+                    if (v >= 1 && v <= FD_MAXNS) return v;
+                }
+                int dev2, smc;
+                CUDA_CHECK(cudaGetDevice(&dev2));
+                CUDA_CHECK(cudaDeviceGetAttribute(&smc, cudaDevAttrMultiProcessorCount, dev2));
+                int v = (smc * 2) / n_kv_heads;
+                return v < 16 ? 16 : v > FD_MAXNS ? FD_MAXNS : v;
+            }();
             if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
-                                    n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok, st,
+                                    n_q_heads / n_kv_heads, head_dim, scale, fdmma_ns, ntok, st,
                                     fdmma_stages)) {
                 dim3 g2(n_q_heads, ntok);
                 k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
-                                                      FD2_NS, pos);
+                                                      fdmma_ns, pos);
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }

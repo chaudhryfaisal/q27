@@ -590,7 +590,7 @@ int main() {
             CUDA_CHECK(cudaMemcpy(posd[t], &hp, 4, cudaMemcpyHostToDevice));
         }
         float* part;
-        CUDA_CHECK(cudaMalloc(&part, (size_t)MAXW * NQH * FD2_NS * FD_ST * 4));
+        CUDA_CHECK(cudaMalloc(&part, (size_t)MAXW * NQH * 192 * FD_ST * 4)); // ns sweep: up to 192 splits
         printf("== ctx %d (KV %zu MB all-heads)\n", CTX, 2 * kvn / 1000000);
         for (int W : {2, 4, 8, 12}) {
             CP3 qp{};
@@ -801,6 +801,28 @@ int main() {
                        s1_mismatch == 0 ? "OK" : "FAIL");
             else
                 printf("\n");
+            // split-count retune (tuning 2026-07-10): sweep ns for the S1
+            // kernel. Wave math: grid = ns*4 CTAs vs SMs*2 resident slots.
+            // NOT bitwise across ns (split boundaries move -> combine fp
+            // order changes) -- tolerance-class, same regime as mma itself.
+            if (W >= 8) {
+                int smc = 0, dev = 0;
+                CUDA_CHECK(cudaGetDevice(&dev));
+                CUDA_CHECK(cudaDeviceGetAttribute(&smc, cudaDevAttrMultiProcessorCount, dev));
+                printf("    ns-sweep (SMs=%d, slots=%d):", smc, smc * 2);
+                for (int ns : {64, 85, 96, 128, 170}) {
+                    auto leg = [&] {
+                        fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                                            ns, W, 0, /*stages=*/1);
+                        dim3 g2(NQH, W);
+                        k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, ns, pp);
+                    };
+                    leg(); CUDA_CHECK(cudaDeviceSynchronize()); // warm/instantiate
+                    double ms = timeit(leg, 100);
+                    printf("  ns=%d %.1f", ns, ms * 1e3);
+                }
+                printf(" us\n");
+            }
         }
         for (int t = 0; t < MAXW; t++) {
             CUDA_CHECK(cudaFree(q[t]));
