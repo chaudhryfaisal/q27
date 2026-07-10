@@ -1273,6 +1273,13 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
             __syncthreads();
             // convert only V (raw fp8 -> half in s_v); K stays raw in kbuf for
             // the fp8 MMA. Same kv2h bytes as the blocking path.
+            // Q27_PV_CONVX: convert-phase marginal-cost probe (Phase B gate) --
+            // repeat the convert N times; TTFT slope = per-convert cost, the
+            // ceiling on what deleting the convert phase can save.
+#ifndef Q27_PV_CONVX
+#define Q27_PV_CONVX 1
+#endif
+            for (int rep = 0; rep < Q27_PV_CONVX; rep++)
             for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
                 int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
                 __half2* vd = (__half2*)(s_v + pp * LDH + d8);
@@ -1398,6 +1405,17 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
         }
 
         // P x V -> O (fp16, verbatim from k_attn_prefill_mma)
+        // fp8-PV tolerance probe (build with -DQ27_PV8_PROBE): round-trip P
+        // through e4m3 before the f16 MMA. V is ALREADY e4m3 in the KV cache
+        // (losslessly widened to half here), so this isolates the ONLY new
+        // precision loss a true fp8-PV MMA would add -- quantizing the softmax
+        // probs. Macro-gated so the shipping path costs nothing.
+#ifdef Q27_PV8_PROBE
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[n][e] = (float)__nv_fp8_e4m3(s[n][e]);
+#endif
         uint32_t pa[2][4];
 #pragma unroll
         for (int h = 0; h < 2; h++) {

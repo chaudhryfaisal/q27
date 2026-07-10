@@ -133,3 +133,36 @@ mbarrier work remains worth doing. The FlashRT gap beyond that is
 math-phase engineering (MMA operand pipelining, instruction mix), not
 async structure -- a different, register-level project if B's numbers
 say it's still worth chasing.
+
+---
+
+## fp8-PV cut (promoted-first Phase B): GATED GO -- run it next session
+
+Two macro-gated probes added to k_attn_prefill_mma_fp8q (default-inert;
+canonical a2982c51 EXACT with them present):
+
+**Tolerance (-DQ27_PV8_PROBE): round-trip P through e4m3, keep f16 MMA.**
+V is already e4m3 in the KV cache, so this isolates the only NEW loss a
+true fp8-PV MMA adds -- quantizing softmax P. @131K vs the default fp8q:
+cosine 0.99996269 (bar >= 0.9999 PASS), argmax MATCH, top5 4/5. Marginally
+below the shipped fp8q gate (0.9999827, top5 5/5) but inside the Phase-B
+bar. Needle 6/6 still required on the real kernel before default-on.
+
+**Convert-phase cost (-DQ27_PV_CONVX=N): repeat the V-convert N times.**
+@131K: N=1 59.0s | N=4 71.0s | N=8 86.0s = ~3.9s PER CONVERT = 6.6% of
+prefill. THIS REVISES THE DAY-1 EV-CUT: the microbench modeled loads+math
+but NOT the convert phase, which sits between two __syncthreads on the
+critical path (cp.async hides the GLOBAL loads, not this smem->smem ALM
+phase). Deleting it -> ~55s @128K = +7% prefill, at/above the GO bar.
+
+**Verdict: fp8-PV MMA is GO.** Tolerance passes; payoff measured ~6.6-7%.
+Implementation (next session, ~1-2 sessions): true m16n8k32.e4m3 PV where
+V is the B operand read STRIDED from s_vraw (no s_v, no convert phase) --
+the mirror of the QK^T path but with the key/dim axes swapped, so the
+B-fragment indexing gathers 4-consecutive-keys-at-fixed-dim (strided by
+HD in s_vraw) instead of QK^T's contiguous 4-dims. Risk: strided smem
+B-reads bank-conflict; net win = (6.6% convert saved) - (conflict cost),
+measured on the real kernel. Frees s_v's 16.5KB -> deeper cp.async ring
+as a bonus. Gates: fp8q tolerance battery (cosine/argmax/top5 @131K +
+needle 6/6 + --pf continuation) + TTFT ladder 8/32/128K + canonical
+(fp16 path untouched). Rigs kept: Q27_PV8_PROBE, Q27_PV_CONVX.
