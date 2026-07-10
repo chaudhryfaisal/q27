@@ -3011,3 +3011,38 @@ Sequencing: A-spike first (1 day, pure measurement); if GO, A build
 mod-8 role-buffer machinery caps at 8 lanes, so >8 needs chunked-scan
 GDN with checkpoint/replay, the DFlash Phase-2 problem inherited). B
 next for TTFT. C rides A's spike data.
+
+## 2026-07-09 (GEMM-verify spike) -- NO-GO at the <=16ms bar; the lever collapses into the tensor-core pivot
+
+Spike protocol: Q27_P0B_T width sweep + nsys per-kernel attribution
+(tiny-prompt run isolates pure T=16 instances; 103 chunks).
+
+**T-shape sweep @26K (chunk+head ms):** T=8 45.8 | 16 47.1 | 32 49.2 |
+64 54.0 | 128 68.5 | 256 107.2 => cost = ~44ms FIXED + 0.25ms/token.
+
+**Attribution of the fixed 44ms (per T=16 cycle):** q4 weight GEMMs
+(k_gemm_mma_T<1,1>, 304 calls) 28.6ms + q8 GEMMs 5.9ms + attention
+(k_attn_prefill_mma_fp8q, 16x200us) 3.2ms + GDN scan 1.5ms + misc ~2.5ms.
+The weight GEMMs stream at 29% of DRAM BW at M=16 (34.5ms vs the 9.9ms
+whole-model floor) -- the T=1024-era tiling collapses at small M (grid
+over rows only; too few CTAs to saturate DRAM).
+
+**Verdict vs the sim:** win zone (13-15ms cycle, +31-46%) needs ~85% BW
+at M=16; our best demonstrated small-M class (tuned GEMV) peaks 50-55%,
+which lands the realistic dedicated-path cycle at 20-26ms = the
+breakeven zone (sim: -4% at 22ms, +13% at 18ms). NOT worth 3-5 sessions
++ P15-class GDN state work for a breakeven-to-+13% range.
+
+**What would reopen it:** a tensor-core weight-GEMM path (in-kernel
+dequant q4->fp8/bf16 + MMA, CUTLASS-class) that demonstrates >=70% BW at
+M=16 -- i.e., the already-assessed NVFP4/tensor-core pivot. The
+deep-ladder lever is not independent of that pivot; it is one of its
+payoffs. The chain-acceptance finding STANDS (flat 0.78-0.86 to d10) and
+makes the pivot's decode case materially stronger than when we assessed
+it (then: "batch-1 bandwidth-bound, not recommended"; now: batch-16
+verify with measured-flat acceptance is the workload the pivot serves).
+
+Levers roadmap after the spike: B (prefill FA2 relayout) resumes as #1
+actionable; the tensor-core pivot gets a strengthened case file (chain
+data + 29%-BW finding + FlashRT/CUTLASS reference); C/D unchanged.
+Rig kept: Q27_P0B_T sweep param.

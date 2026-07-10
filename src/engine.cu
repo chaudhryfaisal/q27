@@ -151,19 +151,22 @@ int main(int argc, char** argv) {
         // S=16 verify anatomy -- one T=16 prefill_chunk + the 16-row head
         // (rmsnorm_T + qxT + mmT). Timing rig only: repeated chunks at the
         // same positions corrupt GDN state by design; state is discarded.
+        // Q27_P0B_T: verify width sweep (spike 2026-07-09); default 16
+        const char* te = getenv("Q27_P0B_T");
+        const int TT = te ? atoi(te) : 16;
         int NP = (int)toks.size();
-        if (NP < 64 || NP + 16 > ctx) {
-            fprintf(stderr, "--p0b: need 64 <= prompt and prompt+16 <= ctx\n");
+        if (NP < 64 || NP + TT > ctx || TT < 1 || TT > (int)Engine::PF_T) {
+            fprintf(stderr, "--p0b: need 64 <= prompt, prompt+T <= ctx, 1 <= T <= PF_T\n");
             return 1;
         }
         int* d_toks;
         float* d_lg;
         CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)NP * 4));
-        CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)16 * VOCAB * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)TT * VOCAB * 4));
         CUDA_CHECK(cudaMemcpyAsync(d_toks, toks.data(), (size_t)NP * 4, cudaMemcpyHostToDevice,
                                    e.stm));
         const int PT = Engine::PF_T;
-        const int depth = NP - 16;
+        const int depth = NP - TT;
         for (int c0 = 0; c0 < depth; c0 += PT) {
             int T = std::min(PT, depth - c0);
             e.prefill_chunk(d_toks + c0, c0, T);
@@ -172,11 +175,11 @@ int main(int argc, char** argv) {
         const DevTensor& onw = e.dm.get("output_norm.weight");
         const DevTensor& head = e.dm.get("output.weight");
         auto cycle = [&](bool with_head) {
-            e.prefill_chunk(d_toks + depth, depth, 16);
+            e.prefill_chunk(d_toks + depth, depth, TT);
             if (with_head) {
-                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, 16, EPS, e.stm);
-                e.qxT(e.x1T, N_EMBD, 16);
-                e.mmT(head, e.x1T, d_lg, 16);
+                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, TT, EPS, e.stm);
+                e.qxT(e.x1T, N_EMBD, TT);
+                e.mmT(head, e.x1T, d_lg, TT);
             }
         };
         cycle(true); // warm
@@ -193,7 +196,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaEventSynchronize(v1));
             float ms = 0;
             CUDA_CHECK(cudaEventElapsedTime(&ms, v0, v1));
-            printf("p0b depth=%d T=16 %s: %.3f ms/cycle\n", depth,
+            printf("p0b depth=%d T=%d %s: %.3f ms/cycle\n", depth, TT,
                    with_head ? "chunk+head" : "chunk-only", ms / REPS);
         }
         return 0;
