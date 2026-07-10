@@ -196,3 +196,28 @@ reads clean contiguous uint32 (no in-loop scatter). Predicted ceiling
 the next attempt if prefill TTFT becomes the priority; kernel + microtest
 kept as its scaffold (proven-correct P-relayout + fp8 PV MMA). Q27_PF_PV8
 stays opt-in, documented negative. Do-not-ship as default (no win).
+
+
+---
+
+## transpose-V variant: +2.4% @128K -- WIN (opt-in, needle-gated for default-on)
+
+Replaced the strided-V gather with a transpose phase: V[key][dim] ->
+s_vt[dim][key] fp8 (8KB write, HALF the convert's 16KB half-write), so the
+PV B operand reads 4 consecutive keys as one aligned uint32 -- scatter
+moved OUT of the MMA loop into a coalesced-read/scattered-write phase.
+
+Measured (base model, fp8 KV, --pf, same-session A/B, 2 reps):
+  128K  base 59.9-60.1s  ->  pv8t 58.5s  = +2.4% (reproducible)
+  32K   base 10.69s      ->  pv8t 10.60s = +0.9%
+Correct: @131K cosine 0.99996543 / argmax MATCH (unchanged from the
+strided version -- transpose is pure data movement). Canonical a2982c51
+EXACT by default; regs 254, no spill.
+
+This lands the filed ~+3% ceiling. Confirms the fp8-PV thesis was right and
+the strided-gather was the wrong access pattern, not the wrong idea.
+Disposition: SHIP OPT-IN (Q27_PF_PV8=1). Default-on is a judgment call --
++2.4% prefill (small live-wall effect at 95% prefix-cache; bigger on cold
+TTFT) against a slightly-worse quality delta than the shipped fp8q
+(top5 4/5 vs 5/5, one extra e4m3 quantization of P). Needle 6/6 required
+before flipping default. Kernel + tools/pv8_mma_test.cu are the artifacts.

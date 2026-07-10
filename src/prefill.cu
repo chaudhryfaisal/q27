@@ -1537,6 +1537,7 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
     __nv_fp8_e4m3* s_kraw = (__nv_fp8_e4m3*)(s_q + 6 * TT * LDQ); // [2][PP*LDK] ping-pong
     __nv_fp8_e4m3* s_vraw = s_kraw + 2 * PP * LDK;           // [2][PP*HD] ping-pong raw
     __nv_fp8_e4m3* s_P = s_vraw + 2 * PP * HD;               // [6][TT*PP] per-warp P relayout
+    __nv_fp8_e4m3* s_vt = s_P + 6 * TT * PP;                 // [HD][PP] transposed V (dim-major)
     const bool cpa = cp_async != 0;
 
     // stage Q (fp32 -> e4m3) once: warp w stages its own head's 16 tokens
@@ -1574,7 +1575,12 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
         if (cpa) {
             cpasync_wait_all();  // this tile's raw K in kbuf, V in vbuf
             __syncthreads();
-            // NO convert phase -- V is consumed raw as the fp8 PV B operand.
+            // transpose V [key][dim] -> s_vt[dim][key] (fp8, stride PP) so the
+            // PV B operand reads 4 consecutive keys as one aligned uint32 (no
+            // in-loop strided gather). 8KB fp8 write vs the convert's 16KB half.
+            for (int idx = threadIdx.x; idx < PP * HD; idx += blockDim.x)
+                s_vt[(idx % HD) * PP + (idx / HD)] = vbuf[idx];
+            __syncthreads();
             // prefetch NEXT tile K + V into the OTHER buffers; vbuf[cur] stays
             // live through this tile's PV MMA (why V is now double-buffered).
             if (p0 + PP < p_hi) {
@@ -1604,6 +1610,9 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
                     vd[j] = ok ? vc[off + j] : __nv_fp8_e4m3(0.f);
                 }
             }
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < PP * HD; idx += blockDim.x)
+                s_vt[(idx % HD) * PP + (idx / HD)] = vbuf[idx];
             __syncthreads();
         }
 
@@ -1701,20 +1710,13 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
         uint32_t a1 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4);
         uint32_t a2 = *(const uint32_t*)(pw + gid * PP + tg * 4 + 16);
         uint32_t a3 = *(const uint32_t*)(pw + (gid + 8) * PP + tg * 4 + 16);
-        // (b) B operand = V[key][dim] from vbuf as n8(dim) x k32(key): gather 4
-        //     strided keys per uint32 (stride HD). vbuf tail past np is zeroed
-        //     by the load phase and masked keys carry P==0, so no bound check.
+        // (b) B operand from s_vt[dim][key]: 4 consecutive keys tg*4..+3 at
+        //     fixed dim are contiguous -> one aligned uint32 (no gather).
 #pragma unroll
         for (int nt = 0; nt < 32; nt++) {
             const int dim = nt * 8 + gid;
-            uint32_t b0 = 0, b1 = 0;
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                unsigned char lo = *(const unsigned char*)&vbuf[(tg * 4 + j) * HD + dim];
-                unsigned char hi = *(const unsigned char*)&vbuf[(tg * 4 + j + 16) * HD + dim];
-                b0 |= (uint32_t)lo << (8 * j);
-                b1 |= (uint32_t)hi << (8 * j);
-            }
+            uint32_t b0 = *(const uint32_t*)(s_vt + dim * PP + tg * 4);
+            uint32_t b1 = *(const uint32_t*)(s_vt + dim * PP + tg * 4 + 16);
             mma_e4m3(o[nt][0], o[nt][1], o[nt][2], o[nt][3], a0, a1, a2, a3, b0, b1, o[nt][0],
                      o[nt][1], o[nt][2], o[nt][3]);
         }
@@ -1954,8 +1956,8 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
                 const char* pv8e = getenv("Q27_PF_PV8");
                 if (pv8e && atoi(pv8e)) {
                     const size_t SMP = (size_t)6 * TT * LDQ * sizeof(__nv_fp8_e4m3) +
-                                       (size_t)(2 * PP * LDK + 2 * PP * 256 + 6 * TT * PP) *
-                                           sizeof(__nv_fp8_e4m3);
+                                       (size_t)(2 * PP * LDK + 2 * PP * 256 + 6 * TT * PP +
+                                                256 * PP) * sizeof(__nv_fp8_e4m3);
                     static bool attrp = false;
                     if (!attrp) {
                         CUDA_CHECK(cudaFuncSetAttribute(
