@@ -3046,3 +3046,26 @@ Levers roadmap after the spike: B (prefill FA2 relayout) resumes as #1
 actionable; the tensor-core pivot gets a strengthened case file (chain
 data + 29%-BW finding + FlashRT/CUTLASS reference); C/D unchanged.
 Rig kept: Q27_P0B_T sweep param.
+
+## 2026-07-09 (prefill FA2 relayout, Phase 3a) -- KILLED same-day: occupancy doubled to 25%, TTFT -1%; the kernel is barrier-serialized, not occupancy-bound
+
+Built the plan's 3a shape (docs/plans/2026-07-09-prefill-fa2-relayout.md):
+384-thread CTA, warp-pair d-split (each warp owns 128 of the head's 256 O
+dims, redundant full QK^T per pair), 144 regs zero-spill vs fp8q's 254,
+LOGITS BITWISE IDENTICAL (exact-math transform -- the d-split technique is
+validated and reusable). ncu: achieved occupancy 24.98%, 11.99 warps/SM --
+the designed doubling, delivered exactly. TTFT 128K: 59.7 -> 60.4s.
+
+The tell: Issued/scheduler 0.26, No Eligible 73.9% -- unchanged with 2x
+warps. Warp pairs are lockstep clones stalling on the same shared chains at
+the same cycles; per-tile __syncthreads serializes every warp through the
+same pipeline phases. Phase-0's "occupancy-bound" read is RETIRED: the
+binding constraint is the synchronous tile pipeline. FlashRT's FA2 wins via
+async structure (software-pipelined tiles, warp-specialized
+producer/consumer, no full-CTA barriers on the hot path) -- that full
+rewrite (2-4 sessions) is what Phase 3 actually costs, with a sharper
+target metric now: Eligible Warps/scheduler (0.44 today), not occupancy.
+
+Kernel + launcher reverted per kill protocol (canonical a2982c51 EXACT
+post-revert); plan doc carries the verdict + do-not-retry (register cuts,
+CTA repackaging, split-kk all preserve the binding barrier structure).
