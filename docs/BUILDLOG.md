@@ -3497,3 +3497,24 @@ fd2, vs ~130-140us modeled floor. Shipped: S1 default + computed
 fdmma_ns. Rejected with attribution: prefetch reorder (wash),
 warp-pair PV (barrier-domain insight), warp-specialized producer
 (this entry).
+
+## 2026-07-10 -- tuned-stack trial triplet (T2/T5/T8): scores at/above every reference band, wide-round wall -6% live, peak 320 t/s
+
+Full stack (width-12 + S1 + ns=85), single slot, CPU-contended host
+(same openrouter campaign as the morning trial -- walls comparable):
+- T2 collab-server 0.85 @ 100s (refs .839-.851: band top)
+- T5 task-queue    0.81 @ 164s (refs .776-.797: ABOVE band, best T5 recorded)
+- T8 analytics     0.82 @ 196s (good basin .815-.84; morning leg 0.84)
+The ns=85 basin reshuffle drew good everywhere -- 4th/5th/6th good-basin
+draws today on the widened stack.
+
+Engine telemetry per task ([req] segmented by journal marks):
+- T8: 221.7 t/s agg, 6.50 tok/rnd, suffix AL 10.07 on 52% of decode,
+  wide round 36.6ms (MORNING pre-tuning: 224.9 agg, AL 10.61 on 62%,
+  39.0ms) -- the -2.4ms/wide-round is the fdmma tuning's live
+  signature; agg parity is trajectory-lottery (different suffix share).
+- T2: 197.5 agg, AL 8.99 on 32%; T5: 199.0 agg, AL 10.04 on 35% --
+  the wide suffix generalizes well beyond T8's echo-heavy profile.
+- Per-request peaks: T8 320 t/s (NEW RECORD; 294 this morning, 254
+  before today), T5 296, T2 280. Wide-round wall 35.7-36.6ms
+  consistent across tasks.
