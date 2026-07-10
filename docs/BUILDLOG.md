@@ -3110,3 +3110,53 @@ verify attention kernel (one KV pass scores all W lanes, split-KV; the
 tokenspeed-MLA/FlashRT verify shape; NOT the retired Task-6 lane-pair
 fusion). Falsifiable check queued: per-lane marginal should ~double at
 61K ctx (phase-width run on docs61k). Plan: docs/plans/2026-07-10-gdn-chunk.md.
+
+## 2026-07-10 -- deep-ladder ceilings 7/8 re-priced on the fdmma flat width curve
+
+Method: tools/ladder_price.py simulates the exact gated-round policy
+(theta=0.5 margin cap, early-exit draft steps at 0.81ms, width-floor
+top-up, leading-run acceptance) over REAL measured 10-deep MTP chains
+(--burst-stats CSVs) and prices rounds with the MEASURED width curves.
+Sim validates against live: mma-vs-fd2 gap at 61K reproduces the
+measured +18.7% A/B.
+
+Width curves (ms/round, measured): mma@26K W4..8 = 16.6/17.7/17.9/19.0/
+21.8 (fd2: 18.5..25.8, W8 -15.5%); mma@61K W4..8 = 18.1/19.2/19.4/20.7/
+23.3 (fd2: 22.6..32.8, W8 -29%).
+
+Chain data, two poles:
+- HOT (echo-heavy, fp16-basin cctx chains, tok/rnd 3.9-4.6): under fd2
+  ceilings 5..8 are a WASH (149->151 t/s @61K -- the historical maxd6/7
+  NO-GO reproduced by the sim). Under mma: c7 = +0.6% over c5, c8 =
+  +4.9% (185.8 vs 177.2 @61K). Deep flips from wash to positive; the
+  win concentrates at ceiling 8, with a local dip at 7 (y7-conditional
+  acceptance on this traffic doesn't quite cover the W8 step; y8 does).
+- COLD (fp8-basin cctx chains regenerated tonight, tok/rnd 2.6): deep
+  loses monotonically on every curve (mma@26K c5 129.4 -> c8 121.0,
+  -6.5%). Confirmed live: forced maxd7 on docs61k = 122.7 vs auto 142.0.
+  The AUTO LADDER's sat/flo bars are the protection -- on this traffic
+  it never promotes past 4/5 (measured md4=252 md5=0 at 61K), so deep
+  ceilings are never engaged and cost nothing.
+
+VERDICT:
+1. auto7 under Q27_FD=mma: SAFE TO ENABLE (ladder-protected on cold,
+   ~wash-to-positive on hot; W8 rounds now 21.8-23.3ms). Modest MTP-only
+   upside; production rec for the live-CC trial = Q27_FD=mma
+   Q27_MAXD=auto7 Q27_SUFFIX=1 -- the suffix drafter is the bigger
+   width-8 consumer (live fired AL 6.48 was WIDTH-CAPPED; sim says the
+   same fires reach 10.7 at K=16).
+2. Ceiling 8+ (W=9..16 verify): the MTP-only case is +4.9% on hot
+   traffic; the suffix case wants W 9-12 outright. fdmma solved the
+   attention share (marginal lane ~1.3ms, W9 extrapolates +1.3); the
+   REMAINING blocker is architecture, not perf: CP3/P3/IP3 p[8] structs,
+   8-lane role-buffer rotation (perm mod 8), and the GDN serial chains
+   at width>8 (the known P15-class problem). That plumbing project is
+   now the gate on everything deeper than ceiling 7.
+3. The maxd7 auto-ladder (ea87ccf, 7th sess) needs no code change --
+   auto7 exists; the flip is an env-config decision post live-CC trial.
+
+Chains: scratchpad/burst_cctx_fp8.csv (+docs61k_fp8 when its 61K
+token-walk completes). Historical footnote: the fp16-vs-fp8 basin split
+of the SAME cctx payload (echo-heavy vs cold, 35% vs 0.8% suffix fire,
+3.9-4.6 vs 2.6 tok/rnd) is the sharpest tie-lottery exhibit yet -- any
+acceptance-sensitive decision MUST name its basin.
