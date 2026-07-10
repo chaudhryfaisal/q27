@@ -56,3 +56,6 @@ build/gdn_chunk_bench: tools/gdn_chunk_bench.cu | build
 
 build/attn_fdw_bench: tools/attn_fdw_bench.cu | build
 	$(NVCC) $(NVCCFLAGS) tools/attn_fdw_bench.cu -o $@
+
+build/fdmma_test: tools/fdmma_test.cu tools/fdmma_kernel.cuh | build
+	$(NVCC) $(NVCCFLAGS) tools/fdmma_test.cu -o $@

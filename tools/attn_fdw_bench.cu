@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
+
+#include "fdmma_kernel.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -663,6 +665,16 @@ int main() {
                 else if (W == 4) launch_fdw3(std::integral_constant<int, 4>{});
                 else launch_fdw3(std::integral_constant<int, 8>{});
             };
+            // fdmma: the tensor-core shared-KV kernel (W>=4; W=2 stays fd2)
+            fdmma::FCP3 mqp{};
+            fdmma::FIP3 mpp{};
+            for (int t = 0; t < W; t++) { mqp.p[t] = qp.p[t]; mpp.p[t] = pp.p[t]; }
+            auto fdmma_leg = [&] {
+                fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                                    FD2_NS, W, 0);
+                dim3 g2(NQH, W);
+                k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, FD2_NS, pp);
+            };
             // correctness: fdw vs fd2 outputs (fp order differs -> tolerance)
             CUDA_CHECK(cudaMemset(part, 0, (size_t)MAXW * NQH * FD2_NS * FD_ST * 4));
             fd2();
@@ -723,12 +735,38 @@ int main() {
                     if (d > mre3) mre3 = d;
                 }
             }
+            // fdmma correctness vs fd2 (both fp8 attention; fdmma adds Q/P
+            // e4m3 -- expect physics-class rel, not fp-reorder-class)
+            double mrem = -1;
+            if (W >= 4) {
+                CUDA_CHECK(cudaMemset(part, 0, (size_t)MAXW * NQH * FD2_NS * FD_ST * 4));
+                fdmma_leg();
+                CUDA_CHECK(cudaDeviceSynchronize());
+                mrem = 0;
+                for (int t = 0; t < W; t++) {
+                    std::vector<float> a(NQH * HD), b(NQH * HD);
+                    CUDA_CHECK(cudaMemcpy(a.data(), o2[t], NQH * HD * 4, cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(b.data(), ow[t], NQH * HD * 4, cudaMemcpyDeviceToHost));
+                    double rms = 0;
+                    for (auto v : a) rms += (double)v * v;
+                    rms = sqrt(rms / a.size()) + 1e-12;
+                    for (size_t i = 0; i < a.size(); i++) {
+                        double d = fabs((double)a[i] - b[i]) / rms;
+                        if (d > mrem) mrem = d;
+                    }
+                }
+            }
             double ms2 = timeit(fd2, 100), msw = timeit(fdw, 100), msw2 = timeit(fdw2, 100);
             double msw3 = timeit(fdw3, 100);
+            double msm = W >= 4 ? timeit(fdmma_leg, 100) : 0;
             printf("  W=%d fd2 %7.1f | v1 %7.1f %.2fx | v2 %7.1f %.2fx | v3 %7.1f %.2fx "
-                   "rel %.1e\n",
+                   "rel %.1e",
                    W, ms2 * 1e3, msw * 1e3, ms2 / msw, msw2 * 1e3, ms2 / msw2, msw3 * 1e3,
                    ms2 / msw3, mre3);
+            if (W >= 4)
+                printf(" | FDMMA %7.1f %.2fx rel %.1e\n", msm * 1e3, ms2 / msm, mrem);
+            else
+                printf("\n");
         }
         for (int t = 0; t < MAXW; t++) {
             CUDA_CHECK(cudaFree(q[t]));
