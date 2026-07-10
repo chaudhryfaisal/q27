@@ -3207,3 +3207,25 @@ VERDICT:
   systematic steering; (b) if steering is real, trial the fp8q-PV
   fallback (f16 PV halves the numerics perturbation) which the design
   doc specified for exactly this contingency.
+
+## 2026-07-10 -- mma basin-steering matrix: NOT systematic; one deterministic T8 tie-flip
+
+{T2,T5,T11,T8} x {off,mma}, minimal config (mma the only variable), fresh
+server per trial: T2 0.839->0.844, T5 0.776->0.797, T11 0.850->0.850,
+T8 0.815->0.559. With all history: T8 off = 0.815/0.834/0.815, T8 mma =
+0.560/0.561/0.559 -- three near-identical scores per leg. VERDICT: mma
+does NOT systematically steer (3/4 tasks parity or better); it behaves
+exactly like a REBUILD in the documented cross-build tie-lottery sense
+-- tie-class token flips, neutral in expectation, and T8 has one
+load-bearing near-tie (the register-handler schema fork) that fp8
+attention numerics deterministically resolve into the punished side of
+that task's hidden auth gate. agent_tests/code_metrics 1.000 throughout.
+
+DECISION: Q27_FD=mma cleared for the CC SERVING env (full stack:
++Q27_SUFFIX=1 +Q27_MAXD=auto7, 249 t/s aggregate measured) -- real-work
+tie-flips are symmetric (T5 went UP); the T8 fork is a benchmark-gate
+idiosyncrasy, same risk class as every shipped numerics change (fp8q,
+fp8-PV) under the house tolerance protocol. Binary default stays fd2
+(benchmark comparability + the cross-build rule: same-binary legs only).
+Reconciliation path if T8-class forks ever matter: the fp8q-PV fdmma
+variant (f16 PV) from the design doc's contingency ladder.
