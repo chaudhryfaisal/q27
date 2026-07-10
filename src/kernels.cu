@@ -248,7 +248,7 @@ struct Q8Lanes {
 template <int N>
 __global__ void __launch_bounds__(256, N <= 8 ? 4 : 3)
     k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
-                const Q4Lanes L, int64_t rows, int64_t cols) {
+                __grid_constant__ const Q4Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -304,7 +304,7 @@ __global__ void __launch_bounds__(256, N <= 8 ? 4 : 3)
 template <int N>
 __global__ void __launch_bounds__(256, N <= 5 ? 4 : 3)
     k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
-                const Q8Lanes L, int64_t rows, int64_t cols) {
+                __grid_constant__ const Q8Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -428,7 +428,8 @@ void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t c
 
 // ---------------- grid-merged 3-token variants ----------------
 
-__global__ void k_rmsnorm3(CP3 xp, const float* __restrict__ w, P3 yp, int n, float eps) {
+__global__ void k_rmsnorm3(__grid_constant__ const CP3 xp, const float* __restrict__ w,
+                           __grid_constant__ const P3 yp, int n, float eps) {
     const float* x = xp.p[blockIdx.x];
     float* y = yp.p[blockIdx.x];
     __shared__ float sh[32];
@@ -451,7 +452,7 @@ void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st, in
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_add3(P3 xp, CP3 yp, int n) {
+__global__ void k_add3(__grid_constant__ const P3 xp, __grid_constant__ const CP3 yp, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) xp.p[blockIdx.y][i] += yp.p[blockIdx.y][i];
 }
@@ -461,7 +462,8 @@ void add3(P3 x, CP3 y, int n, cudaStream_t st, int ntok) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_silu_mul3(P3 gp, CP3 up, int n) {
+__global__ void k_silu_mul3(__grid_constant__ const P3 gp, __grid_constant__ const CP3 up,
+                            int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float v = gp.p[blockIdx.y][i];
@@ -473,7 +475,8 @@ void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st, int ntok) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_quantize_x3(CP3 xp, XQ3 xq, int nblocks) {
+__global__ void k_quantize_x3(__grid_constant__ const CP3 xp,
+                              __grid_constant__ const XQ3 xq, int nblocks) {
     int b = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (b >= nblocks) return;
     const int t = blockIdx.y;

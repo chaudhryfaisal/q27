@@ -13,7 +13,7 @@ __device__ __forceinline__ float wred(float v) {
     return v;
 }
 
-__global__ void k_l2norm3(P3 xp, int head_dim, float eps) {
+__global__ void k_l2norm3(__grid_constant__ const P3 xp, int head_dim, float eps) {
     float* xh = xp.p[blockIdx.y] + (size_t)blockIdx.x * head_dim;
     __shared__ float sh[128];
     float acc = 0.f;
@@ -33,7 +33,8 @@ void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st, int nt
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_gemv_f16_3(const __half* __restrict__ W, CP3 xp, P3 yp, int64_t cols) {
+__global__ void k_gemv_f16_3(const __half* __restrict__ W, __grid_constant__ const CP3 xp,
+                             __grid_constant__ const P3 yp, int64_t cols) {
     const float* x = xp.p[blockIdx.y];
     const __half* wr = W + (size_t)blockIdx.x * cols;
     float acc = 0.f;
@@ -55,8 +56,10 @@ void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaSt
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_gdn_gates3(CP3 ar, CP3 br, const float* __restrict__ a,
-                             const float* __restrict__ dt, P3 g, P3 b, int n) {
+__global__ void k_gdn_gates3(__grid_constant__ const CP3 ar, __grid_constant__ const CP3 br,
+                             const float* __restrict__ a, const float* __restrict__ dt,
+                             __grid_constant__ const P3 g, __grid_constant__ const P3 b,
+                             int n) {
     int h = threadIdx.x;
     if (h >= n) return;
     int t = blockIdx.x;
@@ -71,8 +74,9 @@ void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_gated_norm3(CP3 op, const float* __restrict__ w, CP3 zp, P3 outp, int head_dim,
-                              float eps) {
+__global__ void k_gated_norm3(__grid_constant__ const CP3 op, const float* __restrict__ w,
+                              __grid_constant__ const CP3 zp, __grid_constant__ const P3 outp,
+                              int head_dim, float eps) {
     const int t = blockIdx.y;
     const float* oh = op.p[t] + (size_t)blockIdx.x * head_dim;
     const float* zh = zp.p[t] + (size_t)blockIdx.x * head_dim;
@@ -99,7 +103,8 @@ void gated_norm3(CP3 o, const float* w, CP3 z, P3 out, int n_heads, int head_dim
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_sigmoid_gate3(P3 outp, CP3 qgp, int head_dim, int n) {
+__global__ void k_sigmoid_gate3(__grid_constant__ const P3 outp,
+                                __grid_constant__ const CP3 qgp, int head_dim, int n) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n) return;
     int t = blockIdx.y;
@@ -114,7 +119,8 @@ void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st, i
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_rope3(P3 xp, int head_dim, int n_rot, int stride, IP3 pos, float freq_base) {
+__global__ void k_rope3(__grid_constant__ const P3 xp, int head_dim, int n_rot, int stride,
+                        __grid_constant__ const IP3 pos, float freq_base) {
     const int t = blockIdx.y;
     float* xh = xp.p[t] + (size_t)blockIdx.x * stride;
     int d = threadIdx.x;
@@ -133,8 +139,9 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
 }
 
 template <typename CT>
-__global__ void k_kv_store3(CP3 kp, CP3 vp, CT* __restrict__ kc, CT* __restrict__ vc,
-                            IP3 pos, int rowlen) {
+__global__ void k_kv_store3(__grid_constant__ const CP3 kp, __grid_constant__ const CP3 vp,
+                            CT* __restrict__ kc, CT* __restrict__ vc,
+                            __grid_constant__ const IP3 pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
@@ -160,7 +167,7 @@ static inline P3 out2p(float* o) { return P3{{o, o, o, o}}; }
 // softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
 // combine kernel merges splits. Works for 1..4 tokens via gridDim.z.
 template <typename CT>
-__global__ void k_attn_fd(CP3 qp, int q_stride, const CT* __restrict__ kc,
+__global__ void k_attn_fd(__grid_constant__ const CP3 qp, int q_stride, const CT* __restrict__ kc,
                           const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
                           int n_kv_heads, int gqa, int head_dim, float scale) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
@@ -240,7 +247,8 @@ __global__ void k_attn_fd(CP3 qp, int q_stride, const CT* __restrict__ kc,
     }
 }
 
-__global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n_heads,
+__global__ void k_attn_fd_combine(const float* __restrict__ part,
+                                  __grid_constant__ const P3 outp, int n_heads,
                                   int head_dim, int ns, IP3 pos) {
     const int h = blockIdx.x, t = blockIdx.y;
     // splits at sp*chunk >= seq are empty; fd2 never writes them, and for
@@ -316,7 +324,8 @@ __device__ __forceinline__ void fd2_ld8(const CT* __restrict__ row, int lane, fl
 }
 
 template <typename CT, int NW>
-__global__ void k_attn_fd2(CP3 qp, int q_stride, const CT* __restrict__ kc,
+__global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
+                           const CT* __restrict__ kc,
                            const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
                            int n_kv_heads, int gqa, int head_dim, float scale) {
     // P14: lane (token) is the FASTEST-varying grid axis so the vw same-split
@@ -562,8 +571,9 @@ void attn_decode(const float* q, int q_stride, const void* kcache, const void* v
                  n_kv_heads, head_dim, scale, st, 1, fp8);
 }
 
-__global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict__ S, IP3 tok,
-                         int64_t cols, P3 outp) {
+__global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict__ S,
+                         __grid_constant__ const IP3 tok, int64_t cols,
+                         __grid_constant__ const P3 outp) {
     const int t = blockIdx.y;
     int64_t row = *tok.p[t];
     const int8_t* wr = W + row * cols;
@@ -580,7 +590,8 @@ void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cud
 }
 
 __global__ void k_prep_round(const int* __restrict__ dP, const int* __restrict__ dtok,
-                             WIP3 pos_v, WIP3 pos_m, int nv, int nm, int* outcome) {
+                             __grid_constant__ const WIP3 pos_v,
+                             __grid_constant__ const WIP3 pos_m, int nv, int nm, int* outcome) {
     int P = *dP;
     // verify lanes a.. (width-12: up to 12) and MTP draft positions (ladder
     // ceiling 7 -- policy-decoupled from verify width, plan 2026-07-10)
@@ -600,8 +611,10 @@ void prep_round(const int* d_P, const int* d_token, WIP3 pos_v, WIP3 pos_m, int 
 // lane k's argmax equals draft k. All 11 draft / 12 verdict slots are
 // dereferenced unconditionally (engine allocates every lane; the old
 // kernel read all 7/8 the same way) -- only slots < max_draft / n matter.
-__global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok, IP3 drafts,
-                               IP3 verdicts, CP3 x1s, float* __restrict__ h_next,
+__global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
+                               __grid_constant__ const IP3 drafts,
+                               __grid_constant__ const IP3 verdicts,
+                               __grid_constant__ const CP3 x1s, float* __restrict__ h_next,
                                int* __restrict__ outcome, int n_embd,
                                const int* __restrict__ cap, int max_draft) {
     int dr[11], v[12];

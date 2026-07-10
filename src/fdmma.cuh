@@ -201,8 +201,10 @@ static __device__ __forceinline__ void fdmma_tile_compute(
 
 template <int W, int STAGES = 2>
 __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
-    k_attn_fdmma(FCP3 qp, int q_stride, const __nv_fp8_e4m3* __restrict__ kc,
-                 const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ part, FIP3 pos,
+    k_attn_fdmma(__grid_constant__ const FCP3 qp, int q_stride,
+                 const __nv_fp8_e4m3* __restrict__ kc,
+                 const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ part,
+                 __grid_constant__ const FIP3 pos,
                  int n_kv_heads, int gqa, int head_dim, float scale) {
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
     constexpr int M = 6 * W;                      // live rows (dense r = j*W + t)

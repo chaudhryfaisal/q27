@@ -3558,3 +3558,33 @@ lever for cheaper wide rounds is the mma16 NT=16 GEMM pivot, tools/
 mma16_bench.cu, 76% SOL flat W2..16). Width-12 plan fully closed:
 P0/P1/P2 shipped, P3 priced and resolved. q27-eval restored (widened
 single-slot full stack).
+
+## 2026-07-10 -- vanilla-qwen bench caught a P0-era regression; __grid_constant__ fix lands ABOVE the historical baseline (suite 172.2 vs 161.8)
+
+The base-model bench (the whole point of keeping vanilla qwen as the
+standard) surfaced what the depth-focused width-12 gates could not:
+shortbench suite 149.5 vs the 161.8 reference (-7.6%) with canonical
+EXACT -- identical trajectories, pure ms/round. Bisect: fully present
+at c399d70 (P0). nsys kernel diff: ONLY the dynamically-indexed
+struct-param kernels regressed (k_rmsnorm3 +51%, k_gemv_f16_3 +43%,
+k_quantize_x3 +45%, k_attn_fd2 +58%; compile-time-indexed k_gemv_q?_n
++2%). ptxas: stack frame 128 -> 256B -- the by-value lane structs are
+copied to per-thread LOCAL memory when indexed by blockIdx (the classic
+param trap), and p[8] -> p[16] doubled the copy. The 128B tax had been
+there SINCE P10-A0.
+
+FIX: __grid_constant__ const on every struct-by-value __global__ param
+(20 kernels: spec3.cu 13, kernels.cu 6, fdmma.cuh 1) -- guaranteed
+const-bank residency, no local copy, addressing-only change (bitwise).
+
+RESULTS (vanilla qwen, all gates green: canonical a2982c51 EXACT,
+test_kernels + fdmma_test ALL PASS, sanitizer 0):
+- shortbench suite 149.5 -> 172.2 = +15% over the regressed state and
+  +6.4% ABOVE the 07-09 baseline (161.8); canonical 121.5 -> 140.1.
+- echo 2K full stack: 266.7 -> 317.9 t/s (+19%, identical trajectory).
+- cctx 26K server replay: classic 127.1 -> 143.0, full stack 154.2 ->
+  176.3 (+23% stack-over-classic on the same payload).
+Vanilla bench summary on the fixed binary: suite 172.2 / cctx classic
+143.0 / cctx full-stack 176.3 / echo full-stack 317.9. LESSON promoted
+to the standing gate set: short-ctx suite is the param/launch-overhead
+canary -- depth gates alone missed an 8% engine-wide tax.
