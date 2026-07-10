@@ -198,3 +198,16 @@ fallback; <sm_89 auto-falls-back). Perf +11.8% @128K; correctness greedy-identic
 6/6 to ~301K beyond-native. The fp8 QK^T trades no measurable quality for the speedup. The
 one caveat left for default-on is orthogonal to fp8q: fp8 KV at 34KB/tok caps deep-ctx VRAM
 on 32GB (both paths), so 355K+ needs a tighter KV or a bigger card.
+
+
+## fp8-PV default-on (2026-07-09): +2.4% @128K, needle 6/6 beyond-native
+
+PV MMA moved to fp8 (m16n8k32.e4m3): V transposed to s_vt[dim][key] fp8
+(8KB, half the fp8->half convert's 16KB write), P relaid QK^T-accumulator
+-> A-frag through per-warp s_P, s_v + convert phase deleted. Layout
+de-risked bitwise via tools/pv8_mma_test.cu before kernel work. +2.4%
+@128K (57.9 vs 59.9s), +0.9% @32K. cosine 0.99996543 / argmax MATCH @131K;
+needle 6/6 (tools/needle_pv8.py) to ~166K beyond-native. Default-on on the
+fp8-KV path (Q27_PF_PV8=0 forces the convert/fp8q path); fp16 path + fp16
+canonical untouched. The strided-gather first cut was net ~0% (in-loop
+scatter); the transpose moves the scatter to a coalesced-read phase.

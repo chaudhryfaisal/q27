@@ -221,3 +221,22 @@ Disposition: SHIP OPT-IN (Q27_PF_PV8=1). Default-on is a judgment call --
 TTFT) against a slightly-worse quality delta than the shipped fp8q
 (top5 4/5 vs 5/5, one extra e4m3 quantization of P). Needle 6/6 required
 before flipping default. Kernel + tools/pv8_mma_test.cu are the artifacts.
+
+
+---
+
+## fp8-PV DEFAULT-ON (2026-07-09): needle gate cleared
+
+Needle-retrieval sweep on the pv8 server (tools/needle_pv8.py, 6 planted
+"calibration constant" needles at 10/35/60/70/78/95% depth, verbatim
+read-back): **6/6 PASS at 65K, 130K (native), and 175K tokens
+(beyond-native, deepest needle ~166K)** -- the exact bar that defaulted
+fp8q on. Settles the top5-4/5 concern: the single-position logit artifact
+has ZERO retrieval impact.
+
+Full battery: cosine 0.99996543 / argmax MATCH @131K + needle 6/6
+beyond-native + fp16 canonical a2982c51 EXACT (pv8 is fp8-only) + Q27_PF_PV8=0
+forces the convert path. FLIPPED DEFAULT-ON, matching the fp8q precedent
+(cosine + needle -> default). Net: fp8-KV prefill is now +2.4% @128K
+(57.9 vs 59.9s) at no measured retrieval cost. Phase 3 (prefill) CLOSED
+with a shipped win; transpose write pattern is the durable artifact.

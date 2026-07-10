@@ -1953,8 +1953,12 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
                 // Phase B fp8-PV variant (Q27_PF_PV8=1, opt-in until gated):
                 // no s_v, V double-buffered, +s_P relayout. Its smem map differs
                 // (drop PP*LDH half, add PP*256 fp8 V-buffer + 6*TT*PP fp8 s_P).
+                // DEFAULT ON (2026-07-09): fp8-PV transpose-V variant, +2.4%
+                // @128K prefill, needle 6/6 to ~166K (beyond-native), logit
+                // cosine 0.99997/argmax MATCH @131K -- same gate class that
+                // defaulted fp8q on. Q27_PF_PV8=0 forces the convert path.
                 const char* pv8e = getenv("Q27_PF_PV8");
-                if (pv8e && atoi(pv8e)) {
+                if (!pv8e || atoi(pv8e)) {
                     const size_t SMP = (size_t)6 * TT * LDQ * sizeof(__nv_fp8_e4m3) +
                                        (size_t)(2 * PP * LDK + 2 * PP * 256 + 6 * TT * PP +
                                                 256 * PP) * sizeof(__nv_fp8_e4m3);
