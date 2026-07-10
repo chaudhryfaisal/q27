@@ -3229,3 +3229,49 @@ fp8-PV) under the house tolerance protocol. Binary default stays fd2
 (benchmark comparability + the cross-build rule: same-binary legs only).
 Reconciliation path if T8-class forks ever matter: the fp8q-PV fdmma
 variant (f16 PV) from the design doc's contingency ladder.
+
+## 2026-07-10 -- width-12 P0 DONE: mechanical lane widening 8->12, canonical EXACT, serving-VRAM finding
+
+Plan docs/plans/2026-07-10-width12-verify.md P0, executed as filed.
+Surface: p[16] struct family (P3/CP3/XQ3, IP3 + new WIP3, FCP3/FIP3,
+Q4Lanes/Q8Lanes [10]->[16]); prep_round/finish_round converted to
+pointer-struct signatures at the 17/25-param wall (finish acceptance
+chain generalized to 11 drafts / 12 verdicts, leading-run semantics
+preserved verbatim; outcome 10->14 ints {n, t1, dr1..dr11, pending});
+4 new verify lanes i..l with full activation sets + XQuant + pos/draft/
+verdict scalars (NO h_next/pos_m -- MTP ladder stays 4..7 by policy);
++4 GDN role sets (S_spare8..11 + rings, +627MB/engine); perm mod 12
+(SBuf/RBuf 12-way, advance sites, refinish +12 fixup, lanes[12]); graph
+zoo re-dimensioned [8]->[12] perms (verify_graph_w [13][12], capture
+loops 12); logits2/FD-scratch/d_mask_ids/h_mask_ids5 12-lane; argmax
+chain + logits2 offsets to 12; em[12]/oc[14]; ctx_round_reserve keyed
+on verify_w_max() (value-identical until the P1 suffix width knob).
+Fix in passing: reset() memset stopped at spare 5 (stale P12b list,
+benign only because roles are write-before-read within a round) -- now
+resets all 11 spares; stale mod-7/mod-6 comments corrected. gemv N=12
+instantiation and fdmma W>8 deliberately NOT touched (P1/P2 gates).
+
+GATES all green:
+- canonical EXACT both models, both binaries: vanilla a2982c51 (fp16),
+  qwopus 4c4120c7.
+- replay byte-identity vs pre-widen b69cbd9 binary: gated fp8 auto7 and
+  the full CC stack (fp8+PMIN0.5+auto7+SUFFIX+FD=mma), 256 tok each,
+  byte-identical. (Modulus proof carried by construction: role access
+  is fully SBuf/RBuf-indirected, so a larger modulus only relabels
+  which physical buffer holds a role.)
+- test_kernels ALL PASS (3090 leg); depthctl/toolconstrain/suffixdraft
+  CPU suites PASS; compute-sanitizer memcheck 0 errors (gated fp8 leg).
+- capture wall: 12 perms x 23 graph sets at auto7 -- server slot-0
+  startup unchanged-feeling (~1s capture log gap); CLI canonical run
+  captures 12 perms without measurable startup regression at ctx 2048.
+
+FINDING (P1 blocker for the live trial): the widened 2-slot eval config
+(qwopus, 131072 + 32768 fp8, the 249 t/s env) OOMs at slot-1 sampled
+graph instantiation on the 32GB 5090 -- slot 0 comes up, slot 1 dies at
+engine.cuh cudaGraphInstantiate. Real headroom was ~2.5GB, not the
+plan's ~5GB estimate; +627MB/engine roles x2 + ~1.5x graph memory
+crosses it. q27-eval RESTORED on the pre-widen binary (byte-identical
+serving; snapshot kept at build/prewiden-b69cbd9/). P1 must pick the
+trial serving shape first: single-slot 131K (fits trivially), or
+131K + smaller slot-1, or reclaim graph memory. Widened binaries at
+build/{q27,q27-server} md5-differ from snapshot as expected.

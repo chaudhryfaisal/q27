@@ -225,16 +225,18 @@ __global__ void k_gemv_q8(const int8_t* __restrict__ W, const __half* __restrict
 
 // P10-A0: lane args as by-value arrays so one template covers 2..10 lanes
 // (fused 2-slot verify = 10). Same math order as the old 5-wide param lists.
+// width-12 2026-07-10: slots widened to 16 (struct plumbing only; N=9,11,12
+// stay uninstantiated until the P1 register-cliff measurement).
 struct Q4Lanes {
-    const uint2* eo[10];
-    const float* xs[10];
-    const int* is[10];
-    float* y[10];
+    const uint2* eo[16];
+    const float* xs[16];
+    const int* is[16];
+    float* y[16];
 };
 struct Q8Lanes {
-    const int8_t* nat[10];
-    const float* xs[10];
-    float* y[10];
+    const int8_t* nat[16];
+    const float* xs[16];
+    float* y[16];
 };
 
 // maxd7 width-8 attribution (BUILDLOG 2026-07-09): N=8 naturally compiles to
@@ -347,7 +349,7 @@ void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float
                int64_t rows, int64_t cols, cudaStream_t st) {
     unsigned blocks = (unsigned)((rows + 7) / 8);
     Q4Lanes L;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 16; i++) {
         const XQuant& qq = q[i < nb ? i : 0];
         L.eo[i] = qq.eo; L.xs[i] = qq.scale; L.is[i] = qq.isum;
         L.y[i] = ys[i < nb ? i : 0];
@@ -370,7 +372,7 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float*
                int64_t rows, int64_t cols, cudaStream_t st) {
     unsigned blocks = (unsigned)((rows + 7) / 8);
     Q8Lanes L;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 16; i++) {
         const XQuant& qq = q[i < nb ? i : 0];
         L.nat[i] = qq.nat; L.xs[i] = qq.scale;
         L.y[i] = ys[i < nb ? i : 0];

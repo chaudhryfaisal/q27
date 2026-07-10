@@ -25,8 +25,10 @@
 
 namespace fdmma {
 
-struct FCP3 { const float* p[8]; };
-struct FIP3 { const int* p[8]; };
+// width-12 2026-07-10: p[16] plumbing (matches q27k::CP3/IP3); the kernel
+// stays W<=8 until s_geo re-stride + dispatch cases 9..16 land (plan P2).
+struct FCP3 { const float* p[16]; };
+struct FIP3 { const int* p[16]; };
 
 static __device__ __forceinline__ void mma_e4m3(float& d0, float& d1, float& d2, float& d3,
                                                 uint32_t a0, uint32_t a1, uint32_t a2,
@@ -82,7 +84,7 @@ __global__ void __launch_bounds__(192, 1)
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
     constexpr int M = 6 * W;                      // live rows (dense r = j*W + t)
     constexpr int LIVE_WARPS = (M + TT - 1) / TT; // W=4 -> 2, W=5..8 -> 2..3
-    static_assert(W >= 2 && W <= 8, "IP3/CP3 are p[8]; W>8 needs struct plumbing");
+    static_assert(W >= 2 && W <= 8, "W>8 needs s_geo re-stride + dispatch cases (plan P2)");
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int nsp = gridDim.x; // == ns fed to k_attn_fd_combine (single source, no split-brain)
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;

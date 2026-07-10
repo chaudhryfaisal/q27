@@ -1134,7 +1134,7 @@ int main(int argc, char** argv) {
         int total_emitted = 0, rounds = 0, hist[8] = {0}; // maxd7: up to 8-tok rounds
         while ((int)out.size() < n_gen) {
             if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[8]; // maxd7: depth-7 emits up to 8 tokens
+            int em[W_MAX]; // width-12: a round emits up to 12 tokens
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);

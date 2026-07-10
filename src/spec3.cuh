@@ -8,7 +8,11 @@
 
 namespace q27k {
 
-struct IP3 { const int* p[8]; }; // 8 lanes since maxd7 (pending + 7 drafts)
+struct IP3 { const int* p[16]; }; // width-12: 12 live lanes max, 16 slots (see P3/CP3)
+// Writable-int lane bundle (positions, verdict slots): prep/finish hit the
+// 17/25-param wall at width 8, so wide-verify pointer args ride these
+// by-value structs instead of growing the signatures (width-12 P0).
+struct WIP3 { int* p[16]; };
 
 // L2 norm over contiguous heads, ntok tokens. (q||k are contiguous: pass 32 heads.)
 void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0, int ntok = 3);
@@ -67,25 +71,23 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,
             int ntok = 3);
 
-// Device-side round bookkeeping: prep derives all positions from *d_P and
-// snapshots t1; finish decides acceptance over the draft chain (up to 6 since
-// maxd7), selects next token + h_next, bumps *d_P, and writes
-// outcome = {n, t1, dr1..dr7, pending} for a single small readback.
-void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
-                int* pos_d, int* pos_e, int* pos_f, int* pos_g, int* pos_h, int* pos_m,
-                int* pos_m2, int* pos_m3, int* pos_m4, int* pos_m5, int* pos_m6, int* pos_m7,
+// Device-side round bookkeeping (width-12 P0: pointer-struct signatures --
+// the old flat lists sat at 17/25 params and could not widen). prep derives
+// nv verify positions (pos_v.p[t] = P+1+t) and nm MTP positions from *d_P
+// and snapshots t1; finish decides acceptance over the draft chain, selects
+// next token + h_next, bumps *d_P, and writes
+// outcome = {n, t1, dr1..dr11, pending} (14 ints) for a single small readback.
+void prep_round(const int* d_P, const int* d_token, WIP3 pos_v, WIP3 pos_m, int nv, int nm,
                 int* outcome, cudaStream_t st = 0);
 // max_draft (P12 gated depth): the widest verify column this graph computed
 // (W-1 for a width-W verify). Drafts beyond it are forced rejected so a
 // narrow-verify graph never commits an uncomputed lane. max_draft=4 = the full
-// depth-4 round (bit-identical to the pre-P12 path).
-void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
-                  const int* d_draft3, const int* d_draft4, const int* d_draft5,
-                  const int* d_draft6, const int* d_draft7, const int* va, const int* vb,
-                  const int* vc, const int* vd, const int* ve, const int* vf, const int* vg,
-                  const int* vh, const float* x1a, const float* x1b, const float* x1c,
-                  const float* x1d, const float* x1e, const float* x1f, const float* x1g,
-                  const float* x1h, float* h_next, int* outcome, int n_embd, const int* cap,
-                  int max_draft = 4, cudaStream_t st = 0);
+// depth-4 round (bit-identical to the pre-P12 path). drafts = 11 slots
+// (lanes b..l), verdicts/x1s = 12 lanes; slots past max_draft/width are
+// dereferenced but never influence the outcome (same class as the old flat
+// args, which also read all 7/8 unconditionally).
+void finish_round(int* d_P, int* d_token, IP3 drafts, IP3 verdicts, CP3 x1s, float* h_next,
+                  int* outcome, int n_embd, const int* cap, int max_draft = 4,
+                  cudaStream_t st = 0);
 
 } // namespace q27k

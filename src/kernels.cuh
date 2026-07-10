@@ -59,13 +59,14 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 
 // Grid-merged multi-token variants for the speculative round: identical
 // per-token work distribution, tokens mapped to an extra grid dimension
-// (1 launch vs ntok). ntok in 1..7 selects how many lanes are live (brace
-// inits with fewer entries leave the rest null, unread). P12b: 6 slots for
-// gated maxd=5 (pending + 5 drafts); maxd6 2026-07-08: 7 slots for the
-// ladder ceiling 7 (pending + 7 drafts); shallower widths fill a prefix.
-struct P3 { float* p[8]; };
-struct CP3 { const float* p[8]; };
-struct XQ3 { XQuant q[8]; };
+// (1 launch vs ntok). ntok selects how many lanes are live (brace inits
+// with fewer entries leave the rest null, unread); shallower widths fill a
+// prefix. width-12 2026-07-10: 16 slots (verify lanes a..l = 12 live max;
+// slots sized 16 so a future W=16 revisit is struct-free). Structs ride
+// kernel params by value -- slots beyond ntok are never read.
+struct P3 { float* p[16]; };
+struct CP3 { const float* p[16]; };
+struct XQ3 { XQuant q[16]; };
 
 void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0, int ntok = 3);
 void add3(P3 x, CP3 y, int n, cudaStream_t st = 0, int ntok = 3);
