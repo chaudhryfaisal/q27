@@ -1281,6 +1281,7 @@ struct Engine {
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
         std::chrono::steady_clock::time_point ph_t0, ph_t1;
         bool ph_timed = false; // set once the draft half is stamped (gated branches)
+        int ph_W = 0;          // this round's verify width (gated branches)
         if (tool_split_active && on_drafts) {
             // P11 constrained path: run drafts, read them back, let the host
             // stage per-lane grammar masks (uncapped), then verify. Full spec
@@ -1342,6 +1343,7 @@ struct Engine {
                 for (int k = launched; k < W && k < md_used; k++)
                     CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
                 CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                ph_W = W;
                 gate_cap = cap;
             } else {
                 // Q27_DEXIT=0: monolithic gated draft (the pre-P14 A/B baseline).
@@ -1362,6 +1364,7 @@ struct Engine {
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                ph_W = W;
                 gate_cap = cap;
             }
         } else {
@@ -1371,10 +1374,13 @@ struct Engine {
         int oc[10];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 40, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
-        if (ph_timed)
-            gs.verify_ms += std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - ph_t1)
-                                .count();
+        if (ph_timed) {
+            double v = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - ph_t1)
+                           .count();
+            gs.verify_ms += v;
+            if (ph_W >= 2 && ph_W <= 8) { gs.vw_ms[ph_W] += v; gs.vw_n[ph_W]++; }
+        }
         int n = oc[0];
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
@@ -1891,6 +1897,11 @@ struct Engine {
         // host round-gap + any unattributed (constrained/ungated) rounds.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
+        // verify wall bucketed by verify width W=cap+1 (floored 2, <=8) --
+        // the marginal-lane cost curve that prices deep ladders with draft
+        // off the critical path (Saguaro follow-up). Index by W; 0..1 unused.
+        double vw_ms[9] = {};
+        long vw_n[9] = {};
         int dec = 0, rounds = 0, yields = 0;
         const char* end = "";
     };

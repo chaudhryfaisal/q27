@@ -306,12 +306,19 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[96], gatebuf[512], phbuf[96];
+        char p13buf[96], gatebuf[512], phbuf[352];
         // Q27_PHASE_STATS: per-request gated-round wall split, appended after
         // end= like the P13/gate fields (reqlog_gate's parse is unaffected).
+        // phwn/phwm: per-verify-width round counts and summed verify ms, W=2..8.
         if (e.phase_stats)
-            snprintf(phbuf, sizeof phbuf, " phd=%.1f phv=%.1f phs=%ld", g.draft_ms,
-                     g.verify_ms, g.draft_steps);
+            snprintf(phbuf, sizeof phbuf,
+                     " phd=%.1f phv=%.1f phs=%ld"
+                     " phwn=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                     " phwm=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f",
+                     g.draft_ms, g.verify_ms, g.draft_steps, g.vw_n[2], g.vw_n[3],
+                     g.vw_n[4], g.vw_n[5], g.vw_n[6], g.vw_n[7], g.vw_n[8], g.vw_ms[2],
+                     g.vw_ms[3], g.vw_ms[4], g.vw_ms[5], g.vw_ms[6], g.vw_ms[7],
+                     g.vw_ms[8]);
         else
             phbuf[0] = '\0';
         fprintf(stderr,
