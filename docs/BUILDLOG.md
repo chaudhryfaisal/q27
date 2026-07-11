@@ -3628,3 +3628,34 @@ llama-server /completion timings; q27 numbers = today's vanilla bench):
   llama-cli hangs in conversation mode (-no-cnv is a warning now),
   llama-completion binary is stale (symbol error) -- use llama-server;
   and pkill -f self-matches the invoking shell (use pkill -x, again).
+
+## 2026-07-10 -- VANILLA A/B TRIPLET, q27-vs-llama.cpp through Claude Code: q27 +40% decode, 1.8-3.5x wall at matched scores
+
+Cleanest cross-engine read ever taken here: BOTH engines on vanilla
+qwen36 (q27 5.25bpw zero-config defaults vs llama Q5_K_M + its best
+config draft-mtp10/p-min0.5, -fa, no-think), same 5090, same CC
+harness (claude-code-q27-haight / claude-code-q5km-haight twins), same
+day, back-to-back.
+
+SCORES (converge to the model, as always): T2 0.84 == 0.84; T5 q27
+0.78 vs llama 0.81 (both at the reference band); T8 q27 0.85 GOOD
+basin vs llama 0.52 = the documented engine-independent bad-basin
+auth-gate artifact (per the retrial rule it is NOT read as quality;
+llama has historical T8 goods).
+
+WALL (end-to-end CC task time): T2 93s vs 323s (3.5x), T5 96s vs 171s
+(1.8x), T8 144s vs 109s (llama bad basin truncates early -- not
+comparable). DECODE ([req] vs llama eval-time lines, decode-only):
+q27 213/227/222 t/s aggregate per task (med 209-264, PEAK 362 = new
+live record), suffix AL 8.4-9.6 on 24-31% of decode; llama 157.1
+aggregate (med 169, p75 202, peak 259) over 89 reqs / 73.8K tok.
+=> q27 +40% aggregate decode, +40% peak, and the wall gap is larger
+than the decode gap (prefix-cache architecture + trajectory length --
+llama generated ~1.8x the tokens on its own trajectories; documented
+cross-run lottery, within-leg telemetry is the rate comparison).
+
+Context for the record: 07-06's depth-match had TUNED llama +31% over
+q27 at 75K, retired to PARITY on 07-07; today, post width-12 + fdmma
+tuning + defaults, the same-model comparison is q27 +40% decode and
+multiples on wall. The llama echo-ngram degenerate case (889 t/s,
+earlier entry) remains their one winning cell.
