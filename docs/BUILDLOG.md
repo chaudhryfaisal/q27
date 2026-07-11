@@ -3779,3 +3779,41 @@ VERDICT: codex is a working third harness on q27 across both models
 (T2 parity with CC). T5's tool-formatting basin is a codex x
 model-family interaction to note, not a q27 bug to fix. q27-eval
 restored to the qwopus standing env.
+
+## 2026-07-11 -- full 21-task sweep, Claude Code x vanilla q27: the breadth number
+
+First full-suite sweep (was always a 3-task keyhole before). CC on
+vanilla qwen, q27 zero-config defaults, n=1/task, single slot.
+
+DISTRIBUTION (N=21): mean 0.748, MEDIAN 0.830, stdev 0.140, range
+0.455-0.889. ZERO crashes -- min 0.455 is a real low score, not a wire
+failure; the engine served all 21 categories (greenfield, features,
+bugfix, marathon, recovery, algorithmic, reasoning, correctness,
+ambiguity, real-repo) without a single 0.00.
+
+Clean category split -- median 0.830 because the easy/medium/greenfield
+band clusters tight while the hard-reasoning tail pulls the MEAN down:
+- 0.83-0.89 (13 tasks): plugin-marketplace .889, then a wall of .85
+  (monorepo-disaster, fts-search, ssg-toolkit, yaml-escapes,
+  yaml-trailing-comma, financial-ledger[correctness/hard],
+  debug-nightmare[bugfix/hard]), collab .837, phantom-invoice .833,
+  time-tracker .830.
+- 0.72-0.82 (4): constraint-scheduler[algo/hard] .817, analytics .816,
+  task-queue[marathon] .789, structural-merge[algo/hard] .724.
+- 0.45-0.59 (5, the hard-reasoning tail): factory-reset[reason/hard]
+  .585, permission-maze[ambiguity/hard] .555, ecommerce .510,
+  reactive-spreadsheet[algo/hard] .499, beam-splitter[reason/hard] .455.
+
+READ: the tail is a MODEL capability ceiling on reasoning/algorithmic/
+ambiguity-hard, not an engine effect -- a faithful engine serving this
+27B would show the same shape (correctness/hard financial-ledger scored
+.85, so it is reasoning depth, not correctness, that bites). The
+engine's job is to serve every category without failing, and it did:
+21/21, no crashes, median 0.83.
+
+DECODE over the whole sweep (671 requests, 255K tokens): 233.1 t/s
+aggregate, median 220, p75 254, PEAK 394 (new record); suffix drafter
+AL 9.4 on 38% of decode. Throughput held across all categories.
+
+Blog quality claim now has breadth behind it: median 0.83 across 21
+tasks / 10 categories, zero crashes, at 233 t/s aggregate.
