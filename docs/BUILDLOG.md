@@ -3588,3 +3588,43 @@ Vanilla bench summary on the fixed binary: suite 172.2 / cctx classic
 143.0 / cctx full-stack 176.3 / echo full-stack 317.9. LESSON promoted
 to the standing gate set: short-ctx suite is the param/launch-overhead
 canary -- depth gates alone missed an 8% engine-wide tax.
+
+## 2026-07-10 -- CC DEFAULTS SHIPPED: bare `q27-server model tok` = the full measured stack; 26K echo 400.6 t/s zero-config. Plus llama.cpp cross-engine legs
+
+DEFAULTS FLIP (server only; CLI keeps reference defaults so the bitwise
+canonical world is untouched): a bare invocation now resolves to fp8 KV
++ Q27_FD=mma (sm_89+ arch-gated, else fp16+fd2) + PMIN 0.5 + MAXD auto7
++ SUFFIX_W 12 + PHASE_STATS + fast-head + no-think, and --ctx
+auto-sizes the KV budget to free VRAM (measured anchor 22.6GB fixed +
+34KB/tok fp8; cap 131072, floor 16384, single-slot; multi-slot keeps
+explicit --ctx). Mechanism: setenv(overwrite=0) pre-engine, so user env
+ALWAYS wins; Q27_PROFILE=ref restores the conservative reference
+behavior including the flag defaults (tri-state --fast-head/--think);
+Q27_SUFFIX / Q27_PHASE_STATS parses are now value-aware (=0 disables --
+were presence-only). Startup prints the resolved profile line. README
+Serving section rewritten. GATES: bare-vs-explicit-env server BYTE-
+IDENTICAL on the 26K echo payload; profile banners verified both ways;
+canonical CLI a2982c51 EXACT; bare server on vanilla@26K echo =
+**400.6 t/s** (32 wide rounds) -- the best engine number ever recorded,
+from a zero-config command line. q27-eval unit is now env-free:
+`systemd-run --user --unit=q27-eval build/q27-server qwopus.q27
+qwopus.tok --port 8081` (auto-ctx picked 131072, 27.0GB).
+
+LLAMA.CPP CROSS-ENGINE (same base qwen Q4_K_M, same 5090, same day;
+llama-server /completion timings; q27 numbers = today's vanilla bench):
+- plain: pp512 3721, pp8192 3562 (q27 fp8 prefill ~3480 @8K = parity),
+  tg128 78.7 (plain decode -- both engines BW-bound here).
+- spec short-gen: llama draft-mtp10/p0.5 = 133.3 t/s (accept 97/134)
+  vs q27 suite 172.2 = q27 +29% same-model same-GPU.
+- echo (pure 8-token loop, degenerate best case): llama draft-mtp10
+  287.8 vs q27 317.9 (+10% q27); BUT llama ngram-mod = 889.2 t/s
+  (251/251 drafts accepted, ~24-tok ngram drafts) -- unbounded draft
+  length crushes the pure-loop case where q27 is lane-capped at W=12.
+  NOT commissioned as a counter: live CC traffic runs AL ~10.6 (< the
+  12 cap; the cap does not bind on real work), and the P3 curve says
+  wide lanes are GEMV-N-bound -- the structural answer if pure-echo
+  ever mattered is the mma16 GEMM-verify pivot (batched-GEMM verify =
+  llama's shape), already on file. Ops notes: this llama build's
+  llama-cli hangs in conversation mode (-no-cnv is a warning now),
+  llama-completion binary is stale (symbol error) -- use llama-server;
+  and pkill -f self-matches the invoking shell (use pkill -x, again).

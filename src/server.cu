@@ -100,15 +100,23 @@ struct HookGuard {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C] "
-                        "[--fast-head]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C]\n"
+                "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
+                "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=12 + Q27_FD=mma (sm_89+)\n"
+                "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
+                "  (cap 131072, single-slot). Escapes: Q27_PROFILE=ref (conservative\n"
+                "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
+                "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
+                "  defaults (bitwise canonical).\n",
+                argv[0]);
         return 1;
     }
     std::string model = argv[1], tokpath = argv[2], host = "0.0.0.0";
-    int port = 8080, ctx = 8192;
+    int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
     int n_slots = 1, slot1_ctx = 32768;
-    bool fast = false;
-    bool no_think_srv = false;
+    int fast_flag = -1;        // tri-state: explicit flag wins over profile
+    int think_flag = -1;
     bool kv_fp16 = false;
     bool constrain_tools = false;
     for (int i = 3; i < argc; i++) {
@@ -117,20 +125,84 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) slot1_ctx = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--fast-head")) fast = true;
-        else if (!strcmp(argv[i], "--no-think")) no_think_srv = true;
+        else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
+        else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
+        else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
+        else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
     }
+    // CC-SERVING DEFAULTS (width-12 + tuning day, 2026-07-10): a bare
+    // `q27-server model tok` serves the full measured stack -- the exact
+    // config every live trial and record number was earned on. Mechanism:
+    // setenv(overwrite=0), so any user-set Q27_* env wins untouched;
+    // Q27_PROFILE=ref restores the conservative reference behavior (fp16
+    // KV, ungated, no suffix, fd2). The CLI binary keeps reference
+    // defaults so the bitwise canonical gates are untouched.
+    // fp8 KV + fdmma need sm_89+; older parts fall back to fp16 + fd2.
+    const char* prof = getenv("Q27_PROFILE");
+    const bool ref_profile = prof && !strcmp(prof, "ref");
+    int cc_arch = 0;
+    {
+        int dev = 0, mj = 0, mn = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
+        cc_arch = mj * 10 + mn;
+    }
+    // flag defaults follow the profile: CC = fast-head + no-think (every
+    // live trial); ref = the conservative pre-flip behavior. Explicit
+    // flags win in both.
+    const bool fast = fast_flag >= 0 ? fast_flag != 0 : !ref_profile;
+    const bool no_think_srv = think_flag >= 0 ? think_flag == 0 : !ref_profile;
     if (no_think_srv) fprintf(stderr, "no-think: empty-think prefill on all chat paths\n");
-
-    // P2/P10-prep: the SERVER defaults to fp8 E4M3 KV (quality gated at noise
-    // -- PPL -0.05%, needle 6/6 to 361K -- and it doubles the ctx budget).
-    // --kv-fp16 or Q27_KV=fp16 opts out. The CLI binary keeps fp16 default so
-    // the bitwise canonical gates are untouched.
     if (kv_fp16) setenv("Q27_KV", "fp16", 1);
-    else if (!getenv("Q27_KV")) setenv("Q27_KV", "fp8", 0);
-    fprintf(stderr, "kv cache: %s\n", getenv("Q27_KV"));
+    if (!ref_profile) {
+        if (cc_arch >= 89) {
+            setenv("Q27_KV", "fp8", 0);
+            setenv("Q27_FD", "mma", 0);
+        }
+        setenv("Q27_PMIN", "0.5", 0);
+        setenv("Q27_MAXD", "auto7", 0);
+        setenv("Q27_SUFFIX", "1", 0);
+        setenv("Q27_SUFFIX_W", "12", 0);
+        setenv("Q27_PHASE_STATS", "1", 0);
+    }
+    fprintf(stderr,
+            "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
+            "think=%d\n",
+            ref_profile ? "ref" : "cc", cc_arch, getenv("Q27_KV") ? getenv("Q27_KV") : "fp16",
+            getenv("Q27_FD") ? getenv("Q27_FD") : "fd2",
+            getenv("Q27_PMIN") ? getenv("Q27_PMIN") : "off",
+            getenv("Q27_MAXD") ? getenv("Q27_MAXD") : "4",
+            getenv("Q27_SUFFIX") ? getenv("Q27_SUFFIX") : "0",
+            getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
+            no_think_srv ? 0 : 1);
+
+    // --ctx auto (single-slot): size the KV budget to free VRAM. Anchor:
+    // 131072 fp8 single-slot measured 27.0GB total => fixed (weights +
+    // roles + graphs + buffers) ~= 22.6GB; per-token = 34KB fp8 / 68KB
+    // fp16 (attn + MTP KV). Cap 131072, floor 16384, 4K granularity,
+    // ~1GB slack. Multi-slot keeps the old explicit-ctx contract.
+    if (ctx < 0) {
+        if (n_slots > 1) {
+            ctx = 8192; // legacy default; multi-slot should pass --ctx
+            fprintf(stderr, "--ctx not set with --slots %d: using %d (pass --ctx)\n", n_slots,
+                    ctx);
+        } else {
+            size_t free_b = 0, total_b = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            const bool fp8 = getenv("Q27_KV") && !strcmp(getenv("Q27_KV"), "fp8");
+            const double fixed = 22.6e9, slack = 1.0e9, per_tok = fp8 ? 34e3 : 68e3;
+            long budget = (long)((double)free_b - fixed - slack);
+            long c = budget > 0 ? (long)(budget / per_tok) : 0;
+            if (c > 131072) c = 131072;
+            if (c < 16384) c = 16384;
+            ctx = (int)(c / 4096 * 4096);
+            fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV)\n", ctx, free_b / 1e9,
+                    fp8 ? "fp8" : "fp16");
+        }
+    }
 
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);

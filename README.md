@@ -338,8 +338,19 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
 
 ```
 make build/q27-server
-./build/q27-server model.q27 model.tok --port 8080 --ctx 8192 [--fast-head]
+./build/q27-server model.q27 model.tok --port 8080
 ```
+
+**Defaults (2026-07-10) = the measured Claude-Code stack.** A bare server
+serves the exact config every live trial and record number was earned on:
+fp8 KV + `Q27_FD=mma` (sm_89+; older parts fall back fp16 + fd2),
+`Q27_PMIN=0.5`, `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head,
+no-think, phase stats; `--ctx` auto-sizes the KV budget to free VRAM
+(cap 131072, single-slot). Every knob keeps its env/flag override
+(user env always wins), `Q27_PROFILE=ref` restores the conservative
+reference behavior (fp16, ungated, no suffix, fd2), and the **CLI binary
+keeps reference defaults** so the bitwise canonical gates are untouched.
+Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
 
 Three API shapes on one server:
 - **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)

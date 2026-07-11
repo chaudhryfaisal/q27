@@ -1325,7 +1325,9 @@ struct Engine {
         // width-12 P1: suffix envs parsed BEFORE the warm/capture section --
         // Q27_SUFFIX_W shapes the warm width and adds one per-perm verify
         // graph at exactly that width. <= gate_maxd+1 (or unset) = legacy.
-        suffix_on = getenv("Q27_SUFFIX") != nullptr;
+        // value-aware since the CC-defaults flip: Q27_SUFFIX=0 disables
+        // (was presence-only -- =0 used to ENABLE).
+        suffix_on = getenv("Q27_SUFFIX") && atoi(getenv("Q27_SUFFIX")) != 0;
         sfx_dbg = getenv("Q27_SUFFIX_DBG") != nullptr;
         if (const char* sl = getenv("Q27_SUFFIX_L")) sfx_L = atoi(sl);
         if (const char* sw = getenv("Q27_SUFFIX_W")) {
@@ -1526,7 +1528,7 @@ struct Engine {
         // unset = off (always full width 5 = the canonical depth-4 round).
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
-        phase_stats = getenv("Q27_PHASE_STATS") != nullptr;
+        phase_stats = getenv("Q27_PHASE_STATS") && atoi(getenv("Q27_PHASE_STATS")) != 0;
         // (suffix envs parsed above, pre-capture -- width-12 P1)
         if (suffix_on)
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
