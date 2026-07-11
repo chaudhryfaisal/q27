@@ -3855,3 +3855,29 @@ Build narrow (until a Makefile knob lands):
 3090 serving: build W_MAX=8, run with Q27_KV=fp8 (sm_86 CC profile
 arch-gates fp8 off, but fp8 KV storage works on sm_86 -- only the fdmma
 MMA kernel needs sm_89; force it), explicit --ctx up to ~49152.
+
+## 2026-07-11 -- matched 21-task vanilla-vs-qwopus: "vanilla beats qwopus" was an ARTIFACT (median tie)
+
+Ran both models through the full 21-task suite, same day/GPU/harness
+(vanilla run 13-14-19, qwopus 14-07-43). My pkill clobbered q27-eval
+mid-qwopus-sweep (corrupting 5 consecutive trials); those 5 + the
+documented-bimodal analytics were re-run and substituted (structural
+0.76, financial-ledger 0.85, permission-maze 0.51, reactive 0.76,
+circuit-debugger 0.27, analytics 0.00-retrial).
+
+PAIRED RESULT: vanilla median 0.830 / qwopus median 0.836 -- a TIE.
+Paired-delta median +0.000; 13 of 21 tasks tie within +-0.02. The mean
+gap (qwopus -0.024) is TWO bimodal-basin draws swinging BOTH ways:
+qwopus lost analytics (0.816->0.00) and circuit-debugger (0.626->0.27)
+but WON beam-splitter (0.455->0.845) and reactive-spreadsheet
+(0.499->0.760). Net wash, basin lottery on the hard-reasoning tasks;
+identical on the 13 stable ones. This is the documented "scores
+converge to the model" -- qwopus is a SPEED fine-tune (+35% acceptance,
+219 vs 162 t/s cctx replay), same quality as base. The earlier
+"vanilla beats qwopus" read was the broad-vs-narrow artifact (vanilla
+had a 21-task sweep, qwopus only the 3-task keyhole); matched, they tie.
+
+OPS: canonical a2982c51 re-verified clean (closes W_MAX commit f551561,
+whose in-session check returned the co-located-CLI-OOM empty-md5).
+Lesson re-logged: pkill -x q27-server also kills the standing eval unit
+-- name the PID or CUDA_VISIBLE_DEVICES-scope it.
