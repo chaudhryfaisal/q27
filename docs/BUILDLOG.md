@@ -3700,3 +3700,18 @@ predate the result -- the credibility asset), replication direction
 (+40% n=1 -> +47% n=3), and quality parity scoped as a SYSTEM-level
 claim with the strict-parser reality stated plainly (strict = 0.000 on
 T8-class for any engine; the tolerant parser is load-bearing).
+
+## 2026-07-10 -- codex-vs-q27: BLOCKED, and the blocker is a finding
+
+First-ever codex leg attempted (new codex-q27-haight adapter, OpenAI
+chat path on :8081, same codex-exec invocation as the proven April
+rig): all three trials crashed at 0s on CONFIG LOAD -- current codex
+removed `wire_api = "chat"` entirely ("no longer supported, set
+wire_api=responses", codex discussion 7782). Codex now speaks only the
+OpenAI Responses API, which q27 does not serve; no chat-completions-only
+local server can host codex anymore. The OpenAI-path robustness
+question stays open (only CRUSH has exercised it); the unblock is a
+/v1/responses implementation in q27-server (stateless: input items ->
+ChatML in, response.* SSE out -- a third API surface, NOT commissioned)
+or an external chat<->responses shim. Adapter kept, marked BLOCKED with
+the citation.
