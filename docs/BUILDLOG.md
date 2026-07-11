@@ -3701,17 +3701,47 @@ predate the result -- the credibility asset), replication direction
 claim with the strict-parser reality stated plainly (strict = 0.000 on
 T8-class for any engine; the tolerant parser is load-bearing).
 
-## 2026-07-10 -- codex-vs-q27: BLOCKED, and the blocker is a finding
+## 2026-07-10/11 -- codex-vs-q27: my adapter had the wrong wire_api; the endpoint already shipped
 
-First-ever codex leg attempted (new codex-q27-haight adapter, OpenAI
-chat path on :8081, same codex-exec invocation as the proven April
-rig): all three trials crashed at 0s on CONFIG LOAD -- current codex
-removed `wire_api = "chat"` entirely ("no longer supported, set
-wire_api=responses", codex discussion 7782). Codex now speaks only the
-OpenAI Responses API, which q27 does not serve; no chat-completions-only
-local server can host codex anymore. The OpenAI-path robustness
-question stays open (only CRUSH has exercised it); the unblock is a
-/v1/responses implementation in q27-server (stateless: input items ->
-ChatML in, response.* SSE out -- a third API surface, NOT commissioned)
-or an external chat<->responses shim. Adapter kept, marked BLOCKED with
-the citation.
+CORRECTION to the entry as first filed. The first codex triplet crashed
+at 0s because MY adapter set `wire_api = "chat"`, which current codex
+rejects at config load ("no longer supported, set wire_api=responses",
+codex discussion 7782). The premise I wrote -- "q27 does not serve
+/v1/responses" -- was wrong: q27-server has a complete native Responses
+handler (POST /v1/responses; input items + instructions -> ChatML,
+function_call + custom apply_patch tool bridging, reasoning items,
+response.created/output_item.done/output_text.delta/completed SSE with a
+usage block; the codex-rs wire facts are documented at the handler).
+Live curl on the standing server returns the correct event sequence.
+Fix was one line in the adapter (wire_api=responses). Lesson: read the
+server's own route table before declaring a capability missing -- I had
+a "blocked, needs a third API surface" writeup for an endpoint that was
+already built and gated.
+
+## 2026-07-11 -- codex ENABLED on q27 (third harness): two real /v1/responses fixes, T5 is a model basin
+
+Codex now runs against q27 (adapter codex-q27-haight, wire_api=responses).
+Path to green, two genuine handler bugs found by running it:
+1. OUTPUT-ITEM LIFECYCLE. The existing streaming handler emitted
+   response.output_text.delta with no open item; codex 0.143 enforces
+   the lifecycle ("OutputTextDelta without active item" -> turn abort).
+   T2 survived only because its first output was a tool call (a complete
+   done-only item); T5/T8 led with text and died at 14-22s. Fixed: emit
+   output_item.added + content_part.added before the first delta, and
+   output_text.done + content_part.done + output_item.done at flush.
+   T8 recovered 0.00 -> 0.85.
+2. BARE-CALL RECOVERY (parity with the Anthropic path). Added
+   parse_bare_tool_calls over the accumulated text on finalize -- the
+   model sometimes emits {"name":...,"arguments":...} without the
+   <tool_call> wrapper.
+
+RESULT: T2 0.85, T8 0.85 (matching/beating Claude-Code-on-q27 .85/.82);
+q27 served codex at 157-352 t/s/request, 96% prefix-cache reuse (hit
+49152 every turn), suffix drafter firing. T5 stays 0.00, and it is a
+MODEL-TRAJECTORY BASIN, not a wire defect: Qwopus chose to write the
+whole index.ts as ONE bare exec_command heredoc (14,662 chars) that
+truncated mid-string -- unrecoverable because the content was never
+finished emitting. Same class as the T8 auth-gate bimodality; CC handles
+T5 fine on the identical model, so it's codex-instruction-style-specific
+model behavior, not q27. Three harnesses now proven on q27 (Claude Code
+native Anthropic, CRUSH OpenAI chat, codex OpenAI Responses).

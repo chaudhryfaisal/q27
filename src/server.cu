@@ -1264,7 +1264,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
@@ -1287,7 +1287,7 @@ int main(int argc, char** argv) {
                 json items = json::array();
                 int tool_counter = 0;
                 std::set<std::string> cn = custom_names;
-                std::string think, text, tool_buf;
+                std::string think, text, tool_buf, text_accum;
                 int out_index = 0;
                 auto item_done = [&](const json& it) {
                     ev({{"type", "response.output_item.done"}, {"output_index", out_index++},
@@ -1303,15 +1303,45 @@ int main(int argc, char** argv) {
                                 json::array({{{"type", "summary_text"}, {"text", th}}})},
                                {"encrypted_content", nullptr}});
                 };
+                // codex 0.143 enforces the item lifecycle: an output_text.delta
+                // needs an already-OPEN item (else "OutputTextDelta without
+                // active item" and codex aborts the turn -- the T5/T8 failure).
+                // Open the message item + content part before the first delta;
+                // flush closes the full added->delta->done sequence. msg_index
+                // reserves the current out_index while streaming (only one item
+                // is ever open -- route flushes think/text before a tool).
+                const std::string msg_id = "msg_q27_" + std::to_string(rid);
+                int msg_index = -1;
+                auto open_text = [&]() {
+                    if (msg_index >= 0) return;
+                    msg_index = out_index;
+                    ev({{"type", "response.output_item.added"}, {"output_index", msg_index},
+                        {"item", {{"type", "message"}, {"id", msg_id}, {"role", "assistant"},
+                                  {"status", "in_progress"}, {"content", json::array()}}}});
+                    ev({{"type", "response.content_part.added"}, {"item_id", msg_id},
+                        {"output_index", msg_index}, {"content_index", 0},
+                        {"part", {{"type", "output_text"}, {"text", ""},
+                                  {"annotations", json::array()}}}});
+                };
                 auto flush_text = [&]() {
+                    if (msg_index < 0) { text.clear(); return; }
                     std::string tx = q27::strip_ws2(text);
                     text.clear();
-                    if (tx.empty()) return;
-                    item_done({{"type", "message"}, {"id", "msg_q27_" + std::to_string(rid)},
-                               {"role", "assistant"}, {"status", "completed"},
-                               {"content",
-                                json::array({{{"type", "output_text"}, {"text", tx},
-                                              {"annotations", json::array()}}})}});
+                    ev({{"type", "response.output_text.done"}, {"item_id", msg_id},
+                        {"output_index", msg_index}, {"content_index", 0}, {"text", tx}});
+                    ev({{"type", "response.content_part.done"}, {"item_id", msg_id},
+                        {"output_index", msg_index}, {"content_index", 0},
+                        {"part", {{"type", "output_text"}, {"text", tx},
+                                  {"annotations", json::array()}}}});
+                    json it = {{"type", "message"}, {"id", msg_id}, {"role", "assistant"},
+                               {"status", "completed"},
+                               {"content", json::array({{{"type", "output_text"}, {"text", tx},
+                                                         {"annotations", json::array()}}})}};
+                    ev({{"type", "response.output_item.done"}, {"output_index", msg_index},
+                        {"item", it}});
+                    items.push_back(it);
+                    out_index = msg_index + 1;
+                    msg_index = -1;
                 };
                 auto flush_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
@@ -1348,9 +1378,11 @@ int main(int argc, char** argv) {
                     if (ch == StreamSplitter::THINK) { think += t; return; }
                     if (!think.empty()) flush_think();
                     if (text.empty() && q27::strip_ws2(t).empty()) return;
+                    open_text();
                     text += t;
-                    ev({{"type", "response.output_text.delta"}, {"output_index", out_index},
-                        {"content_index", 0}, {"delta", t}});
+                    text_accum += t; // survives flush_text for bare-call recovery
+                    ev({{"type", "response.output_text.delta"}, {"item_id", msg_id},
+                        {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
                 q27::Utf8Gate ugate;
@@ -1365,6 +1397,35 @@ int main(int argc, char** argv) {
                 if (!tool_buf.empty()) flush_tool();
                 flush_think();
                 flush_text();
+                // wrapper-less call recovery (parity with the Anthropic path):
+                // the model sometimes emits a bare {"name":...,"arguments":...}
+                // as text, no <tool_call> wrapper -- it already streamed as an
+                // output_text item (cosmetic), but codex needs it as a
+                // function_call to execute. Emit the recovered calls as items
+                // after the text (T5 task-queue failed exactly here).
+                if (tools.is_array() && !tools.empty()) {
+                    std::string pre;
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    if (!bcs.empty())
+                        fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (resp)\n",
+                                bcs.size());
+                    for (auto& bc : bcs) {
+                        std::string cid = "call_q27_" + std::to_string(rid) + "_" +
+                                          std::to_string(tool_counter++);
+                        if (cn.count(bc.name)) {
+                            std::string input =
+                                bc.arguments.is_object() && bc.arguments.contains("input") &&
+                                        bc.arguments["input"].is_string()
+                                    ? bc.arguments["input"].get<std::string>()
+                                    : jdump(bc.arguments);
+                            item_done({{"type", "custom_tool_call"}, {"call_id", cid},
+                                       {"name", bc.name}, {"input", input}});
+                        } else {
+                            item_done({{"type", "function_call"}, {"call_id", cid},
+                                       {"name", bc.name}, {"arguments", jdump(bc.arguments)}});
+                        }
+                    }
+                }
                 ev({{"type", "response.completed"},
                     {"response", {{"id", resp_id}, {"object", "response"},
                                   {"status", "completed"}, {"output", items},
