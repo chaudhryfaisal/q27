@@ -1,0 +1,253 @@
+# Quasar: passing my own publish gate
+
+*(draft -- not published. Quasar is the engine, built under the codename q27; the names are used interchangeably below.)*
+
+Day one of this project was July 2nd. A few days in I told a reviewer I
+wouldn't write this post until q27 hit at least parity with tuned
+llama.cpp on the same model, same GPU, same harness. On July 5th I filed
+the measurement protocol: three trials per task, both engines at their
+strongest config, same day. On July 10th -- eight days in -- the protocol ran
+and came back +47% decode over llama's best configuration, with score
+medians converged. The acceptance criteria predate the result by five
+days, which is the only reason you should believe any of the numbers
+below.
+
+## What q27 is
+
+q27 is a from-scratch CUDA inference engine for exactly one model family:
+Qwen3.6-27B-MTP, a hybrid Gated-DeltaNet/attention model with trained-in
+MTP draft heads, running on a single RTX 5090. No abstraction layers, no
+model zoo, no portability. One model, one GPU, as fast as I can make it.
+The repo is in the spirit of antirez/ds4: the engine is the artifact, and
+the build log records everything including the failures.
+
+Two design commitments shaped everything else. Greedy decode is
+bitwise-reproducible and gated: a canonical prompt's 128-token output has
+held byte-identical through every kernel rewrite, width change, and graph
+restructure since the gate existed, and anything that would break it
+ships as a separately-gated tolerance-class path. And negative results
+get the same writeup as wins, with attribution. About a third of this post is
+things that didn't work.
+
+## The suffix drafter, and what's actually novel about it
+
+The model's MTP heads give you self-speculation for free: draft a few
+tokens with the cheap head, verify them in one batched forward, keep the
+prefix that matches. q27 runs that with an adaptive depth ladder (4 to 7
+drafts, promoted and demoted per-stream from realized acceptance).
+
+Agentic traffic has a second structure worth exploiting: Claude Code
+re-emits tool results, rewrites files, and echoes its own earlier output
+constantly. When the committed stream's suffix recurs earlier in the
+context, the continuation of the earlier occurrence is a free draft -- no
+model call at all. q27's suffix drafter indexes the stream with 4-gram
+lookup and fills the verify lanes from the match.
+
+Stream-lookup speculation is an old idea. llama.cpp has ngram speculation
+in the same family, and on a degenerate pure-loop payload it beats q27
+badly (889 vs 318 t/s) because its drafts are effectively unbounded while
+q27 caps at 12 lanes. The part I'll claim is the composition: per-round
+arbitration between the trained MTP ladder and the free suffix drafter,
+both verified through one shared-KV MMA kernel, with the suffix taking
+the echo-heavy stretches so the ladder isn't starved. On live traffic
+the cap doesn't bind -- measured acceptance length is 9 to 10.6 tokens
+per fired round, under the 12-lane ceiling, on 30-60% of all decoded
+tokens.
+
+Getting there meant widening the whole verify architecture from 8 lanes
+to 12: pointer-struct kernel signatures, twelve rotating GDN state
+buffers, a permutation modulus change, and a captured-graph zoo that grew
+1.5x. The widening is byte-identical at old widths by construction --
+role addressing is fully indirected, so a larger modulus only relabels
+which physical buffer holds a role. The plan predicted uncapped
+acceptance around 10.5 based on offline simulation; live traffic
+delivered 10.61 on the first trial. Same fire rate as the old width,
++63% tokens per fire. That's a cap release, and it behaved exactly like
+one.
+
+## A day of kernel tuning, including the failures
+
+The verify-attention kernel (fdmma) scores all lanes against a shared KV
+stream with fp8 tensor-core MMA. At the start of the day it ran 61K
+context, width 12, in 354.7us. By the end: 202.6us, 5.6x over the
+register-accumulator baseline it replaced. Two changes did all of it,
+and three careful attempts did nothing.
+
+ncu said the kernel idled 89% of cycles with no eligible warps: one
+192-thread CTA per SM, three full-CTA barriers per tile, nothing to hide
+latency with. The fix that worked was boring: single-buffer the K/V
+staging, shrink shared memory to 49KB, get the register count to 168,
+and let two CTAs co-reside per SM so they interleave each other's stalls.
++17-26% depending on width, bitwise-identical because the arithmetic is
+shared code.
+
+The second win was wave quantization. The kernel launched 512 CTAs (128
+splits x 4 KV heads) against 340 resident slots -- a full wave plus a
+half-empty one. Setting splits to SMs*2/kv_heads = 85 fills exactly one
+wave: another -29% at the width that matters. The split count is now
+computed from the device at startup.
+
+The three failures are more instructive than the wins:
+
+- Reordering the prefetch to overlap the V-transpose: measured wash. The
+  copies were already hidden. Reverted.
+- Warp-pair PV (halve the output accumulator, split PV dims across
+  paired warps, sync with named barriers): bitwise-correct, lost 6-15%
+  against the 2-CTA kernel.
+- Full warp-specialized producer/consumer (dedicated staging warp,
+  arrive/wait barrier ring, zero CTA-wide barriers in the loop):
+  bitwise-correct, lost by 2x.
+
+All three fail for the same reason, which is the useful part: for this
+kernel family, CTA count dominates intra-CTA orchestration. Two
+independent barrier domains hide stalls better than any clever
+choreography inside one domain, and the clever choreography costs the
+shared memory that buys the second domain. I measured that conclusion
+three different ways in one afternoon and I'm confident enough to put a
+do-not-retry bar in the log: don't revisit warp specialization here
+unless the staging fits under 49KB and 85 registers at the same time.
+
+## The regression my own benchmark caught
+
+The best story of the day is an embarrassing one. After the widening
+shipped -- gates green, canonical byte-identical, sanitizer clean, live
+trial faster -- I ran the short-context benchmark suite on the vanilla
+model and got 149.5 t/s against a 161.8 reference. Identical output
+trajectories. Pure per-round cost. The depth-focused gates never noticed
+because they measure at 26-61K context where attention dominates.
+
+nsys narrowed it to exactly the kernels that take lane-pointer structs
+as by-value parameters and index them with blockIdx. ptxas showed the
+stack frame doubled from 128 to 256 bytes. When you dynamically index a
+by-value kernel parameter, the compiler copies the whole struct to
+per-thread local memory. The widening doubled the struct, which doubled
+a copy that had been silently taxing every multi-lane kernel since the
+structs were introduced weeks earlier.
+
+The fix is one attribute: `__grid_constant__` pins the parameter in
+constant memory and makes dynamic indexing legal without the copy.
+Addressing-only, bitwise. The suite went to 172.2 -- above the baseline
+that predated the regression, because the fix removed the original 128
+bytes too. Two lessons went into the log as standing rules: the
+short-context suite is the launch-overhead canary and runs after any
+plumbing change, and an instrument that demonstrably catches what the
+other gates miss retroactively strengthens every number it ever
+produced.
+
+## Ties, basins, and how to not fool yourself
+
+Greedy decode over a 27B has argmax ties, and any change to floating
+point accumulation order re-rolls them: fp8 attention, split-count
+changes, sometimes just a rebuild. The output is deterministic for a
+given binary and neutral in expectation across binaries, and one
+benchmark in my suite has a hidden test gate that lands on a knife-edge
+tie -- the same task scores 0.85 or 0.55 depending on which side of one
+early tie the trajectory falls, on every engine I've run through it,
+llama included.
+
+That forces some measurement discipline. Bitwise gates only compare legs
+from the same binary. Tolerance-class changes get judged by a basin
+matrix across several tasks plus a re-roll on the next binary, never by
+a single trial on the bimodal task. The fp8 attention kernel looked like
+it was systematically tanking that benchmark until the matrix showed
+three other tasks at parity-or-better and the next binary re-rolled the
+bad basin good with the identical kernel. The flip was a per-binary
+lottery; the kernel steered nothing. If you benchmark greedy LLM
+inference and haven't hit this,
+you will.
+
+## The result
+
+Protocol as filed July 5th: three trials each of three agentic coding
+tasks (a collab server, a task queue, an analytics dashboard), scored by
+deterministic hidden tests, Claude Code as the harness driving each
+engine's native API, no-think greedy both sides, same day, same 5090,
+vanilla model both sides. q27 at its shipped defaults; llama.cpp at its
+best measured config (Q5_K_M, MTP draft speculation depth 10, p-min 0.5,
+flash attention).
+
+Score medians: 0.83 vs 0.83, 0.78 vs 0.79, and the bimodal task drew 2/3
+good basins for q27 against 1/3 for llama. Across the nine draws per
+engine, q27 landed in-band 8/9 and llama 5/9, including one hard zero --
+but n=9 cannot separate those proportions (Fisher's exact p is about
+0.29). It stays an observation until a bigger n separates it. Quality is the model's,
+and quality parity here is a system-level claim: both harness paths
+depend on tolerant tool-call parsing, and strict parsing scores zero on
+some of these tasks for any engine.
+
+Decode, within-leg, 430 requests of telemetry: q27 231.3 t/s aggregate
+(median 225, peak 378) vs llama 157.4 (median 155, peak 274). That's
++47%. The n=1 pilot the day before read +40%; the number strengthened
+under replication, which is what happens when the pilot wasn't a lucky
+draw.
+
+Decompose it before someone else does: q27 reads about 15.8GB of weights
+per step at 5.25 bits/weight; Q5_K_M reads about 18.2GB. On a
+bandwidth-bound decode that's roughly 15 points of the 47 from bit-width
+alone. A 30-trial quality A/B against Q5_K_M scored dead even months of
+tuning ago, so the quant is paid for; the remaining ~22% is mechanism --
+suffix drafter, depth ladder, the fdmma kernel, and prefix-cache
+behavior under a real multi-turn client. End-to-end task wall favored
+q27 3-4x on the clean tasks, but wall is trajectory-confounded (llama
+generated 2.3x the tokens on its own trajectories), so the decode
+telemetry is the claim and the wall is context.
+
+For the record, the trajectory of this comparison: tuned llama beat q27
+by 31% at depth on July 6th. Parity on July 7th. +47% on the 10th. I
+was building until the same benchmark flipped, and the benchmark is the
+one llama was winning.
+
+## Zero-config, because the config was the last bug
+
+Until yesterday the fast configuration was six environment variables of
+tribal knowledge. Now `q27-server model.q27 model.tok` resolves the full
+measured stack -- fp8 KV, MMA attention, the confidence gate, the depth
+ladder, the suffix drafter at width 12 -- arch-gated so older GPUs fall
+back cleanly, with the context size auto-fitted to free VRAM. Every knob
+keeps its override, `Q27_PROFILE=ref` restores the conservative
+reference behavior, and the CLI binary keeps reference defaults so the
+bitwise gates still mean something. The bare command on the vanilla
+model hits 400 t/s on a repetitive-payload ceiling test -- quote that as
+a bound. The headline is 231 t/s on real agentic traffic, from a command
+line with two arguments.
+
+## The receipts
+
+The engine was built with Claude Code driving the sessions, and the token
+bill for the whole eight days is $3,398 -- 2.64 billion tokens, of which
+16M were input, 8.9M were output, and 2.53 billion (96%) were cache
+reads. Read that last number again, because it's the thesis of the engine
+printed as an invoice: agentic traffic is overwhelmingly the same context
+re-read every turn with a small live suffix. That workload shape is why
+q27's prefix cache is built around the recurrent state, why the suffix
+drafter exists at all, and why a one-line billing-header fix on day four
+(Claude Code's mutating prompt head was forcing a full re-prefill every
+turn) was one of the highest-leverage changes of the week.
+
+There's also a recursion in the usage report I want on the record: from
+day three onward, `q27-qwopus-27b` appears in the models column of its
+own build receipt. Once the server spoke the Anthropic API well enough, I
+pointed Claude Code at it and some of the tokens that built q27 were
+decoded by q27, at zero dollars per token. And for scale: the week's
+entire 8.9M output tokens amount to about 10.7 hours of decode at
+tonight's measured 231 t/s. The engine can now retype its own source
+history in an afternoon.
+
+## What's left
+
+The deep-MTP question is closed by pricing rather than building: ceilings
+past 8 lose money even on the friendliest measured traffic, and ceiling
+8's theoretical +2.7% evaporates against live cap distributions plus the
+suffix drafter already owning the saturating stretches. The wide-lane
+cost curve says the marginal is batched-GEMV-bound, so the one filed
+lever for the future is a tensor-core GEMM verify -- which happens to be
+the shape llama's ngram speculation exploits on that degenerate loop.
+If pure-echo traffic ever matters, that's the pivot, and the microbench
+for it already exists in the tree.
+
+Everything above is reproducible from the repo: the build log carries
+every number in this post with its gate output, the negative results
+have their own entries, and the benchmark harness is public. The engine
+is a hobby project for one model on one GPU. It is also, as of this
+week, the fastest way I know of to run this model on this GPU by a
+margin I specified before I could meet it.
