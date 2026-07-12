@@ -4410,3 +4410,29 @@ e4m3 kernel's W12 smem budget; Ampere has neither. VERDICT: W8 stays the
 variant exists (needs the 2-CTA smem math to change, i.e. it does not).
 3090 optimization is now formally parked at the weight roofline: the
 remaining lever is the weight-bit policy study.
+
+## 2026-07-12 -- vanilla mainline llama.cpp on the 3090: the third leg of the triangle
+
+Mainline v1491 (13e67386, no turboquant), Q5_K_M, q8_0 KV, draft-mtp10
+p-min 0.5 fa, same harness/task/day discipline. Ladder: 65K/82K OK, 98K
+OOM -- q8_0 caps it at 81,920 (identical to the fork's q8_0 rung; the
+turbo types are additive).
+
+T8 x3 @82K: 0.57 / 0.55 / 0.54 (hidden .208 = the bimodal low mode x3),
+and the 0.55 trial CRASHED at 594s on the context wall ("request 81966
+tokens exceeds 81920") -- the same failure class as q27's 32K death,
+one tier up. 2/3 completions. GEN decode median 85.6 t/s (p90 105.5,
+135 gens) -- mainline decodes ~6% faster than the turboquant fork build
+(85.6 vs 80.7; version/build delta), so 85.6 is the honest best-llama
+decode figure on this card.
+
+FINAL 3090 TRIANGLE (same card, model family, harness):
+              ctx-max   decode-med   T8            completions
+  mainline    81,920    85.6         0.55x3 low    2/3 (ctx crash)
+  turbo fork  98,304    80.7         mixed         3/3
+  q27 t3+h16  131,072   102.2        0.82x3 good   3/3
+=> vs the strongest vanilla config: q27 +19% decode, +60% context, and
+the context lead is not cosmetic -- T8-class agentic sessions RUN OUT of
+82K on bad basins. llama's GDN context checkpoints (~400MB each, visible
+in its logs) also eat the same VRAM the KV needs. Basin draws remain
+lottery per task; the structural numbers are ctx + decode + completion.
