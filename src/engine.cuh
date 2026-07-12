@@ -59,6 +59,11 @@ static_assert(W_MAX >= 8 && W_MAX <= 12, "Q27_W_MAX in [8,12] (>=8 for maxd7 lad
 // count that scales memory. Arrays that LIST all lane pointers or read the
 // fixed outcome use W_PLUMB; arrays sized by live width use W_MAX.
 static constexpr int W_PLUMB = 12;
+// 12-wide lane-pointer aggregate from one array member (audit refactor):
+// expands to the exact brace list the q27k::*3 kernel wrappers take.
+#define LANES12(F) \
+    {{F##_L[0], F##_L[1], F##_L[2], F##_L[3], F##_L[4], F##_L[5], F##_L[6], \
+      F##_L[7], F##_L[8], F##_L[9], F##_L[10], F##_L[11]}}
 static constexpr int OUTCOME_INTS = W_PLUMB + 2; // n, t1, dr1..dr11, pending
 
 struct Engine {
@@ -98,81 +103,46 @@ struct Engine {
     void *mtp_k, *mtp_v;
     int *d_pos_m, *d_draft;
     // speculative decode (depth-1): b-token buffers, spare GDN state, batch quant
-    float *h_b, *x1_b, *y_b, *qg_b, *kbuf_b, *vbuf_b, *attnout_b;
-    float *qkv_b, *convout_b, *z_b, *alpha_b, *betar_b, *g_b, *beta_b, *o_b, *og_b;
-    float *ffn_g_b, *ffn_u_b, *logits2, *y2big;
+    // audit 2026-07-12: per-lane buffers live in 12-wide arrays now
+    // ([0] aliases the primary lane's pointer, set after allocation).
+    // Was ~200 named members + 12-wide brace lists at every call site.
+    std::array<float*, W_PLUMB> h_L, x1_L, y_L, qg_L, kbuf_L, vbuf_L,
+        attnout_L, qkv_L, convout_L, z_L, alpha_L, betar_L, g_L, beta_L,
+        o_L, og_L, ffn_g_L, ffn_u_L;
+    std::array<int*, W_PLUMB> d_pos_L, d_v_L;
+    std::array<q27k::XQuant, W_PLUMB> xq_L; // [0],[1] alias xq2[0],xq2[1]
+    float *logits2, *y2big;
     // GDN role state, spare sets 1..11 (role 0 = S/conv_ring). Roles 8..11
     // (indices 7..10) exist only when Q27_W_MAX admits them -- nullptr else.
     // Was 11 pairs of named members + ternary chains (audit 2026-07-12).
     float *S_sp[W_PLUMB - 1][N_LAYER], *ring_sp[W_PLUMB - 1][N_LAYER];
-    float *h_c, *x1_c, *y_c, *qg_c, *kbuf_c, *vbuf_c, *attnout_c;
-    float *qkv_c, *convout_c, *z_c, *alpha_c, *betar_c, *g_c, *beta_c, *o_c, *og_c;
-    float *ffn_g_c, *ffn_u_c;
     float *h_next2;
-    q27k::XQuant xqC;
-    int *d_pos_c, *d_pos_m2, *d_draft2, *d_vc;
+    int *d_pos_m2, *d_draft2;
     // depth-3 lane (d): 4th verify column + pass-3 draft chain
-    float *h_d, *x1_d, *y_d, *qg_d, *kbuf_d, *vbuf_d, *attnout_d;
-    float *qkv_d, *convout_d, *z_d, *alpha_d, *betar_d, *g_d, *beta_d, *o_d, *og_d;
-    float *ffn_g_d, *ffn_u_d;
     float *h_next3;
-    q27k::XQuant xqD;
-    int *d_pos_d, *d_pos_m3, *d_draft3, *d_vd;
+    int *d_pos_m3, *d_draft3;
     // depth-4 lane (e): 5th verify column + pass-4 draft chain (P3)
-    float *h_e, *x1_e, *y_e, *qg_e, *kbuf_e, *vbuf_e, *attnout_e;
-    float *qkv_e, *convout_e, *z_e, *alpha_e, *betar_e, *g_e, *beta_e, *o_e, *og_e;
-    float *ffn_g_e, *ffn_u_e;
     float *h_next4;
-    q27k::XQuant xqE;
-    int *d_pos_e, *d_pos_m4, *d_draft4, *d_ve;
+    int *d_pos_m4, *d_draft4;
     // depth-5 lane (f): 6th verify column + pass-5 draft chain (P12b)
-    float *h_f, *x1_f, *y_f, *qg_f, *kbuf_f, *vbuf_f, *attnout_f;
-    float *qkv_f, *convout_f, *z_f, *alpha_f, *betar_f, *g_f, *beta_f, *o_f, *og_f;
-    float *ffn_g_f, *ffn_u_f;
     float *h_next5;
-    q27k::XQuant xqF;
-    int *d_pos_f, *d_pos_m5, *d_draft5, *d_vf;
+    int *d_pos_m5, *d_draft5;
     // depth-6 lane (g): 7th verify column + pass-6 draft chain (maxd6 ladder)
-    float *h_g, *x1_g, *y_g, *qg_g, *kbuf_g, *vbuf_g, *attnout_g;
-    float *qkv_g, *convout_g, *z_g, *alpha_g, *betar_g, *g_g, *beta_g, *o_g, *og_g;
-    float *ffn_g_g, *ffn_u_g;
     float *h_next6;
-    q27k::XQuant xqG;
-    int *d_pos_g, *d_pos_m6, *d_draft6, *d_vg;
+    int *d_pos_m6, *d_draft6;
     // depth-7 lane (h): 8th verify column + pass-7 draft chain (maxd7 ladder)
-    float *h_h, *x1_h, *y_h, *qg_h, *kbuf_h, *vbuf_h, *attnout_h;
-    float *qkv_h, *convout_h, *z_h, *alpha_h, *betar_h, *g_h, *beta_h, *o_h, *og_h;
-    float *ffn_g_h, *ffn_u_h;
     float *h_next7;
-    q27k::XQuant xqH;
-    int *d_pos_h, *d_pos_m7, *d_draft7, *d_vh;
+    int *d_pos_m7, *d_draft7;
     // width-12 lanes (i..l): verify columns 9..12. VERIFY-ONLY -- no h_nextN
     // (the finish h_next select reads x1_*; the MTP chain never extends past
     // depth 7) and no d_pos_mN. Draft slots d_draft8..11 exist so the suffix
     // drafter (P1) can stage proposals 8..11; the MTP chain never writes them.
-    float *h_i, *x1_i, *y_i, *qg_i, *kbuf_i, *vbuf_i, *attnout_i;
-    float *qkv_i, *convout_i, *z_i, *alpha_i, *betar_i, *g_i, *beta_i, *o_i, *og_i;
-    float *ffn_g_i, *ffn_u_i;
-    q27k::XQuant xqI;
-    int *d_pos_i, *d_draft8, *d_vi;
-    float *h_j, *x1_j, *y_j, *qg_j, *kbuf_j, *vbuf_j, *attnout_j;
-    float *qkv_j, *convout_j, *z_j, *alpha_j, *betar_j, *g_j, *beta_j, *o_j, *og_j;
-    float *ffn_g_j, *ffn_u_j;
-    q27k::XQuant xqJ;
-    int *d_pos_j, *d_draft9, *d_vj;
-    float *h_k, *x1_k, *y_k, *qg_k, *kbuf_k, *vbuf_k, *attnout_k;
-    float *qkv_k, *convout_k, *z_k, *alpha_k, *betar_k, *g_k, *beta_k, *o_k, *og_k;
-    float *ffn_g_k, *ffn_u_k;
-    q27k::XQuant xqK;
-    int *d_pos_k, *d_draft10, *d_vk;
-    float *h_l, *x1_l, *y_l, *qg_l, *kbuf_l, *vbuf_l, *attnout_l;
-    float *qkv_l, *convout_l, *z_l, *alpha_l, *betar_l, *g_l, *beta_l, *o_l, *og_l;
-    float *ffn_g_l, *ffn_u_l;
-    q27k::XQuant xqL;
-    int *d_pos_l, *d_draft11, *d_vl;
+    int *d_draft8;
+    int *d_draft9;
+    int *d_draft10;
+    int *d_draft11;
     int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
-    int *d_pos_a, *d_pos_b, *d_va, *d_vb;
     // P7 constrained tool decoding: resident mask pool + per-slot ids +
     // acceptance cap. All -1/0 when inactive -> bitwise-identical decode.
     unsigned* d_mask_pool = nullptr;
@@ -497,16 +467,16 @@ struct Engine {
         A(&mtp_k, kv_bytes(false));
         A(&mtp_v, kv_bytes(true));
         A((void**)&d_pos_m, 4); A((void**)&d_draft, 4);
-        A((void**)&h_b, N_EMBD * 4); A((void**)&x1_b, N_EMBD * 4); A((void**)&y_b, N_EMBD * 4);
-        A((void**)&qg_b, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_b, N_KV * HEAD_DIM * 4); A((void**)&vbuf_b, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_b, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_b, GDN_CH * 4); A((void**)&convout_b, GDN_CH * 4);
-        A((void**)&z_b, GDN_V * 4);
-        A((void**)&alpha_b, GDN_HEADS * 4); A((void**)&betar_b, GDN_HEADS * 4);
-        A((void**)&g_b, GDN_HEADS * 4); A((void**)&beta_b, GDN_HEADS * 4);
-        A((void**)&o_b, GDN_V * 4); A((void**)&og_b, GDN_V * 4);
-        A((void**)&ffn_g_b, N_FFN * 4); A((void**)&ffn_u_b, N_FFN * 4);
+        A((void**)&h_L[1], N_EMBD * 4); A((void**)&x1_L[1], N_EMBD * 4); A((void**)&y_L[1], N_EMBD * 4);
+        A((void**)&qg_L[1], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[1], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[1], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[1], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[1], GDN_CH * 4); A((void**)&convout_L[1], GDN_CH * 4);
+        A((void**)&z_L[1], GDN_V * 4);
+        A((void**)&alpha_L[1], GDN_HEADS * 4); A((void**)&betar_L[1], GDN_HEADS * 4);
+        A((void**)&g_L[1], GDN_HEADS * 4); A((void**)&beta_L[1], GDN_HEADS * 4);
+        A((void**)&o_L[1], GDN_V * 4); A((void**)&og_L[1], GDN_V * 4);
+        A((void**)&ffn_g_L[1], N_FFN * 4); A((void**)&ffn_u_L[1], N_FFN * 4);
         A((void**)&logits2, W_MAX * (size_t)VOCAB * 4); // width-12: 12 verify lanes
         mask_words = (VOCAB + 31) / 32;
         A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
@@ -519,154 +489,162 @@ struct Engine {
         A((void**)&y2big, 2 * (size_t)N_FFN * 4);
         xq2[0] = q27k::xquant_alloc(N_FFN);
         xq2[1] = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_a, 4); A((void**)&d_pos_b, 4);
-        A((void**)&d_va, 4); A((void**)&d_vb, 4);
-        A((void**)&h_c, N_EMBD * 4); A((void**)&x1_c, N_EMBD * 4); A((void**)&y_c, N_EMBD * 4);
-        A((void**)&qg_c, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_c, N_KV * HEAD_DIM * 4); A((void**)&vbuf_c, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_c, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_c, GDN_CH * 4); A((void**)&convout_c, GDN_CH * 4);
-        A((void**)&z_c, GDN_V * 4);
-        A((void**)&alpha_c, GDN_HEADS * 4); A((void**)&betar_c, GDN_HEADS * 4);
-        A((void**)&g_c, GDN_HEADS * 4); A((void**)&beta_c, GDN_HEADS * 4);
-        A((void**)&o_c, GDN_V * 4); A((void**)&og_c, GDN_V * 4);
-        A((void**)&ffn_g_c, N_FFN * 4); A((void**)&ffn_u_c, N_FFN * 4);
+        A((void**)&d_pos_L[0], 4); A((void**)&d_pos_L[1], 4);
+        A((void**)&d_v_L[0], 4); A((void**)&d_v_L[1], 4);
+        A((void**)&h_L[2], N_EMBD * 4); A((void**)&x1_L[2], N_EMBD * 4); A((void**)&y_L[2], N_EMBD * 4);
+        A((void**)&qg_L[2], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[2], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[2], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[2], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[2], GDN_CH * 4); A((void**)&convout_L[2], GDN_CH * 4);
+        A((void**)&z_L[2], GDN_V * 4);
+        A((void**)&alpha_L[2], GDN_HEADS * 4); A((void**)&betar_L[2], GDN_HEADS * 4);
+        A((void**)&g_L[2], GDN_HEADS * 4); A((void**)&beta_L[2], GDN_HEADS * 4);
+        A((void**)&o_L[2], GDN_V * 4); A((void**)&og_L[2], GDN_V * 4);
+        A((void**)&ffn_g_L[2], N_FFN * 4); A((void**)&ffn_u_L[2], N_FFN * 4);
         A((void**)&h_next2, N_EMBD * 4);
-        xqC = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_c, 4); A((void**)&d_pos_m2, 4); A((void**)&d_draft2, 4);
-        A((void**)&d_vc, 4);
-        A((void**)&h_d, N_EMBD * 4); A((void**)&x1_d, N_EMBD * 4); A((void**)&y_d, N_EMBD * 4);
-        A((void**)&qg_d, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_d, N_KV * HEAD_DIM * 4); A((void**)&vbuf_d, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_d, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_d, GDN_CH * 4); A((void**)&convout_d, GDN_CH * 4);
-        A((void**)&z_d, GDN_V * 4);
-        A((void**)&alpha_d, GDN_HEADS * 4); A((void**)&betar_d, GDN_HEADS * 4);
-        A((void**)&g_d, GDN_HEADS * 4); A((void**)&beta_d, GDN_HEADS * 4);
-        A((void**)&o_d, GDN_V * 4); A((void**)&og_d, GDN_V * 4);
-        A((void**)&ffn_g_d, N_FFN * 4); A((void**)&ffn_u_d, N_FFN * 4);
+        xq_L[2] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[2], 4); A((void**)&d_pos_m2, 4); A((void**)&d_draft2, 4);
+        A((void**)&d_v_L[2], 4);
+        A((void**)&h_L[3], N_EMBD * 4); A((void**)&x1_L[3], N_EMBD * 4); A((void**)&y_L[3], N_EMBD * 4);
+        A((void**)&qg_L[3], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[3], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[3], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[3], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[3], GDN_CH * 4); A((void**)&convout_L[3], GDN_CH * 4);
+        A((void**)&z_L[3], GDN_V * 4);
+        A((void**)&alpha_L[3], GDN_HEADS * 4); A((void**)&betar_L[3], GDN_HEADS * 4);
+        A((void**)&g_L[3], GDN_HEADS * 4); A((void**)&beta_L[3], GDN_HEADS * 4);
+        A((void**)&o_L[3], GDN_V * 4); A((void**)&og_L[3], GDN_V * 4);
+        A((void**)&ffn_g_L[3], N_FFN * 4); A((void**)&ffn_u_L[3], N_FFN * 4);
         A((void**)&h_next3, N_EMBD * 4);
-        xqD = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_d, 4); A((void**)&d_pos_m3, 4); A((void**)&d_draft3, 4);
-        A((void**)&d_vd, 4);
-        A((void**)&h_e, N_EMBD * 4); A((void**)&x1_e, N_EMBD * 4); A((void**)&y_e, N_EMBD * 4);
-        A((void**)&qg_e, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_e, N_KV * HEAD_DIM * 4); A((void**)&vbuf_e, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_e, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_e, GDN_CH * 4); A((void**)&convout_e, GDN_CH * 4);
-        A((void**)&z_e, GDN_V * 4);
-        A((void**)&alpha_e, GDN_HEADS * 4); A((void**)&betar_e, GDN_HEADS * 4);
-        A((void**)&g_e, GDN_HEADS * 4); A((void**)&beta_e, GDN_HEADS * 4);
-        A((void**)&o_e, GDN_V * 4); A((void**)&og_e, GDN_V * 4);
-        A((void**)&ffn_g_e, N_FFN * 4); A((void**)&ffn_u_e, N_FFN * 4);
+        xq_L[3] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[3], 4); A((void**)&d_pos_m3, 4); A((void**)&d_draft3, 4);
+        A((void**)&d_v_L[3], 4);
+        A((void**)&h_L[4], N_EMBD * 4); A((void**)&x1_L[4], N_EMBD * 4); A((void**)&y_L[4], N_EMBD * 4);
+        A((void**)&qg_L[4], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[4], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[4], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[4], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[4], GDN_CH * 4); A((void**)&convout_L[4], GDN_CH * 4);
+        A((void**)&z_L[4], GDN_V * 4);
+        A((void**)&alpha_L[4], GDN_HEADS * 4); A((void**)&betar_L[4], GDN_HEADS * 4);
+        A((void**)&g_L[4], GDN_HEADS * 4); A((void**)&beta_L[4], GDN_HEADS * 4);
+        A((void**)&o_L[4], GDN_V * 4); A((void**)&og_L[4], GDN_V * 4);
+        A((void**)&ffn_g_L[4], N_FFN * 4); A((void**)&ffn_u_L[4], N_FFN * 4);
         A((void**)&h_next4, N_EMBD * 4);
-        xqE = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_e, 4); A((void**)&d_pos_m4, 4); A((void**)&d_draft4, 4);
-        A((void**)&d_ve, 4);
+        xq_L[4] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[4], 4); A((void**)&d_pos_m4, 4); A((void**)&d_draft4, 4);
+        A((void**)&d_v_L[4], 4);
         // depth-5 lane (f), P12b
-        A((void**)&h_f, N_EMBD * 4); A((void**)&x1_f, N_EMBD * 4); A((void**)&y_f, N_EMBD * 4);
-        A((void**)&qg_f, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_f, N_KV * HEAD_DIM * 4); A((void**)&vbuf_f, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_f, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_f, GDN_CH * 4); A((void**)&convout_f, GDN_CH * 4);
-        A((void**)&z_f, GDN_V * 4);
-        A((void**)&alpha_f, GDN_HEADS * 4); A((void**)&betar_f, GDN_HEADS * 4);
-        A((void**)&g_f, GDN_HEADS * 4); A((void**)&beta_f, GDN_HEADS * 4);
-        A((void**)&o_f, GDN_V * 4); A((void**)&og_f, GDN_V * 4);
-        A((void**)&ffn_g_f, N_FFN * 4); A((void**)&ffn_u_f, N_FFN * 4);
+        A((void**)&h_L[5], N_EMBD * 4); A((void**)&x1_L[5], N_EMBD * 4); A((void**)&y_L[5], N_EMBD * 4);
+        A((void**)&qg_L[5], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[5], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[5], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[5], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[5], GDN_CH * 4); A((void**)&convout_L[5], GDN_CH * 4);
+        A((void**)&z_L[5], GDN_V * 4);
+        A((void**)&alpha_L[5], GDN_HEADS * 4); A((void**)&betar_L[5], GDN_HEADS * 4);
+        A((void**)&g_L[5], GDN_HEADS * 4); A((void**)&beta_L[5], GDN_HEADS * 4);
+        A((void**)&o_L[5], GDN_V * 4); A((void**)&og_L[5], GDN_V * 4);
+        A((void**)&ffn_g_L[5], N_FFN * 4); A((void**)&ffn_u_L[5], N_FFN * 4);
         A((void**)&h_next5, N_EMBD * 4);
-        xqF = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_f, 4); A((void**)&d_pos_m5, 4); A((void**)&d_draft5, 4);
-        A((void**)&d_vf, 4);
+        xq_L[5] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[5], 4); A((void**)&d_pos_m5, 4); A((void**)&d_draft5, 4);
+        A((void**)&d_v_L[5], 4);
         // depth-6 lane (g), maxd6
-        A((void**)&h_g, N_EMBD * 4); A((void**)&x1_g, N_EMBD * 4); A((void**)&y_g, N_EMBD * 4);
-        A((void**)&qg_g, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_g, N_KV * HEAD_DIM * 4); A((void**)&vbuf_g, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_g, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_g, GDN_CH * 4); A((void**)&convout_g, GDN_CH * 4);
-        A((void**)&z_g, GDN_V * 4);
-        A((void**)&alpha_g, GDN_HEADS * 4); A((void**)&betar_g, GDN_HEADS * 4);
-        A((void**)&g_g, GDN_HEADS * 4); A((void**)&beta_g, GDN_HEADS * 4);
-        A((void**)&o_g, GDN_V * 4); A((void**)&og_g, GDN_V * 4);
-        A((void**)&ffn_g_g, N_FFN * 4); A((void**)&ffn_u_g, N_FFN * 4);
+        A((void**)&h_L[6], N_EMBD * 4); A((void**)&x1_L[6], N_EMBD * 4); A((void**)&y_L[6], N_EMBD * 4);
+        A((void**)&qg_L[6], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[6], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[6], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[6], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[6], GDN_CH * 4); A((void**)&convout_L[6], GDN_CH * 4);
+        A((void**)&z_L[6], GDN_V * 4);
+        A((void**)&alpha_L[6], GDN_HEADS * 4); A((void**)&betar_L[6], GDN_HEADS * 4);
+        A((void**)&g_L[6], GDN_HEADS * 4); A((void**)&beta_L[6], GDN_HEADS * 4);
+        A((void**)&o_L[6], GDN_V * 4); A((void**)&og_L[6], GDN_V * 4);
+        A((void**)&ffn_g_L[6], N_FFN * 4); A((void**)&ffn_u_L[6], N_FFN * 4);
         A((void**)&h_next6, N_EMBD * 4);
-        xqG = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_g, 4); A((void**)&d_pos_m6, 4); A((void**)&d_draft6, 4);
-        A((void**)&d_vg, 4);
+        xq_L[6] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[6], 4); A((void**)&d_pos_m6, 4); A((void**)&d_draft6, 4);
+        A((void**)&d_v_L[6], 4);
         // depth-7 lane (h), maxd7
-        A((void**)&h_h, N_EMBD * 4); A((void**)&x1_h, N_EMBD * 4); A((void**)&y_h, N_EMBD * 4);
-        A((void**)&qg_h, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_h, N_KV * HEAD_DIM * 4); A((void**)&vbuf_h, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_h, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_h, GDN_CH * 4); A((void**)&convout_h, GDN_CH * 4);
-        A((void**)&z_h, GDN_V * 4);
-        A((void**)&alpha_h, GDN_HEADS * 4); A((void**)&betar_h, GDN_HEADS * 4);
-        A((void**)&g_h, GDN_HEADS * 4); A((void**)&beta_h, GDN_HEADS * 4);
-        A((void**)&o_h, GDN_V * 4); A((void**)&og_h, GDN_V * 4);
-        A((void**)&ffn_g_h, N_FFN * 4); A((void**)&ffn_u_h, N_FFN * 4);
+        A((void**)&h_L[7], N_EMBD * 4); A((void**)&x1_L[7], N_EMBD * 4); A((void**)&y_L[7], N_EMBD * 4);
+        A((void**)&qg_L[7], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[7], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[7], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[7], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[7], GDN_CH * 4); A((void**)&convout_L[7], GDN_CH * 4);
+        A((void**)&z_L[7], GDN_V * 4);
+        A((void**)&alpha_L[7], GDN_HEADS * 4); A((void**)&betar_L[7], GDN_HEADS * 4);
+        A((void**)&g_L[7], GDN_HEADS * 4); A((void**)&beta_L[7], GDN_HEADS * 4);
+        A((void**)&o_L[7], GDN_V * 4); A((void**)&og_L[7], GDN_V * 4);
+        A((void**)&ffn_g_L[7], N_FFN * 4); A((void**)&ffn_u_L[7], N_FFN * 4);
         A((void**)&h_next7, N_EMBD * 4);
-        xqH = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_h, 4); A((void**)&d_pos_m7, 4); A((void**)&d_draft7, 4);
-        A((void**)&d_vh, 4);
+        xq_L[7] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[7], 4); A((void**)&d_pos_m7, 4); A((void**)&d_draft7, 4);
+        A((void**)&d_v_L[7], 4);
         // width-12 lanes (i..l): verify columns 9..12, no h_next/pos_m (the
         // MTP chain stays <= depth 7; these lanes are suffix-fed in P1).
         // d_draft8..11 + d_v* are memset once: k_finish_round dereferences
         // every slot unconditionally, and until P1 captures widths > 8
         // nothing else writes the new draft slots.
-        A((void**)&h_i, N_EMBD * 4); A((void**)&x1_i, N_EMBD * 4); A((void**)&y_i, N_EMBD * 4);
-        A((void**)&qg_i, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_i, N_KV * HEAD_DIM * 4); A((void**)&vbuf_i, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_i, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_i, GDN_CH * 4); A((void**)&convout_i, GDN_CH * 4);
-        A((void**)&z_i, GDN_V * 4);
-        A((void**)&alpha_i, GDN_HEADS * 4); A((void**)&betar_i, GDN_HEADS * 4);
-        A((void**)&g_i, GDN_HEADS * 4); A((void**)&beta_i, GDN_HEADS * 4);
-        A((void**)&o_i, GDN_V * 4); A((void**)&og_i, GDN_V * 4);
-        A((void**)&ffn_g_i, N_FFN * 4); A((void**)&ffn_u_i, N_FFN * 4);
-        xqI = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_i, 4); A((void**)&d_draft8, 4); A((void**)&d_vi, 4);
-        A((void**)&h_j, N_EMBD * 4); A((void**)&x1_j, N_EMBD * 4); A((void**)&y_j, N_EMBD * 4);
-        A((void**)&qg_j, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_j, N_KV * HEAD_DIM * 4); A((void**)&vbuf_j, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_j, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_j, GDN_CH * 4); A((void**)&convout_j, GDN_CH * 4);
-        A((void**)&z_j, GDN_V * 4);
-        A((void**)&alpha_j, GDN_HEADS * 4); A((void**)&betar_j, GDN_HEADS * 4);
-        A((void**)&g_j, GDN_HEADS * 4); A((void**)&beta_j, GDN_HEADS * 4);
-        A((void**)&o_j, GDN_V * 4); A((void**)&og_j, GDN_V * 4);
-        A((void**)&ffn_g_j, N_FFN * 4); A((void**)&ffn_u_j, N_FFN * 4);
-        xqJ = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_j, 4); A((void**)&d_draft9, 4); A((void**)&d_vj, 4);
-        A((void**)&h_k, N_EMBD * 4); A((void**)&x1_k, N_EMBD * 4); A((void**)&y_k, N_EMBD * 4);
-        A((void**)&qg_k, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_k, N_KV * HEAD_DIM * 4); A((void**)&vbuf_k, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_k, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_k, GDN_CH * 4); A((void**)&convout_k, GDN_CH * 4);
-        A((void**)&z_k, GDN_V * 4);
-        A((void**)&alpha_k, GDN_HEADS * 4); A((void**)&betar_k, GDN_HEADS * 4);
-        A((void**)&g_k, GDN_HEADS * 4); A((void**)&beta_k, GDN_HEADS * 4);
-        A((void**)&o_k, GDN_V * 4); A((void**)&og_k, GDN_V * 4);
-        A((void**)&ffn_g_k, N_FFN * 4); A((void**)&ffn_u_k, N_FFN * 4);
-        xqK = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_k, 4); A((void**)&d_draft10, 4); A((void**)&d_vk, 4);
-        A((void**)&h_l, N_EMBD * 4); A((void**)&x1_l, N_EMBD * 4); A((void**)&y_l, N_EMBD * 4);
-        A((void**)&qg_l, 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_l, N_KV * HEAD_DIM * 4); A((void**)&vbuf_l, N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_l, N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_l, GDN_CH * 4); A((void**)&convout_l, GDN_CH * 4);
-        A((void**)&z_l, GDN_V * 4);
-        A((void**)&alpha_l, GDN_HEADS * 4); A((void**)&betar_l, GDN_HEADS * 4);
-        A((void**)&g_l, GDN_HEADS * 4); A((void**)&beta_l, GDN_HEADS * 4);
-        A((void**)&o_l, GDN_V * 4); A((void**)&og_l, GDN_V * 4);
-        A((void**)&ffn_g_l, N_FFN * 4); A((void**)&ffn_u_l, N_FFN * 4);
-        xqL = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_l, 4); A((void**)&d_draft11, 4); A((void**)&d_vl, 4);
+        A((void**)&h_L[8], N_EMBD * 4); A((void**)&x1_L[8], N_EMBD * 4); A((void**)&y_L[8], N_EMBD * 4);
+        A((void**)&qg_L[8], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[8], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[8], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[8], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[8], GDN_CH * 4); A((void**)&convout_L[8], GDN_CH * 4);
+        A((void**)&z_L[8], GDN_V * 4);
+        A((void**)&alpha_L[8], GDN_HEADS * 4); A((void**)&betar_L[8], GDN_HEADS * 4);
+        A((void**)&g_L[8], GDN_HEADS * 4); A((void**)&beta_L[8], GDN_HEADS * 4);
+        A((void**)&o_L[8], GDN_V * 4); A((void**)&og_L[8], GDN_V * 4);
+        A((void**)&ffn_g_L[8], N_FFN * 4); A((void**)&ffn_u_L[8], N_FFN * 4);
+        xq_L[8] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[8], 4); A((void**)&d_draft8, 4); A((void**)&d_v_L[8], 4);
+        A((void**)&h_L[9], N_EMBD * 4); A((void**)&x1_L[9], N_EMBD * 4); A((void**)&y_L[9], N_EMBD * 4);
+        A((void**)&qg_L[9], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[9], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[9], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[9], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[9], GDN_CH * 4); A((void**)&convout_L[9], GDN_CH * 4);
+        A((void**)&z_L[9], GDN_V * 4);
+        A((void**)&alpha_L[9], GDN_HEADS * 4); A((void**)&betar_L[9], GDN_HEADS * 4);
+        A((void**)&g_L[9], GDN_HEADS * 4); A((void**)&beta_L[9], GDN_HEADS * 4);
+        A((void**)&o_L[9], GDN_V * 4); A((void**)&og_L[9], GDN_V * 4);
+        A((void**)&ffn_g_L[9], N_FFN * 4); A((void**)&ffn_u_L[9], N_FFN * 4);
+        xq_L[9] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[9], 4); A((void**)&d_draft9, 4); A((void**)&d_v_L[9], 4);
+        A((void**)&h_L[10], N_EMBD * 4); A((void**)&x1_L[10], N_EMBD * 4); A((void**)&y_L[10], N_EMBD * 4);
+        A((void**)&qg_L[10], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[10], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[10], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[10], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[10], GDN_CH * 4); A((void**)&convout_L[10], GDN_CH * 4);
+        A((void**)&z_L[10], GDN_V * 4);
+        A((void**)&alpha_L[10], GDN_HEADS * 4); A((void**)&betar_L[10], GDN_HEADS * 4);
+        A((void**)&g_L[10], GDN_HEADS * 4); A((void**)&beta_L[10], GDN_HEADS * 4);
+        A((void**)&o_L[10], GDN_V * 4); A((void**)&og_L[10], GDN_V * 4);
+        A((void**)&ffn_g_L[10], N_FFN * 4); A((void**)&ffn_u_L[10], N_FFN * 4);
+        xq_L[10] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[10], 4); A((void**)&d_draft10, 4); A((void**)&d_v_L[10], 4);
+        A((void**)&h_L[11], N_EMBD * 4); A((void**)&x1_L[11], N_EMBD * 4); A((void**)&y_L[11], N_EMBD * 4);
+        A((void**)&qg_L[11], 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_L[11], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[11], N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_L[11], N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_L[11], GDN_CH * 4); A((void**)&convout_L[11], GDN_CH * 4);
+        A((void**)&z_L[11], GDN_V * 4);
+        A((void**)&alpha_L[11], GDN_HEADS * 4); A((void**)&betar_L[11], GDN_HEADS * 4);
+        A((void**)&g_L[11], GDN_HEADS * 4); A((void**)&beta_L[11], GDN_HEADS * 4);
+        A((void**)&o_L[11], GDN_V * 4); A((void**)&og_L[11], GDN_V * 4);
+        A((void**)&ffn_g_L[11], N_FFN * 4); A((void**)&ffn_u_L[11], N_FFN * 4);
+        // lane index 0 aliases the primary lane's buffers (audit refactor):
+        // every 12-wide call site indexes one array instead of 12 names.
+        h_L[0] = h; x1_L[0] = x1; y_L[0] = y; qg_L[0] = qg; kbuf_L[0] = kbuf;
+        vbuf_L[0] = vbuf; attnout_L[0] = attnout; qkv_L[0] = qkv;
+        convout_L[0] = convout; z_L[0] = z; alpha_L[0] = alpha;
+        betar_L[0] = betar; g_L[0] = g; beta_L[0] = beta; o_L[0] = o;
+        og_L[0] = og; ffn_g_L[0] = ffn_g; ffn_u_L[0] = ffn_u;
+        xq_L[0] = xq2[0]; xq_L[1] = xq2[1];
+        xq_L[11] = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_L[11], 4); A((void**)&d_draft11, 4); A((void**)&d_v_L[11], 4);
         CUDA_CHECK(cudaMemset(d_draft8, 0, 4)); CUDA_CHECK(cudaMemset(d_draft9, 0, 4));
         CUDA_CHECK(cudaMemset(d_draft10, 0, 4)); CUDA_CHECK(cudaMemset(d_draft11, 0, 4));
-        CUDA_CHECK(cudaMemset(d_vi, 0, 4)); CUDA_CHECK(cudaMemset(d_vj, 0, 4));
-        CUDA_CHECK(cudaMemset(d_vk, 0, 4)); CUDA_CHECK(cudaMemset(d_vl, 0, 4));
-        CUDA_CHECK(cudaMemset(d_pos_i, 0, 4)); CUDA_CHECK(cudaMemset(d_pos_j, 0, 4));
-        CUDA_CHECK(cudaMemset(d_pos_k, 0, 4)); CUDA_CHECK(cudaMemset(d_pos_l, 0, 4));
+        CUDA_CHECK(cudaMemset(d_v_L[8], 0, 4)); CUDA_CHECK(cudaMemset(d_v_L[9], 0, 4));
+        CUDA_CHECK(cudaMemset(d_v_L[10], 0, 4)); CUDA_CHECK(cudaMemset(d_v_L[11], 0, 4));
+        CUDA_CHECK(cudaMemset(d_pos_L[8], 0, 4)); CUDA_CHECK(cudaMemset(d_pos_L[9], 0, 4));
+        CUDA_CHECK(cudaMemset(d_pos_L[10], 0, 4)); CUDA_CHECK(cudaMemset(d_pos_L[11], 0, 4));
         A((void**)&d_P, 4);
         A((void**)&d_outcome, OUTCOME_INTS * 4); // fixed 14: {n, t1, dr1..dr11, pending}
         CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
@@ -965,17 +943,24 @@ struct Engine {
     // dmax = # MTP drafts the draft graph produces (4 default; 5 for the gated
     // depth-5 draft graph). Capture-time only, like vw.
     int dmax = 4;
+    void qx5(const std::array<float*, W_PLUMB>& x, int cols) {
+        qx5(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], cols);
+    }
+    void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys) {
+        mm5(w, ys[0], ys[1], ys[2], ys[3], ys[4], ys[5], ys[6], ys[7], ys[8], ys[9], ys[10],
+            ys[11]);
+    }
     void qx5(const float* xa, const float* xb, const float* xc, const float* xd, const float* xe,
              const float* xf, const float* xg, const float* xh, const float* xi, const float* xj,
              const float* xk, const float* xl, int cols) {
-        q27k::XQ3 q{{xq2[0], xq2[1], xqC, xqD, xqE, xqF, xqG, xqH, xqI, xqJ, xqK, xqL}};
+        q27k::XQ3 q{{xq2[0], xq2[1], xq_L[2], xq_L[3], xq_L[4], xq_L[5], xq_L[6], xq_L[7], xq_L[8], xq_L[9], xq_L[10], xq_L[11]}};
         q27k::quantize3({{xa, xb, xc, xd, xe, xf, xg, xh, xi, xj, xk, xl}}, cols, q, stm, vw);
     }
     void mm5(const DevTensor& w, float* out_a, float* out_b, float* out_c, float* out_d,
              float* out_e, float* out_f, float* out_g, float* out_h, float* out_i, float* out_j,
              float* out_k, float* out_l) {
-        q27k::XQuant qs[W_PLUMB] = {xq2[0], xq2[1], xqC, xqD, xqE, xqF, xqG, xqH, xqI, xqJ, xqK,
-                                  xqL};
+        q27k::XQuant qs[W_PLUMB] = {xq2[0], xq2[1], xq_L[2], xq_L[3], xq_L[4], xq_L[5], xq_L[6], xq_L[7], xq_L[8], xq_L[9], xq_L[10],
+                                  xq_L[11]};
         float* const ys[W_PLUMB] = {out_a, out_b, out_c, out_d, out_e, out_f, out_g, out_h, out_i,
                                   out_j, out_k, out_l};
         if (w.dtype == DType::Q4_G64)
@@ -988,168 +973,100 @@ struct Engine {
 
     void gdn_pair(int il) {
         const float eps = EPS;
-        qx5(x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l, N_EMBD);
-        mm5(T(il, "attn_qkv.weight"), qkv, qkv_b, qkv_c, qkv_d, qkv_e, qkv_f, qkv_g, qkv_h,
-            qkv_i, qkv_j, qkv_k, qkv_l);
-        mm5(T(il, "attn_gate.weight"), z, z_b, z_c, z_d, z_e, z_f, z_g, z_h, z_i, z_j, z_k, z_l);
+        qx5(x1_L, N_EMBD);
+        mm5(T(il, "attn_qkv.weight"), qkv_L);
+        mm5(T(il, "attn_gate.weight"), z_L);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         {{x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l}},
-                         {{alpha, alpha_b, alpha_c, alpha_d, alpha_e, alpha_f, alpha_g, alpha_h,
-                           alpha_i, alpha_j, alpha_k, alpha_l}}, GDN_HEADS,
+                         LANES12(x1),
+                         LANES12(alpha), GDN_HEADS,
                          N_EMBD, stm, vw);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         {{x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l}},
-                         {{betar, betar_b, betar_c, betar_d, betar_e, betar_f, betar_g, betar_h,
-                           betar_i, betar_j, betar_k, betar_l}}, GDN_HEADS,
+                         LANES12(x1),
+                         LANES12(betar), GDN_HEADS,
                          N_EMBD, stm, vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates3({{alpha, alpha_b, alpha_c, alpha_d, alpha_e, alpha_f, alpha_g, alpha_h,
-                           alpha_i, alpha_j, alpha_k, alpha_l}},
-                         {{betar, betar_b, betar_c, betar_d, betar_e, betar_f, betar_g, betar_h,
-                           betar_i, betar_j, betar_k, betar_l}}, sa, sdt,
-                         {{g, g_b, g_c, g_d, g_e, g_f, g_g, g_h, g_i, g_j, g_k, g_l}},
-                         {{beta, beta_b, beta_c, beta_d, beta_e, beta_f, beta_g, beta_h, beta_i,
-                           beta_j, beta_k, beta_l}}, GDN_HEADS, stm, vw);
+        q27k::gdn_gates3(LANES12(alpha),
+                         LANES12(betar), sa, sdt,
+                         LANES12(g),
+                         LANES12(beta), GDN_HEADS, stm, vw);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
         // width-vw graph skips the rest, leaving their (never-read) role buffers
         // untouched. Lane a (role 0, the pending token) always runs.
-        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm);   // a
-        if (vw > 1) q27k::conv_step(RBuf(il, 0), RBuf(il, 1), qkv_b, cw, convout_b, GDN_CH, stm);
-        if (vw > 2) q27k::conv_step(RBuf(il, 1), RBuf(il, 2), qkv_c, cw, convout_c, GDN_CH, stm);
-        if (vw > 3) q27k::conv_step(RBuf(il, 2), RBuf(il, 3), qkv_d, cw, convout_d, GDN_CH, stm);
-        if (vw > 4) q27k::conv_step(RBuf(il, 3), RBuf(il, 4), qkv_e, cw, convout_e, GDN_CH, stm);
-        if (vw > 5) q27k::conv_step(RBuf(il, 4), RBuf(il, 5), qkv_f, cw, convout_f, GDN_CH, stm);
-        if (vw > 6) q27k::conv_step(RBuf(il, 5), RBuf(il, 6), qkv_g, cw, convout_g, GDN_CH, stm);
-        if (vw > 7) q27k::conv_step(RBuf(il, 6), RBuf(il, 7), qkv_h, cw, convout_h, GDN_CH, stm);
-        if (vw > 8) q27k::conv_step(RBuf(il, 7), RBuf(il, 8), qkv_i, cw, convout_i, GDN_CH, stm);
-        if (vw > 9) q27k::conv_step(RBuf(il, 8), RBuf(il, 9), qkv_j, cw, convout_j, GDN_CH, stm);
-        if (vw > 10) q27k::conv_step(RBuf(il, 9), RBuf(il, 10), qkv_k, cw, convout_k, GDN_CH, stm);
-        if (vw > 11) q27k::conv_step(RBuf(il, 10), RBuf(il, 11), qkv_l, cw, convout_l, GDN_CH, stm);
+        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm); // lane 0
+        for (int L = 1; L < vw; L++)
+            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, stm);
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
-        q27k::l2norm3({{convout, convout_b, convout_c, convout_d, convout_e, convout_f,
-                        convout_g, convout_h, convout_i, convout_j, convout_k, convout_l}}, 32,
+        q27k::l2norm3(LANES12(convout), 32,
                       GDN_DIM, eps, stm, vw);
-        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm);          // a
-        if (vw > 1) q27k::delta_step(SBuf(il, 0), SBuf(il, 1), convout_b, g_b, beta_b, o_b, stm);
-        if (vw > 2) q27k::delta_step(SBuf(il, 1), SBuf(il, 2), convout_c, g_c, beta_c, o_c, stm);
-        if (vw > 3) q27k::delta_step(SBuf(il, 2), SBuf(il, 3), convout_d, g_d, beta_d, o_d, stm);
-        if (vw > 4) q27k::delta_step(SBuf(il, 3), SBuf(il, 4), convout_e, g_e, beta_e, o_e, stm);
-        if (vw > 5) q27k::delta_step(SBuf(il, 4), SBuf(il, 5), convout_f, g_f, beta_f, o_f, stm);
-        if (vw > 6) q27k::delta_step(SBuf(il, 5), SBuf(il, 6), convout_g, g_g, beta_g, o_g, stm);
-        if (vw > 7) q27k::delta_step(SBuf(il, 6), SBuf(il, 7), convout_h, g_h, beta_h, o_h, stm);
-        if (vw > 8) q27k::delta_step(SBuf(il, 7), SBuf(il, 8), convout_i, g_i, beta_i, o_i, stm);
-        if (vw > 9) q27k::delta_step(SBuf(il, 8), SBuf(il, 9), convout_j, g_j, beta_j, o_j, stm);
-        if (vw > 10) q27k::delta_step(SBuf(il, 9), SBuf(il, 10), convout_k, g_k, beta_k, o_k, stm);
-        if (vw > 11) q27k::delta_step(SBuf(il, 10), SBuf(il, 11), convout_l, g_l, beta_l, o_l, stm);
+        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm); // lane 0
+        for (int L = 1; L < vw; L++)
+            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], stm);
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm3({{o, o_b, o_c, o_d, o_e, o_f, o_g, o_h, o_i, o_j, o_k, o_l}}, nw,
-                          {{z, z_b, z_c, z_d, z_e, z_f, z_g, z_h, z_i, z_j, z_k, z_l}},
-                          {{og, og_b, og_c, og_d, og_e, og_f, og_g, og_h, og_i, og_j, og_k,
-                            og_l}}, GDN_HEADS, GDN_DIM, eps, stm, vw);
-        qx5(og, og_b, og_c, og_d, og_e, og_f, og_g, og_h, og_i, og_j, og_k, og_l, GDN_V);
-        mm5(T(il, "ssm_out.weight"), y, y_b, y_c, y_d, y_e, y_f, y_g, y_h, y_i, y_j, y_k, y_l);
+        q27k::gated_norm3(LANES12(o), nw,
+                          LANES12(z),
+                          LANES12(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
+        qx5(og_L, GDN_V);
+        mm5(T(il, "ssm_out.weight"), y_L);
     }
 
     void attn_pair(int il) {
         int ci = attn_cache_idx[il];
-        qx5(x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l, N_EMBD);
-        mm5(T(il, "attn_q.weight"), qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j,
-            qg_k, qg_l);
+        qx5(x1_L, N_EMBD);
+        mm5(T(il, "attn_q.weight"), qg_L);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
-        q27k::rmsnorm_heads(qg, qn, qg, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 1) q27k::rmsnorm_heads(qg_b, qn, qg_b, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 2) q27k::rmsnorm_heads(qg_c, qn, qg_c, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 3) q27k::rmsnorm_heads(qg_d, qn, qg_d, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 4) q27k::rmsnorm_heads(qg_e, qn, qg_e, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 5) q27k::rmsnorm_heads(qg_f, qn, qg_f, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 6) q27k::rmsnorm_heads(qg_g, qn, qg_g, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 7) q27k::rmsnorm_heads(qg_h, qn, qg_h, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 8) q27k::rmsnorm_heads(qg_i, qn, qg_i, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 9) q27k::rmsnorm_heads(qg_j, qn, qg_j, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 10) q27k::rmsnorm_heads(qg_k, qn, qg_k, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        if (vw > 11) q27k::rmsnorm_heads(qg_l, qn, qg_l, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_k.weight"), kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h,
-            kbuf_i, kbuf_j, kbuf_k, kbuf_l);
-        q27k::rmsnorm_heads(kbuf, kn, kbuf, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 1) q27k::rmsnorm_heads(kbuf_b, kn, kbuf_b, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 2) q27k::rmsnorm_heads(kbuf_c, kn, kbuf_c, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 3) q27k::rmsnorm_heads(kbuf_d, kn, kbuf_d, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 4) q27k::rmsnorm_heads(kbuf_e, kn, kbuf_e, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 5) q27k::rmsnorm_heads(kbuf_f, kn, kbuf_f, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 6) q27k::rmsnorm_heads(kbuf_g, kn, kbuf_g, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 7) q27k::rmsnorm_heads(kbuf_h, kn, kbuf_h, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 8) q27k::rmsnorm_heads(kbuf_i, kn, kbuf_i, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 9) q27k::rmsnorm_heads(kbuf_j, kn, kbuf_j, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 10) q27k::rmsnorm_heads(kbuf_k, kn, kbuf_k, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        if (vw > 11) q27k::rmsnorm_heads(kbuf_l, kn, kbuf_l, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_v.weight"), vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h,
-            vbuf_i, vbuf_j, vbuf_k, vbuf_l);
-        q27k::IP3 P{{d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_f, d_pos_g, d_pos_h,
-                     d_pos_i, d_pos_j, d_pos_k, d_pos_l}};
-        q27k::rope3({{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k, qg_l}},
+        for (int L = 0; L < vw; L++)
+            q27k::rmsnorm_heads(qg_L[L], qn, qg_L[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
+        mm5(T(il, "attn_k.weight"), kbuf_L);
+        for (int L = 0; L < vw; L++)
+            q27k::rmsnorm_heads(kbuf_L[L], kn, kbuf_L[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
+        mm5(T(il, "attn_v.weight"), vbuf_L);
+        q27k::IP3 P LANES12(d_pos);
+        q27k::rope3(LANES12(qg),
                     N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
                     FREQ_BASE, stm, vw);
-        q27k::rope3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h, kbuf_i,
-                      kbuf_j, kbuf_k, kbuf_l}}, N_KV, HEAD_DIM, N_ROT,
+        q27k::rope3(LANES12(kbuf), N_KV, HEAD_DIM, N_ROT,
                     HEAD_DIM, P, FREQ_BASE, stm, vw);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
         // branch on kv_kind only (init-fixed, graph-capture-safe)
         if (kv_kind == KV_T3)
-            q27k::wht3({{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
-                         qg_l}}, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
+            q27k::wht3(LANES12(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
-            q27k::kv_store_t3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h,
-                                kbuf_i, kbuf_j, kbuf_k, kbuf_l}},
-                              {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h,
-                                vbuf_i, vbuf_j, vbuf_k, vbuf_l}}, kcache[ci], vcache[ci],
+            q27k::kv_store_t3(LANES12(kbuf),
+                              LANES12(vbuf), kcache[ci], vcache[ci],
                               P, N_KV, HEAD_DIM, stm, vw, /*k_plain=*/kv_kind == KV_T3V);
         else
-            q27k::kv_store3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h,
-                              kbuf_i, kbuf_j, kbuf_k, kbuf_l}},
-                            {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h,
-                              vbuf_i, vbuf_j, vbuf_k, vbuf_l}}, kcache[ci], vcache[ci],
+            q27k::kv_store3(LANES12(kbuf),
+                            LANES12(vbuf), kcache[ci], vcache[ci],
                             P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
-        q27k::attn_decode3({{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
-                             qg_l}}, 2 * HEAD_DIM, kcache[ci],
+        q27k::attn_decode3(LANES12(qg), 2 * HEAD_DIM, kcache[ci],
                            vcache[ci],
-                           {{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
-                             attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
+                           LANES12(attnout),
                            scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_kind);
         // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
         if (kv_kind >= KV_T3)
-            q27k::wht3({{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
-                         attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
+            q27k::wht3(LANES12(attnout),
                        N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
-        q27k::sigmoid_gate3({{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
-                              attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
-                            {{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
-                              qg_l}}, N_HEAD, HEAD_DIM, stm, vw);
-        qx5(attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f, attnout_g, attnout_h,
-            attnout_i, attnout_j, attnout_k, attnout_l, N_HEAD * HEAD_DIM);
-        mm5(T(il, "attn_output.weight"), y, y_b, y_c, y_d, y_e, y_f, y_g, y_h, y_i, y_j, y_k,
-            y_l);
+        q27k::sigmoid_gate3(LANES12(attnout),
+                            LANES12(qg), N_HEAD, HEAD_DIM, stm, vw);
+        qx5(attnout_L, N_HEAD * HEAD_DIM);
+        mm5(T(il, "attn_output.weight"), y_L);
     }
 
     void ffn_pair(int il) {
-        qx5(x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l, N_EMBD);
-        mm5(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e, ffn_g_f,
-            ffn_g_g, ffn_g_h, ffn_g_i, ffn_g_j, ffn_g_k, ffn_g_l);
-        mm5(T(il, "ffn_up.weight"), ffn_u, ffn_u_b, ffn_u_c, ffn_u_d, ffn_u_e, ffn_u_f, ffn_u_g,
-            ffn_u_h, ffn_u_i, ffn_u_j, ffn_u_k, ffn_u_l);
-        q27k::silu_mul3({{ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e, ffn_g_f, ffn_g_g, ffn_g_h,
-                          ffn_g_i, ffn_g_j, ffn_g_k, ffn_g_l}},
-                        {{ffn_u, ffn_u_b, ffn_u_c, ffn_u_d, ffn_u_e, ffn_u_f, ffn_u_g, ffn_u_h,
-                          ffn_u_i, ffn_u_j, ffn_u_k, ffn_u_l}}, N_FFN, stm, vw);
-        qx5(ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e, ffn_g_f, ffn_g_g, ffn_g_h, ffn_g_i,
-            ffn_g_j, ffn_g_k, ffn_g_l, N_FFN);
-        mm5(T(il, "ffn_down.weight"), y, y_b, y_c, y_d, y_e, y_f, y_g, y_h, y_i, y_j, y_k, y_l);
+        qx5(x1_L, N_EMBD);
+        mm5(T(il, "ffn_gate.weight"), ffn_g_L);
+        mm5(T(il, "ffn_up.weight"), ffn_u_L);
+        q27k::silu_mul3(LANES12(ffn_g),
+                        LANES12(ffn_u), N_FFN, stm, vw);
+        qx5(ffn_g_L, N_FFN);
+        mm5(T(il, "ffn_down.weight"), y_L);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
@@ -1176,8 +1093,7 @@ struct Engine {
     // (prep_round hit the 17-param wall). Positions 9..12 are written every
     // round but only read by graphs captured at vw > 8 (suffix widths, P1).
     q27k::WIP3 lane_pos() {
-        return {{d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_f, d_pos_g, d_pos_h, d_pos_i,
-                 d_pos_j, d_pos_k, d_pos_l}};
+        return LANES12(d_pos);
     }
     q27k::WIP3 mtp_pos() {
         return {{d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7}};
@@ -1212,12 +1128,12 @@ struct Engine {
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
                      {{d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
                        d_draft7, d_draft8, d_draft9, d_draft10, d_draft11}},
-                     N_EMBD, {{h, h_b, h_c, h_d, h_e, h_f, h_g, h_h, h_i, h_j, h_k, h_l}}, stm,
+                     N_EMBD, LANES12(h), stm,
                      vw);
-        q27k::CP3 Hc{{h, h_b, h_c, h_d, h_e, h_f, h_g, h_h, h_i, h_j, h_k, h_l}},
-            Yc{{y, y_b, y_c, y_d, y_e, y_f, y_g, y_h, y_i, y_j, y_k, y_l}};
-        q27k::P3 Hm{{h, h_b, h_c, h_d, h_e, h_f, h_g, h_h, h_i, h_j, h_k, h_l}},
-            X1m{{x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l}};
+        q27k::CP3 Hc LANES12(h),
+            Yc LANES12(y);
+        q27k::P3 Hm LANES12(h),
+            X1m LANES12(x1);
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
             q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, vw);
@@ -1231,7 +1147,7 @@ struct Engine {
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
         q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, vw);
-        qx5(x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k, x1_l, N_EMBD);
+        qx5(x1_L, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
         mm5(dm.get(vhead), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
@@ -1247,50 +1163,48 @@ struct Engine {
         // P7: slot 0 (the post-pending lane) is the constrained one; slots
         // 1-4 keep id -1 (v1 caps acceptance in-grammar instead of chasing
         // draft-dependent states the host cannot know pre-launch)
-        q27k::argmax_masked(logits2, VOCAB, d_mask_pool, mask_words, d_mask_ids, 0, d_va,
+        q27k::argmax_masked(logits2, VOCAB, d_mask_pool, mask_words, d_mask_ids, 0, d_v_L[0],
                             d_amax, stm);
         if (vw > 1)
             q27k::argmax_masked(logits2 + VOCAB, VOCAB, d_mask_pool, mask_words, d_mask_ids, 1,
-                                d_vb, d_amax, stm);
+                                d_v_L[1], d_amax, stm);
         if (vw > 2)
             q27k::argmax_masked(logits2 + 2 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 2, d_vc, d_amax, stm);
+                                d_mask_ids, 2, d_v_L[2], d_amax, stm);
         if (vw > 3)
             q27k::argmax_masked(logits2 + 3 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 3, d_vd, d_amax, stm);
+                                d_mask_ids, 3, d_v_L[3], d_amax, stm);
         if (vw > 4)
             q27k::argmax_masked(logits2 + 4 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 4, d_ve, d_amax, stm);
+                                d_mask_ids, 4, d_v_L[4], d_amax, stm);
         if (vw > 5)
             q27k::argmax_masked(logits2 + 5 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 5, d_vf, d_amax, stm);
+                                d_mask_ids, 5, d_v_L[5], d_amax, stm);
         if (vw > 6)
             q27k::argmax_masked(logits2 + 6 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 6, d_vg, d_amax, stm);
+                                d_mask_ids, 6, d_v_L[6], d_amax, stm);
         if (vw > 7)
             q27k::argmax_masked(logits2 + 7 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 7, d_vh, d_amax, stm);
+                                d_mask_ids, 7, d_v_L[7], d_amax, stm);
         if (vw > 8)
             q27k::argmax_masked(logits2 + 8 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 8, d_vi, d_amax, stm);
+                                d_mask_ids, 8, d_v_L[8], d_amax, stm);
         if (vw > 9)
             q27k::argmax_masked(logits2 + 9 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 9, d_vj, d_amax, stm);
+                                d_mask_ids, 9, d_v_L[9], d_amax, stm);
         if (vw > 10)
             q27k::argmax_masked(logits2 + 10 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 10, d_vk, d_amax, stm);
+                                d_mask_ids, 10, d_v_L[10], d_amax, stm);
         if (vw > 11)
             q27k::argmax_masked(logits2 + 11 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 11, d_vl, d_amax, stm);
+                                d_mask_ids, 11, d_v_L[11], d_amax, stm);
         // P12: a width-vw verify computed columns 0..vw-1; cap acceptance at vw-1
         // drafts so finish never commits an uncomputed lane. vw=5 => max_draft=4.
         q27k::finish_round(d_P, d_token,
                            {{d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
                              d_draft7, d_draft8, d_draft9, d_draft10, d_draft11}},
-                           {{d_va, d_vb, d_vc, d_vd, d_ve, d_vf, d_vg, d_vh, d_vi, d_vj, d_vk,
-                             d_vl}},
-                           {{x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h, x1_i, x1_j, x1_k,
-                             x1_l}},
+                           LANES12(d_v),
+                           LANES12(x1),
                            h_next, d_outcome, N_EMBD, d_accept_cap, vw - 1, stm);
     }
 
@@ -1312,7 +1226,7 @@ struct Engine {
                           d_accept_cap, vw - 1, VOCAB, d_spec, stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
         q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
-                             x1_b, x1_c, x1_d, x1_e, h_next, d_outcome, N_EMBD, stm);
+                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD, stm);
     }
 
     void spec_round_launches() {
@@ -1377,18 +1291,18 @@ struct Engine {
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6, z7 = 7;
         int z8 = 8, z9 = 9, z10 = 10, z11 = 11; // width-12 lanes i..l
         auto seed_positions = [&]() {
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &z2, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_d, &z3, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_e, &z4, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_f, &z5, 4, cudaMemcpyHostToDevice, stm)); // P12b
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_g, &z6, 4, cudaMemcpyHostToDevice, stm)); // maxd6
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_h, &z7, 4, cudaMemcpyHostToDevice, stm)); // maxd7
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_i, &z8, 4, cudaMemcpyHostToDevice, stm)); // width-12
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_j, &z9, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_k, &z10, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_l, &z11, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[0], &z0, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[1], &z1, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[2], &z2, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[3], &z3, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[4], &z4, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[5], &z5, 4, cudaMemcpyHostToDevice, stm)); // P12b
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[6], &z6, 4, cudaMemcpyHostToDevice, stm)); // maxd6
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[7], &z7, 4, cudaMemcpyHostToDevice, stm)); // maxd7
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[8], &z8, 4, cudaMemcpyHostToDevice, stm)); // width-12
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[9], &z9, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[10], &z10, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[11], &z11, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m3, &z2, 4, cudaMemcpyHostToDevice, stm));
@@ -1928,7 +1842,7 @@ struct Engine {
     // the freshly staged slot-0 mask. Everything needed is still resident:
     // per-lane GDN states / conv rings sit in the rotating role buffers (the
     // round "commits" by advancing perm, never by copying -- state-after-lane-
-    // (m-1) is old role m-1), lane hiddens in x1..x1_f, lane logits in
+    // (m-1) is old role m-1), lane hiddens in x1..x1_L[5], lane logits in
     // logits2. KV/MTP rows past the kept position are rewritten by the next
     // round. Must be called BETWEEN rounds (server on_round hook), with the
     // engage mask already staged on this stream so the re-argmax orders after
@@ -1937,8 +1851,8 @@ struct Engine {
     int refinish_round(int m, int n, int P_target) {
         perm = (perm + (m - n) + W_MAX) % W_MAX;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P_target, 4, cudaMemcpyHostToDevice, stm));
-        const float* lanes[W_PLUMB] = {x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h,
-                                     x1_i, x1_j, x1_k, x1_l};
+        const float* lanes[W_PLUMB] = {x1, x1_L[1], x1_L[2], x1_L[3], x1_L[4], x1_L[5], x1_L[6], x1_L[7],
+                                     x1_L[8], x1_L[9], x1_L[10], x1_L[11]};
         CUDA_CHECK(cudaMemcpyAsync(h_next, lanes[m - 1], (size_t)N_EMBD * 4,
                                    cudaMemcpyDeviceToDevice, stm));
         q27k::argmax_masked(logits2 + (size_t)(m - 1) * VOCAB, VOCAB, d_mask_pool, mask_words,

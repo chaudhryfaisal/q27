@@ -4654,3 +4654,26 @@ Remaining audit item, uncommissioned: collapse the 12-lane copy-paste
 state (S_spare1..11 + _b.._l vars, ~500 lines) into a struct array --
 pure refactor now that the aliasing bug is located and fixed;
 must hold canonical EXACT.
+
+## 2026-07-12 -- 12-lane copy-paste state COLLAPSED (audit item, two gated stages)
+
+Stage A: S_spare1..11 / ring_spare1..11 -> S_sp/ring_sp[W_PLUMB-1][N_LAYER]
+arrays; SBuf/RBuf 12-way ternary chains -> one index expression; alloc +
+2x memset blocks -> loops.
+Stage B: the 18 per-lane float* families (h/x1/y/qg/kbuf/vbuf/attnout/
+qkv/convout/z/alpha/betar/g/beta/o/og/ffn_g/ffn_u) x lanes b..l, plus
+d_pos_a..l, d_va..l, xqC..xqL -> std::array members with [0] aliasing
+the primary lane's pointer. 45 twelve-wide brace lists -> LANES12(F)
+macro; conv/delta/rmsnorm if-chains -> loops (launch order preserved);
+mm5/qx5 grew array overloads (the lm-head logits2-slice call keeps the
+12-arg form). Kept named: h_next2..7, d_pos_m2..7, d_draft2..11 (small,
+irregular shapes).
+
+GATES: canonical a2982c51 EXACT after EACH stage (pure pointer-identity
+refactor -- [0] aliases mean identical kernel args, loops preserve launch
+order); test_kernels ALL PASS; W8 + W12 server builds clean; server
+26K replay 176.6/177.3 t/s (pre-refactor same-day: 176.6/177.5 -- same
+basin, same speed). Net -446 lines of copy-paste (360+86); the lane
+state is now ~20 array members and 6 loops. En-route gotcha: LANES12
+next to a declarator name token-pastes (q27k::IP3 P{{...}} ->
+PLANES12) -- spaced.
