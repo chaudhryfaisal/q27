@@ -140,7 +140,9 @@ default width-12 build OOMs at graph setup on 24GB. Serve it with
 must be otherwise idle: ~2.7GB of other resident VRAM is the difference
 between boot and OOM.
 
-Pick a quant first. Three tiers, one repo -- all serve identically,
+Pick a quant first. Three tiers, one repo
+([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27))
+-- all serve identically,
 they trade decode speed for model quality:
 
 | tier | file | GPU | pick it when |
@@ -175,7 +177,11 @@ make
   --tokens "760,6511,314,9338,369" -n 128 --ctx 2048 --spec
 
 # 4. serve -- zero config; defaults resolve the full measured stack
-#    and --ctx auto-sizes to your VRAM (see Serving for escapes)
+#    and --ctx auto-sizes to your VRAM (see Serving for escapes).
+#    Binds 127.0.0.1 only: the server has NO auth. To reach it from
+#    other machines or from containers (Claude Code in docker resolves
+#    the host via the bridge, not loopback), opt in explicitly:
+#      --host 0.0.0.0
 ./build/q27-server ../models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
   ../models/qwen36-27b-mtp/qwen36-27b-mtp.tok --port 8080
 ```
