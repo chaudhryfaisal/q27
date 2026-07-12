@@ -4208,3 +4208,27 @@ Raising the auto cap for Q27_KV=turbo3 (e.g. to 262144 native) is a
 one-line change -- left for a deliberate default decision, since serving
 wall at depth and needle latency (355K prefill ~458s first-hit) belong in
 that conversation.
+
+## 2026-07-11 -- 3090 + turbo3 thunderdome: a 24GB card serves Claude Code at 131K ctx
+
+W_MAX=8 build (build/q27-server-w8, not a Makefile target), Q27_KV=turbo3,
+sm_86 => fd2 path (no fdmma), qwopus, T8 x3 via the same CC harness leg.
+
+- Fit: needs the full card -- with vox-transcriber's 2.7GB resident the W8
+  fixed stack OOMs at ANY ctx (fixed ~22.2GB measured). vox paused (Gabe
+  approved): 32K boots at 22.7GB; 131072 boots at 23.9/24.6GB. turbo3 KV
+  at 131K = 1.78GB -- fp16 (8.5GB) and even fp8 (4.5GB) CANNOT fit beside
+  the fixed stack. turbo3 is the difference between a 32K box and a 131K
+  box on this card.
+- 32K first attempt: all 3 trials died ON THE CONTEXT WALL at ~75s -- T8
+  grows past 32K by ~turn 10; the server behaved perfectly (anthropic-shaped
+  400 ctx-limit, no crash). Confirms the 07-09 "3090 caps 32K" note is a
+  KV-BYTES cap that turbo3 removes.
+- 131K run: 3/3 full sessions (509/297/466s, ~3.07M tok each), scores
+  0.55/0.52/0.54 = the T8 bimodal low mode again (hidden .198; same basin
+  class as the 5090 fp8 leg -- lottery, not hardware). Live decode over
+  197 requests: median 70.0 t/s, p90 91.6 -- consistent with the ~60 t/s
+  3090 class from 07-09, now WITH 4x the context. Wall 2-3.5x the 5090.
+VERDICT: turbo3 makes the 3090 a viable long-context CC box (131K, 70 t/s
+median). Constraint to note: the card must be dedicated (vox's 2.7GB is
+the difference between boot and OOM).
