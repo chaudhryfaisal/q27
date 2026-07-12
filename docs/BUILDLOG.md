@@ -4232,3 +4232,32 @@ sm_86 => fd2 path (no fdmma), qwopus, T8 x3 via the same CC harness leg.
 VERDICT: turbo3 makes the 3090 a viable long-context CC box (131K, 70 t/s
 median). Constraint to note: the card must be dedicated (vox's 2.7GB is
 the difference between boot and OOM).
+
+## 2026-07-11 -- 3090 head-to-head: q27+turbo3 vs llama.cpp+turbo-KV (the fork turbo3 came from)
+
+Same card (vox paused), same model family (qwopus MTP; q27 17.7GB internal
+quant vs llama Q5_K_M 19.5GB), same CC harness leg, T8 x3. llama =
+llama-cpp-turboquant fork bin (mainline-recent, --spec-type draft-mtp
+n-max 10 p-min 0.5, -fa on, single slot).
+
+Fit ladder (llama): q8_0 KV 82K OK (23.4GB, not probed higher);
+-ctk/-ctv turbo3: 65K/98K OK (23.1GB), 131K OOM -- its auto-asymmetric
+rule fired live ("GQA ratio 6:1 -- upgrading K from turbo3 to q8_0"), so
+llama's turbo3 mode on this model is q8_0-K + turbo3-V, and its 19.5GB
+weights artifact eats the rest. q27's symmetric 3-bit K+V (validated
+no-crater at GQA 6, this morning's triage) + 17.7GB weights reach 131K.
+
+T8 x3 @ each engine's max ctx:
+  q27+turbo3 @131K:   0.52/0.54/0.55 (3x low basin), walls 297-509s,
+                      decode median 70.0 t/s (p90 91.6, 197 reqs)
+  llama+turboKV @98K: 0.84/0.56/0.57 (mixed basins),  walls 242-479s,
+                      decode median 80.7 t/s (p90 112.5, 89 gens)
+Scores = basin lottery at n=3 (llama drew one high basin; the 5090
+campaigns established score-parity at scale -- scores converge to the
+model). Substantive deltas: llama +15% median decode on sm_86 (q27 has no
+fdmma leg there -- fd2 only); q27 +33% ctx ceiling (symmetric 3-bit K+V,
+i.e. the K-no-crater finding is worth exactly the 98K->131K gap here).
+READ: on Ada/Blackwell q27 wins wall via fdmma; on Ampere llama's kernels
+are stronger but its own shipped turbo-KV config can't match q27's ceiling
+because it refuses 3-bit K at GQA>=6 -- which this morning's PPL triage
+showed is over-conservative for this model.
