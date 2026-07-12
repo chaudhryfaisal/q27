@@ -4436,3 +4436,20 @@ the context lead is not cosmetic -- T8-class agentic sessions RUN OUT of
 82K on bad basins. llama's GDN context checkpoints (~400MB each, visible
 in its logs) also eat the same VRAM the KV needs. Basin draws remain
 lottery per task; the structural numbers are ctx + decode + completion.
+
+## 2026-07-12 -- sglang on Qwen3.6-27B: NO FUNCTIONAL SUPPORT (dated finding, time-boxed probe)
+
+sglang 0.5.15 (fresh venv, 5090), two checkpoints, both dead in the GDN
+weight-loader mapping:
+- Lorbus int4-AutoRound: loader DROPS `linear_attn.in_proj_ba.weight`
+  on every GDN layer ("not found in params_dict"), then the marlin GPTQ
+  repacker hard-crashes on a 96-wide projection ("size_n = 96 not
+  divisible by tile_n_size = 64").
+- rdtand NVFP4 (the SAME checkpoint vLLM serves): compressed-tensors
+  loader cannot map `linear_attn.in_proj_qkvz` ("unable to find matching
+  target").
+BF16 untestable on 32GB (54.7GB). Conclusion: sglang's qwen3.6
+hybrid-GDN support is incomplete at the quantized-checkpoint loader
+level as of 0.5.15 / 2026-07-12. No decode number is possible; the
+cross-engine pitch cites llama.cpp and vLLM (measured) and this finding
+for sglang. Probe cost: ~35 min, two launch attempts, no code written.

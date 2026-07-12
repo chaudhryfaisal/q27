@@ -10,7 +10,9 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
   over mainline llama.cpp -- whose best config crashed an agentic
   session on its own 82K context wall. vLLM measured 4.7x slower wall
   on real Claude-Code traffic (its prefix cache gets 0% reuse on this
-  hybrid-GDN architecture).
+  hybrid-GDN architecture). sglang 0.5.15 cannot load the model at all
+  (quantized-checkpoint loader gaps on the GDN layers; BUILDLOG
+  2026-07-12).
 - **turbo3 3-bit KV cache**, symmetric K+V: 13.4 KB/token, ~1% PPL,
   needle 6/6 at a 361K-token prompt, 655K context allocatable on a
   5090, two full 131K tenants at once, and a 24GB card promoted from a
