@@ -23,6 +23,7 @@
 
 #include <cstdint>
 
+#include "cuda_common.h" // kv2h (H16 fp8 tile fill)
 #include "turbo3.cuh" // T3 verify leg: block struct + stage8_e4m3
 
 namespace fdmma {
@@ -460,6 +461,324 @@ inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, 
         default: return false; // W<4 (and 13..16) stay on fd2
     }
 #undef FDMMA_CASE
+}
+
+
+// ---- H16: fp16-MMA verify variant (docs/plans/2026-07-12-fdmma-f16.md).
+// sm_80+ tensor cores: the 3090's verify leg, and an mma leg for fp16 KV
+// on any arch. Geometry, split rules, two-sided masking, online softmax,
+// and the fd2 partial epilogue are the e4m3 kernel's, verbatim. The mma
+// idioms are the f16 prefill kernel's: A-frags at kb+tg*2/+8, S->PV A-frag
+// register identity (no s_P relayout), ldmatrix.trans on natural [key][dim]
+// V rows (no s_vt transpose). Single-buffered half tiles, blocking fill
+// (v1: no cp.async -- profile before adding it); ~59KB at W8 = 1 CTA/SM on
+// sm_86, so the launcher sizes ns to one 1-CTA wave (SMs/kv_heads).
+// FMT: 0 = fp16 rows, 1 = fp8 rows (kv2h), 2 = turbo3 blocks (stage8_h2).
+constexpr int FDMMA_LDH16 = FDMMA_HD + 8; // halves; 528B rows, frag loads 16B-aligned
+
+__host__ __device__ constexpr size_t fdmma_h16_smem_bytes(int W) {
+    return ((size_t)fdmma_qrows(W) * FDMMA_LDH16 + 2ull * FDMMA_PP * FDMMA_LDH16) *
+               sizeof(__half) +
+           3 * 16 * sizeof(int) + 4 * sizeof(int);
+}
+
+static __device__ __forceinline__ uint32_t h16_h2u(__half2 h) {
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+static __device__ __forceinline__ void h16_mma(float& d0, float& d1, float& d2, float& d3,
+                                               uint32_t a0, uint32_t a1, uint32_t a2,
+                                               uint32_t a3, uint32_t b0, uint32_t b1, float c0,
+                                               float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2),
+          "f"(c3));
+}
+static __device__ __forceinline__ void h16_ldm_x2_trans(uint32_t& r0, uint32_t& r1,
+                                                        const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
+template <int W, int FMT>
+__global__ void __launch_bounds__(192, 1)
+    k_attn_fdmma_h16(__grid_constant__ const FCP3 qp, int q_stride,
+                     const void* __restrict__ kc, const void* __restrict__ vc,
+                     float* __restrict__ part, __grid_constant__ const FIP3 pos,
+                     int n_kv_heads, int gqa, int head_dim, float scale) {
+    constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDH = FDMMA_LDH16;
+    constexpr int M = 6 * W;
+    constexpr int LIVE_WARPS = (M + TT - 1) / TT;
+    constexpr int QROWS = fdmma_qrows(W);
+    static_assert(W >= 2 && W <= 8, "H16 caps at W=8 (sm_86 99KB smem)");
+    const int sp = blockIdx.x, kvh = blockIdx.y;
+    const int nsp = gridDim.x;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+
+    extern __shared__ unsigned char smem_raw8[];
+    __half* s_q = (__half*)smem_raw8;              // [QROWS][LDH]
+    __half* s_k = s_q + (size_t)QROWS * LDH;       // [PP][LDH]
+    __half* s_v = s_k + (size_t)PP * LDH;          // [PP][LDH]
+    int* s_geo = (int*)(s_v + (size_t)PP * LDH);
+
+    // ---- per-lane split geometry (verbatim from k_attn_fdmma)
+    if (threadIdx.x < W) {
+        const int t = threadIdx.x;
+        const int seq = *pos.p[t] + 1;
+        const int ch = (seq + nsp - 1) / nsp;
+        const int lo = sp * ch, hi = min(seq, lo + ch);
+        s_geo[t] = lo;
+        s_geo[16 + t] = hi;
+        s_geo[32 + t] = seq;
+    }
+    if (threadIdx.x >= W && threadIdx.x < 16) {
+        s_geo[threadIdx.x] = 0; s_geo[16 + threadIdx.x] = 0; s_geo[32 + threadIdx.x] = 0;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int beg = INT_MAX, end = 0, any = 0;
+        for (int t = 0; t < W; t++)
+            if (s_geo[t] < s_geo[32 + t]) {
+                any = 1;
+                beg = min(beg, s_geo[t]);
+                end = max(end, s_geo[16 + t]);
+            }
+        s_geo[48] = any;
+        s_geo[49] = any ? (beg & ~(PP - 1)) : 0;
+        s_geo[50] = end;
+    }
+    __syncthreads();
+    if (!s_geo[48]) return;
+    const int p_beg = s_geo[49], p_end = s_geo[50];
+
+    // ---- stage Q once, fp32 -> half (less lossy than the e4m3 cast)
+    for (int idx = threadIdx.x; idx < LIVE_WARPS * TT * HD; idx += 192) {
+        const int r = idx / HD, d = idx % HD;
+        float v = 0.f;
+        if (r < M) {
+            const int t = r % W, j = r / W;
+            v = qp.p[t][(size_t)(kvh * gqa + j) * q_stride + d];
+        }
+        s_q[(size_t)r * LDH + d] = __float2half_rn(v);
+    }
+
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; i++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[i][e] = 0.f;
+    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
+
+    const int R0 = warp * TT + gid, R1 = R0 + 8;
+    const int lo0 = R0 < M ? s_geo[R0 % W] : 0, hi0 = R0 < M ? s_geo[16 + R0 % W] : 0;
+    const int lo1 = R1 < M ? s_geo[R1 % W] : 0, hi1 = R1 < M ? s_geo[16 + R1 % W] : 0;
+
+    for (int p0 = p_beg; p0 < p_end; p0 += PP) {
+        __syncthreads(); // prior tile's fragment readers are done
+        for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += 192) {
+            const int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+            const int gpos = p0 + pp;
+            __half2* kd = (__half2*)(s_k + (size_t)pp * LDH + d8);
+            __half2* vd = (__half2*)(s_v + (size_t)pp * LDH + d8);
+            if (gpos < p_end) {
+                if constexpr (FMT == 2) {
+                    const size_t rb = ((size_t)gpos * n_kv_heads + kvh) * 2;
+                    q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)kc + rb, d8, kd);
+                    q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)vc + rb, d8, vd);
+                } else if constexpr (FMT == 1) {
+                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d8;
+                    const __nv_fp8_e4m3* kr = (const __nv_fp8_e4m3*)kc + off;
+                    const __nv_fp8_e4m3* vr = (const __nv_fp8_e4m3*)vc + off;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        kd[j] = __halves2half2(kv2h(kr[2 * j]), kv2h(kr[2 * j + 1]));
+                        vd[j] = __halves2half2(kv2h(vr[2 * j]), kv2h(vr[2 * j + 1]));
+                    }
+                } else {
+                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d8;
+                    // 8 halves = 16 bytes = one uint4 (uint2 was the bug:
+                    // 4 halves copied, 4 left uninitialized -> NaN)
+                    const uint4 kw = *(const uint4*)((const __half*)kc + off);
+                    const uint4 vw = *(const uint4*)((const __half*)vc + off);
+                    *(uint4*)kd = kw;
+                    *(uint4*)vd = vw;
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    kd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                    vd[j] = kd[j];
+                }
+            }
+        }
+        __syncthreads();
+        if (warp >= LIVE_WARPS) continue;
+
+        // ---- QK^T (prefill f16 idiom over the e4m3 kernel's rows/masks)
+        float sfr[4][4];
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) sfr[n][e] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; kk++) {
+            const int kb = kk * 16;
+            uint32_t a0 = h16_h2u(*(const __half2*)(s_q + (size_t)R0 * LDH + kb + tg * 2));
+            uint32_t a1 = h16_h2u(*(const __half2*)(s_q + (size_t)R1 * LDH + kb + tg * 2));
+            uint32_t a2 = h16_h2u(*(const __half2*)(s_q + (size_t)R0 * LDH + kb + tg * 2 + 8));
+            uint32_t a3 = h16_h2u(*(const __half2*)(s_q + (size_t)R1 * LDH + kb + tg * 2 + 8));
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                uint32_t b0 =
+                    h16_h2u(*(const __half2*)(s_k + (size_t)(n * 8 + gid) * LDH + kb + tg * 2));
+                uint32_t b1 = h16_h2u(
+                    *(const __half2*)(s_k + (size_t)(n * 8 + gid) * LDH + kb + tg * 2 + 8));
+                h16_mma(sfr[n][0], sfr[n][1], sfr[n][2], sfr[n][3], a0, a1, a2, a3, b0, b1,
+                        sfr[n][0], sfr[n][1], sfr[n][2], sfr[n][3]);
+            }
+        }
+
+        // ---- two-sided mask + online softmax (verbatim from k_attn_fdmma)
+        const int a0r = lo0 - p0, b0r = hi0 - p0;
+        const int a1r = lo1 - p0, b1r = hi1 - p0;
+        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int c0 = n * 8 + tg * 2, c1 = c0 + 1;
+#pragma unroll
+            for (int e = 0; e < 4; e++) sfr[n][e] *= scale;
+            if (c0 < a0r || c0 >= b0r) sfr[n][0] = -FLT_MAX;
+            if (c1 < a0r || c1 >= b0r) sfr[n][1] = -FLT_MAX;
+            if (c0 < a1r || c0 >= b1r) sfr[n][2] = -FLT_MAX;
+            if (c1 < a1r || c1 >= b1r) sfr[n][3] = -FLT_MAX;
+            rmax0 = fmaxf(rmax0, fmaxf(sfr[n][0], sfr[n][1]));
+            rmax1 = fmaxf(rmax1, fmaxf(sfr[n][2], sfr[n][3]));
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, off));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, off));
+        }
+        const float mn0 = fmaxf(m0, rmax0), mn1 = fmaxf(m1, rmax1);
+        const float sc0 = m0 == -FLT_MAX ? 0.f : expf(m0 - mn0);
+        const float sc1 = m1 == -FLT_MAX ? 0.f : expf(m1 - mn1);
+        float rl0 = 0.f, rl1 = 0.f;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            sfr[n][0] = sfr[n][0] == -FLT_MAX ? 0.f : expf(sfr[n][0] - mn0);
+            sfr[n][1] = sfr[n][1] == -FLT_MAX ? 0.f : expf(sfr[n][1] - mn0);
+            sfr[n][2] = sfr[n][2] == -FLT_MAX ? 0.f : expf(sfr[n][2] - mn1);
+            sfr[n][3] = sfr[n][3] == -FLT_MAX ? 0.f : expf(sfr[n][3] - mn1);
+            rl0 += sfr[n][0] + sfr[n][1];
+            rl1 += sfr[n][2] + sfr[n][3];
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rl0 += __shfl_xor_sync(0xffffffff, rl0, off);
+            rl1 += __shfl_xor_sync(0xffffffff, rl1, off);
+        }
+        l0 = l0 * sc0 + rl0;
+        l1 = l1 * sc1 + rl1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            o[i][0] *= sc0;
+            o[i][1] *= sc0;
+            o[i][2] *= sc1;
+            o[i][3] *= sc1;
+        }
+
+        // ---- PV (prefill f16 idiom): S -> A-frags in registers, ldm.trans V
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            pa[h][0] = h16_h2u(__floats2half2_rn(sfr[2 * h][0], sfr[2 * h][1]));
+            pa[h][1] = h16_h2u(__floats2half2_rn(sfr[2 * h][2], sfr[2 * h][3]));
+            pa[h][2] = h16_h2u(__floats2half2_rn(sfr[2 * h + 1][0], sfr[2 * h + 1][1]));
+            pa[h][3] = h16_h2u(__floats2half2_rn(sfr[2 * h + 1][2], sfr[2 * h + 1][3]));
+        }
+#pragma unroll
+        for (int nt = 0; nt < 32; nt++) {
+            const int d0 = nt * 8;
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int kp0 = h * 16;
+                uint32_t b0, b1;
+                h16_ldm_x2_trans(b0, b1, s_v + (size_t)(kp0 + (lane & 15)) * LDH + d0);
+                h16_mma(o[nt][0], o[nt][1], o[nt][2], o[nt][3], pa[h][0], pa[h][1], pa[h][2],
+                        pa[h][3], b0, b1, o[nt][0], o[nt][1], o[nt][2], o[nt][3]);
+            }
+        }
+    }
+
+    // ---- epilogue (verbatim from k_attn_fdmma: fd2 layout + write rule)
+    if (warp >= LIVE_WARPS) return;
+#pragma unroll
+    for (int rr = 0; rr < 2; rr++) {
+        const int R = rr ? R1 : R0;
+        if (R >= M) continue;
+        const int t = R % W, j = R / W;
+        if (s_geo[t] >= s_geo[32 + t]) continue;
+        const float m = rr ? m1 : m0, l = rr ? l1 : l0;
+        const size_t pair = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
+        float* dst = part + (pair * nsp + sp) * FDMMA_ST;
+        if (tg == 0) { dst[0] = m; dst[1] = l; }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int c = n * 8 + tg * 2;
+            dst[2 + c] = o[n][rr ? 2 : 0];
+            dst[2 + c + 1] = o[n][rr ? 3 : 1];
+        }
+    }
+}
+
+template <int W, int FMT>
+inline void launch_fdmma_h16_w(FCP3 qp, int q_stride, const void* kc, const void* vc,
+                               float* part, FIP3 pos, int n_kv_heads, int gqa, int head_dim,
+                               float scale, int ns, cudaStream_t st) {
+    static bool attr = false;
+    const size_t sm = fdmma_h16_smem_bytes(W);
+    if (!attr) {
+        cudaFuncSetAttribute(k_attn_fdmma_h16<W, FMT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+        attr = true;
+    }
+    dim3 g((unsigned)ns, (unsigned)n_kv_heads);
+    k_attn_fdmma_h16<W, FMT><<<g, 192, sm, st>>>(qp, q_stride, kc, vc, part, pos, n_kv_heads,
+                                                 gqa, head_dim, scale);
+}
+
+// H16 dispatch: W 4..8 only (smem); fmt 0=fp16 1=fp8 2=turbo3.
+inline bool launch_fdmma_h16(FCP3 qp, int q_stride, const void* kc, const void* vc,
+                             float* part, FIP3 pos, int n_kv_heads, int gqa, int head_dim,
+                             float scale, int ns, int ntok, int fmt, cudaStream_t st) {
+#define FDMMA_H16_CASE(N)                                                                     \
+    case N:                                                                                   \
+        if (fmt == 2)                                                                         \
+            launch_fdmma_h16_w<N, 2>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+                                     head_dim, scale, ns, st);                                \
+        else if (fmt == 1)                                                                    \
+            launch_fdmma_h16_w<N, 1>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+                                     head_dim, scale, ns, st);                                \
+        else                                                                                  \
+            launch_fdmma_h16_w<N, 0>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+                                     head_dim, scale, ns, st);                                \
+        return true
+    switch (ntok) {
+        FDMMA_H16_CASE(4);
+        FDMMA_H16_CASE(5);
+        FDMMA_H16_CASE(6);
+        FDMMA_H16_CASE(7);
+        FDMMA_H16_CASE(8);
+        default: return false; // W<4 and 9..16 stay on fd2
+    }
+#undef FDMMA_H16_CASE
 }
 
 } // namespace fdmma

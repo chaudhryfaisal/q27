@@ -162,6 +162,11 @@ int main(int argc, char** argv) {
         if (cc_arch >= 89) {
             setenv("Q27_KV", "fp8", 0);
             setenv("Q27_FD", "mma", 0);
+        } else if (cc_arch >= 80) {
+            // H16 (fp16-MMA) verify: Ampere gets the mma path too
+            // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md); KV default
+            // stays fp16 there (no fp8 HW) -- turbo3 opt-in recommended.
+            setenv("Q27_FD", "mma", 0);
         }
         setenv("Q27_PMIN", "0.5", 0);
         setenv("Q27_MAXD", "auto7", 0);

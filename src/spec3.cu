@@ -693,7 +693,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // below); everything else falls through to fd2, so W=2..3 rounds and
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
-    if (fd && strcmp(fd, "mma") == 0 && (fp8 || kvk == KV_T3) && ntok >= 4 && ntok <= 12) {
+    if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= 12) {
         static int arch = -1;
         if (arch < 0) {
             int dev, mj, mn;
@@ -702,7 +702,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
             arch = mj * 10 + mn;
         }
-        if (arch >= 89) {
+        if (arch >= 89 && (fp8 || kvk == KV_T3)) {
             fdmma::FCP3 mq;
             fdmma::FIP3 mp;
             for (int t = 0; t < 16; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
@@ -744,6 +744,35 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
                 dim3 g2(n_q_heads, ntok);
                 k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
                                                       fdmma_ns, pos);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        } else if (arch >= 80 && ntok <= 8) {
+            // H16 (fp16-MMA) verify: sm_80..88, all KV formats (fp16 gets
+            // its first mma leg); W caps at 8 (smem). Tolerance-class like
+            // e4m3 fdmma -- engages only under Q27_FD=mma.
+            // One 1-CTA wave: ns = SMs/kv_heads (H16 is 1 CTA/SM).
+            static const int h16_ns = [n_kv_heads] {
+                if (const char* e = getenv("Q27_FDMMA_NS")) {
+                    int v = atoi(e);
+                    if (v >= 1 && v <= FD_MAXNS) return v;
+                }
+                int dev2, smc;
+                CUDA_CHECK(cudaGetDevice(&dev2));
+                CUDA_CHECK(cudaDeviceGetAttribute(&smc, cudaDevAttrMultiProcessorCount, dev2));
+                int v = smc / n_kv_heads;
+                return v < 8 ? 8 : v > FD_MAXNS ? FD_MAXNS : v;
+            }();
+            fdmma::FCP3 mq;
+            fdmma::FIP3 mp;
+            for (int t = 0; t < 16; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
+            const int fmt = kvk == KV_T3 ? 2 : kvk == KV_FP8 ? 1 : 0;
+            if (fdmma::launch_fdmma_h16(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
+                                        n_q_heads / n_kv_heads, head_dim, scale, h16_ns,
+                                        ntok, fmt, st)) {
+                dim3 g2(n_q_heads, ntok);
+                k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
+                                                      h16_ns, pos);
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }

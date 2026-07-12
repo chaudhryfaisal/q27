@@ -4328,3 +4328,48 @@ distrust, not a VRAM fact (fp8 measured to 294912 today, turbo3 to
 both fp8 and turbo3; explicit --ctx still overrides both ways. q27-eval
 now serves 262144 fp8 zero-config. Cold-prefill TTFT at full window is
 the accepted tradeoff (~4-5 min worst case at 262K).
+
+## 2026-07-12 -- fdmma-h16: fp16-MMA verify for Ampere (and fp16-KV everywhere)
+
+Goal: beat llama.cpp wall clock on 3090 thunderdome tasks (yesterday:
+llama 80.7 t/s median vs q27 70.0; the gap was fd2-only verify on sm_86).
+Sizing first: Q27_PHASE_STATS on a 3090 cctx2 replay showed verify wall =
+53% of decode. Plan: docs/plans/2026-07-12-fdmma-f16.md.
+
+SHIPPED: k_attn_fdmma_h16<W, FMT> (fdmma.cuh) -- m16n8k16.f16 MMA verify,
+sm_80+. The e4m3 kernel's geometry/split/two-sided-mask/online-softmax/
+fd2-partial-epilogue verbatim; the f16 prefill kernel's mma idioms make it
+SIMPLER than its donor: S->PV A-frag register identity (no s_P relayout)
+and ldmatrix.trans on natural V rows (no s_vt transpose). Single-buffered
+half tiles, blocking fill, ~59KB at W8 = 1 CTA/SM on sm_86; launcher ns =
+SMs/kv_heads (one 1-CTA wave). FMT covers all three KV formats landing as
+half: fp16 raw (uint4 -- uint2 first cut left 4 halves uninitialized,
+caught by the unit test as NaN via the NaN-hardened compare), fp8 kv2h,
+turbo3 stage8_h2. W 4..8 only (99KB smem cap); 9..12 fall to fd2.
+Dispatch: sm_89+ keeps e4m3 for fp8/turbo3; fp16-KV + sm_80..88 all
+formats route H16 under Q27_FD=mma. Server profile now sets Q27_FD=mma on
+cc_arch 80..88 too.
+
+GATES:
+- test_kernels ALL PASS both arches. H16-vs-fd2 rel 1.2-2.7e-3 across
+  fp16/fp8/turbo3 x W {5,8} x seq {47,4096} -- an order of magnitude
+  tighter than the e4m3 fdmma's 0.16-0.24 floor (fp16 Q and P, exact kv2h).
+- Canonical 8 legs (p4base vs new, 5090): fp16/fp8/v1/fp8mma ALL bitwise
+  EXACT (no reroll this build).
+- Sanitizer: racecheck (3090, turbo3+mma) 0 hazards; memcheck (5090,
+  fp16+mma) 0 errors. Filtered + capped per the standing rule.
+- 3090 like-for-like replay (same server config as the morning fd2
+  instrumentation, cctx2 x3): tps 90.3/93.1 -> 119.9/123.0 = +32%
+  decode; verify wall 1456-1481 -> 1096-1111 ms (-25%); dec_ms -24%.
+- Thunderdome T8 x3 @131K turbo3+mma vs yesterday's llama best
+  (98K turboKV fork, 242-479s walls, 80.7 t/s median):
+  q27-h16 @131K: 0.82 / 0.82 / 0.82 (285/304/433s, hidden .938 -- three
+  good basins vs llama's one-of-three), live decode median 102.2 t/s
+  (p90 133.2, 166 reqs, busy-agg 107.4) vs llama's 80.7 = q27 +27%,
+  flipped from -13% yesterday. Raw wall medians 304 vs 267s are
+  trajectory-confounded (q27 sessions pushed 2.84M tokens each vs llama's
+  1.48M mean -- 1.9x the work); per the standing methodology the decode
+  telemetry is the rate currency, and on matched work q27 now wins wall
+  outright. VERDICT: on Ampere, q27 beats llama's best on decode rate
+  (+27%), ctx ceiling (+33%), and basin draws (3/3 vs 1/3). Both engines
+  measured at their strongest same-day configs.
