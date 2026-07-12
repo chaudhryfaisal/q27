@@ -51,8 +51,7 @@ tables in BUILDLOG):
 - Decode @26K (server replay, constructed cctx payload, fp8 basin):
   classic config 143.0 / **full default stack 176.3 t/s** (+23%).
 - Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
-  server 400.6 t/s** -- the degenerate-echo CEILING, quoted as a bound,
-  never a headline.
+  server 400.6 t/s** -- the degenerate-echo CEILING.
 - Live Claude-Code traffic (vanilla, n=3 x {T2,T5,T8} = 9 trials, 430
   requests): **231.3 t/s aggregate**, per-request median 225 / p75 277 /
   **peak 378 t/s**; suffix drafter AL 9.4 on 37% of decode.
