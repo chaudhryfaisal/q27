@@ -4373,3 +4373,23 @@ GATES:
   outright. VERDICT: on Ampere, q27 beats llama's best on decode rate
   (+27%), ctx ceiling (+33%), and basin draws (3/3 vs 1/3). Both engines
   measured at their strongest same-day configs.
+
+## 2026-07-12 -- 3090 post-h16 profile: the round is at the weight roofline; cp.async-h16 plan KILLED by data
+
+nsys (turbo3+mma decode, 3090): GEMV weight stream = 68.4% of GPU time
+(k_gemv_q4 27.5 + q4_n 22.8 + q8 10.8 + q8_n 7.3); h16 verify attention
+0.3%, fd2_t3 wide rounds 0.4%, GDN delta_step 3.4%. ncu on k_gemv_q4:
+80.8-90.3% DRAM SOL (735-823 GB/s of 936) -- the big FFN gemvs sit at
+~90%, essentially the roofline; the small-grid attn projections at ~81%
+(sub-saturating grid, ~1-2% engine-wide if chased). The performance
+model's 85-90% efficiency assumption holds on Ampere.
+
+VERDICTS: (a) the planned cp.async double-buffer for h16 is DEAD --
+attention is 0.3% of the round, there is nothing left to hide; (b) the
+3090 decode ceiling is now weight BYTES x acceptance, nothing else. The
+two live levers: W9/W10 build probe (suffix width headroom = more
+accepted tokens per weight stream; VRAM says W10@131K turbo3 is
+borderline on 24GB) and the parked lower-bit weight policy (the only
+path to materially fewer bytes; needs its own quality-gated study).
+Standing rule reaffirmed: profile before building -- this killed a
+planned kernel change for the cost of one nsys run.
