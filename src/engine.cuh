@@ -2458,6 +2458,25 @@ struct Engine {
             gs.hit = base;
             gs.ckpt = ck;
             gs.pf = NP - base;
+            // P9 alias fix (audit, 2026-07-12): re-prefilling [base..NP)
+            // overwrites those KV rows with THIS conversation. Any cached
+            // state whose coverage extends past base and does not match the
+            // new prompt would later restore GDN state over foreign KV rows
+            // (measured: a diverged branch left ring entries that restored
+            // 4468 tokens of state over 1300+ foreign rows). Entries that
+            // ARE a prefix of the new prompt stay valid: deterministic
+            // prefill rewrites their rows with identical values.
+            auto covers_prefix = [&](const std::vector<int>& t) {
+                return t.size() <= prompt.size() &&
+                       std::equal(t.begin(), t.end(), prompt.begin());
+            };
+            for (auto& c : ckpts)
+                if (c.buf && (int)c.toks.size() > base && !covers_prefix(c.toks))
+                    c.toks.clear();
+            if (have_snap && (int)snap_toks.size() > base && !covers_prefix(snap_toks)) {
+                have_snap = false;
+                snap_toks.clear();
+            }
             if (ck >= 0) ckpt_restore(ck);
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }

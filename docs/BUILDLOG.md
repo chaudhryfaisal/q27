@@ -4624,3 +4624,33 @@ q6 212.4 (-5.5%) -> q6k 201.0 (-10.5%), consistent with the 26K replay
 ladder (shallower live mix, smaller price). Verdict: tiers are for PPL/
 robustness buyers, not task-score buyers; the default stays 5.25 bpw.
 Logs ~/.cache/tier_dome/; runs 2026-07-12T19-32-02 following.
+
+## 2026-07-12 -- P9 checkpoint-ring ALIAS FIXED (audit finding, RED/GREEN receipts)
+
+Gabe's audit pointed at the ring restore path. The bug: on a mid-history
+divergence (base > 0 via ckpt or snap hit), re-prefill overwrites KV
+rows [base..NP) with the NEW conversation, but ring entries and the
+stable snapshot whose coverage extends past base survived untouched. A
+later request matching the OLD prompt then restores GDN state over
+foreign KV rows -- silent mixed-conversation state. The serial path
+already guarded exactly this class (R1 finding, ckpt_clear on
+overwrite); the batched divergence path did not.
+
+RED (measured, Q27_CKPT_INTERVAL=64, A 4469 tok / B sharing ~1230):
+  R3 (A again after B): prefix_hit=4468 ckpt=4 -- restored A@4468 state
+  over ~1300 rows of B's KV.
+GREEN (fix): R3 prefix_hit=1024 ckpt=0 -- only the checkpoint whose
+  covered rows survived B's overwrite.
+
+Fix (engine.cuh, generate() batched path): after computing base, drop
+every ring entry and the snapshot whose coverage exceeds base UNLESS
+its tokens are a prefix of the new prompt (those rows get rewritten
+with identical values -- deterministic prefill, pf identity gates).
+Canonical a2982c51 EXACT (host-side cache-policy change only). Repro
+script scratchpad ckpt_alias_test.sh pattern recorded here: two long
+prompts sharing >1 chunk of prefix, diverge, replay the first.
+
+Remaining audit item, uncommissioned: collapse the 12-lane copy-paste
+state (S_spare1..11 + _b.._l vars, ~500 lines) into a struct array --
+pure refactor now that the aliasing bug is located and fixed;
+must hold canonical EXACT.
