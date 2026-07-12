@@ -15,8 +15,10 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 - **turbo3 3-bit KV cache**, symmetric K+V: 13.4 KB/token, ~1% PPL,
   needle 6/6 at a 361K-token prompt, 655K context allocatable on a
   5090, two full 131K tenants at once, and a 24GB card promoted from a
-  32K box to a 131K box. The fork this quant came from refuses 3-bit K
-  on this model class and caps 33% lower; we measured instead
+  32K box to a 131K box. Ported from
+  [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+  (credit where due -- the quant design is theirs); that fork refuses
+  3-bit K on this model class and caps 33% lower; we measured instead
   (K costs +0.17%).
 - **Native Anthropic Messages endpoint at Claude-Code grade**: thinking
   blocks, tool_use with input_json_delta streaming, exact
@@ -331,7 +333,8 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
   nothing. 34 KB/token, +11% decode @28.5K, PPL -0.05%, KL 3.4e-5. The
   CLI stays fp16 so the bitwise canonicals hold.
 - **turbo3 3-bit KV** (`Q27_KV=turbo3`; `turbo3v` = fp16-K diagnostic):
-  WHT-rotated 50-byte blocks per 128 dims (TurboQuant port,
+  WHT-rotated 50-byte blocks per 128 dims (ported from
+  [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant),
   src/turbo3.cuh), 13.4 KB/token. Full stack: decode, verify (fdmma
   dequant-to-e4m3 tiles), batched prefill. PPL fp16 7.317 / fp8 7.327 /
   turbo3 7.381; K costs +0.17% -- the GQA=6 K-crater the source fork
