@@ -1,8 +1,6 @@
 # Quasar
 
-A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090. One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4) -- ds4's DwarfStar is small and dense; Quasar is the same shelf pointed the other way: a compact source with outsized output.
-
-Built under the codename `q27`, which the binaries (`q27`, `q27-server`), the `Q27_*` env vars, and the `q27k` namespace keep -- so every command below is unchanged.
+A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090. One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
 **Baseline model (2026-07-09): vanilla Qwen3.6-27B-MTP** (`qwen36-27b-mtp`,
 canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate
