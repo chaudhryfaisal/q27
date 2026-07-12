@@ -53,18 +53,18 @@ tables in BUILDLOG):
   classic config 143.0 / **full default stack 176.3 t/s** (+23%).
 - Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
   server 400.6 t/s** -- the degenerate-echo CEILING.
-- Live Claude-Code traffic (vanilla, n=3 x {T2,T5,T8} = 9 trials, 430
-  requests): **231.3 t/s aggregate**, per-request median 225 / p75 277 /
+- Live Claude-Code traffic (vanilla, 9 scored task trials across 3
+  task types, 430 requests): **231.3 t/s aggregate**, per-request median 225 / p75 277 /
   **peak 378 t/s**; suffix drafter AL 9.4 on 37% of decode.
 - Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (~2200 t/s).
-- Cross-engine (2026-07-10, protocol filed 07-05: 3 trials x {T2,T5,T8}
-  per engine, both legs strongest config, same day/GPU/harness):
+- Cross-engine (2026-07-10, protocol filed 07-05: 3 scored task trials x 3 task
+  types per engine, both legs strongest config, same day/GPU/harness):
   **q27 +47% decode vs llama.cpp's best** (231.3 vs 157.4 t/s aggregate
   over 430/197 requests; medians 225 vs 155, peaks 378 vs 274; llama =
-  Q5_K_M draft-mtp10/p-min0.5/fa). Score medians converge (T2 0.83 ==
-  0.83, T5 0.78 vs 0.79) -- quality is the model's, and score parity is
+  Q5_K_M draft-mtp10/p-min0.5/fa). Score medians converge per task
+  (0.83 == 0.83; 0.78 vs 0.79) -- quality is the model's, and score parity is
   a system claim (the tolerant parser is load-bearing for BOTH engines;
-  strict parsing scores 0.000 on T8-class tasks). In-band draws q27 8/9
+  strict parsing scores 0.000 on the hardest task class). In-band draws q27 8/9
   vs llama 5/9 -- n=9 can't separate that (Fisher p~=0.29), reported
   descriptively. Wall favors q27 3-4x but is trajectory-confounded;
   decode telemetry is the rate currency. Decomposition: ~15 points of
@@ -93,8 +93,8 @@ tables in BUILDLOG):
   t/s (-11%), 26K replay 176.6 -> 169.2 (-4%). fp8 auto-ctx 196608 on a
   5090. Does NOT fit 24GB cards (fixed cost alone is 24.2 GB) -- the
   default 5.25 bpw artifact remains the 3090 answer.
-- Weight-tier decode on live CC traffic (07-12, same-day T8 x3 per
-  tier, per-request median / p90, dec>=32 requests):
+- Weight-tier decode on live CC traffic (07-12, same-day scored task
+  trials, 3 per tier, per-request median / p90, dec>=32 requests):
 
   | tier | bpw | live decode | vs default |
   |---|---|---|---|
@@ -102,7 +102,7 @@ tables in BUILDLOG):
   | q6 | 6.0 | 212.4 / 308.7 | -5.5% |
   | q6k | 6.8 | 201.0 / 317.6 | -10.5% |
 
-  T8 scores do NOT separate across tiers (basin lottery at n=3; all 9
+  Task scores do NOT separate across tiers (bimodal scoring basins at n=3; all 9
   trials completed) -- the quality tiers buy PPL margin, not task
   scores. The serving default stays 5.25 bpw.
 - Weight tier x KV format -> max context on a 32GB 5090 (auto-ctx
@@ -119,7 +119,7 @@ tables in BUILDLOG):
   GB of weights); q6k+fp8 at 114K can pinch a deep agentic session, so
   pair the quality tiers with `Q27_KV=turbo3`.
 - 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
-  at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
+  at **131K ctx**, 3/3 scored task sessions -- vs vanilla mainline llama.cpp's
   85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
   ctx** on the strongest vanilla config. Raw prefill on the 3090 goes
   the other way: llama pp8192 1355 t/s vs q27 1065-1089 (-21%; parity
@@ -198,7 +198,7 @@ Five stages shipped in one day, each gated; the full entries (and their
 negatives) are the 2026-07-10 BUILDLOG block. Headlines:
 
 - **Width-12 verify**: lanes 8 -> 12; widths 9..12 belong to the suffix
-  drafter (live T8 AL 10.61 on 61.6% of decode -- the predicted cap
+  drafter (live agentic-session AL 10.61 on 61.6% of decode -- the predicted cap
   release). Byte-identical at old widths by construction.
 - **fdmma tuned 5.6x over fd2** at 61K W12 (2-CTA STAGES=1 + computed
   split count); three orchestration negatives filed with a do-not-retry
@@ -348,9 +348,9 @@ These numbers are NOT interchangeable -- each answers a different question:
 - **Tie-lottery methodology** (the project's most subtle measurement
   concept): tolerance-class numerics changes (fp8 paths, mma, split-count)
   re-roll greedy argmax ties -- **neutral in expectation, deterministic
-  per build**. A quality flip on ONE benchmark basin (the T8 auth-gate)
+  per build**. A quality flip on ONE benchmark basin (an auth-gate scoring case)
   is therefore read via a basin MATRIX across tasks plus a re-roll on the
-  next binary, not via a single retrial: mma flipped T8 bad on the 07-10
+  next binary, not via a single retrial: mma flipped that task bad on the 07-10
   morning binaries and re-rolled GOOD (0.84-0.85) on the width-12
   binaries with the identical kernel -- per-binary lottery, not
   kernel-class steering. Acceptance-sensitive decisions must name their
@@ -659,7 +659,7 @@ docs/perf-attribution-p14.md.
 - strict-parser A/B -- **DONE 2026-07-08, verdict: NOT engine-true; the mode-1
   (dropped-wrapper) rescue is load-bearing.** `Q27_TOOL_STRICT=1` severs every
   rescue (plain-JSON wrapped calls only, bare-scan off, [q27-strict] logs count
-  suppressions). T8 CC greedy: tolerant **0.837** (12 mode-1 rescues incl. the
+  suppressions). hardest-task CC greedy: tolerant **0.837** (12 mode-1 rescues incl. the
   OPENING turn) / strict **0.000** (first-turn wrapper-less call suppressed ->
   CC one-shot-quits) / strict + `--constrain-tools` **0.549** (grammar carries
   wrapped calls, session survives 491s, but one mid-session wrapper-less turn
@@ -691,7 +691,7 @@ docs/perf-attribution-p14.md.
 - chunked-WY delta scan
 - cross-session checkpoint pool (P9 covers same-session)
 - importance-weighted scales, AWQ-style (only path left on the +3.05% PPL
-  gap -- see risk 2; Thunderdome says the gap doesn't bite on agentic coding)
+  gap -- see risk 2; scored task trials say the gap doesn't bite on agentic coding)
 - P11 split-path (`Q27_TOOL_SPLIT`): unexplained crash under accumulated
   multi-request state -- flake hunt required before any split/adaptive
   path ships; keep OFF under `--slots`
@@ -709,4 +709,4 @@ block with its numbers and negative results) lives in
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
 5. **Long-context correctness: VALIDATED to 361K (2026-07-02, fp8 KV).** Original 64K validation: (a) `--nll-long 65536` flat buckets; (b) cross-engine vs llama-perplexity +2.0% at [32K,64K) (smaller than the short-context delta, so no length-dependent divergence); (c) needle 3/3 @55K. Extended after P2 with a 783K-token corpus (War and Peace, tokenized with the model's own vocab; `--nll-long` buckets now reach 320K+): (d) fp16-vs-fp8 NLL A/B at 163840, bucket deltas within +-0.06% at ALL depths (fp8 cost does not grow with position); (e) fp8 `--nll-long 370000` single pass: buckets flat 7.2-7.6 to 256K, then a graceful +3% drift beyond the native 262K (7.89 at 256-320K, 7.69 at 320K+) -- no blowup even in RoPE-extrapolation territory; (f) needle retrieval **6/6 on a 361.5K-token haystack** (depths 35K/124K/213K/248K within native + 276K/337K BEYOND native, all exact, think traces naming surrounding chapters); (g) `--kvstats 131072`: K amax 21.7 / V amax 128.4, zero E4M3 saturation at depth. Decode at 361K depth: 19.1 t/s (fp8, spec). Caveat: each distinct long prompt is a full cold prefill (~22 min @361K) -- the GDN recurrent snapshot makes the prefix cache all-or-nothing, so mid-document divergence cannot reuse state [mitigated same-session by P9's checkpoint ring -- restore from nearest checkpoint <= divergence; cross-session pool still parked]. Risk 3 is covered to 64K by (a)+(b).
-6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). **RESOLVED for fp8 KV (P2, 2026-07-02):** the tolerance-gate machinery now exists and passed -- logit A/B vs the fp16 path (cosine 0.9995, top-1 exact, KL 3.4e-5 @512-tok prompt), corpus PPL delta -0.05%, needle 3/3 -- and fp8 ships opt-in (`Q27_KV=fp8`) with the fp16 default still bitwise-canonical. The same gate recipe applies to any future fp16/fp8 MMA decode path. **AMENDED for the g64 activation regroup (2026-07-04, policy sign-off):** batched-prefill activations now default to per-64 quantization (`Q27_PF_XG`, matching the Q4 weight group so two K=32 mmas chain in int32 before one fp dequant step). Per-64 amax changes the int8 values vs the decode path's per-32, so serial-vs-batched identity no longer holds BY DESIGN on the default path. Replacement gates: test_kernels g64-vs-exact (same quantized inputs through the dp4a exact path, rounding-noise bound), corpus PPL delta, canonical md5 (the canonical CLI run prefills serially and stays bitwise), thunderdome spot-check. `Q27_PF_XG=32` restores the exact path and the `--pf` identity gate enforces it there.
+6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). **RESOLVED for fp8 KV (P2, 2026-07-02):** the tolerance-gate machinery now exists and passed -- logit A/B vs the fp16 path (cosine 0.9995, top-1 exact, KL 3.4e-5 @512-tok prompt), corpus PPL delta -0.05%, needle 3/3 -- and fp8 ships opt-in (`Q27_KV=fp8`) with the fp16 default still bitwise-canonical. The same gate recipe applies to any future fp16/fp8 MMA decode path. **AMENDED for the g64 activation regroup (2026-07-04, policy sign-off):** batched-prefill activations now default to per-64 quantization (`Q27_PF_XG`, matching the Q4 weight group so two K=32 mmas chain in int32 before one fp dequant step). Per-64 amax changes the int8 values vs the decode path's per-32, so serial-vs-batched identity no longer holds BY DESIGN on the default path. Replacement gates: test_kernels g64-vs-exact (same quantized inputs through the dp4a exact path, rounding-noise bound), corpus PPL delta, canonical md5 (the canonical CLI run prefills serially and stays bitwise), scored-task spot-check. `Q27_PF_XG=32` restores the exact path and the `--pf` identity gate enforces it there.
