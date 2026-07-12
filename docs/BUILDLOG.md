@@ -4261,3 +4261,21 @@ READ: on Ada/Blackwell q27 wins wall via fdmma; on Ampere llama's kernels
 are stronger but its own shipped turbo-KV config can't match q27's ceiling
 because it refuses 3-bit K at GQA>=6 -- which this morning's PPL triage
 showed is over-conservative for this model.
+
+## 2026-07-11 -- turbo3 2-slot on the 5090: TWO full 131K slots, two concurrent CC sessions
+
+Q27_KV=turbo3 --slots 2 --slot1-ctx 131072: BOTH slots admitted at 131,072
+(30.6/32.6GB; per-slot KV 1.78GB x2). fp8 could never do this -- its
+2-slot config left slot 1 ~23K after the per-slot fixed cost (P10-era
+budget); turbo3 turns the second slot into a FULL-context peer.
+
+Load test: thunderdome T8 --trials 2 --parallel 2 = two concurrent CC
+sessions on one 5090 (R1b round-interleaving). Both completed, 253s/256s
+(0.83 + 0.46 -- basin lottery), vs solo turbo3 132-148s: ~1.8x per-session
+wall => 2 users in 256s vs ~280s serialized, plus zero queue latency for
+the second user. Per-request decode median under contention 103.5 t/s
+(p90 200.8 -- the interleave gaps favor whichever slot holds the GPU).
+
+READ: turbo3 makes the 5090 a genuine 2-user 131K box. Serving default
+still fp8 single-slot pending a deliberate flip; the 2-slot turbo3 config
+is validated and one flag away.
