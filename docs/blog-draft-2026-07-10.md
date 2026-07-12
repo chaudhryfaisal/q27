@@ -203,7 +203,7 @@ Until yesterday the fast configuration was six environment variables of
 tribal knowledge. Now `q27-server model.q27 model.tok` resolves the full
 measured stack -- fp8 KV, MMA attention, the confidence gate, the depth
 ladder, the suffix drafter at width 12 -- arch-gated so older GPUs fall
-back cleanly, with the context size auto-fitted to free VRAM. Every knob
+back cleanly, with the context size auto-fitted to free VRAM (capped at the 262K native window for the compact KV formats since day nine). Every knob
 keeps its override, `Q27_PROFILE=ref` restores the conservative
 reference behavior, and the CLI binary keeps reference defaults so the
 bitwise gates still mean something. The bare command on the vanilla
@@ -233,6 +233,129 @@ entire 8.9M output tokens amount to about 10.7 hours of decode at
 tonight's measured 231 t/s. The engine can now retype its own source
 history in an afternoon.
 
+## Day nine: the 3-bit KV cache
+
+Before q27 existed I had a llama.cpp fork with an experimental KV quant
+called turbo3: QuaRot-style, L2-normalize each 128-dim group, rotate it
+through a baked Walsh-Hadamard transform, then 3-bit quantize against 8
+Lloyd-Max centroids with a corrected per-block norm. 50 bytes per 128
+dims. On day nine I ported it into q27: 13.4 KB per token against fp8's
+34 and fp16's 68.
+
+The port went microtest-first. The block format, the rotation tables,
+and the quantizer were validated bit-for-bit against the fork's CPU
+reference before any engine wiring existed, and every engine kernel that
+followed was tested against the same oracle -- write a failing test,
+watch it fail, then build the kernel. The failing-test step earned its
+keep immediately: the stub run exposed that my own comparison harness
+swallowed NaNs through std::max, which means it would have passed a
+garbage kernel. The fp8 and fp16 paths held byte-identical through all
+three phases of the port; the canonical gate ran before and after every
+one.
+
+The correctness contract is the pretty part. Dequantized K equals
+rotated K, so the attention dot needs Q rotated once after rope, and the
+rotation is orthonormal so the scores are unchanged. V accumulates in
+the rotated basis and one inverse transform on the pooled output
+un-rotates everything at once. Three small kernels, no change to the
+softmax anywhere.
+
+## The finding: 3-bit K survives where its own author said it wouldn't
+
+My fork refuses to run turbo3 on K when the GQA ratio is 6 or higher --
+it silently upgrades K to q8_0, because a 7:1 model cratered to
+perplexity 2887 in early testing and the guard got written wide. This
+model sits at exactly 6.0. That guard was the single biggest open
+question in the port plan, so instead of trusting it I measured it:
+teacher-forced NLL over the same wikitext chunks, four KV configs, same
+binary.
+
+fp16 7.317, fp8 7.327, turbo3-V-only 7.368, turbo3 K+V 7.381. Quantizing
+V to 3 bits costs +0.70%. Adding 3-bit K on top costs another +0.17%.
+The crater does not exist here -- probably because at head_dim 256 the
+rotation runs over two independent 128-groups per head, each with its
+own norm. The guard is over-conservative for this model, and there is a
+number below for exactly what that conservatism costs.
+
+The rest of the quality file, so nobody has to take the PPL row on
+faith: position-bucketed NLL over a single 297K-token pass is flat and
+tracks fp8 within +0.65-1.2% in every bucket, so the delta does not
+compound with depth. Needle retrieval is 6/6 exact at a 361,513-token
+prompt, two needles past the native window -- the deepest retrieval this
+engine has produced under any KV format. And on basin-matched replay of
+a real Claude Code transcript, speculative acceptance ties fp8 to the
+third decimal: 5.818 tokens per round on both legs. The 3-bit cache
+costs the drafter nothing.
+
+Wall clock needed one more kernel. The verify-attention MMA path reads
+raw fp8 tiles, so turbo3 initially fell back to the slower register
+kernel and paid 26% at 27K context. Teaching the tile loader to expand
+blocks to e4m3 in shared memory -- the MMA math untouched -- closed
+that to -4.4% at 27K, and at 61K turbo3 comes out 9.6% ahead of fp8
+because it reads 2.56x fewer KV bytes into a bandwidth-bound kernel.
+
+Ceilings, all measured the same evening on the 5090: fp16 allocates to
+roughly 180K, fp8 to 294,912 (the estimate in the log was 285K; the
+ladder says 295), turbo3 to 655,360 -- two and a half times the native
+window, bounded by VRAM and nothing else. The serving cap that used to
+sit at 131K was a habit from the fp8 era; it now sits at the 262,144
+native window for the compact formats, and the eval server boots there
+zero-config.
+
+## What a 24GB card is for
+
+The fun demonstrations came after the gates. A 3090 running this model
+could historically serve 32K of context -- the first trial run proved
+the point by dying on the context wall at turn ten, three times out of
+three, while the server calmly returned well-formed context-limit
+errors. That cap was never compute; it was KV bytes. With turbo3 the
+same card serves Claude Code at 131K context and 70 tokens per second
+median, and completed three full agentic benchmark sessions without a
+single protocol failure. The fork the quant came from tops out at 98K
+on the same card, partly because of its heavier weight file and partly
+because of that K guard -- refusing 3-bit K at ratio 6.0 costs it
+exactly the 98K-to-131K gap. On Ampere its kernels decode 15% faster
+than mine; the engine with the measured K answer holds the context
+ceiling. I will take that trade, and both numbers are in the log.
+
+On the 5090, the same bytes buy tenancy instead: two slots at a full
+131K each, validated with pairs of concurrent Claude Code sessions.
+Light agentic tasks interleave through each other's tool-execution gaps
+and land solo-class scores at solo-class wall times, two-up. Heavy
+sustained decode splits the GPU fairly at about 1.8x per-session wall.
+There is no vLLM-style aggregate speedup hiding in there, and the log
+now has a short doc on why: this engine already spends its weight-read
+amortization on speculative width within one user -- 5.8 committed
+tokens per weight stream is the batch. Multi-slot buys capacity and
+zero-queue admission, and with fp8 the second tenant got 23K of
+context. With turbo3 both tenants are whole.
+
+## The trial that debugged the parser
+
+The first fp8-vs-turbo3 benchmark run of the evening produced garbage in
+the most instructive way available. The fp8 leg scored 0.00 three times
+in nine seconds each: the model emitted its very first tool call in a
+known malformed shape, the tolerant parser declined to rescue it, Claude
+Code saw prose with no tool call, and every session ended at turn one.
+
+The decline was the bug, and it was a designed decline. The parser
+infers a tool name for name-dropped calls by matching argument keys
+against the registered tool schemas, and refuses on a scoring tie
+because guessing wrong is worse than not rescuing. Two days ago that was
+sound. Current Claude Code registries carry property twins -- Bash and
+Monitor both take command and description -- so the orphaned arguments
+tied 4-4 and the refusal fired. What surfaced it was a benign
+accumulation-order reroll from a header change that nudged the greedy
+trajectory onto the malformed shape (see the ties section above; it
+always comes back). The fix is a tie-break: a tied candidate whose
+required parameters are absent from the arguments could never have
+validated anyway, so eliminate it, and rescue only a unique survivor.
+The exact bytes from the failing trial are now a unit test, drift mode
+catalog entry ten, and the same benchmark re-run scores normally. The
+benchmark caught a serving bug that every future harness version would
+have hit. That is the second time this week an instrument paid for
+itself; I plan to keep buying instruments.
+
 ## What's left
 
 The deep-MTP question is closed by pricing rather than building: ceilings
@@ -243,7 +366,11 @@ cost curve says the marginal is batched-GEMV-bound, so the one filed
 lever for the future is a tensor-core GEMM verify -- which happens to be
 the shape llama's ngram speculation exploits on that degenerate loop.
 If pure-echo traffic ever matters, that's the pivot, and the microbench
-for it already exists in the tree.
+for it already exists in the tree. The turbo3 follow-ons are smaller:
+the prefill tile loader reads blocks with scalar byte loads and nobody
+has profiled whether that matters at 128K, and the 3-bit cache is one
+default flip away from being the serving standard if the acceptance
+parity holds over more traffic.
 
 Everything above is reproducible from the repo: the build log carries
 every number in this post with its gate output, the negative results
