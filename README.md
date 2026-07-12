@@ -139,16 +139,28 @@ default width-12 build OOMs at graph setup on 24GB. Serve it with
 must be otherwise idle: ~2.7GB of other resident VRAM is the difference
 between boot and OOM.
 
+Pick a quant first. Three tiers, one repo -- all serve identically,
+they trade decode speed for model quality:
+
+| tier | file | GPU | pick it when |
+|---|---|---|---|
+| **default** (5.25 bpw) | `qwen36-27b-mtp.q27` | 24GB+ | you want max speed; the only tier that fits 24GB cards |
+| q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | 32GB | +0.35% PPL off Q5_K_M for ~5% slower decode |
+| q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | 32GB | quality matching the best GGUFs of this model, ~10% slower decode |
+
+Task scores measure the same across tiers (scored task trials, 07-12)
+-- the quality tiers buy perplexity margin, not benchmark wins. When in
+doubt take the default; with `Q27_KV=turbo3` every tier keeps the full
+262144-token window on a 32GB card.
+
 ```bash
-# 1. model + tokenizer from Hugging Face (~17GB; Apache-2.0)
+# 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);
+#    swap --include for the tier file you picked above
 huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
+  --include qwen36-27b-mtp.q27 qwen36-27b-mtp.tok CHECKSUMS.md5 \
   --local-dir models/qwen36-27b-mtp
 # fine-tune variant: signalnine/Qwopus3.6-27B-v2-MTP-q27
-# quality tiers (5090-class only):
-#   qwen36-27b-mtp-q6.q27  -- 6.0 bpp, +0.35% PPL vs Q5_K_M, ~10% slower
-#   qwen36-27b-mtp-q6k.q27 -- 6.8 bpp, beats/matches every measured GGUF
-#                             of this model, ~17% slower short-ctx
-# verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5)
+# verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5 --ignore-missing)
 
 # 2. build (CLI + server + test suites) -- or skip the toolchain and
 #    grab prebuilt linux x86_64 binaries (CUDA runtime statically
