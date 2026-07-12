@@ -4188,8 +4188,10 @@ Ladder (5090, CLI --spec boot + decode, W_MAX=12 build, explicit --ctx):
 196608 / 262144 / 327680 / 393216 / 458752 / 524288 / 589824 / 655360 ALL
 OK -- no OOM through the top rung (KV 8.9GB + fixed ~22.6GB = 31.5 of
 32.6GB). turbo3's ceiling is VRAM-bound around ~660K, 2.5x the 262K native
-window and ~2.3x fp8's practical max (fp8 --nll-long fit at 262144;
-297054 did not).
+window and ~2.2x fp8's practical max (MEASURED 2026-07-11 evening
+ladder, W12 build: fp8 OK at 294912, OOM at 299102 and 311296 -- so the
+earlier "297054 did not fit" line, written from VRAM math before the
+probe, happened to be right; the standing ~285K estimate was ~3% low).
 
 Position-bucket NLL (--nll-long, wikitext-2 297054 tokens, ONE pass, no
 resets): turbo3 buckets 5.02-6.13 PPL from 0-2k through 256k-320k -- FLAT
@@ -4307,3 +4309,11 @@ turbo3 does NOT lift -- GDN role sets, not KV, are the per-slot cost).
 Multi-slot's actual product: 2x full-context tenants + zero-queue
 admission + near-zero cost on bursty CC traffic (T2/T11 pairs at
 solo-class score AND wall).
+
+## 2026-07-11 -- fp8 ctx ceiling MEASURED on the 5090 (W12): 294912 OK, 299102 OOM
+
+Ladder (CLI --spec boot + decode): 262144 / 278528 / 294912 OK; 299102 and
+311296 OOM. Replaces the ~285K post-width-12 estimate (+3%). For the
+record alongside turbo3's 655360 (2.2x) and fp16's ~180K. Also corrects
+the ctx-sweep entry's untested "297054 did not fit" aside -- probed now,
+it indeed does not (barely: the boundary sits in [294912, 299102)).
