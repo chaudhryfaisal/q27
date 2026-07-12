@@ -4279,3 +4279,17 @@ the second user. Per-request decode median under contention 103.5 t/s
 READ: turbo3 makes the 5090 a genuine 2-user 131K box. Serving default
 still fp8 single-slot pending a deliberate flip; the 2-slot turbo3 config
 is validated and one flag away.
+
+## 2026-07-11 -- 2-slot turbo3 task breadth: T2 + T11 concurrent pairs
+
+Same 2x131K turbo3 config, each task run as a CONCURRENT pair (both slots
+loaded):
+  T2  (Collab Server, greenfield/complex): 0.85 / 0.84 @ 152/162s,
+      hidden tests 1.000 both -- the historical SOLO good-basin score
+      (0.851, fp8 era) at near-solo walls, two-up.
+  T11 (Debug Nightmare, bugfix/hard):      0.85 / 0.85 @ 69/70s.
+With T8's pair (0.83/0.46 @ 253/256s): six concurrent-session runs on the
+2-slot box, zero protocol/ctx failures, scores at the single-user record
+basins on T2/T11. Lighter tasks (T2/T11) barely feel the second tenant;
+T8's heavy decode shows the ~1.8x interleave cost. q27-eval restored to
+default fp8 single-slot.
