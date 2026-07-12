@@ -93,6 +93,18 @@ tables in BUILDLOG):
   t/s (-11%), 26K replay 176.6 -> 169.2 (-4%). fp8 auto-ctx 196608 on a
   5090. Does NOT fit 24GB cards (fixed cost alone is 24.2 GB) -- the
   default 5.25 bpw artifact remains the 3090 answer.
+- Weight-tier decode on live CC traffic (07-12, same-day T8 x3 per
+  tier, per-request median / p90, dec>=32 requests):
+
+  | tier | bpw | live decode | vs default |
+  |---|---|---|---|
+  | default | 5.25 | **224.7** / 328.6 t/s | -- |
+  | q6 | 6.0 | 212.4 / 308.7 | -5.5% |
+  | q6k | 6.8 | 201.0 / 317.6 | -10.5% |
+
+  T8 scores do NOT separate across tiers (basin lottery at n=3; all 9
+  trials completed) -- the quality tiers buy PPL margin, not task
+  scores. The serving default stays 5.25 bpw.
 - 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
   at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
   85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
