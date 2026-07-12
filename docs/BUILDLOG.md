@@ -4600,3 +4600,27 @@ quality, -15% depth decode). Next uncommissioned lever: attn_q
 promotion (+~0.34GB, unmeasured); AWQ-style scales remain the real
 path past uniform promotion. Losers c2/c3 + naive Q6_K deleted;
 unsloth 6-bit GGUFs kept as reference bars.
+
+## 2026-07-12 -- tier dome (T8 x3 x {v1.4, q6, q6k}, 5090, zero-config fp8): no score separation; live decode price -5.5%/-10.5%
+
+Same-day 3-leg thunderdome on the new weight tiers, model swapped under
+the same q27-eval unit/adapter, telemetry from per-request tps= lines
+(dec>=32 filter):
+
+    leg   trials (score@wall)              med   live decode med/p90 (n)
+    v1.4  0.84@155s 0.83@121s 0.23@134s*   0.83  224.7 / 328.6 (151)
+    q6    0.55@200s 0.83@322s 0.81@295s    0.81  212.4 / 308.7 (142)
+    q6k   0.83@149s 0.56@153s 0.48@130s    0.56  201.0 / 317.6 (153)
+    * v1.4 trial 3 = harness coverage-tool failure (coverage-summary.json
+      never produced; scored as 0 coverage), not a model failure.
+
+READ PER THE STANDING T8 DOCTRINE: T8 scores are bimodal basin samples
+(~0.85 vs ~0.55); good-basin draws 2/3 vs 2/3 vs 1/3 at n=3 are not
+separable (and all 9 trials passed/ran to completion). The PPL ladder
+(8.041/7.946/7.913) does NOT visibly move T8 scores -- sub-2% PPL deltas
+sit below the task-score noise floor, as expected. What the dome DID
+measure cleanly: the tiers' live-traffic decode price, v1.4 224.7 ->
+q6 212.4 (-5.5%) -> q6k 201.0 (-10.5%), consistent with the 26K replay
+ladder (shallower live mix, smaller price). Verdict: tiers are for PPL/
+robustness buyers, not task-score buyers; the default stays 5.25 bpw.
+Logs ~/.cache/tier_dome/; runs 2026-07-12T19-32-02 following.
