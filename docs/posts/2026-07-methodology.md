@@ -1,6 +1,11 @@
-# Quasar: passing my own publish gate
+# Quasar: the build log is the product
 
-*(draft -- not published. Quasar is the engine, built under the codename q27; the names are used interchangeably below.)*
+*(draft -- not published. Quasar is the engine, built under the codename
+q27; the names are used interchangeably below. The headline results
+live in two companion posts -- the 5090 speed post and the 3090/turbo3
+post; this one is about the methodology that produced them: basins,
+tie lotteries, kill criteria, and what happened when an outside audit
+pointed at my cache code.)*
 
 Day one of this project was July 2nd. A few days in I told a reviewer I
 wouldn't write this post until q27 hit at least parity with tuned
@@ -411,6 +416,47 @@ memory wall now, where the only remaining lever is reading fewer
 weight bytes -- a quantization-policy study with a quality budget, not
 a kernel afternoon. 70 to 102 tokens per second in a day, and the last
 30% of that day was spent proving there is no cheap fourth act.
+
+## The audit, the alias, and the ledger
+
+Two days after the numbers stabilized, an outside audit of the repo
+came back with four findings, ranked. Three were hygiene (an
+unauthenticated server binding all interfaces by default, a stale
+hardcoded model name, an overclaimed traceability sentence). The
+fourth was pointed at the checkpoint ring, and it was the worst CLASS
+of bug this engine can have: on a mid-history divergence, the
+re-prefill overwrote KV rows with the new conversation while ring
+entries and the snapshot covering those rows survived -- so a later
+request matching the OLD conversation could restore recurrent state
+over foreign attention rows. Silent mixed-conversation state,
+corrupting exactly the feature (the prefix cache) that carries the
+cross-engine result. No existing gate could see it: the canonical is
+CLI-serial, and the serial path's guard never covered the batched
+divergence route.
+
+The handling is the methodology in miniature. First a RED receipt:
+craft the divergence-then-replay shape, watch the buggy binary restore
+4,468 tokens of state over ~1,300 rows another conversation had
+overwritten -- measure the corruption before touching the code. Then
+the fix, scoped with a principled exception: entries that remain a
+prefix of the new prompt stay valid, because deterministic prefill
+rewrites their rows with identical values. GREEN: the replay restores
+exactly the surviving checkpoint. Canonical unchanged (host-side cache
+policy only). Shipped same day as a point release.
+
+Then the part that separates a ledger from a highlight reel: the
+exposure audit. "No published number rode the bug" has to be a checked
+claim. journald still held every [gen] line since the 10th; grepping
+for divergence-restores found 552 traversals of the alias condition --
+every single one on July 11th, live agentic sessions where Claude
+Code's subagent sidechains interleave two conversation branches on one
+engine. Every replay bench, the protocol A/B, and everything measured
+on the 12th: zero traversals, structurally clean. The July 11th
+session scores are annotated provisional in the docs until rerun. And
+the divergence-then-replay shape is now a standing gate
+(tools/ckpt_gate.sh), the same way every parser drift mode became a
+fixture: bugs earn their regression tests by demonstrating a shape,
+and the shape stays in the battery forever.
 
 ## What's left
 
