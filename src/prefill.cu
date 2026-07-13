@@ -20,16 +20,9 @@ static __device__ __forceinline__ float warp_reduce_f(float v) {
 // dp4a'd against TB tokens' activations (weight DRAM traffic /TB; activation
 // tile stays L2-resident).
 
-// reports the __CUDA_ARCH__ of the image actually loaded on this device --
-// the honest capability signal for arch-conditional instruction paths (an
-// sm_89 device running the sm_86 image must NOT enable sm_89-only code)
-__global__ void k_arch_probe(int* out) {
-#if defined(__CUDA_ARCH__)
-    *out = __CUDA_ARCH__; // 860, 890, 1200, ...
-#else
-    *out = 0;
-#endif
-}
+// Loaded-image arch probe moved to cuda_common.h (q27_loaded_image_arch) so
+// spec3.cu's fdmma dispatch can share it instead of re-deriving arch from
+// cudaDeviceGetAttribute -- see the comment there.
 
 template <int TB, int CS>
 __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
@@ -1935,22 +1928,17 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         // LOADED IMAGE, not the physical device (review follow-up 2026-07-09
         // #4): the build carries sm_86 + sm_120 SASS only, so an sm_89 device
         // (Ada) runs the sm_86 image -- where mma_e4m3 IS the no-op stub even
-        // though the device attribute says CC 8.9. k_arch_probe reports the
-        // __CUDA_ARCH__ the running image was compiled for. Cached (image
-        // doesn't change); the env is RE-READ per launch -- test_kernels
+        // though the device attribute says CC 8.9. q27_loaded_image_arch()
+        // (cuda_common.h) reports the __CUDA_ARCH__ the running image was
+        // compiled for, and is shared with spec3.cu's fdmma dispatch so this
+        // fix can't drift out of sync again. Cached (image doesn't change);
+        // the env is RE-READ per launch -- test_kernels
         // exercises both the f16-staging bitwise path (=0) and the fp8q
         // tolerance path (=1) in one process, and a getenv at launch
         // frequency (once per chunk x layer) is noise.
         static int fp8mma_arch = -1;
         if (fp8mma_arch < 0) {
-            int* d_arch = nullptr;
-            int h_arch = 0;
-            if (cudaMalloc(&d_arch, 4) == cudaSuccess) {
-                k_arch_probe<<<1, 1>>>(d_arch);
-                if (cudaMemcpy(&h_arch, d_arch, 4, cudaMemcpyDeviceToHost) != cudaSuccess)
-                    h_arch = 0;
-                cudaFree(d_arch);
-            }
+            int h_arch = q27_loaded_image_arch();
             fp8mma_arch = h_arch >= 890 ? 1 : 0;
             if (!fp8mma_arch)
                 fprintf(stderr,

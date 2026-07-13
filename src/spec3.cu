@@ -694,15 +694,19 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
     if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= 12) {
+        // Gate on the LOADED IMAGE, not the physical device (same bug class
+        // as the prefill fp8mma_arch fix, docs/BUILDLOG.md 2026-07-09 "fp8
+        // dispatch" finding -- this dispatch was added the next day and
+        // reintroduced it via cudaDeviceGetAttribute). On a build lacking a
+        // native sm_89 cubin, an Ada device reports CC 8.9 here but runs the
+        // sm_86 image, where fdmma's mma_e4m3() is an identity no-op stub --
+        // this would silently corrupt verify-attention output instead of
+        // falling back to fd2/H16. q27_loaded_image_arch() reports the
+        // __CUDA_ARCH__ actually compiled in (860/890/1200), so compare
+        // against the *100 thresholds, not the raw major*10+minor CC.
         static int arch = -1;
-        if (arch < 0) {
-            int dev, mj, mn;
-            CUDA_CHECK(cudaGetDevice(&dev));
-            CUDA_CHECK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev));
-            CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
-            arch = mj * 10 + mn;
-        }
-        if (arch >= 89 && (fp8 || kvk == KV_T3)) {
+         if (arch < 0) arch = q27_loaded_image_arch();
+         if (arch >= 890 && (fp8 || kvk == KV_T3)) {
             fdmma::FCP3 mq;
             fdmma::FIP3 mp;
             for (int t = 0; t < 16; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
@@ -747,10 +751,14 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
-        } else if (arch >= 80 && ntok <= 8) {
+        } else if (arch >= 800 && ntok <= 8) {
             // H16 (fp16-MMA) verify: sm_80..88, all KV formats (fp16 gets
             // its first mma leg); W caps at 8 (smem). Tolerance-class like
-            // e4m3 fdmma -- engages only under Q27_FD=mma.
+            // e4m3 fdmma -- engages only under Q27_FD=mma. mma.sync.m16n8k16
+            // f16 is a plain Ampere-era instruction (no e4m3/sm_89 stub
+            // involved), so unlike the branch above there was never a
+            // correctness gap here -- just fixed for consistency with the
+            // shared arch value's units (*100, not major*10+minor).
             // One 1-CTA wave: ns = SMs/kv_heads (H16 is 1 CTA/SM).
             static const int h16_ns = [n_kv_heads] {
                 if (const char* e = getenv("Q27_FDMMA_NS")) {

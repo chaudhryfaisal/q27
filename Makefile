@@ -1,8 +1,13 @@
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
 NVCC      ?= /usr/local/cuda/bin/nvcc
-# sm_120 = RTX 5090, sm_86 = RTX 3090 (fallback device for tests)
+# sm_120 = RTX 5090, sm_89 = Ada (RTX 4090, L4, L40/L40S), sm_86 = RTX 3090 /
+# A10G. sm_89 gets its own cubin so the e4m3
+# fp8-MMA paths (fdmma.cuh, prefill.cu) actually engage on Ada instead of
+# silently running as the sm_86 no-op stub under minor-version forward
+# compatibility -- see q27_loaded_image_arch() in cuda_common.h.
 NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
 .PHONY: all clean
@@ -72,3 +77,13 @@ build/q27-server-w8: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu s
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+
+BUILD_CONTAINER=q27-builder
+BUILD_IMAGE=nvidia/cuda:12.8.2-devel-ubuntu22.04
+build-in-docker:
+	@if ! docker ps -a --format '{{.Names}}' | grep -qx "$(BUILD_CONTAINER)"; then \
+		docker run -d --name $(BUILD_CONTAINER) -v $(PWD):/work -w /work ${BUILD_IMAGE} sleep infinity; \
+	elif ! docker ps --format '{{.Names}}' | grep -qx "$(CONTAINER)"; then \
+		docker start $(BUILD_CONTAINER); \
+	fi
+	docker exec $(BUILD_CONTAINER) sh -lc 'make build/q27-server-w8  NVCCFLAGS="${NVCCFLAGS}" '
