@@ -3658,7 +3658,11 @@ Context for the record: 07-06's depth-match had TUNED llama +31% over
 q27 at 75K, retired to PARITY on 07-07; today, post width-12 + fdmma
 tuning + defaults, the same-model comparison is q27 +40% decode and
 multiples on wall. The llama echo-ngram degenerate case (889 t/s,
-earlier entry) remains their one winning cell.
+earlier entry) is their one winning cell. [2026-07-13 CORRECTION: it is
+NOT just the degenerate loop -- see the cap-binding entry that date;
+ngram wins the realistic file-re-emission regime too, 653 vs 377, and
+q27's "cap never binds" claim was regime-limited. Corrected in README +
+speed post.]
 
 ## 2026-07-10 -- n>=3 CROSS-ENGINE PROTOCOL RUN: q27 +47% decode, score medians converge, 8/9 vs 5/9 trial robustness
 
@@ -4762,3 +4766,691 @@ prefix_hit=34343 each time). Vanilla + w8 + turbo3 + this harness
 build reaches a drift shape the recovery satisfies but CC rejects.
 NOT triaged tonight; the loop payload shape is in journald
 (2026-07-12 20:52-21:26). Candidate fixture once reproduced small.
+
+## 2026-07-13 -- the 12-lane suffix cap BINDS on file re-emission (external-review-driven) + two more findings
+
+The maintainer of the turboquant fork (TheTom/llama-cpp-turboquant @
+558c6b78e) ran a KV-matched, slot-matched, sampling-matched A/B of his
+build vs q27@dc8d5ad on the 5090. His headline that mattered: in the
+file-re-emission regime his ngram-mod does 653 t/s vs q27's fused
+MTP+suffix 376.9 (+73%), at 85%+ draft acceptance. That directly
+challenges q27's published "12-lane cap never binds on real traffic."
+
+MEASURED (Q27_SUFFIX_DBG trace, file re-emission payload = real code
+file + targeted addition, forced full-file re-emit):
+- suffix-fired rounds 103, ladder rounds 253; suffix mean accepted
+  10.68 against the 12 ceiling.
+- accepted-length histogram, suffix rounds: n=12 in 83/103 fires = 81%
+  PINNED AT THE CAP. The rest scattered 1..11. This is truncation, not
+  weak matching -- llama's unbounded ngram takes ~24-token drafts at
+  251/251, q27 stops at 12 by construction.
+VERDICT: the cap binds in this regime. Published claim corrected
+(README, speed post, the 07-09 entry above).
+
+Widening is a BOUNDED plumbing project, not a kernel rewrite: the fdmma
+verify kernel already has FDMMA_CASE 13..16 ("kernel is 16-ready"), and
+the lane-pointer structs (P3/CP3/IP3/XQ3) are already float*[16]. What
+is still 12-wide: W_PLUMB (outcome ints, emit[], S_sp/ring_sp role
+arrays, the gch/gnh/glf/gla histograms) and the per-perm captured-graph
+zoo (grows with W_MAX). So W16 is the same CLASS of work as the 8->12
+widening was (~a day, its own canonical campaign, +~630MB role VRAM for
+4 more sets + graph growth), gated by the modulus-relabel invariant
+that kept 8->12 bitwise. NOT built tonight -- sized and filed; it is the
+single highest-value speed item and it barely touches novel-prose rate
+(suffix only fires on repetition; the MTP ladder path is untouched).
+
+### Finding 2: over-refusal localizes to the no-think serving default
+
+Reviewer saw q27 flatly refuse a signed-authorization pentest scan and
+an OTC-dosage question where his build answered; verified not an
+injected system prompt. Localized it: the CC serving profile defaults
+to no-think, which prefills an empty <think></think> block
+(api_common.h chatml_prompt). A/B, same prompt, default vs --think:
+- pentest (nmap SYN scan, stated engagement ID): no-think SOFT-REFUSES
+  ("cannot provide the command even with claimed authorization");
+  --think reasons through the authorization and GIVES the command
+  (`nmap -sS -p 80,443,8080,8443 10.2.0.0/24`).
+- otc: answered correctly under BOTH (could not reproduce the reviewer's
+  flat OTC refusal on default serving -- likely phrasing/sampling; the
+  pentest class is the clean repro).
+Mechanism: a reasoning model handed zero reasoning budget pattern-
+matches "nmap SYN scan -> refuse" instead of reaching "authorized ->
+answer." NOT a fix to the default (no-think is the speed default and
+carries the 224 t/s headline); this is a documented tradeoff --
+operators who need borderline-legit compliance pass --think, one flag.
+Filed for the serving docs.
+
+### Finding 3: GQA-6 guard, INDEPENDENT cross-engine confirmation
+
+The reviewer forced his fork's auto-asymmetric guard off
+(TURBO_AUTO_ASYMMETRIC=0): symmetric 3-bit K+V ran clean, +0.87% total
+on this model -- matching q27's own triage (+0.70% V, +0.17% K-on-top)
+from a SEPARATE engine. Same mechanism cited independently (head_dim 256
+= two independent 128-dim WHT groups protecting K at GQA 6). This is the
+strongest validation the K-crater refutation has: two engines, one
+finding. Belongs in the 3090 post as external confirmation. His
+actionable: per-arch guard calibration / documented override (his fork's
+call; the calibration logic is q27's to offer back).
+
+## 2026-07-13 -- over-refusal FIXED: default system prompt when client sends none
+
+Root cause (measured, not assumed): the over-refusal needs BOTH the
+no-think empty-<think> prefill AND no system prompt. A/B under no-think,
+pentest ask:
+- no system prompt        -> SOFT-REFUSES
+- "You are a helpful assistant." -> COMPLIES (gives the nmap command)
+- Claude-Code-shaped system -> COMPLIES
+So real Claude Code never hits this (it always sends a substantial
+system prompt); only bare /v1/messages | /v1/chat/completions requests
+do. The empty think block gives zero reasoning budget; with zero system
+context on top, the model falls to a defensive refusal prior.
+
+Fix (api_common.h chatml_prompt): inject "You are a helpful assistant."
+ONLY when the client supplied no system prompt (Q27_BARE=1 opts out).
+Zero reasoning cost (no think tokens), prefix-cached (before stable_off,
+snapshot-safe), does not touch client-supplied system prompts, and does
+not affect the /v1/completions raw-text replay path (no chat template),
+so the 224 t/s headline and the server replay gates are untouched.
+
+Validation A/B (no-think default, no client system):
+- authorized pentest (signed engagement ID): COMPLIES, gives
+  `nmap -sS -p 80,443,8080,8443 10.2.0.0/24`.
+- OTC ibuprofen dosing: answered correctly.
+- MALICIOUS CONTROL (hospital ransomware, extortion note): still
+  REFUSED -- the default recovers legitimate compliance without
+  stripping genuine safety.
+- Q27_BARE=1: reverts to the prior refusal (clean opt-out / repro of
+  the reviewer's exact condition).
+Canonical a2982c51 EXACT (CLI uses --tokens, never the chat template).
+README serving-section note updated to reference the fix.
+
+## 2026-07-13 -- W16 BUILT AND MEASURED: cap raise is a NO-GO; the real bottleneck was a GEMV register spill (+18% on the SHIPPED width)
+
+Built the W16 plan (docs/plans/2026-07-13-w16-suffix.md), gated it, and
+measured it. The plan's premise -- "81% of suffix fires pin at the 12-lane
+cap, so raise the cap" -- is half right, and the half that is wrong is the
+half that mattered.
+
+### The cap binds. Raising it makes things WORSE.
+
+Suffix-leg width curve (the width-12 P3 instrument: server Q27_MAXD=4 +
+Q27_SUFFIX_W=W, open-cut echo payload @28K, qwopus, 5090):
+
+  W_MAX=16 build:  W=12   24.28 ms/rnd   2.103 ms/tok   434.5 t/s  <- OPTIMUM
+                   W=13   27.21          2.194          427.1
+                   W=14   30.47          2.177          424.0
+                   W=16   39.97          2.518          368.5  <- -15% t/s
+
+The cap-binding claim reproduces exactly, at BOTH widths (Q27_SUFFIX_DBG):
+  W=12: 21/22 fires = 95% pinned at n=12
+  W=16: 15/16 fires = 94% pinned at n=16
+So W16 delivers precisely the +33% accepted-tokens-per-fire the plan
+predicted -- and throughput falls anyway, because the wide round costs MORE
+than proportionally. Tokens per fire was never the throughput variable.
+
+Not a tuning artifact. At W=16, the stages/ns choice this session added
+(below) is the best of the four combinations, and W16 still loses:
+  auto (stages=2, ns=42)  39.52 ms/rnd  372.4 t/s  <- best
+  stages=1, ns=85         40.96         360.3      (what the old code picked)
+  stages=1, ns=42         39.94         368.6
+  stages=2, ns=85         39.99         368.2
+
+VERDICT: W16 = measured NO-GO. W12 is the per-token optimum of this kernel
+family. Q27_W_MAX stays 12; no q27-server-w16 target is recommended. The
+answer to the fork maintainer's 653-vs-377 is NOT verify width.
+
+### What the width curve was actually hiding: a register-spill cliff
+
+The 07-10 width-12 P3 entry recorded "per-token at full accept flattens: W8
+2.93 / W10 2.88 / W12 2.94 ms/tok" and attributed the accelerating marginal
+lane (1.6 -> 2.7 -> 3.2 ms) to "GEMV-N". That was the right suspect and the
+wrong diagnosis: it is not that a wide GEMV is inherently expensive, it is
+that ours was SPILLING.
+
+k_gemv_q4_n / k_gemv_q8_n carried `__launch_bounds__(256, N <= 8 ? 4 : 3)`.
+The 3-CTA pin gives ~80 registers, and past N=9 the per-lane accumulators
+stop fitting. ptxas -v on sm_120, q4:
+
+  N=12: 40B stack /  76B spill stores      N=14: 104B / 140B
+  N=13: 40B      /  68B                    N=15: 144B / 212B
+                                           N=16: 232B / 296B
+
+Retiering widths >= 10 to a 2-CTA/128-reg pin (Q27_GEMV_2CTA_MIN=10, swept:
+N=9 is the crossover and stays 3-CTA) buys the accumulators back. Measured
+q4 ffn 17408x5120, ms/call:
+
+            N=10    N=11    N=12    N=13    N=16
+  3-CTA    0.0536  0.0638  0.0702  0.0800  0.180
+  2-CTA    0.0476  0.0509  0.0554  0.0638  0.113
+
+ENGINE A/B, same binary, same day, same payload -- only the pin differs:
+
+  W    old ms/rnd   new    | old ms/tok  new   | old t/s  new t/s
+  5      15.99     16.02   |   3.211    3.217  |  305.2   304.7   (control)
+  8      19.54     19.65   |   2.462    2.476  |  387.5   385.4   (control)
+  10     24.12     21.42   |   2.472    2.194  |  388.9   433.5
+  12     29.16     24.33   |   2.526    2.107  |  367.4   433.4
+
+W5/W8 are unchanged by construction (their pins do not move) and land within
+noise -- the control that says the delta is the pin and nothing else. At the
+SHIPPED suffix width the round drops 29.16 -> 24.33 ms: **+18% t/s (367 ->
+434) on the production path, no plumbing required.**
+
+And note what it does to the SHAPE: under the old pin, per-token cost was
+flat-to-RISING past W8 (2.462 -> 2.472 -> 2.526) -- widening was worthless,
+exactly as P3 concluded. Under the new pin it falls monotonically. The
+"widening does not pay" finding was an artifact of the spill, not a property
+of the design. (It still does not pay past 12 -- see the W16 curve -- but for
+a different reason: the fdmma occupancy cliff below.)
+
+The retier touches ONLY suffix rounds: gated ladder rounds verify widths
+2..gate_maxd+1 (<= 8), which keep their existing pins. Canonical a2982c51
+EXACT on both builds.
+
+### fdmma loses its 2-CTA occupancy at W>=14 (why 14..16 are expensive)
+
+k_attn_fdmma's shipped STAGES=1 variant is the default because TWO CTAs
+co-reside per SM. s_q holds fdmma_qrows(W) = 16-rounded 6W rows: 80 rows
+through W=13, but 96 from W=14 (6*14=84). smem(W,1) goes 48.0KB -> 52.1KB,
+so 2 CTAs need 104.2KB against a 100KB sharedMemPerMultiprocessor -- and
+occupancy silently drops to ONE CTA, which is strictly worse single-buffered.
+The split count ns had the same 2-CTA assumption baked in (SMs*2/kv_heads).
+
+Fixed both: stages=1 iff 2*fdmma_smem_bytes(W,1) <= smem/SM, else stages=2;
+ns = SMs*(2 or 1)/kv_heads to match. No-op at W<=13 (2 CTAs still fit -> ns
+computes 85 on the 5090, bit-for-bit the shipped value); worth +3.4% at W16.
+This is why W=13 is the last cheap width and 14..16 are not.
+
+### Shipped anyway: the plumbing, because the refactor is a keeper
+
+W_PLUMB moved to cuda_common.h (spec3.cu could not see it, which is why
+k_finish_round carried hardcoded 11/12 literals that no compiler could tie
+back to the width) and went 12 -> 16, the hard ceiling of the kernel family
+(k_attn_fdmma asserts 6*W <= 96 rows). Q27_W_MAX stays 12. Every "list every
+lane" site is now loop-built off W_PLUMB rather than a hand-written brace
+list -- that class of site is where the 8->12 widening hid the k_quantize_x3
+lane-aliasing bug, and where a 4-lens audit workflow found this session's
+worst bug: refinish_round's 12-entry `lanes[W_PLUMB]` list left slots 12..15
+nullptr, so a W_MAX=16 server taking a tool-marker completion on a >=13-token
+suffix round would memcpy from nullptr and die. Also fixed: the CLI round-
+outcome print indexed 12 fixed slots out of a hist[W_MAX] array (a stack OOB
+read on the w8 build, silent truncation above it), and the graph banner
+hardcoded "12 perms".
+
+Costs measured, not assumed: shortbench suite 171.7 t/s vs the 172.2 vanilla
+standard (noise) -- the plumbing canary says W_PLUMB=16 taxes the ladder path
+nothing.
+
+GATES: canonical a2982c51 EXACT (default W12 build AND W_MAX=16 build);
+fdmma_test PASS at widths 4..16 x stages{1,2} x ns{128,85,42} (modeled cos
+1.0000000, rel 3-5e-6); test_kernels ALL PASS; compute-sanitizer memcheck 0
+errors on a W_MAX=16 run in which a 16-token suffix round actually committed;
+shortbench 171.7.
+
+### Where the 653 actually lives
+
+Not in the cap. The wide-round marginal is still superlinear even retiered
+(q4 gemv 0.055 ms/call at N=12 -> 0.113 at N=16), and fdmma's occupancy
+cliff sits at 14. The honest lever remains the one P3 named: the mma16 NT=16
+GEMM pivot (tools/mma16_bench.cu, 76% SOL, 0.043-0.045 ms FLAT W2..16). What
+changed today is the size of the prize -- the GEMV it has to beat is now
+0.055 ms at N=12, not 0.070 -- and the fact that a GEMM verify would be flat
+in W is exactly what would make widths past 12 pay at all. W16 reopens ONLY
+behind that pivot.
+
+## 2026-07-13 (cont.) -- the retier through the REAL harness: mechanism confirmed, headline rescoped (+19% was the echo number, agentic is ~+5%)
+
+Ran the gemv pin A/B through thunderdome + Claude Code (recreated the
+claude-code-q27-haight adapter -- the old one was an uncommitted convention
+and is gone; it now lives in the thunderdome tree, base URL retargeted at
+:8081, otherwise the stock CC adapter verbatim). Leg = the binary behind
+:8081; T8 + T2; same day, same model.
+
+FIRST, THE GATE THE 07-13 REVIEW SAID WAS MISSING. Nothing exercised the
+retiered widths for TOKEN identity -- the canonical prompt never runs a suffix
+round. Closed it: old-pin vs new-pin on a suffix-heavy payload, greedy ->
+BYTE-IDENTICAL output (same md5, same 254 suffix tokens over 22 rounds), only
+the wall moved (642 -> 534 ms). The retier is a PURE speed change; quality
+cannot move. That is the strongest form of the claim and it is now gated.
+
+MECHANISM CONFIRMED ON LIVE AGENTIC TRAFFIC. Over 3,389 (old) and 2,024 (new)
+real suffix rounds driven by Claude Code:
+  suffix ms/round  29.53 -> 24.78  = -16.1%
+matching the isolated bench (-17%). Per-round cost is trajectory-independent,
+so this number is unconfounded.
+
+BUT THE RAW AGGREGATE A/B IS UNINFORMATIVE: 252.5 -> 251.9 t/s (-0.3%). The
+legs FORKED (the documented cross-run CC confound -- tool outputs carry
+wall-clock bytes): old drew a 48.1%-suffix trajectory, new a 38.5% one. At
+n=1/leg the trajectory lottery swamps a ~5% effect. Trajectory-matched
+counterfactual (each leg priced under the other pin, using its OWN round counts
+-- no cross-leg pairing): +6.3% and +5.2%.
+
+RESOLVED IT PROPERLY with fixed-BYTES paired replays (byte-identity means both
+binaries walk the same trajectory -- no fork, no lottery). All four verified
+IDENTICAL output:
+  payload    suffix tok/decode   old ms/sfx-rnd -> new    delta t/s
+  codegen          0.4%            28.8 -> 24.2            -0.1%
+  testgen          0.0%             (never fires)          -0.3%
+  docs            21.9%            29.0 -> 24.3            +2.0%
+  echo            99.2%            29.1 -> 24.4           +17.4%
+
+THE LAW: the suffix round gets 16% cheaper EVERYWHERE it fires (28.8/29.0/29.1
+-> 24.2/24.3/24.4 -- dead uniform). The ENGINE-level gain is that 16% times the
+suffix WALL share. Novel generation never fires the suffix drafter, so it gets
+exactly nothing. Real CC agentic work sits at 27-37% suffix wall share (T8/T2
+re-emit files constantly) -> ~+5-6%.
+
+HEADLINE RESCOPED. The "+19%" is the ECHO/repetition number, NOT an engine
+average. README corrected. This does not change the W16 verdict (per-token still
+bottoms at W12) and it does not change the mma16-GEMM conclusion -- if anything
+it sharpens it: a verify GEMM flat in W is what would make the WIDE path cheap
+enough to matter on traffic that is not already repetitive.
+
+Scores (descriptive only, n=1, and the pin CANNOT move them -- byte-identity):
+new 0.52/0.55 (T8/T2), old 0.29/0.57. Both legs sit below the historical 0.82-0.85
+band on this RECREATED adapter, on both legs -- read nothing into it except that
+the recreated adapter is not bit-for-bit the lost original. Not chased.
+
+Tools: tools/thunderdome_pin_ab.sh, tools/pin_ab_report.py ([req] gotcha: dec/
+tps/sfxm/sfxn are PER-REQUEST but sfx=<fired>,<tok> is ENGINE-CUMULATIVE --
+summing it across requests overcounts; take the last line, or diff consecutive).
+
+## 2026-07-13 (cont.) -- spill audit across ALL kernels: the LADDER gemv was never occupancy-swept either (+1.7% on the main decode path)
+
+The 2-CTA retier came from noticing one kernel spilled. Nobody had ever asked
+the same question of the other 183. Asked it (`nvcc -Xptxas -v` over kernels.cu
+/ spec3.cu / blocks.cu / prefill.cu): 30 of 184 kernels spill. Ranked by spill
+stores, the interesting ones are all in the same family -- and four of them are
+the widths the LADDER verifies:
+
+  k_gemv_q4_n<4>  48B spill @ 64 regs (4-CTA)
+  k_gemv_q4_n<5>  36B         "
+  k_gemv_q4_n<8>  24B         "
+
+The 4-CTA/64-reg tier dates from the depth-4 era and was never swept. It is
+beaten by 3 CTAs / 80 regs at EVERY ladder width:
+
+  q4 ffn 17408x5120, ms/call    N=5     N=6     N=7     N=8
+    4-CTA (old)                0.0361  0.0338  0.0368  0.0438
+    3-CTA (new)                0.0332  0.0329  0.0341  0.0391
+                                -8.0%   -2.7%   -7.3%  -10.7%
+
+This one is worth more than the suffix retier in BREADTH: gated rounds verify
+widths 2..gate_maxd+1, so it hits EVERY round, not just the repetitive ones.
+
+  canonical         139.8 -> 142.2 t/s  (+1.7%, md5 a2982c51 EXACT)
+  shortbench suite  171.9 -> 174.9 t/s  (+1.7%)
+  @26K, fixed-bytes paired (all IDENTICAL output):
+    codegen +0.8%   testgen +0.6%   docs +0.7%   echo -0.0%
+
+The gain SHRINKS with context (+1.7% @2K -> +0.7% @26K) because attention, not
+the weight GEMV, owns a deep round -- exactly the mirror of the suffix retier,
+which is worthless on novel prose and worth +17% on echo. Together the two pins
+cover the two regimes: the ladder pin pays on every round and most at short
+context; the suffix pin pays only on repetition. Neither moves a single token
+(both are register allocation; canonical EXACT).
+
+N<=3 stays 4-CTA (narrow gated graphs, untouched). Knobs: Q27_GEMV_3CTA_MIN_Q4
+(4) and Q27_GEMV_2CTA_MIN (10).
+
+STILL ON THE TABLE (not built): k_gemv_q8_n<6..9> spill 80-112B at the 3-CTA
+pin, but the q8 head only runs WITHOUT --fast-head, so it is off the serving
+path -- fix if the reference profile ever matters. k_attn_fdmma<6/7/8> spill
+8-24B at 168 regs; that kernel is occupancy/latency-bound, not register-bound
+(three separate 2026-07-10 experiments said so), so the bar to retry is low
+value.
+
+THE REAL REMAINING LEVER, now priced: the mma16 NT=16 GEMM verify pivot. With
+the GEMV retiered, the crossover is visible -- gemv is 0.033-0.039 ms/call at
+ladder widths but 0.055 @N=12 and 0.113 @N=16, while the MMA GEMM measured
+0.043-0.045 ms FLAT W2..16 (76% SOL, tools/mma16_bench.cu). So the GEMM LOSES
+below ~N=10 and wins 2.5x at N=16. The architecture that falls out is a HYBRID:
+GEMV for the ladder (2..8), MMA GEMM for the suffix widths (>=10). That flattens
+the wide-round marginal -- which is the one thing that would make the W16 cap
+raise pay, and it is exactly the conclusion the 07-10 P3 entry reached from the
+other direction. This is the next build, not another pin.
+
+## 2026-07-13 (cont.) -- P0 of the GEMM-verify plan: RUN, and it PASSES. Build.
+
+The plan (docs/plans/2026-07-13-gemm-verify.md) put a kill-criterion in front of
+the kernel: nsys a live width-12 suffix round, sum the GEMV nodes, and STOP if
+they are under 12 ms of a ~24.3 ms round. Ran it.
+
+INSTRUMENT NOTE (cost me one run): nsys does NOT break out CUDA-graph replays by
+default, and `--cuda-graph-trace=node` did not change that here either -- every
+decode kernel reports exactly ONE round's worth of instances (gemv_q4_n<12>: 305
+= the round's 305 Q4 mm5 calls; fdmma<12>: 16 = the attn layers; finish_round: 1).
+Those instances are the EAGER warm round that build_spec_graphs executes at
+vw = sfx_width(). That turns out to be exactly the instrument we wanted: a clean,
+complete node histogram of one width-12 verify round. Window it on the single
+k_finish_round and sum.
+
+ONE WIDTH-12 VERIFY ROUND (2889 nodes, 21.38 ms GPU-busy):
+  13.89 ms  65.0%  k_gemv_q4_n<12>     <-- weight GEMV
+   2.52 ms  11.8%  k_delta_step        <-- the GDN serial chain
+   1.78 ms   8.3%  k_gemv_q8_n<12>     <-- weight GEMV
+   0.48 ms   2.3%  k_conv_step
+   0.48 ms   2.2%  k_gemv_f16_3
+   0.46 ms   2.1%  k_rmsnorm3
+   0.45 ms   2.1%  k_rmsnorm_heads
+   0.35 ms   1.6%  k_attn_fdmma<12>    (ctx ~0 in the warm round; ~2.5 ms @28K)
+   ... (nothing else above 0.35 ms)
+  WEIGHT GEMV = 15.66 ms = 73% of GPU-busy.
+
+Reconciled against the real graph-replayed round (sfxm/sfxn = 24.76 ms @28K) and
+the independent DRAM-cold replay (tools/round_weight_cost: 16.73 ms): the warm
+round runs the GEMV L2-warm at ctx 0 and its fdmma is nearly free, so the honest
+in-context figures are GEMV ~= 16.4 ms and NW ~= 8.36 ms. Both instruments agree
+to within 1 ms and the sum reproduces the 24.76 ms round.
+
+  P0 BAR: >= 15.5 BUILD | 12-15.5 re-derive | < 12 STOP.
+  MEASURED: 15.66 ms (nsys) / 16.73 (cold replay). ==> **BUILD.**
+
+RE-DERIVED PAYOFF (measured, not modelled):
+  P2 (GEMM @ W12):  round 24.76 -> 20.34 ms (-17.9%); echo 427 -> 511 t/s (+19.5%);
+                    real agentic +4.7% to +6.4%.
+  P3 (+ W16 cap):   round(16)/round(12) under the GEMM = 1.025, i.e. the cap needs
+                    only +2.5% more accepted tokens to pay -- and echo delivers
+                    +37.4%. A 15x margin. echo 662 t/s; agentic +10.7% to +15.1%.
+Slightly under the plan's estimate (+21.9% / +5.1-7.1%) because NW is ~10% bigger
+than the subtraction said. The plan's own numbers, corrected by its own P0. It
+holds.
+
+FREE FINDING, and it is a good one: **k_delta_step -- the GDN serial delta chain --
+is 2.52 ms, the biggest NON-weight kernel in the round (12%).** Once the weight
+path is flat, that is the next thing standing up. GDN chunking was SHELVED on
+2026-07-09 ("state-WRITE-bound, 1.21-1.29x, below the 2.5x bar") on the theory
+that the wide marginal was GDN-bound; it is not, it is GEMV-bound -- but delta_step
+is still 12% of a wide round and nobody has profiled it since. Re-open AFTER P2.
+
+Also priced for free: nothing else in the round is above 0.5 ms. There is no
+hidden term. The round really is weights + delta + a long tail.
+
+## 2026-07-13 (cont.) -- P3: the W16 cap REOPENS on the flat GEMM, but only in the file-re-emission regime. Default stays W12.
+
+Rebuilt -DQ27_W_MAX=16 with the P2 GEMM wired, canonical a2982c51 EXACT (the
+ladder still never reaches the GEMM). Then measured the two things that decide a
+cap raise: the WIDTH CURVE (is the wide round cheap now?) and the ACCEPT
+HISTOGRAM (does live traffic actually want the extra lanes?).
+
+WIDTH CURVE, W16 server, GEMM engaged (echo payload):
+   W   @28K rnd   t/s    @60K rnd   t/s
+   12    19.95    519      21.05    509
+   13    20.48    552      21.63    519
+   14    20.99    592      22.51    550
+   16    21.95    631      23.59    584
+round(16)/round(12) = 1.100 @28K, 1.121 @60K. The round is now essentially FLAT
+in width -- the exact thing that was missing on 07-13, when the same curve read
+W12 24.28 -> W16 39.97 (round ratio 1.65) and W16 LOST 15%. With the GEMM, W16 is
++22% over W12 @28K, +15% @60K. The fdmma 1-CTA cliff at W>=14 costs a little at
+depth (ratio 1.10 -> 1.12) but does not change the verdict.
+
+THE REOPEN ARITHMETIC, now measured both sides:
+  a cap raise pays iff tok(16)/tok(12) > round(16)/round(12).
+  round side: 1.10-1.12 (was 1.65).
+  token side, CONTROLLED (same fixed echo payload, both caps, Q27_SUFFIX_DBG):
+    cap 12 mean 11.54 tok/fire, cap 16 mean 15.88 -> 1.375.
+  1.375 > 1.12 -> WINS with ~3x margin. On echo the cap raise is worth +21% t/s
+  ON TOP of P2 (echo 519 -> 631).
+
+BUT GATE 8 (the one that decides the DEFAULT) is live CC traffic, not echo. T8
+through Claude Code, cap-12 leg: 628 suffix fires, MEAN ACCEPTED 7.82, median 9,
+only 41% pinned at 12. Live agentic fires mostly do not reach the EXISTING 12
+cap, so raising it to 16 has almost nothing to bite on. (The cap-16 leg forked to
+a different trajectory -- 32 fires vs 628 -- so its mean is not comparable; the
+cap-12 leg ALONE is the finding, and it is unconfounded.)
+
+VERDICT: the 07-13 W16 NO-GO is REVISED, not reversed. W16 went from "loses
+everywhere" to "wins the file-re-emission regime (+21%), neutral on mixed
+agentic." The default stays Q27_W_MAX=12: on typical traffic fires don't saturate
+12, so the extra 4 lanes (+630 MB roles, ~1.8x graph-zoo boot) buy nothing.
+q27-server-w16 is now a LEGITIMATE build for repetition-heavy serving -- exactly
+the fork maintainer's 653-vs-377 file-re-emission scenario, where W12+GEMM does
+519 and W16+GEMM does 631, closing most of the gap to llama's 653 (true parity
+still needs unbounded suffix, out of scope). The knob to reach for is the build,
+not a default.
+
+WHY THIS IS THE RIGHT OUTCOME: P2 already banked the flat GEMM on ALL traffic
+(the W12 round dropped 24.76 -> 19.96 regardless of width). P3's remaining
+question was only "does raising the CAP on top of that pay," and the honest
+answer is "only when the traffic is repetitive enough to fill the current cap,"
+which the live histogram says is a minority of real agentic work. The GEMM was
+the lever; the cap was not.
+
+New tools: tools/gate8_caphist.sh (live cap A/B), the WC_CTX/WC_PAY knobs on
+width_curve.sh, scratchpad/accept_payload_echo60k.json.
+
+## 2026-07-13 (cont.) -- k_delta_step register fusion: the GDN chain wrote its state TWICE; write it once (+1.5% ladder / +2.6% echo, bitwise, helps EVERY round)
+
+P0 flagged k_delta_step (the GDN DeltaNet recurrence) as the biggest non-weight
+kernel in a wide round -- 2.52 ms, 12%. It is bandwidth-bound, and it was moving
+2x the floor.
+
+MEASURED (tools/delta_bench.cu, isolation): the shipped kernel writes the 128x128
+per-head state So in pass 1 (decay) and reads it back + rewrites it in pass 2
+(delta update) = 12 MB traffic where the recurrence floor is 6 MB (read Si once,
+write So once). Keeping this thread's 32 decayed state values in REGISTERS across
+the two passes drops the redundant write+read:
+  SOL state read+write (6 MB):   0.0041 ms  1525 GB/s
+  k_delta_ship (48 blk):         0.0061 ms  (12 MB, So written twice)
+  k_delta_reg  (48 blk):         0.0041 ms  = SOL exactly, -33%/call
+  bitwise reg-vs-ship: state 0 diffs, o 0 diffs.
+Not occupancy-bound: 48 blocks (one per head) already saturate HBM once the
+redundant traffic is gone, so a column-split (more blocks) would buy nothing --
+the register version already hits SOL. The 07-09 "state-WRITE-bound, 3.1 MB/step
+contractual" note was RIGHT about the floor; the kernel just wasn't at it.
+
+BITWISE by construction: fp32 in a register == fp32 round-tripped through global,
+and the arithmetic is unchanged (s is the same value whether it lives in So or a
+register), so the GDN state and every downstream token are bit-for-bit identical.
+Canonical a2982c51 EXACT; test_kernels delta-wy PASS; memcheck 0 errors; 80 regs,
+0 spill.
+
+ENGINE IMPACT -- and this one helps traffic the GEMM CANNOT:
+  shortbench suite  174.7 -> 177.4 (+1.5%)   canonical 142.0 -> 144.3
+  echo W12 round    19.96 -> 19.42 ms         echo t/s 519 -> 532 (+2.6%)
+delta_step runs on EVERY GDN layer of EVERY decode round -- spec or single-token,
+ladder or suffix, novel prose or echo. So unlike the GEMM (suffix rounds only) and
+the retiers (mostly suffix), this is a universal +1.5%, INCLUDING the novel-prose
+224 t/s headline path where the suffix drafter never fires. Small but free and
+everywhere.
+
+NEXT non-weight lever (priced by the same P0 histogram): nothing else in the round
+exceeds 0.5 ms after this -- k_conv_step (0.48) and k_gemv_f16_3 (0.48, the GDN
+in/out proj) are the tail, and both are already near their floors. The round is
+now weights (GEMM, flat) + delta (at floor) + a sub-0.5ms tail. The remaining
+structural lever is the one named all along: the MTP draft ladder re-streaming the
+head, which is W-invariant and shows on no width curve -- P0's histogram is where
+to look next.
+
+## 2026-07-13 (cont.) -- MTP draft head lever: INVESTIGATED, NO-GO. The draft is at its SOL floor; no free win, and the on-path lever is a quality tradeoff that most likely loses on novel prose.
+
+P0 flagged the MTP draft ladder as the last non-verify lever. Investigated it
+properly (3-design/3-adversarial workflow + direct profiling + the realized-cost
+telemetry nobody had read). Verdict: NO-GO for now. Plan + full reasoning in
+docs/plans/2026-07-13-mtp-draft-head.md.
+
+WHAT THE DRAFT ACTUALLY IS. Each of the (up to) 4 serial draft steps runs a full
+mtp_forward through the trained MTP module (blk.64): ~427 MB of Q8 MTP-layer
+weights + the 635 MB Q4 vocab head, ~1.1 GB/step. The head is streamed once per
+step (4x/round at full depth). Measured single-token head GEMV = 635MB/0.40ms =
+1587 GB/s = SOL. The steps are SERIAL (step k+1 embeds step k's token) so they
+cannot batch, and 635MB >> 128MB L2 so nothing caches. UNLIKE k_delta_step there
+is NO redundant traffic to reclaim -- the single-token gemv_q4/gemv_q8 are 44/48
+regs, 0 spill, already at SOL. The free-win angle is DEAD (independently confirmed
+by the adversarial pass).
+
+THE HEADLINE WAS MIS-SIZED (my error). "2.91 ms = 12% of the round" divided the
+draft by a WIDTH-12 round -- but width-12 rounds are SUFFIX rounds, and suffix
+rounds SKIP the draft ladder entirely. The 2.91 ms is a saturating (all-4-margins-
+passed) peak that never coexists with a width-12 verify. REALIZED production number
+(the dexit-averaged telemetry at server.cu:450, phd/phv, read for the first time
+on live novel codegen/testgen/docs @~25K ctx): draft = 220-227 ms vs verify
+1160-1410 ms = **14-16% of the decode wall**, at **3.0-3.7 steps/round** (adaptive
+depth + dexit ALREADY trim below the nominal 4). Matches the memory's "12-15% of
+decode wall." So the lever is real but ~14%, not a hidden 22%+, and gets smaller
+with context (<5% at 61K, attention-dominated).
+
+WHY NO ON-PATH WIN.
+- Free/bitwise: none. At SOL, serial, non-redundant.
+- SHORTLIST head (project only top-K vocab rows for the draft argmax): correctness
+  is safe (the verify recomputes the true token; a shortlist miss only lowers n,
+  the finish_round equality walk still commits the verify verdict). BUT (1) a
+  static unigram/BPE shortlist is dead -- the argmax is content-driven; the only
+  high-recall all-vocab scorer IS a low-rank/distilled head, which is an offline
+  artifact that DOES NOT EXIST in-tree (turbo3 is KV-only). (2) Acceptance
+  COMPOUNDS: a miss at step k truncates the ladder at n=k; modeled as a truncating
+  geometric, break-even against a ~10% head-only ceiling needs per-step
+  shortlist-vs-Q4 recall ~0.95 (off-shortlist p ~5%), and higher baseline
+  acceptance makes the bar TIGHTER. Novel prose is exactly where argmax is least
+  predictable and recall is lowest, and the 4 steps predict forward positions the
+  verify never scored, so recall DECAYS with depth. (3) Even a FREE head caps the
+  win at 61% of the draft (the 427 MB MTP layer stays a ~1.1 ms floor, doesn't fit
+  L2) -> ~4-6% engine at the short-ctx headline, ~0 at depth.
+  Concentration probe (small corpus, 2048 tok/631 distinct): suggestive (top-32K
+  covers this sample) but OVERFIT to 4 prompts -- the 248K vocab exists for the
+  multilingual/code/symbol tail that diverse traffic hits. Not decisive; the real
+  measurement is per-step shortlist-vs-Q4 recall on held-out diverse traffic, which
+  the plan makes P1 and which most likely fails.
+- ADAPTIVE DEPTH is already shipped and spent (depthctl, dexit): the 3.0-3.7
+  steps/round IS the shipped adaptive trim. No headroom there.
+
+THE REAL (UN-BUILT) LEVER is OFF-PATH drafting on the idle 3090 -- hides 100% of
+the draft (head + layer) at zero acceptance cost. But draft(R+1) consumes h_next
+produced at the END of verify(R), so overlap requires speculating verify(R)'s
+accepted-count n before it lands -- and n is LEAST predictable on novel prose
+(exactly where the draft cost lives). Ceiling ~14-18% if perfectly hidden (matches
+the memory's Saguaro estimate); realistic +3-9% minus misprediction, for a
+weeks-long dual-GPU pipeline on a contended sm_86 3090. Worth starting ONLY if
+decode t/s becomes the headline (today prefill dominates agentic wall) AND
+gate_n_hist comes back peaked (it will not, on novel prose).
+
+DECISION: do NOT build a shortlist kernel on spec. The draft stays at its floor.
+If revisited, P1 is the zero-cost acceptance probe (log draft argmax vs Q4-head
+argmax per step on diverse traffic, compute per-step recall); build only if recall
+>= 0.97 at steps 3-4 and >= 0.95 at 1-2. This is the session's discipline applied
+to a negative: measured the bound, priced the tradeoff, declined the speculative
+build. New tool signal: the phd/phv/phs [req] fields ARE the realized draft
+telemetry -- read them before sizing any draft work.
+
+## 2026-07-13 (cont.) -- PREFILL profiled: it is NOT attention-bound and NOT dominant-aggregate. The lever is the weight GEMM's LSU/occupancy floor (ldmatrix untried). Diagnosis banked; rewrite is a green-light decision.
+
+Chased "prefill dominates agentic wall." Two corrections to standing beliefs, both measured.
+
+PREMISE CORRECTED. On real cold T8 agentic traffic (215 reqs, this session's harness
+[req] telemetry): prefill is 34% of request wall at the MEDIAN (decode 66%), because
+generation-heavy requests dominate the aggregate. BUT prefill is 88-96% for
+large-prompt/short-output requests (read a 24-50K file, make a small edit) -- common in
+agentic coding. So prefill is a large minority overall and dominates the read-heavy
+request class, but "dominates agentic wall" (aggregate) is FALSE on this traffic; decode
+does. (These are hit=0 cold; real interactive caching lowers prefill further.)
+
+MEMORY CORRECTED. The standing belief (07-07) was that prefill-attention (O(N^2),
+k_attn_prefill_mma) is the top lever. nsys of a 65K near-pure prefill (23.6s, 2763 tok/s):
+  weight GEMM (k_gemm_mma_T)   8624 ms  63.9%   <- the real cost
+  attn O(N^2) (prefill_mma_pv8) 2330 ms  17.3%
+  GDN delta/conv                1298 ms   9.6%
+  quant/norm/elt                1180 ms   8.7%
+Attention is only 17% at 65K (it grows quadratically, so it overtakes only at ~130K+).
+At agentic context (24-65K) prefill is WEIGHT-GEMM-bound, not attention-bound.
+
+THE BOUND, ncu'd (k_gemm_mma_T, NT=128, on ffn_gate at T=1024):
+  Compute(SM) SoL 59% | DRAM 6% (NOT memory-bound) | ALU 13% (dequant is cheap)
+  LSU pipe 63% (the hottest unit) | warps_active 16.6% | issue_active 36% (schedulers
+  64% IDLE) | 168-252 regs -> 1 block/SM.
+Diagnosis: the kernel builds MMA fragments with ~80 SCALAR 32-bit smem loads per thread
+per stage; the LSU pipe is the bottleneck and low occupancy (1 block/SM, reg-limited)
+can't hide the load latency (issue 36%). NOT tensor-bound, NOT DRAM-bound, NOT
+bank-conflicted (LDX=144 padding makes the layout conflict-free -- verified by hand).
+The author already tried double-buffering + __launch_bounds__ occupancy forcing (both
+SLOWER, "local optimum, do not retry") and swept NT=64->128 (128 won, for A-fragment
+reuse). Register reduction for 2 blocks/SM is blocked by the acc[8][4]=32-reg
+accumulator (the NT=128 tile the author chose).
+
+THE UNTRIED LEVER: ldmatrix (LDSM). One ldmatrix loads a full MMA fragment vs 4 scalar
+loads, cutting LSU instruction count ~4x -- directly at the 63% bottleneck. Plausible
+1.2-1.4x on the GEMM (59% SoL -> ~80%), = ~15-25% on prefill = ~5-8% on the read-heavy
+request class. HONEST RISK: (a) it is an intricate, correctness-critical rewrite of a
+bitwise-gated kernel (canonical a2982c51); (b) reducing LSU may shift the bottleneck to
+occupancy/issue, capping the win; (c) the author's "local optimum" suggests diminishing
+returns. Realistic EV is a real-but-modest win with a genuine chance of near-floor.
+
+STATUS: diagnosis complete and banked. The ldmatrix rewrite is a materially larger,
+uncertain undertaking than this session's surgical decode wins -- a green-light decision,
+not an autonomous surgical fix. Cheapest decisive experiment = an ldmatrix fork of
+k_gemm_mma_T as a standalone microbench (fork the kernel, one shape ffn_gate T=1024,
+tolerance-check vs the shipped kernel, measure LSU% + time). Build it only on go.
+Everything else in prefill (attn 17%, GDN 10%, quant 9%) is smaller and mostly at floor.
+
+## 2026-07-13 (cont.) -- prefill GEMM ldmatrix SPIKE: +4.1% bitwise ceiling (occupancy-limited beyond). Lever is real but small; NOT the hoped 1.4x.
+
+Built the ldmatrix spike (tools/gemm_ldm_spike.cu) -- a fork of the XG64 prefill
+GEMM on real ffn_gate weights at T=1024, A/B'd against the scalar reference,
+tolerance-gated. Answered "does ldmatrix beat the scalar smem fragment loads?":
+  scalar     : 0.6392 ms
+  ldmatrix-A : 0.6634 ms  -3.7%   (A is amortized 8x across subtiles -- ldmatrix
+                                    instruction overhead > the load it saves)
+  ldmatrix-B : 0.6143 ms  +4.1%   <- the win: B is loaded ONCE per subtile (32/gg)
+  ldmatrix-AB: 0.6321 ms  +1.1%   (A's -3.7% cancels most of B's +4.1%)
+All BITWISE identical to scalar (rel 0.00, 0/17.8M floats differ -- ldmatrix moves
+the same bytes into the same registers; my A-operand x4 and B-operand x2 address
+formulas were correct first try).
+
+VERDICT: the ldmatrix lever is REAL but SMALL. +4.1% on the GEMM = +2.6% on prefill
+(GEMM is 64% of prefill) = ~+0.9% on median agentic wall, up to ~+2.5% on read-heavy
+(prefill-dominant) requests. NOT the hoped 1.2-1.4x. WHY: ncu confirms the kernel
+stays occupancy-limited after ldmatrix -- LSU drops but warps_active is still 16.6%
+(1 block/SM, reg-limited) and issue_active 35% (schedulers idle). ldmatrix relieves
+the LSU THROUGHPUT pressure but not the LATENCY/occupancy wall, so most of the
+theoretical 59%->85% SoL headroom is unreachable without 2 blocks/SM -- which needs
+a register cut the NT=128 acc[8][4] accumulator blocks. The author already found
+NT=64 (which could fit 2 blocks/SM) SLOWER -- pre-ldmatrix; whether NT=64 + ldmatrix-B
++ 2-block occupancy wins is an open follow-on, a full re-tune not a spike.
+
+RECOMMENDATION: the honest ceiling for the prefill GEMM's CURRENT SHAPE is ~+4%
+(ldmatrix-B, bitwise). Worth integrating as free prefill-path perf (bounded: B-load
+swap in the 4 real kernel variants Q4/Q8 x XG32/XG64, canonical-gated), but it is a
+~+1-2.5% engine win, not a headline. The bigger prize (NT=64 + ldmatrix + 2 blocks/SM)
+is a genuine GEMM re-tune with uncertain payoff (author's NT=64 negative), a separate
+green-light. Prefill attention (17% @65K, grows to ~130K+) and GDN (10%) remain smaller
+and mostly at floor. Spike tool kept for the follow-on. This is the session's discipline
+on a marginal lever: measured the ceiling, reported it honestly, did not oversell +4% as
+the 1.4x the framing hoped.
+
+## 2026-07-14 -- P1 SHIPPED: ldmatrix-B integrated into the prefill GEMM, bitwise, +1.5% batched prefill (below the +2.6% projection)
+
+External review P1: integrate the ldmatrix-B spike (tools/gemm_ldm_spike.cu,
+07-13: +4.1% GEMM, bitwise, 0/17.8M floats differ; B-side only -- A loses, AB
+cancels) into the production prefill GEMM (src/prefill.cu k_gemm_mma_T, scalar
+B-loads). Done: added a plain `ldm_x2` helper (non-trans m8n8.x2.shared.b16) and
+swapped the scalar activation-fragment loads for `ldmatrix.x2` in BOTH branches --
+XG64 (two x2 per gg, b0..b3) and XG32 (one x2 per cc, b0,b1) -- behind
+`#if Q27_GEMM_LDMB` (default 1; -DQ27_GEMM_LDMB=0 = scalar reference, the in-binary
+A/B leg). ldmatrix address = the spike's exact formula (lane->token lane%8, K-half
+(lane%16)/8), which reuses production's own MR/NT/KS/LDX layout, so it's a direct
+swap.
+
+GATES (vanilla qwen, --pf batched prefill = the k_gemm_mma_T path):
+  - BITWISE: dump-logits(LDMB=1) == dump-logits(LDMB=0), byte-for-byte (993280-B
+    logit vector), on BOTH branches -- default XG64 AND Q27_PF_XG=32. ldmatrix moves
+    the same bytes into the same registers; confirmed in the production kernel on
+    real weights, not just the synthetic spike.
+  - canonical a2982c51 EXACT (decode path unaffected -- it uses the GEMV, not this
+    kernel).
+  - Q8 (Q4IN=false) NOT run (no Q8 weights on hand) but covered BY CONSTRUCTION:
+    the B/activation load I changed is Q4IN-independent (Q4IN only touches the
+    weight/A side + scale unpack), identical code in each branch.
+
+PERF (--pf 4096, batched TTFT t/s, 3 runs median, <0.3% spread):
+  LDMB ON  3507.3 t/s   LDMB OFF 3455.4 t/s   = +1.50% end-to-end batched prefill.
+
+HONEST DELTA: +1.5% measured, BELOW the reviewer's +2.6% projection. The +4.1% was
+the ffn_gate GEMM in ISOLATION at T=1024; end-to-end batched prefill at T=4096 runs
+all layers' GEMMs plus attention/GDN/other kernels, so the isolated GEMM win does
+not translate 1:1 (either the GEMM is <64% of prefill at this shape or the in-context
+per-GEMM benefit is smaller). Still a FREE, bitwise, universal-on-prefill win with
+zero VRAM/quality cost -- default on. Session discipline again: measure the real
+end-to-end number, don't ship the isolated-kernel projection. NOTE: the CLI carries
+it; server binaries (q27-server[-w16]) need a rebuild to pick up the prefill.cu
+change. Reference binary build/q27-ldmoff kept for A/B.

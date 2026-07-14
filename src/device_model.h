@@ -33,6 +33,10 @@ class DeviceModel {
 
     const DevTensor& get(const std::string& name) const;
     bool model_has(const std::string& name) const { return model_.find(name) != nullptr; }
+    // The Model behind this DeviceModel. The engine sizes the vgemm workspace by
+    // walking the weight list BEFORE upload_all(), so it needs shapes/dtypes when
+    // no DevTensor exists yet.
+    const Model& model() const { return model_; }
     size_t bytes_resident() const { return bytes_; }
 
     // Weight-integrity checksums: order-independent u64 word-sums of every

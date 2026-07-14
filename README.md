@@ -41,6 +41,38 @@ scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
 `CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
 Historical numbers in this README were measured on Qwopus unless noted.
 
+**2026-07-13 optimization pass** (all bitwise-gated, canonical `a2982c51`
+EXACT; the 2026-07-10 aggregate numbers below predate these and tick up):
+
+- **Flat-in-W verify GEMM (`k_vgemm`).** The batched verify weight GEMV was
+  register-bound at width (nsys: 73% of a wide round, 1230 GB/s at W=5
+  collapsing to 444 at W=16). An m16n8k32 s8 MMA over the same weights is
+  flat (11.8 -> 12.5 ms, W5..16). Wired at `gemm_min=9` so only suffix rounds
+  reach it and the ladder stays bitwise by construction. Suffix round
+  **24.33 -> 19.96 ms**; echo **427 -> 519 t/s**; real T8 agentic suffix
+  rounds 24.76 -> 20.85 ms. Deterministic (no atomics -- the K-split reduce is
+  two-pass on purpose).
+- **W16 cap REOPENED (file-re-emission only).** With the flat GEMM the wide
+  round is flat (`round(16)/round(12)` = 1.10, was 1.65), so the 07-13 W16
+  NO-GO flips: echo **W16 631 vs W12 519 t/s (+22%)**. But live agentic fires
+  average 7.82 tok (under the 12 cap), so W_MAX stays 12 by default;
+  `q27-server-w16` is now a legit repetition-heavy-serving build.
+- **GEMV occupancy retiers.** Two `__launch_bounds__` register-spill fixes:
+  suffix widths (2-CTA pin, +19% on echo suffix rounds) and ladder widths
+  (3-CTA pin, **suite 172 -> 177 t/s, +1.7% on every round**).
+- **GDN `k_delta_step` register fusion.** The DeltaNet recurrence wrote its
+  128x128 state twice (12 MB) where the floor is 6 MB; hold the decayed values
+  in registers, write once -> SOL, bitwise. +1.5% on **every** decode round
+  including novel prose.
+- **Investigated and declined** (measured NO-GOs, receipts in BUILDLOG): the
+  MTP draft head (at its SOL floor; a shortlist most likely loses on novel
+  prose) and the prefill weight GEMM (ldmatrix spike = +4.1% bitwise ceiling,
+  occupancy-limited beyond -- not the hoped 1.4x; left as a green-light).
+- Prefill profiled: at 24-65K context it is **weight-GEMM-bound (64%), not
+  attention-bound** (attn 17%; overtakes only ~130K+). On agentic traffic
+  prefill is 34% of request wall at the median (88-96% for large-prompt/short-
+  output reads), decode dominates the aggregate.
+
 **Reference numbers** (2026-07-10, master, vanilla model, 5090; full
 tables in BUILDLOG):
 
@@ -69,8 +101,27 @@ tables in BUILDLOG):
   decode telemetry is the rate currency. Decomposition: ~15 points of
   the 47 are bit-width (15.8 vs 18.2 GB/step), the rest is mechanism.
   Arc: tuned llama +31% on 07-06, parity 07-07, q27 +47% on 07-10.
-  llama's one winning cell: ngram spec on a pure token loop (889 t/s;
-  q27's 12-lane cap never binds on real traffic).
+  llama's ngram spec wins the repetition regime: on file re-emission
+  its unbounded prompt-lookup drafts beat q27's fused MTP+suffix (an
+  external fork-maintainer A/B measured 653 vs 377 t/s). q27's suffix
+  draft does truncate at the 12-lane verify cap, and that cap DOES bind
+  (95% of fires pin at 12) -- but **widening it is not the fix, and we
+  measured that the hard way**: a W16 build accepts the predicted +33%
+  tokens per fire and still LOSES 15% throughput, because the wide round
+  costs more than proportionally. What the cap was hiding is that the
+  batched verify GEMV was spilling registers under a 3-CTA occupancy pin;
+  retiering widths >=10 to a 2-CTA pin cuts the cost of a 12-lane suffix
+  round by **16%** (29.5 -> 24.8 ms) with no widening at all, and per-token
+  cost now bottoms at W12. SCOPE THAT HONESTLY: the engine-level gain is
+  proportional to how much the traffic repeats itself, because the retier
+  only touches suffix rounds. Byte-identical paired replays: novel codegen
+  +0% (suffix never fires), docs-style +2%, real agentic CC tasks ~+5-6%
+  (T8/T2, 27-37% suffix wall share), pure file re-emission **+17%**. The
+  headline is the repetition regime, not the engine average. Closing the rest of the gap needs a verify GEMM
+  that is flat in width, not more lanes (BUILDLOG 2026-07-13). Against
+  llama's *deployed* config (draft-mtp) q27 still wins both regimes;
+  the ngram win is to a mode llama does not run in production and that
+  is mutually exclusive with draft-mtp and poor on novel prose.
 - Fine-tune headroom, REVISED by the matched 21-task sweep (07-11):
   Qwopus is a SPEED fine-tune worth **+5.7% decode on real traffic**
   (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
@@ -451,6 +502,20 @@ single-slot). Every knob keeps its env/flag override
 reference behavior (fp16, ungated, no suffix, fd2), and the **CLI binary
 keeps reference defaults** so the bitwise canonical gates are untouched.
 Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
+
+Behavior note (`--think`): the default serving profile is no-think for
+speed -- it prefills an empty `<think></think>` block, which is what
+carries the ~224 t/s headline. The cost is a reasoning model handed
+zero reasoning budget, which over-refuses a narrow class of
+borderline-but-legitimate requests (measured: a signed-authorization
+pentest command it declines under no-think, it supplies under `--think`
+after reasoning through the authorization; BUILDLOG 2026-07-13). Mitigated as of 2026-07-13: a bare
+request with NO system prompt was the trigger (empty think budget +
+zero context -> defensive refusal); the server now injects a minimal
+default system prompt when the client sends none, which recovers
+compliance at zero reasoning cost and never fires for real Claude Code
+(it always sends a system prompt). `Q27_BARE=1` opts out. For heavier
+compliance-sensitive workloads `--think` remains the stronger lever.
 
 Three API shapes on one server:
 - **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)
