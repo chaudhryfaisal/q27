@@ -41,6 +41,38 @@ scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
 `CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
 Historical numbers in this README were measured on Qwopus unless noted.
 
+**2026-07-13 optimization pass** (all bitwise-gated, canonical `a2982c51`
+EXACT; the 2026-07-10 aggregate numbers below predate these and tick up):
+
+- **Flat-in-W verify GEMM (`k_vgemm`).** The batched verify weight GEMV was
+  register-bound at width (nsys: 73% of a wide round, 1230 GB/s at W=5
+  collapsing to 444 at W=16). An m16n8k32 s8 MMA over the same weights is
+  flat (11.8 -> 12.5 ms, W5..16). Wired at `gemm_min=9` so only suffix rounds
+  reach it and the ladder stays bitwise by construction. Suffix round
+  **24.33 -> 19.96 ms**; echo **427 -> 519 t/s**; real T8 agentic suffix
+  rounds 24.76 -> 20.85 ms. Deterministic (no atomics -- the K-split reduce is
+  two-pass on purpose).
+- **W16 cap REOPENED (file-re-emission only).** With the flat GEMM the wide
+  round is flat (`round(16)/round(12)` = 1.10, was 1.65), so the 07-13 W16
+  NO-GO flips: echo **W16 631 vs W12 519 t/s (+22%)**. But live agentic fires
+  average 7.82 tok (under the 12 cap), so W_MAX stays 12 by default;
+  `q27-server-w16` is now a legit repetition-heavy-serving build.
+- **GEMV occupancy retiers.** Two `__launch_bounds__` register-spill fixes:
+  suffix widths (2-CTA pin, +19% on echo suffix rounds) and ladder widths
+  (3-CTA pin, **suite 172 -> 177 t/s, +1.7% on every round**).
+- **GDN `k_delta_step` register fusion.** The DeltaNet recurrence wrote its
+  128x128 state twice (12 MB) where the floor is 6 MB; hold the decayed values
+  in registers, write once -> SOL, bitwise. +1.5% on **every** decode round
+  including novel prose.
+- **Investigated and declined** (measured NO-GOs, receipts in BUILDLOG): the
+  MTP draft head (at its SOL floor; a shortlist most likely loses on novel
+  prose) and the prefill weight GEMM (ldmatrix spike = +4.1% bitwise ceiling,
+  occupancy-limited beyond -- not the hoped 1.4x; left as a green-light).
+- Prefill profiled: at 24-65K context it is **weight-GEMM-bound (64%), not
+  attention-bound** (attn 17%; overtakes only ~130K+). On agentic traffic
+  prefill is 34% of request wall at the median (88-96% for large-prompt/short-
+  output reads), decode dominates the aggregate.
+
 **Reference numbers** (2026-07-10, master, vanilla model, 5090; full
 tables in BUILDLOG):
 
