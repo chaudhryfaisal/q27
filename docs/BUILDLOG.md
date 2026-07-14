@@ -5511,3 +5511,50 @@ outputs, INCLUDING the canonical (NP=5 -> batched -> new md5, needs re-baseline)
 Deferred to a quality/policy call, not a bug fix. No code shipped for it (knob
 reverted). Discipline note: "fix the bug" turned up that there was no bug -- the
 measurement (XG32 mismatches at native batched sizes) refuted the premise.
+
+## 2026-07-14 -- security/robustness review triage: 4 in-scope fixes, 3 out-of-scope (hostile artifact), 1 deferred
+
+Second external security review (server/loader/tokenizer). Cross-checked against the
+authoritative docs/SECURITY-MODEL.md (single-operator localhost engine; hostile-
+artifact + adversarial-DoS findings out of scope by design). Verified each against
+current code before acting.
+
+FIXED (in-scope -- bite the operator's own benign workflow; all built + smoke-verified):
+- #1 empty-prompt crash (HIGH, REAL, a GAP past the 2026-07-07 fix). reuse_len() ->
+  ckpt_best() runs at SLOT SELECTION, before the engine-entry `NP>=1` guard
+  (engine.cuh:2259). ckpt_best did `c.toks.size() > prompt.size()-1` -> size_t
+  underflow to SIZE_MAX on an empty prompt -> nothing skipped -> std::equal derefs the
+  empty vector's begin() (nullptr) -> crash, once any checkpoint exists. Fix:
+  `c.toks.size()+1 > prompt.size()` (no underflow) + reject empty prompt at the
+  handler (server.cu, 400 before slot claim). Smoke: `{"prompt":""}` and missing
+  prompt both -> HTTP 400, server stays alive.
+- #2 disconnect keeps generating (Anthropic + Responses). The OpenAI streaming
+  callback already returns the sink.write() result (stops on disconnect); Anthropic
+  (server.cu:1032) and Responses returned `true` unconditionally. Fix: the ev SSE
+  emitter sets a captured `alive` flag on write failure; both callbacks return
+  `alive`. Smoke: Anthropic stream, max_tokens=800, client cut at 3s -> engine
+  stopped at dec=408 (was: generate to 800).
+- #3 quadratic BPE (the one #3 sub-point the security model itself flags). bpe_word
+  is O(n^2) (full pair rescan + erase-in-loop); a no-whitespace blob (minified JS/
+  base64) collapses to one huge word and stalls tokenization. Fix: WORD_CAP=1024,
+  chunk over-cap words -> O(n*WORD_CAP). Inert below 1024B, so normal text +
+  canonical byte-identical. (The unbounded-request-size half of #3 stays out --
+  network/DoS, `--host 127.0.0.1` is the mitigation.)
+- #7 missing terminal finish_reason (OpenAI streaming). Every chunk had
+  finish_reason:null then [DONE]; clients never learned stop vs length. Fix: emit a
+  terminal chunk with "length" (produced>=nm) or "stop" before [DONE]. Smoke: stream
+  now ends with finish_reason:"length".
+
+OUT OF SCOPE (require a hostile model/tokenizer artifact -- SECURITY-MODEL.md
+dispositions these as #9/#10/#11; q27 loads one self-produced model+tokenizer):
+- #4 model tensor bounds integer overflow (loader.cpp), #5 model metadata negative
+  layer index (engine.cuh:445), #6 truncated tokenizer header reads (tokenizer.cpp:58).
+  Real code observations, but they need an attacker-supplied artifact q27 does not face.
+  (If q27 ever ingests third-party model zoos, these re-activate -- per the model doc.)
+
+DEFERRED:
+- #8 capturing structured bindings is a C++20 feature (server.cu:1303 make_item_cbs
+  4-tuple, 32 refs). NVCC warns but builds+runs; a real fix is a struct-return refactor
+  of 32 sites for a portability nicety. Low; left as a warning.
+
+Gates: canonical a2982c51 EXACT; test_tokenizer self-tests PASS; server smokes above.
