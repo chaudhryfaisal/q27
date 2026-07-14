@@ -519,6 +519,14 @@ Gates 1, 2, 5, 7, 9, 10.
 **Keep-bar: suffix round 24.33 -> <= 20.5 ms.** Above 21.5 and the NW-is-additive model is
 wrong; stop and do not build P3.
 
+> **P3 DONE 2026-07-13: cap REOPENS but only file-re-emission; default stays W12.**
+> The round is flat now (round(16)/round(12) = 1.10-1.12, was 1.65), so on echo the
+> cap pays +21% (W16 631 vs W12 519 t/s @28K) -- the 07-13 NO-GO is revised. BUT
+> gate 8 (live T8): fires average 7.82 tok, under the existing 12 cap, so raising it
+> buys nothing on mixed agentic traffic. Ship P2's GEMM (done); keep W_MAX=12;
+> q27-server-w16 is now a legit repetition-heavy-serving build (closes most of the
+> llama 653 gap). Full numbers: BUILDLOG same date.
+
 ### P3 -- the W16 REOPEN. The payoff. ~1 session.
 
 Rebuild `-DQ27_W_MAX=16` (target exists), `Q27_SUFFIX_W=16`, re-run `tools/width_curve.sh`

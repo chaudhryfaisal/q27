@@ -16,7 +16,7 @@ BIN="${1:?usage: width_curve.sh <server-binary> <W>...}"; shift
 MODEL="${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}"
 TOK="${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}"
 PORT="${PORT:-8099}"
-PAY="$(dirname "$0")/../scratchpad/accept_payload_echo.json"
+PAY="${WC_PAY:-$(dirname "$0")/../scratchpad/accept_payload_echo.json}"
 [ -f "$PAY" ] || { echo "missing $PAY -- run tools/make_payloads.py" >&2; exit 1; }
 
 printf '%-4s %10s %8s %9s %9s %8s\n' W ms/round tok/rnd ms/token t/s dec
@@ -24,7 +24,7 @@ for W in "$@"; do
   CUDA_VISIBLE_DEVICES="${BENCH_GPU:-0}" \
   Q27_KV=fp8 Q27_FD=mma Q27_MAXD=4 Q27_PMIN=0.5 Q27_SUFFIX=1 Q27_SUFFIX_W="$W" \
   Q27_PHASE_STATS=1 \
-    "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 32768 --no-think --fast-head \
+    "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx ${WC_CTX:-32768} --no-think --fast-head \
     >/tmp/wc_$W.log 2>&1 &
   SRV=$!
   for _ in $(seq 120); do

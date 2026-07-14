@@ -5166,3 +5166,57 @@ is still 12% of a wide round and nobody has profiled it since. Re-open AFTER P2.
 
 Also priced for free: nothing else in the round is above 0.5 ms. There is no
 hidden term. The round really is weights + delta + a long tail.
+
+## 2026-07-13 (cont.) -- P3: the W16 cap REOPENS on the flat GEMM, but only in the file-re-emission regime. Default stays W12.
+
+Rebuilt -DQ27_W_MAX=16 with the P2 GEMM wired, canonical a2982c51 EXACT (the
+ladder still never reaches the GEMM). Then measured the two things that decide a
+cap raise: the WIDTH CURVE (is the wide round cheap now?) and the ACCEPT
+HISTOGRAM (does live traffic actually want the extra lanes?).
+
+WIDTH CURVE, W16 server, GEMM engaged (echo payload):
+   W   @28K rnd   t/s    @60K rnd   t/s
+   12    19.95    519      21.05    509
+   13    20.48    552      21.63    519
+   14    20.99    592      22.51    550
+   16    21.95    631      23.59    584
+round(16)/round(12) = 1.100 @28K, 1.121 @60K. The round is now essentially FLAT
+in width -- the exact thing that was missing on 07-13, when the same curve read
+W12 24.28 -> W16 39.97 (round ratio 1.65) and W16 LOST 15%. With the GEMM, W16 is
++22% over W12 @28K, +15% @60K. The fdmma 1-CTA cliff at W>=14 costs a little at
+depth (ratio 1.10 -> 1.12) but does not change the verdict.
+
+THE REOPEN ARITHMETIC, now measured both sides:
+  a cap raise pays iff tok(16)/tok(12) > round(16)/round(12).
+  round side: 1.10-1.12 (was 1.65).
+  token side, CONTROLLED (same fixed echo payload, both caps, Q27_SUFFIX_DBG):
+    cap 12 mean 11.54 tok/fire, cap 16 mean 15.88 -> 1.375.
+  1.375 > 1.12 -> WINS with ~3x margin. On echo the cap raise is worth +21% t/s
+  ON TOP of P2 (echo 519 -> 631).
+
+BUT GATE 8 (the one that decides the DEFAULT) is live CC traffic, not echo. T8
+through Claude Code, cap-12 leg: 628 suffix fires, MEAN ACCEPTED 7.82, median 9,
+only 41% pinned at 12. Live agentic fires mostly do not reach the EXISTING 12
+cap, so raising it to 16 has almost nothing to bite on. (The cap-16 leg forked to
+a different trajectory -- 32 fires vs 628 -- so its mean is not comparable; the
+cap-12 leg ALONE is the finding, and it is unconfounded.)
+
+VERDICT: the 07-13 W16 NO-GO is REVISED, not reversed. W16 went from "loses
+everywhere" to "wins the file-re-emission regime (+21%), neutral on mixed
+agentic." The default stays Q27_W_MAX=12: on typical traffic fires don't saturate
+12, so the extra 4 lanes (+630 MB roles, ~1.8x graph-zoo boot) buy nothing.
+q27-server-w16 is now a LEGITIMATE build for repetition-heavy serving -- exactly
+the fork maintainer's 653-vs-377 file-re-emission scenario, where W12+GEMM does
+519 and W16+GEMM does 631, closing most of the gap to llama's 653 (true parity
+still needs unbounded suffix, out of scope). The knob to reach for is the build,
+not a default.
+
+WHY THIS IS THE RIGHT OUTCOME: P2 already banked the flat GEMM on ALL traffic
+(the W12 round dropped 24.76 -> 19.96 regardless of width). P3's remaining
+question was only "does raising the CAP on top of that pay," and the honest
+answer is "only when the traffic is repetitive enough to fill the current cap,"
+which the live histogram says is a minority of real agentic work. The GEMM was
+the lever; the cap was not.
+
+New tools: tools/gate8_caphist.sh (live cap A/B), the WC_CTX/WC_PAY knobs on
+width_curve.sh, scratchpad/accept_payload_echo60k.json.
