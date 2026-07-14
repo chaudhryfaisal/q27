@@ -5382,3 +5382,38 @@ not an autonomous surgical fix. Cheapest decisive experiment = an ldmatrix fork 
 k_gemm_mma_T as a standalone microbench (fork the kernel, one shape ffn_gate T=1024,
 tolerance-check vs the shipped kernel, measure LSU% + time). Build it only on go.
 Everything else in prefill (attn 17%, GDN 10%, quant 9%) is smaller and mostly at floor.
+
+## 2026-07-13 (cont.) -- prefill GEMM ldmatrix SPIKE: +4.1% bitwise ceiling (occupancy-limited beyond). Lever is real but small; NOT the hoped 1.4x.
+
+Built the ldmatrix spike (tools/gemm_ldm_spike.cu) -- a fork of the XG64 prefill
+GEMM on real ffn_gate weights at T=1024, A/B'd against the scalar reference,
+tolerance-gated. Answered "does ldmatrix beat the scalar smem fragment loads?":
+  scalar     : 0.6392 ms
+  ldmatrix-A : 0.6634 ms  -3.7%   (A is amortized 8x across subtiles -- ldmatrix
+                                    instruction overhead > the load it saves)
+  ldmatrix-B : 0.6143 ms  +4.1%   <- the win: B is loaded ONCE per subtile (32/gg)
+  ldmatrix-AB: 0.6321 ms  +1.1%   (A's -3.7% cancels most of B's +4.1%)
+All BITWISE identical to scalar (rel 0.00, 0/17.8M floats differ -- ldmatrix moves
+the same bytes into the same registers; my A-operand x4 and B-operand x2 address
+formulas were correct first try).
+
+VERDICT: the ldmatrix lever is REAL but SMALL. +4.1% on the GEMM = +2.6% on prefill
+(GEMM is 64% of prefill) = ~+0.9% on median agentic wall, up to ~+2.5% on read-heavy
+(prefill-dominant) requests. NOT the hoped 1.2-1.4x. WHY: ncu confirms the kernel
+stays occupancy-limited after ldmatrix -- LSU drops but warps_active is still 16.6%
+(1 block/SM, reg-limited) and issue_active 35% (schedulers idle). ldmatrix relieves
+the LSU THROUGHPUT pressure but not the LATENCY/occupancy wall, so most of the
+theoretical 59%->85% SoL headroom is unreachable without 2 blocks/SM -- which needs
+a register cut the NT=128 acc[8][4] accumulator blocks. The author already found
+NT=64 (which could fit 2 blocks/SM) SLOWER -- pre-ldmatrix; whether NT=64 + ldmatrix-B
++ 2-block occupancy wins is an open follow-on, a full re-tune not a spike.
+
+RECOMMENDATION: the honest ceiling for the prefill GEMM's CURRENT SHAPE is ~+4%
+(ldmatrix-B, bitwise). Worth integrating as free prefill-path perf (bounded: B-load
+swap in the 4 real kernel variants Q4/Q8 x XG32/XG64, canonical-gated), but it is a
+~+1-2.5% engine win, not a headline. The bigger prize (NT=64 + ldmatrix + 2 blocks/SM)
+is a genuine GEMM re-tune with uncertain payoff (author's NT=64 negative), a separate
+green-light. Prefill attention (17% @65K, grows to ~130K+) and GDN (10%) remain smaller
+and mostly at floor. Spike tool kept for the follow-on. This is the session's discipline
+on a marginal lever: measured the ceiling, reported it honestly, did not oversell +4% as
+the 1.4x the framing hoped.
