@@ -8,10 +8,21 @@
 namespace q27 {
 
 DeviceModel::~DeviceModel() {
+    host_unregister_all();
     for (auto& [k, t] : dev_) {
         if (t.data) cudaFree(t.data);
         if (t.scales) cudaFree(t.scales);
     }
+    if (stream_) cudaStreamDestroy(stream_);
+}
+
+void DeviceModel::host_unregister_all() {
+    for (auto& [name, idx] : host_reg_) {
+        const Tensor& t = model_.tensors[idx];
+        if (t.data)   cudaHostUnregister((void*)t.data);
+        if (t.scales) cudaHostUnregister((void*)t.scales);
+    }
+    host_reg_.clear();
 }
 
 const DevTensor& DeviceModel::upload(const std::string& name) {
@@ -34,6 +45,51 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
         d.scales_bytes = src.scales_size;
     }
     return dev_.emplace(name, d).first->second;
+}
+
+void DeviceModel::upload_all_async() {
+    if (!stream_) CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+
+    const size_t n = model_.tensors.size();
+    for (size_t i = 0; i < n; i++) {
+        const Tensor& t = model_.tensors[i];
+        CUDA_CHECK(cudaHostRegister((void*)t.data, t.data_size, cudaHostRegisterMapped));
+        host_reg_[t.name] = i;
+        if (t.scales) {
+            CUDA_CHECK(cudaHostRegister((void*)t.scales, t.scales_size, cudaHostRegisterMapped));
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const Tensor& t = model_.tensors[i];
+        DevTensor d;
+        d.dtype = t.dtype;
+        d.rows = t.rows();
+        d.cols = t.cols();
+        CUDA_CHECK(cudaMalloc(&d.data, t.data_size));
+        bytes_ += t.data_size;
+        d.data_bytes = t.data_size;
+        if (t.scales) {
+            CUDA_CHECK(cudaMalloc(&d.scales, t.scales_size));
+            bytes_ += t.scales_size;
+            d.scales_bytes = t.scales_size;
+        }
+        dev_.emplace(t.name, std::move(d));
+    }
+
+    for (const auto& t : model_.tensors) {
+        auto it = dev_.find(t.name);
+        DevTensor& d = it->second;
+        CUDA_CHECK(cudaMemcpyAsync(d.data, t.data, t.data_size, cudaMemcpyHostToDevice, stream_));
+        if (t.scales) {
+            CUDA_CHECK(cudaMemcpyAsync(d.scales, t.scales, t.scales_size, cudaMemcpyHostToDevice, stream_));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void DeviceModel::upload_all() {
+    upload_all_async();
 }
 
 // Order-independent u64 word-sum (wraparound add): any flipped bit changes it,
@@ -102,10 +158,6 @@ int DeviceModel::checksum_verify(bool print) const {
         fprintf(stderr, "weight verify: %zu tensors, %d mismatched%s\n", sums_.size(), bad,
                 bad ? " -- RESIDENT WEIGHTS CORRUPTED (reload required)" : "");
     return bad;
-}
-
-void DeviceModel::upload_all() {
-    for (const auto& t : model_.tensors) upload(t.name);
 }
 
 const DevTensor& DeviceModel::get(const std::string& name) const {

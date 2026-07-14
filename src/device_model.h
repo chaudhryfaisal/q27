@@ -52,6 +52,10 @@ class DeviceModel {
     std::unordered_map<std::string, DevTensor> dev_;
     std::unordered_map<std::string, unsigned long long> sums_;
     size_t bytes_ = 0;
+    cudaStream_t stream_ = nullptr;
+    std::unordered_map<std::string, size_t> host_reg_;
+    void host_unregister_all();
+    void upload_all_async();
 };
 
 } // namespace q27
