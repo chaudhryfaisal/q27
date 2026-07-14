@@ -5454,3 +5454,50 @@ zero VRAM/quality cost -- default on. Session discipline again: measure the real
 end-to-end number, don't ship the isolated-kernel projection. NOTE: the CLI carries
 it; server binaries (q27-server[-w16]) need a rebuild to pick up the prefill.cu
 change. Reference binary build/q27-ldmoff kept for A/B.
+
+## 2026-07-14 -- P2: short-tail prefill GEMM = runtime NT dispatch (+13-16% short prefill, bitwise); serial-threshold is the bigger follow-on
+
+External review P2: the NT=128 prefill GEMM collapses below T~32 (a mostly-empty
+128-token tile + high smem = low occupancy). Fix per the plan (docs/plans/
+2026-07-13-gemm-verify.md:414): prefill is NOT graph-captured, so NT can be picked
+at launch for free; NT is BITWISE-invariant (same per-output FP accumulation order),
+so it is a pure speed choice.
+
+MICROBENCH (scratchpad/gemm_nt_sweep.cu, real ffn_gate Q4, templated NT):
+  T    best-NT   ms(best vs NT=128)
+  16   NT=16     0.025 vs 0.067  (2.7x)
+  32   NT=32     0.027 vs 0.068  (2.5x)
+  64   NT=64     0.047 vs 0.072  (1.5x)
+  128  NT=128    optimum
+  192  NT=64     +34% (128+64 wastes a half-tile)
+Smaller tile fills small T and uses less smem (more occupancy). Big win <= T=64.
+
+SHIPPED: templated k_gemm_mma_T<Q4IN,XG64,NT>; launch_gemm_mma_x dispatches
+nt = T<=16?16 : T<=32?32 : T<=64?64 : 128 (Q27_PF_NT forces a fixed tile for A/B).
+4 NT x 4 (Q4IN,XG64) = 16 instantiations; each sets its own smem attr once.
+
+GATES (vanilla qwen): canonical a2982c51 EXACT; BITWISE auto-dispatch ==
+forced-NT=128 dump-logits byte-for-byte @T=16 (auto->16), T=48 (auto->64), T=512
+(auto->128). NT invariance proven, not asserted.
+
+PERF (--pf batched TTFT, 3-4 run median): +16% @T=32, +13% @T=64 end-to-end. Diluted
+from the isolated 2.5-3x GEMM by the non-GEMM prefill (attention/GDN/norms). Applies
+to prefix-cache suffixes and prefill tails: prefill_chunk runs with small Tc even on
+long prompts (engine.cuh:2343 chunks [base..NP) at PF_T; short suffix Tc=NP-base ->
+NT dispatch), so the common agentic short-turn case benefits. Free, bitwise, no VRAM.
+
+SEPARATE FINDING -- serial-threshold lowering ATTEMPTED, BLOCKED by a latent bug:
+total prompts < 32 tokens skip batched prefill (engine.cuh:2291 `NP >= 32`) and take
+the SERIAL per-token path -- 230ms @T=16 (~16x14ms), NT-INDEPENDENT. Lowering the
+threshold (behind a Q27_PF_MINBATCH knob) DID give 4.0x @NP=16 (230->58ms), 2.2x
+@NP=8. BUT the --pf serial-vs-batched M6 identity FAILS under the EXACT XG32 path at
+NP=6,8,10 (and PASSES at NP=5,12,16) -- and it fails with the SHIPPED NT=128 kernel
+too (Q27_PF_NT=128), so it is NOT the NT dispatch. It is a PRE-EXISTING, latent,
+non-monotonic correctness bug in the batched prefill path at small NP, masked all
+along because NP<32 always took serial. So the 32-threshold is load-bearing for
+CORRECTNESS, not just GEMM efficiency. The knob was REVERTED (a threshold that
+silently produces wrong output for short prompts is a footgun). The 4x short-prompt
+win is real but BLOCKED pending diagnosis+fix of the batched-path small-NP bug
+(candidates: split-attention pf_part min, GDN chunk boundary, mtp_warm at tiny T).
+Filed as the next follow-on -- repro: `Q27_PF_XG=32 Q27_PF_MINBATCH=8 q27 model
+--tokens ... --pf 8` FAILs the identity gate.

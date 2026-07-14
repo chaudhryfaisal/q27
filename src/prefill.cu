@@ -235,11 +235,11 @@ static __device__ __forceinline__ void mma_s8_acc(int& d0, int& d1, int& d2, int
 // decode path's per-32) -- gated by tolerance + PPL + canonical instead of
 // the pf-identity gate (policy sign-off 2026-07-04). XG64=false is the exact
 // legacy path, bit-identical to the pre-regroup kernel.
-template <bool Q4IN, bool XG64>
+template <bool Q4IN, bool XG64, int NT>
 __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                              const int8_t* __restrict__ nat, const float* __restrict__ xs,
                              float* __restrict__ y, int64_t rows, int64_t cols, int T) {
-    constexpr int MR = 64, NT = 128, KS = 128;  // block tile: rows, tokens, staged K
+    constexpr int MR = 64, KS = 128;  // block tile: rows, staged K (NT = token tile, templated)
     constexpr int XGS = XG64 ? 64 : 32;         // activation quant group
     constexpr int XSC = KS / XGS;               // x-scales per token per stage
     // NT=128 (was 64): doubles A-fragment reuse per staged weight byte at
@@ -497,26 +497,52 @@ static bool prefill_xg64() {
     return !(e && !strcmp(e, "32"));
 }
 
-template <bool Q4IN, bool XG64>
-static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
-                              int64_t rows, int64_t cols, int T, cudaStream_t st) {
-    constexpr int MR = 64, NT = 128, KS = 128, LDW = KS + 16, LDX = KS + 16;
+// Q27_PF_NT: force a fixed prefill GEMM token-tile width (16/32/64/128) for A/B;
+// 0/unset = auto-dispatch by T. Re-read per launch, same policy as prefill_xg64.
+static int prefill_nt() {
+    const char* e = getenv("Q27_PF_NT");
+    return e ? atoi(e) : 0;
+}
+
+template <bool Q4IN, bool XG64, int NT>
+static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
+                           int64_t rows, int64_t cols, int T, cudaStream_t st) {
+    constexpr int MR = 64, KS = 128, LDW = KS + 16, LDX = KS + 16;
     constexpr int XSC = XG64 ? 2 : 4;
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * XSC) * 4;
-    if (cols % KS) {
-        fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);
-        exit(1);
-    }
-    static bool attr = false;
+    static bool attr = false; // per-<Q4IN,XG64,NT> instantiation
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_T<Q4IN, XG64>,
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_T<Q4IN, XG64, NT>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
     dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR));
-    k_gemm_mma_T<Q4IN, XG64><<<grid, 256, SM, st>>>(W, S, XG64 ? xq.nat64 : xq.nat,
-                                                    XG64 ? xq.s64 : xq.scale, y, rows, cols, T);
+    k_gemm_mma_T<Q4IN, XG64, NT><<<grid, 256, SM, st>>>(W, S, XG64 ? xq.nat64 : xq.nat,
+                                                        XG64 ? xq.s64 : xq.scale, y, rows, cols, T);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Short-tail dispatch (P2): the NT=128 tile collapses below T~32 (mostly-empty
+// tile + high smem -> low occupancy). Pick the smallest tile that fits T, so a
+// prefix-cache suffix or short prompt runs at 1.5-3x (measured, ffn_gate Q4).
+// NT is BITWISE-invariant (same per-output FP accumulation order), so this only
+// changes speed. Prefill is not graph-captured, so the launch-time choice is free.
+template <bool Q4IN, bool XG64>
+static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
+                              int64_t rows, int64_t cols, int T, cudaStream_t st) {
+    constexpr int KS = 128;
+    if (cols % KS) {
+        fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);
+        exit(1);
+    }
+    int nt = prefill_nt();
+    if (nt == 0) nt = T <= 16 ? 16 : T <= 32 ? 32 : T <= 64 ? 64 : 128;
+    switch (nt) {
+        case 16: launch_gemm_nt<Q4IN, XG64, 16>(W, S, xq, y, rows, cols, T, st); break;
+        case 32: launch_gemm_nt<Q4IN, XG64, 32>(W, S, xq, y, rows, cols, T, st); break;
+        case 64: launch_gemm_nt<Q4IN, XG64, 64>(W, S, xq, y, rows, cols, T, st); break;
+        default: launch_gemm_nt<Q4IN, XG64, 128>(W, S, xq, y, rows, cols, T, st); break;
+    }
 }
 
 template <bool Q4IN>
