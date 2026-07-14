@@ -8,7 +8,7 @@ NVCC      ?= /usr/local/cuda/bin/nvcc
 # compatibility -- see q27_loaded_image_arch() in cuda_common.h.
 NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
-             -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
+             -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall -diag-suppress 3357,177
 
 .PHONY: all clean
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
@@ -102,3 +102,14 @@ build-in-docker:
 		docker start $(BUILD_CONTAINER); \
 	fi
 	docker exec $(BUILD_CONTAINER) sh -lc 'make build/q27-server-w8  NVCCFLAGS="${NVCCFLAGS}" '
+GH_SHA_HEAD ?= $(shell git rev-parse --short HEAD)
+GH_BRANCH ?= $(shell git branch --show-current)
+GH_TAG ?= ${GH_BRANCH}-${GH_SHA_HEAD}
+GH_FILES ?= build/*
+gh-release:
+	@gh release delete "$(GH_TAG)" -y 2>/dev/null || true
+	@git tag -d "$(GH_TAG)" 2>/dev/null || true
+	@git push --delete origin "$(GH_TAG)" 2>/dev/null || true
+	git tag "$(GH_TAG)"
+	git push origin "$(GH_TAG)"
+	gh release create --notes "$(shell sha1sum ${GH_FILES})" --title "$(GH_TAG)" "$(GH_TAG)" $(GH_FILES)
