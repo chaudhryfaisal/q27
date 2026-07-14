@@ -8,9 +8,9 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 .PHONY: all clean
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
 
-build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/device_model.cu src/loader.cpp \
+build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h | build
-	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/device_model.cu src/loader.cpp -o $@
+	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 build:
 	mkdir -p build
@@ -30,23 +30,23 @@ build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/t
 build/test_suffixdraft: tools/test_suffixdraft.cpp src/suffixdraft.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_suffixdraft.cpp -o $@
 
-build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
-	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
+build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
+	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
 
 build/mma16_bench: tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
 
-build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp \
+build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
                     src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h | build
-	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp -o $@
+	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 
-build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu \
+build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
 clean:
 	rm -rf build
@@ -81,9 +81,9 @@ build/turbo3_test: tools/turbo3_test.cu src/turbo3.cuh | build
 # 24GB-card (3090-class) server: Q27_W_MAX=8 shrinks the GDN role sets +
 # graph zoo so the fixed stack fits beside the weights (the default W12
 # build OOMs at graph instantiation on 24GB). Same sources, own binary.
-build/q27-server-w8: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu \
+build/q27-server-w8: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@

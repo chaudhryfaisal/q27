@@ -23,6 +23,7 @@
 #include "kernels.cuh"
 #include "loader.h"
 #include "turbo3.cuh"
+#include "vgemm.cuh"
 
 using q27::DevTensor;
 using q27::DType;
@@ -113,6 +114,19 @@ struct Engine {
     std::array<int*, W_PLUMB> d_pos_L, d_v_L;
     std::array<q27k::XQuant, W_PLUMB> xq_L; // [0],[1] alias xq2[0],xq2[1]
     float *logits2, *y2big;
+    // P2 (docs/plans/2026-07-13-gemm-verify.md): the flat-in-W verify weight path.
+    // The batched GEMV is register-bound at width -- 15.7 ms of a 21.4 ms width-12
+    // round (nsys), collapsing to 444 GB/s at W=16 against a 1453 GB/s SOL. k_vgemm
+    // is FLAT (11.8 -> 12.5 ms over widths 5..16). gemm_min is the width at which
+    // mm5 switches: 9, i.e. STRICTLY ABOVE the ladder's max verify width
+    // (gate_maxd+1 <= 8), so every gated/draft/sampled round keeps the GEMV and the
+    // canonical bitwise gate holds BY CONSTRUCTION rather than by hope. Only suffix
+    // rounds (which verify at sfx_width() == W_MAX) reach the GEMM.
+    // gemm_min_rows keeps the tiny attn_k/attn_v (1024 rows) on the GEMV -- they
+    // cannot fill a K-split grid, and they are only 170 MB/round.
+    float* d_vgemm_ws = nullptr;
+    int gemm_min = 9;
+    int64_t gemm_min_rows = 4096;
     // GDN role state, spare sets 1..11 (role 0 = S/conv_ring). Roles 8..11
     // (indices 7..10) exist only when Q27_W_MAX admits them -- nullptr else.
     // Was 11 pairs of named members + ternary chains (audit 2026-07-12).
@@ -481,6 +495,15 @@ struct Engine {
         A((void**)&o_L[1], GDN_V * 4); A((void**)&og_L[1], GDN_V * 4);
         A((void**)&ffn_g_L[1], N_FFN * 4); A((void**)&ffn_u_L[1], N_FFN * 4);
         A((void**)&logits2, W_MAX * (size_t)VOCAB * 4); // width-12: 12 verify lanes
+        // P2: k_vgemm's deterministic cross-CTA K-split partials. Sized by WALKING
+        // THE WEIGHT LIST (never hardcoded -- the z policy decides how big this is,
+        // and a policy change would silently overrun a fixed buffer). Sized off the
+        // Model, not the DeviceModel: upload_all() has not run yet at this point.
+        // ~3.3 MB on this checkpoint (ffn_gate at z=3 x 16 lanes x 17408 rows).
+        {
+            size_t wsb = q27k::vgemm_ws_bytes_model(dm.model(), gemm_min_rows);
+            if (wsb) A((void**)&d_vgemm_ws, wsb);
+        }
         mask_words = (VOCAB + 31) / 32;
         A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
         A((void**)&d_mask_ids, W_MAX * 4);
@@ -937,6 +960,27 @@ struct Engine {
         q27k::quantize3(xs, cols, q, stm, vw);
     }
     void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
+        // P2: WIDE rounds take the flat-in-W MMA GEMM; the ladder keeps the GEMV.
+        // Both `vw` and `gemm_min` are host ints read at CUDA-GRAPH CAPTURE, so the
+        // branch is baked per graph -- no per-call work, no divergence at replay.
+        // vw <= 8 (every gated, draft and sampled round) can never take this branch:
+        // gemm_min is 9 and build_spec_graphs aborts if gate_maxd+1 ever reaches it.
+        // That is what makes the canonical bitwise gate structural.
+        // k_vgemm reuses the group-32 int8 activations quantize3 ALREADY writes
+        // (xq_L[i].nat/.scale are dead stores on the dp4a GEMV path today), so this
+        // adds no quantize pass, no buffer and no graph node on the activation side.
+        if (vw >= gemm_min && (int64_t)w.rows >= gemm_min_rows) {
+            q27k::XLanes X{};
+            q27k::YLanes Y{};
+            for (int i = 0; i < W_PLUMB; i++) {
+                X.nat[i] = xq_L[i].nat;
+                X.xs[i] = xq_L[i].scale;
+                Y.y[i] = ys_a[i];
+            }
+            // Honor the false: an ineligible shape MUST fall through to the GEMV
+            // rather than silently produce nothing (the launch_fdmma contract).
+            if (q27k::vgemm_verify(w, X, Y, d_vgemm_ws, vw, stm)) return;
+        }
         q27k::XQuant qs[W_PLUMB];
         float* ys[W_PLUMB];
         for (int i = 0; i < W_PLUMB; i++) {
@@ -1226,6 +1270,25 @@ struct Engine {
         if (gate_maxd < 4) gate_maxd = 4;
         if (gate_maxd > 7) gate_maxd = 7;
         if (maxd_auto) dctl.k_max = gate_maxd;
+        // P2: the width at which mm5 switches from the GEMV to k_vgemm.
+        // Q27_GEMM_MIN=99 disables the GEMM entirely (the in-binary A/B control:
+        // same binary, GEMM off, must reproduce the old round AND byte-identical
+        // output -- gate 5).
+        if (const char* e = getenv("Q27_GEMM_MIN")) gemm_min = atoi(e);
+        // THE GUARDRAIL. The canonical bitwise gate is structural only while the
+        // ladder's widest verify (gate_maxd+1) stays strictly below gemm_min. If a
+        // future ceiling or a careless env ever crosses that line, the ladder would
+        // silently start computing logits on a different numeric path and the
+        // canonical md5 would drift -- a class of bug this project has paid for
+        // twice today. Refuse to run instead.
+        if (gate_maxd + 1 >= gemm_min) {
+            fprintf(stderr,
+                    "q27: FATAL -- ladder verify width %d reaches the GEMM path "
+                    "(Q27_GEMM_MIN=%d). The canonical bitwise gate no longer holds "
+                    "by construction. Raise Q27_GEMM_MIN above %d or lower Q27_MAXD.\n",
+                    gate_maxd + 1, gemm_min, gate_maxd + 1);
+            abort();
+        }
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
         if (const char* e = getenv("Q27_MAXD_RESET")) maxd_reset = atoi(e) != 0;
         if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);

@@ -247,6 +247,21 @@ int vgemm_z(int64_t rows, int64_t cols) {
     return z < 1 ? 1 : z;
 }
 
+size_t vgemm_ws_bytes_model(const q27::Model& m, int64_t min_rows) {
+    size_t mx = 0;
+    for (const q27::Tensor& t : m.tensors) {
+        if (t.dtype != q27::DType::Q4_G64 && t.dtype != q27::DType::Q8_G128) continue;
+        const int64_t rows = (int64_t)t.rows(), cols = (int64_t)t.cols();
+        if (rows < min_rows) continue;          // stays on the GEMV
+        if (cols % VG_KB_MULT != 0) continue;   // ineligible; vgemm_verify refuses it
+        int z = vgemm_z(rows, cols);
+        if (z <= 1) continue;                   // MODE 0 needs no workspace
+        size_t b = (size_t)z * W_PLUMB * (size_t)rows * 4;
+        if (b > mx) mx = b;
+    }
+    return mx;
+}
+
 size_t vgemm_ws_bytes(const q27::DevTensor* const* wl, int n) {
     size_t mx = 0;
     for (int i = 0; i < n; i++) {

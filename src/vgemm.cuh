@@ -43,7 +43,7 @@
 
 #include "cuda_common.h" // W_PLUMB
 
-namespace q27 { struct DevTensor; }
+namespace q27 { struct DevTensor; struct Model; }
 
 namespace q27k {
 
@@ -84,9 +84,15 @@ constexpr size_t vgemm_smem_bytes(bool q4in) {
 // a stable z, and the same weight always gets the same z (determinism).
 int vgemm_z(int64_t rows, int64_t cols);
 
-// Workspace: max over the round's weights of z*W_PLUMB*rows floats. Walk the real
-// weight list -- do NOT hardcode; a z-policy change silently overruns it.
+// Workspace: max over the round's weights of z*W_PLUMB*rows floats. Walk the REAL
+// weight list -- do NOT hardcode a size; the plan's own review caught that moving
+// the z policy (ctaTarget 1400 -> 2400) pushes ffn_gate from 3.34 MB to 5.57 MB and
+// silently overruns a hardcoded buffer.
 size_t vgemm_ws_bytes(const q27::DevTensor* const* ws, int n);
+// Same, sized off the Model -- the engine allocates BEFORE upload_all(), so no
+// DevTensors exist yet. min_rows must match the engine's gemm_min_rows (small
+// weights stay on the GEMV and never touch the workspace).
+size_t vgemm_ws_bytes_model(const q27::Model& m, int64_t min_rows);
 
 // The dispatch. Returns false if the shape is not eligible (caller MUST fall back
 // to the GEMV and honor the false, exactly like launch_fdmma).

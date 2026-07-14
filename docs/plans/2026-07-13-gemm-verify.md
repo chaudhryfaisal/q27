@@ -503,6 +503,15 @@ shipped a NO-GO.**
 the KB-align/trim fixes (5.1), the `cols % 256` check (5.2), and `vgemm_ws_bytes()` walking
 the weight list. Gates 3, 4, 6.
 
+> **P0/P1/P2 DONE 2026-07-13 (same day).** P0 measured GEMV = 15.7 ms of a 21.4 ms
+> round (BUILD). P1 shipped src/vgemm (gates 3/4/6 green: rel 1.9e-7, 64 regs / 0
+> spill / 4 CTA/SM, sanitizer clean). P2 wired it at gemm_min=9: **canonical EXACT
+> with GEMM on AND off** (the guardrail aborts if a ladder width ever reaches the
+> GEMM), suffix round **24.33 -> 19.96 ms** (echo 427 -> 519 t/s, under the 20.5
+> keep-bar), determinism gate byte-identical run-to-run, Q27_GEMM_MIN=99 byte-matches
+> the pre-P2 binary, shortbench 174.7 (ladder untouched). P3 (the W16 cap reopen) is
+> next.
+
 ### P2 -- engine wiring at W=12. `gemm_min = 9`. ~1 session.
 
 The five `engine.cuh` edits. Ships with `Q27_GEMM_MIN=99` as the in-binary disable.
