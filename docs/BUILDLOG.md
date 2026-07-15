@@ -5840,3 +5840,39 @@ the results/latest symlink (stagger >=2s); first validation attempt at w16
 "prompt is too long" 400s CC could not compact out of at that window).
 Q27_BATCH stays DEFAULT-OFF; flip is a product call now that stability is
 proven -- P2 (mixer overlap, ~1.75x arithmetic) is the remaining perf lever.
+
+**2026-07-15 -- TURBO3 KV x CONTINUOUS BATCHING: VALIDATED (correctness +
+stability + capacity); quality scare at n=1 RETIRED by n=3 (lottery); perf
+tax measured.** Rerun of the CC validation with Q27_KV=turbo3. Gates first:
+fused_smoke honors caller-pinned Q27_KV (94e3684) and ALL legs pass
+byte-identical under turbo3 (solo/fused/conductor/A2-error); then the Task-10
+byte-identity gate under turbo3 (all-gated concurrent replay, suffix off,
+scratchpad/t3_byteident/): 4/4 streams byte-identical to solo, cold AND warm,
+with heavy fusion (bat=2.0,65). The fused path is bytewise sane on turbo3.
+
+CAPACITY: turbo3's 2.56x smaller rows turn the W12 2-slot shape from 2x48K
+(fp8) into 2x96K on 32GB (29.6GB used) -- ZERO ctx-limit 400s across every
+turbo3 CC run (fp8 2x48K drew 8-26 per run). The compaction squeeze that
+capped the fp8 CC validation is gone.
+
+QUALITY (n=3/leg, medians, batched vs same-shape control): task-queue 0.577
+vs 0.540, collab-server 0.287 vs 0.568. Directions MIXED, within-leg spreads
+dominate (task-queue batched spans 0.215-0.607; rep1's alarming 0.215/0.272-
+vs-0.540/0.631 gap inverted at rep2) -- per the standing statistical register
+(n<=9/leg cannot separate binary tables) this is the documented basin
+lottery, NOT a batching effect. CC-agent crashes appeared in BOTH legs and in
+the fp8 control too (eval-artifact class). Absolute turbo3 scores pool below
+the fp8-131K-era bands (0.78-0.85) -- turbo3-vs-fp8 quality remains an OPEN
+dedicated question (the pending PPL+needle gate from the 07-11 port), NOT
+answerable from these shape-confounded runs.
+
+PERF TAX: turbo3 cold prefill 1483 t/s vs fp8 3258 (2.2x slower, 26.8K
+payload); batched-leg per-request decode med 113 t/s (t3 attention dequant +
+P1 serial mixers compound). Stability: ~900 batched requests across the day,
+zero end=error / [req-error] / 5xx, zero server crashes.
+
+SERVING GUIDANCE: fp8 W12 2x48K stays the CC batch-serving default (faster,
+quality-known); Q27_KV=turbo3 is the capacity lever when >48K/slot matters
+more than speed. OPS: bare `wait` in a script that backgrounded the server
+waits forever (use explicit pids); pkill -f self-matches the invoking shell
+(use pkill -x -- relearned the hard way).
