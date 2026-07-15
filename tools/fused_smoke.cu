@@ -150,7 +150,12 @@ int main(int argc, char** argv) {
     unsetenv("Q27_SUFFIX");   // suffix rounds are a different (non-gated) branch
     unsetenv("Q27_SUFFIX_W");
     unsetenv("Q27_DEXIT");    // default ON = the per-step draft loop we mirror
-    unsetenv("Q27_KV");       // fp16 KV, the canonical-gate config
+    // fp16 KV (the canonical-gate config) UNLESS the caller pins a cache kind:
+    // solo-vs-fused byte-identity must hold for every KV format the mix path
+    // serves (fp8/t3 branch inside attn_mix), so Q27_KV=turbo3 etc. runs the
+    // same legs on that format (turbo3-x-batch validation, 2026-07-15).
+    if (!getenv("Q27_KV")) unsetenv("Q27_KV");
+    else fprintf(stderr, "fused_smoke: KV pinned to %s by caller\n", getenv("Q27_KV"));
     unsetenv("Q27_TOOL_SPLIT");
 
     // canonical tokens (stream A) + shortbench "hash-table" prompt (stream B)
