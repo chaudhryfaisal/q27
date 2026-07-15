@@ -20,7 +20,7 @@ UNIT=${SWEBENCH_UNIT:-$ENGINE-eval}
 RES="$SP/results.$ENGINE.jsonl"
 : >"$RES"
 
-curl -s -m 3 http://127.0.0.1:$PORT/health | grep -qiE 'ok|status' || { echo "engine :8081 not up" >&2; exit 1; }
+case "$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" in 200|401) ;; *) echo "engine :$PORT not up" >&2; exit 1;; esac
 echo "=== SWE-bench agentic bench | engine=$ENGINE (:8081, journal $UNIT) | img=$IMG ==="
 RUN_START="$(date '+%Y-%m-%d %H:%M:%S')"
 

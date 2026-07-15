@@ -5686,3 +5686,30 @@ smoke agrees: q27 vs llama+MTP = 157 vs 92 novel (x1.7), 178 vs 184 fileemit (ti
 agentic is novel-heavy so the mix lands at x1.74. Quality engine-independent (11-12/12).
 Answers "what about llama.cpp with MTP": it closes ~half the gap to q27; the residual
 1.74x is q27's engine, not the drafter. Full 4-engine table in docs/BENCHMARKING.md.
+
+**2026-07-15 -- CROSS-ENGINE #5: vLLM NVFP4 + MTP on the SWE-bench agentic bench.**
+Added vLLM as a 5th engine. vLLM has no /v1/messages, so Claude Code drives it via a
+litellm Anthropic<->OpenAI shim (:8081 -> vLLM :8080). Model: unsloth/Qwen3.6-27B-NVFP4
+(compressed-tensors, has mtp_num_hidden_layers=1; multimodal Qwen3_5ForConditionalGeneration
+variant, vision tower unused). vLLM nightly, 5090-only, single-seq, fp8 KV, MTP spec
+(method:mtp n=3). Gotchas hit + fixed: (a) hermes tool-parser returns null -- this model
+emits Qwen XML tool calls <function=x><parameter=y>, needs --tool-call-parser qwen3_coder;
+(b) KV didn't fit 131072 at 0.92 util -> 0.96; (c) first run 4/12 empty = ContextWindowExceeded
+(Claude Code requests ~32k max_tokens, prompt+output > the 98304 I'd set) -> raised to 131072,
+re-ran clean 12/12. Harness/scripts in bench/swebench/vllm/. Decode t/s from vLLM /metrics
+(generation_tokens_total / inter_token_latency_seconds_sum).
+
+  engine                          decode agg  wall/inst  gold
+  q27 (MTP + SuffixDraft, fused)  202.7 t/s    47 s      11/12
+  vLLM NVFP4 + MTP (n=3)          117.1 t/s   133 s      11/12
+  llama mainline + MTP (n-max 6)  116.3 t/s    80 s      11/12
+  llama ngram-mod (fork)           61.1 t/s   118 s      11/12
+  llama mainline (no spec)         62.0 t/s   120 s      12/12
+
+TWO KEY TAKEAWAYS: (1) vLLM's MTP (117.1) == llama's MTP (116.3) to within noise -- two
+independent codebases converge on the same ~117 t/s MTP ceiling, and q27 is a further
+~1.73x on top with the SAME head. Strong evidence the lead is q27's engine, not a one-off.
+(2) vLLM has the WORST wall/inst (133s) despite competitive decode, because prefix caching
+is dead on hybrid-GDN (0% reuse) -> re-prefill every turn, plus the litellm hop. q27/llama
+reuse prefix state across turns and convert competitive decode into low wall time. Quality
+engine-independent (11-12/12). Full 5-engine table + vLLM caveats in docs/BENCHMARKING.md.
