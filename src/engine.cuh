@@ -1259,45 +1259,45 @@ struct Engine {
         for (int k = 0; k + 1 < W_PLUMB; k++) t.p[k + 1] = d_draft_L[k];
         return t;
     }
-    void spec_verify_forward() {
-        // P0 batching: one solo view for the whole forward (vw/stm snapshot at
-        // capture time, exactly when the members were read before).
-        const LaneView sv = solo_view();
+    void spec_verify_forward(const LaneView& v) {
+        // P0 batching: the CALLER builds the view (solo: solo_view() -- a
+        // vw/stm snapshot taken exactly when the members were read before),
+        // so the P1 fused round can hand this same forward a union view.
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, verify_tokens(),
-                     N_EMBD, LANESW(h), stm,
-                     vw);
-        q27k::CP3 Hc LANESW(h),
-            Yc LANESW(y);
-        q27k::P3 Hm LANESW(h),
-            X1m LANESW(x1);
+        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok,
+                     N_EMBD, LANESV(v, h), v.stm,
+                     v.vw);
+        q27k::CP3 Hc LANESV(v, h),
+            Yc LANESV(v, y);
+        q27k::P3 Hm LANESV(v, h),
+            X1m LANESV(v, x1);
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, vw);
-            if (attn_layer[il]) attn_pair(il, sv);
-            else gdn_pair(il, sv);
-            q27k::add3(Hm, Yc, N_EMBD, stm, vw);
+            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
+            if (attn_layer[il]) attn_pair(il, v);
+            else gdn_pair(il, v);
+            q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm, vw);
-            ffn_pair(il, sv);
-            q27k::add3(Hm, Yc, N_EMBD, stm, vw);
+            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
+            ffn_pair(il, v);
+            q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, vw);
-        qx5(sv, x1_L, N_EMBD);
+        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
+        qx5(v, v.x1, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
-        // lane t's logits live at logits2 + t*VOCAB (the alloc is W_MAX*VOCAB;
-        // only lanes < vw are computed, and only those are ever read).
-        std::array<float*, W_PLUMB> lg{};
-        for (int t = 0; t < W_PLUMB; t++)
-            lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
-        mm5(sv, dm.get(vhead), lg);
+        // lane t's logits live at v.lg[t] (solo: logits2 + t*VOCAB, alloc is
+        // W_MAX*VOCAB; only lanes < vw are computed, and only those are read).
+        mm5(v, dm.get(vhead), v.lg);
     }
 
     // P11: verify half -- batch-5 forward, masked argmax per lane, finish_round.
-    void spec_verify_launches() {
-        spec_verify_forward();
+    // P0 batching: forward + per-lane argmax read the view; the mask pool
+    // (d_mask_pool/d_mask_ids/d_amax) and finish_round stay MEMBER-based --
+    // the tail is per-engine forever (design 2026-07-14).
+    void spec_verify_launches(const LaneView& v) {
+        spec_verify_forward(v);
         // P7: slot 0 (the post-pending lane) is the constrained one; the rest
         // keep id -1 (v1 caps acceptance in-grammar instead of chasing
         // draft-dependent states the host cannot know pre-launch).
@@ -1305,9 +1305,9 @@ struct Engine {
         // identical launch sequence in the identical order for any vw, so the
         // captured graphs -- and the tokens they produce -- are unchanged at
         // every width the chain covered.
-        for (int t = 0; t < vw; t++)
-            q27k::argmax_masked(logits2 + (size_t)t * VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, t, d_v_L[t], d_amax, stm);
+        for (int t = 0; t < v.vw; t++)
+            q27k::argmax_masked(v.lg[t], VOCAB, d_mask_pool, mask_words,
+                                d_mask_ids, t, v.dv[t], d_amax, v.stm);
         // P12: a width-vw verify computed columns 0..vw-1; cap acceptance at vw-1
         // drafts so finish never commits an uncomputed lane. vw=5 => max_draft=4.
         q27k::IP3 drafts{};
@@ -1323,15 +1323,18 @@ struct Engine {
     // acceptance (k_spec_accept), a resample of the new pending from the stop
     // lane (k_sample_stop -> d_token), and finish keyed on the accepted count n.
     // Draws key Philox on *d_P; greedy graphs stay bitwise (separate graph set).
-    void spec_verify_launches_sampled() {
-        spec_verify_forward();
+    // P0 batching: forward + per-lane nucleus read the view; spec_accept/
+    // sample_stop/finish_sampled stay MEMBER-based (they take logits2 as a
+    // flat base pointer -- per-engine tail state, per-engine forever).
+    void spec_verify_launches_sampled(const LaneView& v) {
+        spec_verify_forward(v);
         // P14: width-vw sampled verify -- nucleus stats + accept walk over the
         // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
         // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
         // unchanged: it keys on n<=vw and its src select covers n in 1..5.
-        for (int k = 0; k < vw; k++)
-            q27k::nucleus(logits2 + (size_t)k * VOCAB, VOCAB, d_samp, d_nuc + k * 4, stm);
+        for (int k = 0; k < v.vw; k++)
+            q27k::nucleus(v.lg[k], VOCAB, d_samp, d_nuc + k * 4, v.stm);
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
                           d_accept_cap, vw - 1, VOCAB, d_spec, stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
@@ -1341,12 +1344,17 @@ struct Engine {
 
     void spec_round_launches() {
         spec_draft_launches();
-        spec_verify_launches();
+        // P0 batching: build the solo view ONCE per round, verify half only --
+        // the draft half never touches mm5/qx5 (Task 2 grep), so it stays
+        // member-based and view-free.
+        const LaneView sv = solo_view();
+        spec_verify_launches(sv);
     }
 
     void spec_sample_round_launches() {
         spec_draft_launches();
-        spec_verify_launches_sampled();
+        const LaneView sv = solo_view();
+        spec_verify_launches_sampled(sv);
     }
 
     void build_spec_graphs() {
@@ -1516,7 +1524,7 @@ struct Engine {
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-            spec_verify_launches();
+            spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
             CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gv));
@@ -1529,7 +1537,7 @@ struct Engine {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches();
+                spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
                 CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
                 CUDA_CHECK(cudaGraphDestroy(gw));
@@ -1541,7 +1549,7 @@ struct Engine {
                 vw = sfx_w;
                 cudaGraph_t gs_;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches();
+                spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
                 CUDA_CHECK(
                     cudaGraphInstantiate(&verify_graph_w[sfx_w][p], gs_, nullptr, nullptr, 0));
@@ -1575,7 +1583,7 @@ struct Engine {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches_sampled();
+                spec_verify_launches_sampled(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
                 CUDA_CHECK(
                     cudaGraphInstantiate(&verify_sample_graph_w[W][p], gw, nullptr, nullptr, 0));
