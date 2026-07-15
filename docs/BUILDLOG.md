@@ -5558,3 +5558,131 @@ DEFERRED:
   of 32 sites for a portability nicety. Low; left as a warning.
 
 Gates: canonical a2982c51 EXACT; test_tokenizer self-tests PASS; server smokes above.
+
+**2026-07-14 -- CROSS-ENGINE: q27 vs llama-cpp-turboquant (TheTom) ngram-mod, side-by-side.**
+Both engines, vanilla qwen, greedy, decode-only t/s (excludes prefill). q27 =
+NVFP4 5.25bpw git 94e645a (MTP+SuffixDraft, its shipped config). llama =
+Qwen3.6-27B-MTP-Q5_K_M ~5.5bpw git c3e6dbb13 with `--spec-type ngram-mod`
+(n_match=24, n_max=64, n_min=48 defaults; self-speculative, no draft model).
+IDENTICAL /v1/completions payloads on both. Decode-only comparison isolates
+spec-decode effectiveness (both base kernels ~50-65 t/s single-stream, so the
+delta IS the drafter):
+
+  payload                     regime                 q27        llama ngram-mod
+  echo_ctx12k (256 tok)       pure verbatim echo     603 t/s*   529 t/s (96% acc)
+  fileemit_verbatim (1024)    partial-echo cont.     178 t/s    409 t/s (89% acc)*
+  novel_prose (400)           novel generation       157 t/s*   56 cold / 97 warmed
+  echo_ctx26k (256)           CONFOUNDED (diverged)  290 t/s    49 t/s (0 drafts)
+  (* = winner; tok/round q27: 11.6 / 3.0 / 2.6 respectively)
+
+NO clean winner -- complementary drafter strengths:
+1. PURE SHORT ECHO (drafter fires hard, 108 fires, 11.6 tok/rnd): q27 WINS
+   603 vs 529. Fused MTP+suffix verify is faster per accepted token than
+   ngram-mod's separate draft/verify once acceptance is near-saturated.
+2. PARTIAL-ECHO CONTINUATION (12K ctx, 1024 tok code): llama WINS 409 vs 178.
+   q27's SuffixDraft fired only 25-38x/291 rounds (3.0 tok/rnd) where
+   ngram-mod hit 89%. ROOT CAUSE = mechanism: q27 SuffixDraft needs EXACT
+   suffix repetition + is greedy-gated + capped at width 12; ngram-mod's
+   24-token lookup drafts up to 64 forward from ANY in-context match, so it
+   tolerates near-repeats that break q27's suffix match. THIS is TheTom's
+   "653 file-re-emit" regime -- real, and q27's weakest spot.
+3. NOVEL GENERATION: q27 WINS decisively 157 vs 56 (cold). MTP head drafts a
+   learned guess every round regardless of echo material; ngram-mod has
+   nothing to match -> falls to base decode. NOTE: ngram-mod PERSISTS its
+   table across requests, so repeated identical novel prompts warm 56->79->97
+   by echoing their own prior greedy output; the cold 56 is the honest
+   single-shot number. q27's 157.5 is request-invariant (no server-side table).
+4. echo_ctx26k is NOT comparable: Q5 vs NVFP4 quant divergence made the greedy
+   outputs differ (llama 169 tok w/ 0 drafts vs q27 256 tok) -> different text,
+   drop it.
+
+bpw confound: llama Q5_K_M ~5.5bpw has MORE bits than q27's 5.25 (mild edge to
+llama) yet still loses novel + pure-echo -> qualitative conclusion robust.
+
+ENGINEERING LEVER (not yet built): the fileemit regime is where q27 leaves the
+most on the table. Adding an ngram-style long-lookahead lookup (24-tok match ->
+draft-forward-N) to COMPLEMENT MTP+SuffixDraft (not replace) would capture
+llama's partial-echo win without touching the novel-prose MTP advantage. The
+current SuffixDraft is deliberately conservative (exact-suffix + greedy-gate +
+W12) for bitwise determinism; an ngram path would need the same tie/tolerance
+discipline as the wide fdmma verify. Candidate follow-on.
+
+**2026-07-14 -- CROSS-ENGINE #2: llama-ngram-mod ON REAL THUNDERDOME AGENTIC TRAFFIC.**
+Drove Claude Code (the claude-code-q27-haight adapter -- retargets ANTHROPIC_BASE_URL
+at :8081) against the llama-cpp-turboquant fork on the SAME 3 tasks q27 ran. The fork
+serves the Anthropic /v1/messages API natively (streaming, tool_use, thinking blocks,
+count_tokens all verified) so no proxy needed. llama config made FAIR to q27:
+5090-only (CUDA_VISIBLE_DEVICES=0, no 3090 layer-split), q8_0 KV (~ q27 fp8), single
+slot, --spec-type ngram-mod --jinja, Q5_K_M ~5.5bpw. Same base model.
+
+                          wall    exit       score   q27 wall  q27 score
+  analytics-dashboard     741s    completed  0.609    150s     0.512
+  time-tracker            173s    completed  0.653     54s     0.791
+  structural-merge        363s    completed  0.943     90s     0.911
+
+  DECODE:   llama 61.0 t/s agg / 55.5 med   vs   q27 289.8 agg / 236.5 med
+  ngram-mod draft acceptance on agentic traffic = 34% (14370/42116)
+
+q27 is ~4.75x faster decode and ~4x faster wall-to-wall on real agentic coding, and
+wins DESPITE its known cold-prefill disadvantage (llama has the tensor-core GEMM) --
+because agentic turns are decode-bound (long generation), and decode is where q27's
+MTP dominates. The 34% ngram-mod acceptance is the whole story: real agentic coding is
+mostly NOVEL generation (writing new code), not re-emission, so ngram-mod falls to
+llama's ~55 t/s base rate. It only hit 89% on the synthetic fileemit payload. q27's
+MTP head drafts every round regardless of echo -> 5.46 tok/round -> 289.8 t/s.
+Both engines COMPLETED all tasks; scores are run-to-run noisy (agentic nondeterminism),
+not the signal. Cost column ignored (synthetic price, meaningless for local).
+
+Net across both cross-engine studies: ngram-mod's win is REAL but NARROW (high-echo
+re-emission only); on the actual q27 workload q27 wins decisively. The fileemit lever
+(add ngram-lookahead to complement MTP) would help the narrow echo case without
+touching this agentic win. See prior 2026-07-14 entry for the payload-level split.
+
+**2026-07-14 -- CROSS-ENGINE #3: reproducible SWE-bench agentic bench, THREE engines.**
+Replaced the private thunderdome tasks (not redistributable) with a public, pinned
+task set: 12 SWE-bench_Verified instances (fast-test repos: requests/flask/pytest/
+pylint/xarray, <15min difficulty), Claude Code driving each engine's Anthropic
+/v1/messages API, sandboxed per-instance in the thunderdome/claude-code Docker image
+via plain `docker run` (NOT the private orchestration; --user 1000:1000 node, since
+claude refuses --dangerously-skip-permissions as root). Artifacts in bench/swebench/
+(run.sh, manifest.json, select_instances.py, results.*.jsonl). Full method +
+reproduce steps in docs/BENCHMARKING.md. Fair config: all 5090-only, q8 KV, greedy,
+same base model (Qwen3.6-27B-MTP), llama Q5_K_M ~5.5bpw (+0.25 vs q27 NVFP4).
+
+  engine                        decode agg  med    wall/inst  gold-file
+  q27 (MTP+SuffixDraft)         202.7 t/s   208.4   47 s      11/12
+  llama ngram-mod (fork c3e6d)  61.1 t/s    56.9   118 s      11/12
+  llama MAINLINE (13e67386,none) 62.0 t/s   62.5   120 s      12/12
+
+MAINLINE BASELINE IS THE PAYOFF: it loads the qwen35 GGUF fine (LLM_ARCH_QWEN35 +
+/v1/messages both upstream as of Jul-01) and runs stock autoregressive (no spec).
+Result: fork ngram-mod (61.1) == mainline (62.0) within noise -- actually fork is
+marginally LOWER (failed-draft + table overhead at 34% acceptance ~cancels wins).
+So on REAL agentic coding ngram-mod adds ~nothing; its Method-A win (409 vs 178 on
+synthetic file-emit) does NOT generalize. Base decode kernels are comparable (~62
+t/s), so the ENTIRE ~3.3x gap is q27's MTP head drafting productively on novel
+generation where prompt-lookup/ngram have nothing to match. Quality identical
+(11-12/12 gold-file, model is the same; engine only changes speed). q27 finishes
+each instance in ~40% of the llama wall time despite +0.25bpw and slower cold prefill.
+
+**2026-07-14 -- CROSS-ENGINE #4: llama.cpp WITH the MTP head (apples-to-apples).**
+Ran mainline llama.cpp (13e67386, which has --spec-type draft-mtp + auto-discovers the
+GGUF's MTP head) with --spec-type draft-mtp --spec-draft-n-max 6 on the same 12
+SWE-bench instances. Same MTP head + same model as q27 -> isolates ENGINE quality, not
+drafter choice. Fair config (5090-only, q8 KV, greedy). results.llamammtp.jsonl.
+
+  engine                                 decode agg  med    wall/inst  gold
+  q27 (MTP + SuffixDraft, fused)         202.7 t/s   208.4   47 s      11/12
+  llama mainline + MTP (n-max 6)         116.3 t/s   127.3   80 s      11/12
+  llama ngram-mod (fork)                  61.1 t/s    56.9  118 s      11/12
+  llama mainline (no spec)                62.0 t/s    62.5  120 s      12/12
+
+GAP DECOMPOSITION (real agentic decode, all same model): stock 62 -> +ngram-mod ~62
+(x1.0, adds nothing) -> +MTP 116 (x1.9, MTP is the real lever, 58% accept on agentic vs
+ngram's 34%) -> q27 203 (x1.74 ON TOP of llama+MTP). So MTP nearly doubles stock, and
+q27's engine (fused shared-KV MTP+SuffixDraft verify, NVFP4 kernels, tie/tolerance
+discipline) is another ~1.74x over mainline's MTP -- with the IDENTICAL head. Payload
+smoke agrees: q27 vs llama+MTP = 157 vs 92 novel (x1.7), 178 vs 184 fileemit (tie);
+agentic is novel-heavy so the mix lands at x1.74. Quality engine-independent (11-12/12).
+Answers "what about llama.cpp with MTP": it closes ~half the gap to q27; the residual
+1.74x is q27's engine, not the drafter. Full 4-engine table in docs/BENCHMARKING.md.
