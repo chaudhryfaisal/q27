@@ -116,6 +116,10 @@ consequence: the batch is pointer plumbing over buffers engines already own.
 - P2 mixer overlap: ~117 -> ~1.7x. P2 draft fusion: ~105 -> ~1.9x.
 - 3-4 slots (W16 build): weight sweep stays ~flat -> toward 2.5-3x.
 These are planning numbers, not promises; the P1 A/B is the arbiter.
+- MEASURED P1: 1.21x at 2 slots (bar 1.3x missed) -- serial mixers + serial
+  drafts came in as priced; the miss is +2.0 ms/round GEMV-family width
+  scaling and +1.9 ms/round eager launch tax, both unpriced above; P2
+  arithmetic from the measured walls ~1.75x (BUILDLOG 2026-07-15).
 
 ## Gates
 

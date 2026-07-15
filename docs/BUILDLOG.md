@@ -5807,3 +5807,9 @@ both payloads (vgemm tolerance family, priced) but is rep-deterministic.
 Task 9 TODO check: fused rounds have no phd/phv wall buckets -- fully-fused
 [req] prints clean zeros (phd=0.0 phv=0.0 phs=0), solo-tail rounds fill
 normally, no garbage fields.
+Sanitizer (review-fix pass, 07-15): memcheck 0 errors with FULL allocation
+tracking at a small footprint (w16 server, Q27_BATCH=1 fp8, 8K x 2 slots,
+2 concurrent ~240-token prompts x 64 tokens, 32 fused k=2 rounds, bat=2.0
+both [req] lines; scratchpad/t12_san/sanitizer.small.log) -- the 32K w16
+config OOMs memcheck's own tracking (documented limitation, standing
+kernel-filtered+memory-capped rule).

@@ -1285,6 +1285,12 @@ struct Engine {
         // P0 batching: the CALLER builds the view (solo: solo_view() -- a
         // vw/stm snapshot taken exactly when the members were read before),
         // so the P1 fused round can hand this same forward a union view.
+        // SKELETON MIRROR WARNING (review M3): fused_verify_round in
+        // src/conductor.h mirrors this loop skeleton (embed3 -> per-layer
+        // rmsnorm3/pair/add3/rmsnorm3/ffn_pair/add3 -> output norm/qx5/head
+        // mm5) with per-engine mix sub-launches. Structural changes HERE
+        // MUST be mirrored there and re-gated with fused_smoke (build line
+        // in tools/fused_smoke.cu's header).
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok,
                      N_EMBD, LANESV(v, h), v.stm,
@@ -1842,6 +1848,38 @@ struct Engine {
     // below is host bookkeeping the solo path already runs inside spec_round;
     // spec_round itself is left untouched (it owns telemetry/adaptive-depth
     // extras the P1 fixed-ladder conductor does not use).
+    //
+    // Thin named accessors (review M3): every raw member conductor.h reads,
+    // behind a name with a one-line why, so the reach surface stays
+    // greppable and deliberate (A4: a new member need adds an accessor here
+    // with a comment saying why -- never a raw reach from conductor.h).
+    // why: fused members must share ONE weight set -- the union sweep reads
+    // weights through es[0]; build_union_view identity-compares this, and
+    // the fused forward reads embed/norm/head tensors through it.
+    const q27::DeviceModel& shared_dm() const { return dm; }
+    // why: the fused layer loop forks the attn vs GDN pre/mix/post trio per
+    // layer, exactly as spec_verify_forward does.
+    bool is_attn_layer(int il) const { return attn_layer[il]; }
+    // why: the fused head must pick the same output tensor (Q4 fast head vs
+    // fp16) the solo verify picks, or fused logits fork numerically.
+    bool fast_head_on() const { return fast_head; }
+    // why: the union round borrows es[0]'s k_vgemm workspace (A9: sized from
+    // vgemm_ws_bytes_model for W_PLUMB lanes, so any engine's covers any
+    // legal union).
+    float* vgemm_ws() const { return d_vgemm_ws; }
+    // why: build_union_view asserts the granted width was installed
+    // (set_round_width) before the member's mix/tails read it.
+    int round_width() const { return vw; }
+    // why: the conductor records each member's draft_done event on the
+    // stream its draft phase ran on, then makes the fused stream wait on it.
+    cudaStream_t stream() const { return stm; }
+    // why: the conductor D2Hs every member's round outcome itself -- one
+    // sync for the whole batch -- then hands the host copy to
+    // commit_outcome().
+    const int* outcome_dev() const { return d_outcome; }
+    // why: leave() hands the finish reason (stamped by finish_decode) to
+    // the request thread via TokenQueue::close.
+    const char* end_reason() const { return gs.end; }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
@@ -2490,6 +2528,10 @@ struct Engine {
     struct GenStats {
         int prompt = 0, hit = 0, ckpt = -1, pf = 0; // tokens
         double pf_ms = 0, dec_ms = 0, cb_ms = 0;    // cb = time inside on_token
+        // (review L3) under Q27_BATCH=1 the sink is the conductor's queue
+        // push: cb_ms then times on_emit + TokenQueue::push on the CONDUCTOR
+        // thread, not the client SSE write (which runs on the request thread
+        // draining the queue and is not timed anywhere).
         // R1b: time parked in on_round_gap calls that actually handed the
         // GPU over (includes the pre-yield drain of our own in-flight
         // chunks), and how many handovers. pf_ms/dec_ms stay wall-inclusive

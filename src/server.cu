@@ -602,6 +602,40 @@ int main(int argc, char** argv) {
     {
         const char* e = getenv("Q27_BATCH");
         if (e && atoi(e) != 0) {
+            // Batch-mode config validation (review M2), mirroring the
+            // gemm_min guardrail's refuse-to-run posture (engine.cuh "THE
+            // GUARDRAIL"): the conductor's draft_and_gate() asserts the
+            // gated-dexit greedy-spec config PER ROUND -- i.e. deep into
+            // serving, on a live request. Check the env strings HERE, before
+            // the Conductor exists, with logic identical to the engine's own
+            // parses (build_spec_graphs / make_decode_task /
+            // set_tool_constraint -- the engine reads them later, so parse
+            // the raw strings the same way it will).
+            const char* pm = getenv("Q27_PMIN"); // engine: atof; gate iff > 0
+            if (!pm || atof(pm) <= 0) {
+                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the gated draft "
+                                "(Q27_PMIN > 0; it is %s). Set Q27_PMIN=0.5 or drop Q27_BATCH.\n",
+                        pm ? pm : "unset");
+                exit(1);
+            }
+            const char* de = getenv("Q27_DEXIT"); // engine: atoi != 0, default on
+            if (de && atoi(de) == 0) {
+                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the dexit draft "
+                                "loop (Q27_DEXIT=%s disables it). Drop Q27_DEXIT or Q27_BATCH.\n",
+                        de);
+                exit(1);
+            }
+            if (getenv("Q27_SAMPLE_PLAIN")) { // engine: presence-only
+                fprintf(stderr, "q27-server: FATAL -- Q27_SAMPLE_PLAIN (any value) forces the "
+                                "plain sampler, which has no fused path. Drop it or Q27_BATCH.\n");
+                exit(1);
+            }
+            if (getenv("Q27_TOOL_SPLIT")) { // engine: presence-only
+                fprintf(stderr, "q27-server: FATAL -- Q27_TOOL_SPLIT (any value) enables the "
+                                "split constrained rounds, which have no fused path. Drop it "
+                                "or Q27_BATCH.\n");
+                exit(1);
+            }
             conductor = std::make_unique<q27::Conductor>(gpu_gate);
             fprintf(stderr, "continuous batching: ON (Q27_BATCH=1, union cap %d)\n", W_MAX);
         }

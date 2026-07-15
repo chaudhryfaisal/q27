@@ -11,9 +11,13 @@
 // earned width does.
 //
 // The Conductor (Task 9: registry, round loop, token queues) calls a THIN
-// ENGINE-OWNED surface only -- solo_view()/pre/mix/post/tails/
-// set_round_width/draft_and_gate/suffix_propose/commit_outcome/pre_round/
-// post_round/decode_step -- no friend access, no raw member reaches from
+// ENGINE-OWNED surface only: the entrypoints (solo_view()/pre/mix/post/
+// tails/T()/set_round_width/draft_and_gate/suffix_propose/commit_outcome/
+// pre_round/post_round/decode_step) plus the named ACCESSORS engine.cuh
+// declares for the conductor (shared_dm/is_attn_layer/fast_head_on/
+// vgemm_ws/round_width/stream/outcome_dev/end_reason, each with a why-
+// comment at its declaration). No friends; every raw-member need is met by
+// adding an accessor in engine.cuh, never by reaching into the engine from
 // this header (consensus addendum A4). The trim policy, TokenQueue and the
 // ConductorCore scheduling skeleton below are pure host code (deterministic,
 // CPU-tested in tools/test_conductor.cpp); the fused round + the real
@@ -26,6 +30,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace q27 {
@@ -80,23 +85,32 @@ struct TokenQueue {
     }
     // Close with the finish reason (Engine gs.end: "eos"/"n_max"/...). The
     // reason pointer must be a string literal / static (never freed).
+    // LIFETIME RULE (review H1): the consumer may destroy this queue the
+    // MOMENT it observes `closed` (pop() returning false unblocks the
+    // request thread, whose stack owns the queue) -- so once the mutex
+    // unlocks, NO queue member, cv included, may be touched. The notify
+    // therefore runs INSIDE the locked region: a waiter cannot re-check the
+    // predicate until the lock drops, and a consumer entering pop() blocks
+    // on the mutex, so the notify always executes on a live cv. (A notify
+    // after the unlock could race the consumer observing `closed` via an
+    // earlier wakeup and freeing the queue: use-after-free.)
     void close(const char* why) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            closed = true;
-            reason = why;
-        }
-        cv.notify_one();
+        std::lock_guard<std::mutex> lk(m);
+        closed = true;
+        reason = why;
+        cv.notify_one(); // under the lock -- see LIFETIME RULE above
     }
-    // Close with a host-side error instead of a normal finish (A2 note above).
+    // Close with a host-side error instead of a normal finish (A2 note
+    // above). `what` is COPIED into the queue (the A2 unwind passes
+    // e.what(), which dies with the exception object), unlike close()'s
+    // static-only reason.
     void fail(const char* what) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            error = what;
-            closed = true;
-            reason = "error";
-        }
-        cv.notify_one();
+        std::lock_guard<std::mutex> lk(m);
+        error_owned = what;
+        error = error_owned.c_str();
+        closed = true;
+        reason = "error";
+        cv.notify_one(); // under the lock -- see close()'s LIFETIME RULE
     }
     // Drain everything available, APPENDING to out; blocks until at least one
     // token arrives or the queue closes. Returns false only when the queue is
@@ -126,6 +140,7 @@ private:
     bool closed = false;
     const char* reason = "";
     const char* error = nullptr;
+    std::string error_owned; // backing store for `error` (fail() copies)
 };
 
 // ---------------------------------------------------------------------------
@@ -156,8 +171,14 @@ private:
 // the trim policy are the whole scheduler.
 template <class MemberT>
 struct ConductorCore {
-    enum { MAX_K = 16 }; // >= any legal union (floor-2 lanes under a
-                         // W_MAX/W_PLUMB cap); asserted per round
+    // MAX_K sizes round()'s stack arrays. The LEGAL member ceiling is
+    // MAX_K/2 = 8, not 16: floor-2 lanes mean k members need >= 2k union
+    // lane slots, and the lane plumbing has W_PLUMB = 16 slots (review L1 --
+    // the old comment claimed 16 members were a legal union). MAX_K
+    // deliberately EQUALS W_PLUMB (static_assert at the CUDA Conductor
+    // below; this pure-host half compiles without cuda_common.h) so the
+    // hard k <= MAX_K/2 check in round() is exactly k <= W_PLUMB/2.
+    enum { MAX_K = 16 };
     int cap;             // union width cap (the real conductor passes W_MAX)
     explicit ConductorCore(int cap_) : cap(cap_) {}
     std::vector<MemberT*> members; // live set; mutated at round boundaries only
@@ -198,7 +219,21 @@ struct ConductorCore {
             }
             return (int)members.size();
         }
-        assert(k <= MAX_K);
+        // Batch-formation HARD check (review L1), not an assert: k members at
+        // the floor-2 trim need 2k union lanes, so k > MAX_K/2 (== W_PLUMB/2
+        // = 8) can never trim under the plumbing and the union view would
+        // overflow engine lane arrays -- memory corruption, not a policy
+        // miss. Unreachable in the server (its slot count is clamped <= 4);
+        // this is for EMBEDDERS driving the class directly, who get a real
+        // refuse-to-run (the guardrail posture) even in an NDEBUG build.
+        if (k > MAX_K / 2) {
+            fprintf(stderr,
+                    "conductor: FATAL -- %d members exceed the legal union ceiling %d "
+                    "(floor-2 lanes over %d plumbed lane slots). Admission control is "
+                    "the caller's job; refusing to form the batch.\n",
+                    k, MAX_K / 2, (int)MAX_K);
+            abort();
+        }
         MemberT* ms[MAX_K];
         int want[MAX_K];
         bool sfx[MAX_K], done[MAX_K];
@@ -318,7 +353,7 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
     // One weight set serves every lane: the fused sweep reads weights (and
     // attn_layer geometry) through es[0], so all members must share the
     // DeviceModel (the server's shared_model/shared_dm construction).
-    for (int m = 1; m < k; m++) assert(&es[m]->dm == &es[0]->dm);
+    for (int m = 1; m < k; m++) assert(&es[m]->shared_dm() == &es[0]->shared_dm());
     UnionView uv;
     uv.k = k;
     // start from es[0]'s solo view: sane padding for slots >= union width
@@ -327,7 +362,7 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
     for (int m = 0; m < k; m++) {
         assert(w[m] >= 2 && w[m] <= W_MAX); // per-engine: logits2/roles are W_MAX-lane
         // granted width must already be installed (mix/tail read member vw)
-        assert(es[m]->vw == w[m]);
+        assert(es[m]->round_width() == w[m]);
         const Engine::LaneView sv = es[m]->solo_view();
         for (int j = 0; j < w[m]; j++, u++) {
             assert(u < W_PLUMB);
@@ -348,10 +383,10 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
         }
     }
     assert(u <= W_PLUMB); // A9: es[0]'s vgemm_ws is sized for W_PLUMB lanes
-    assert(es[0]->d_vgemm_ws != nullptr);
+    assert(es[0]->vgemm_ws() != nullptr);
     uv.view.vw = u;
     uv.view.stm = cstm;
-    uv.view.vgemm_ws = es[0]->d_vgemm_ws;
+    uv.view.vgemm_ws = es[0]->vgemm_ws();
     // union-class GEMM family (policy block in the header comment above):
     // all-suffix -> vgemm (2); all-gated OR mixed -> GEMV (99, gated lanes
     // keep the bitwise contract; mixed unions' suffix lanes tolerance-fork).
@@ -377,7 +412,13 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
 // per-engine mix (SEQUENCE state: KV/GDN roles, serial on cstm at P1); post
 // (union); union add3/rmsnorm3; ffn_pair(union); union add3 }; union output
 // norm + head into per-slot lg = each engine's own logits2 lanes; per-engine
-// greedy tails on cstm. pre/post/ffn_pair are Engine methods but read ONLY
+// greedy tails on cstm.
+// SKELETON MIRROR WARNING (review M3): the loop below is a hand-maintained
+// COPY of Engine::spec_verify_forward's skeleton (engine.cuh) with the
+// union-vs-per-engine split applied. Structural changes THERE (layer-loop
+// shape, kernel order, head selection) MUST be mirrored HERE and re-gated
+// with fused_smoke (build line in tools/fused_smoke.cu's header).
+// pre/post/ffn_pair are Engine methods but read ONLY
 // the view + shared weights (dm/T(il)/EPS), so calling them on es[0] with the
 // union view sweeps every engine's lanes in one pass -- that is the whole
 // point: one weight read serves all slots.
@@ -401,7 +442,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
-    const DevTensor& emb = e0.dm.get("token_embd.weight");
+    const DevTensor& emb = e0.shared_dm().get("token_embd.weight");
     q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok, N_EMBD,
                  LANESV(v, h), v.stm, v.vw);
     q27k::CP3 Hc LANESV(v, h), Yc LANESV(v, y);
@@ -409,7 +450,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     for (int il = 0; il < N_LAYER; il++) {
         const float* an = (const float*)e0.T(il, "attn_norm.weight").data;
         q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
-        if (e0.attn_layer[il]) {
+        if (e0.is_attn_layer(il)) {
             e0.attn_pre(il, v);
             for (int m = 0; m < k; m++) es[m]->attn_mix(il, cstm);
             e0.attn_post(il, v);
@@ -424,13 +465,13 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
         e0.ffn_pair(il, v);
         q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
     }
-    const float* on = (const float*)e0.dm.get("output_norm.weight").data;
+    const float* on = (const float*)e0.shared_dm().get("output_norm.weight").data;
     q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
     e0.qx5(v, v.x1, N_EMBD);
-    const char* vhead = (e0.fast_head && e0.dm.model_has("output_q4.weight"))
+    const char* vhead = (e0.fast_head_on() && e0.shared_dm().model_has("output_q4.weight"))
                             ? "output_q4.weight"
                             : "output.weight";
-    e0.mm5(v, e0.dm.get(vhead), v.lg);
+    e0.mm5(v, e0.shared_dm().get(vhead), v.lg);
     // per-engine tails: own lane pointers (solo view), granted width,
     // conductor stream -- argmax/accept + finish land in each engine's own
     // d_v/d_outcome/h_next, and perm-role commit semantics are untouched.
@@ -482,6 +523,11 @@ public:
         bool round_is_suffix() const { return sfx_round; }
         void set_granted(int w) { e->set_round_width(w); }
     };
+    // Review L1: ConductorCore::round()'s hard k <= MAX_K/2 check stands in
+    // for k <= W_PLUMB/2 (the pure-host half cannot see cuda_common.h);
+    // this pin keeps the two ceilings the same number.
+    static_assert((int)ConductorCore<Member>::MAX_K == W_PLUMB,
+                  "MAX_K must equal W_PLUMB or round()'s union ceiling check drifts");
 
     // gate: the server's GpuGate -- prefill chunks time-slice against decode
     // rounds through it, unchanged (design "Scheduler"). cap: the union
@@ -542,6 +588,20 @@ public:
         CUDA_CHECK(cudaEventCreateWithFlags(&mm->draft_done, cudaEventDisableTiming));
         {
             std::lock_guard<std::mutex> lk(m);
+            // Review M4: registration racing shutdown. If the stop flag is
+            // already up, run()'s shutdown drain may have ALREADY adopted its
+            // last-instant joins -- a member pushed now would never be
+            // cancelled and its caller would block on the queue forever.
+            // Refuse under the same lock the drain takes: fail the queue so
+            // the caller unblocks with a surfaced error instead of a hang.
+            // Unreachable in the current server (it destroys the Conductor
+            // only after the HTTP listener stops taking requests), but this
+            // class is server-agnostic and embedders deserve the check.
+            if (stop) {
+                CUDA_CHECK(cudaEventDestroy(mm->draft_done));
+                q->fail("conductor stopping: registration refused");
+                return;
+            }
             join_q.push_back(std::move(mm));
         }
         cv.notify_one();
@@ -611,9 +671,28 @@ private:
     // queue sink. true = done. bat telemetry: a solo round contributes k=1
     // per round that actually RAN (pre_round exits inside decode_step do not
     // advance t->rounds, so the delta is the ran-count).
+    // A2 unwind (addendum A2, review M1): CUDA failures stay process-fatal
+    // (CUDA_CHECK exits, never throws -- deliberately not wrapped); a HOST
+    // exception from the bookkeeping half (post_round -> on_emit/queue sink,
+    // grammar scan, ...) must kill only THIS member, not the conductor
+    // thread. Fail its queue (copies what()), null it so leave() -- which
+    // runs after the member's removal -- cannot close a queue the request
+    // thread may already have observed closed and destroyed (H1 lifetime
+    // rule), and report done so core.round() erases the member.
     bool solo_round(Member& mm) {
         long r0 = mm.t->rounds;
-        bool done = !mm.e->decode_step(*mm.t);
+        bool done;
+        try {
+            done = !mm.e->decode_step(*mm.t);
+        } catch (const std::exception& ex) {
+            mm.q->fail(ex.what());
+            mm.q = nullptr;
+            done = true;
+        } catch (...) {
+            mm.q->fail("unknown host exception in solo round bookkeeping");
+            mm.q = nullptr;
+            done = true;
+        }
         mm.t->bat_members += mm.t->rounds - r0;
         return done;
     }
@@ -642,19 +721,38 @@ private:
             es[i] = ms[i]->e;
             sampled[i] = ms[i]->sampled;
             evs[i] = ms[i]->draft_done;
-            CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stm));
+            CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stream()));
         }
         fused_verify_round(es, granted, k, cstm, evs, sfx, sampled);
         int oc[ConductorCore<Member>::MAX_K][OUTCOME_INTS];
         for (int i = 0; i < k; i++)
-            CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->d_outcome, OUTCOME_INTS * 4,
+            CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->outcome_dev(), OUTCOME_INTS * 4,
                                        cudaMemcpyDeviceToHost, cstm));
         CUDA_CHECK(cudaStreamSynchronize(cstm)); // ONE sync for the batch
         for (int i = 0; i < k; i++) {
-            int em[W_MAX];
-            int n = es[i]->commit_outcome(oc[i], em, ms[i]->sampled, sfx[i],
-                                          ms[i]->gate_cap, ms[i]->md_used);
-            done[i] = !es[i]->post_round(*ms[i]->t, em, n);
+            // A2 unwind (addendum A2, review M1): per-member host bookkeeping
+            // (commit_outcome + post_round, whose sink runs on_emit + the
+            // queue push). A throw here fails THIS member's queue (fail()
+            // copies what()), removes the member via done[i], and lets the
+            // loop continue to members i+1..k-1 -- the conductor thread
+            // stays alive for everyone else. CUDA errors are NOT wrapped:
+            // CUDA_CHECK exits the process (A2 keeps them fatal). q is
+            // nulled so leave() cannot touch a queue the request thread may
+            // already have observed closed and destroyed (H1 lifetime rule).
+            try {
+                int em[W_MAX];
+                int n = es[i]->commit_outcome(oc[i], em, ms[i]->sampled, sfx[i],
+                                              ms[i]->gate_cap, ms[i]->md_used);
+                done[i] = !es[i]->post_round(*ms[i]->t, em, n);
+            } catch (const std::exception& ex) {
+                ms[i]->q->fail(ex.what());
+                ms[i]->q = nullptr;
+                done[i] = true;
+            } catch (...) {
+                ms[i]->q->fail("unknown host exception in fused round bookkeeping");
+                ms[i]->q = nullptr;
+                done[i] = true;
+            }
             // Task 10 [req] bat= telemetry: this member's round ran k-wide
             // (post_round above advanced t->rounds unconditionally), and
             // k >= 2 here by the core's dispatch.
@@ -667,8 +765,11 @@ private:
     // decode_step/post_round and stamped gs.end): hand the stop reason to
     // the request thread via the queue close, release the event, free the
     // Member. Runs on the conductor thread only; `owned` needs no lock.
+    // q == nullptr: the A2 unwind already failed (closed) the queue -- it
+    // must not be touched again (H1 lifetime rule: the request thread may
+    // have destroyed it the moment it observed closed).
     void leave(Member& mm) {
-        mm.q->close(mm.e->gs.end);
+        if (mm.q) mm.q->close(mm.e->end_reason());
         CUDA_CHECK(cudaEventDestroy(mm.draft_done));
         for (size_t i = 0; i < owned.size(); i++) {
             if (owned[i].get() == &mm) {
