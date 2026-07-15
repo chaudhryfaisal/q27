@@ -1064,8 +1064,8 @@ struct Engine {
     // v.vw/v.stm, so the composed pair emits the bit-identical launch
     // sequence -- graph capture records the same nodes in the same order
     // (addendum A8). The fused driver never calls the composed pairs, only
-    // pre/mix/post individually (P1 Task 8 adds explicit stream/width params
-    // to mix; until then mix takes none by design).
+    // pre/mix/post individually (P1 Task 8: mix takes an explicit stream --
+    // the conductor's -- while width stays member vw, the granted width).
     void gdn_pre(int il, const LaneView& v) {
         qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_qkv.weight"), v.qkv);
@@ -1087,22 +1087,27 @@ struct Engine {
     }
     // -- split point: sequence state (RBuf/SBuf recurrent roles) begins here;
     //    weight sweep above reads only the view (design 2026-07-14) --
-    void gdn_mix(int il) {
+    // P1 batching: mix takes an explicit STREAM (the fused round runs every
+    // engine's mix on the conductor stream; solo passes member stm -- same
+    // value, same launch sequence). Width stays MEMBER vw: each engine's mix
+    // walks its OWN granted lanes 0..vw-1, never the union width (the
+    // conductor sets vw per round via set_round_width before the fused round).
+    void gdn_mix(int il, cudaStream_t st) {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
         // width-vw graph skips the rest, leaving their (never-read) role buffers
         // untouched. Lane a (role 0, the pending token) always runs.
-        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm); // lane 0
+        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, st); // lane 0
         for (int L = 1; L < vw; L++)
-            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, stm);
+            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, st);
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
         q27k::l2norm3(LANESW(convout), 32,
-                      GDN_DIM, eps, stm, vw);
-        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm); // lane 0
+                      GDN_DIM, eps, st, vw);
+        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, st); // lane 0
         for (int L = 1; L < vw; L++)
-            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], stm);
+            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], st);
     }
     // -- split point: back to the weight sweep (per-lane elementwise + o-proj
     //    on the view); mix wrote o_L in place, the view aliases it --
@@ -1116,7 +1121,7 @@ struct Engine {
     }
     void gdn_pair(int il, const LaneView& v) {
         gdn_pre(il, v);
-        gdn_mix(il);
+        gdn_mix(il, stm);
         gdn_post(il, v);
     }
 
@@ -1143,32 +1148,33 @@ struct Engine {
     }
     // -- split point: sequence state (KV cache + attention scratch + kv_kind-
     //    branched turbo3 rotates) begins here (design 2026-07-14) --
-    void attn_mix(int il) {
+    // P1 batching: explicit stream, member width -- same contract as gdn_mix.
+    void attn_mix(int il, cudaStream_t st) {
         int ci = attn_cache_idx[il];
         q27k::IP3 P LANESW(d_pos);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
         // branch on kv_kind only (init-fixed, graph-capture-safe)
         if (kv_kind == KV_T3)
-            q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
+            q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, st, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
             q27k::kv_store_t3(LANESW(kbuf),
                               LANESW(vbuf), kcache[ci], vcache[ci],
-                              P, N_KV, HEAD_DIM, stm, vw, /*k_plain=*/kv_kind == KV_T3V);
+                              P, N_KV, HEAD_DIM, st, vw, /*k_plain=*/kv_kind == KV_T3V);
         else
             q27k::kv_store3(LANESW(kbuf),
                             LANESW(vbuf), kcache[ci], vcache[ci],
-                            P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
+                            P, N_KV * HEAD_DIM, st, vw, kv_fp8);
         q27k::attn_decode3(LANESW(qg), 2 * HEAD_DIM, kcache[ci],
                            vcache[ci],
                            LANESW(attnout),
-                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_kind);
+                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, st, vw, kv_kind);
         // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
         if (kv_kind >= KV_T3)
             q27k::wht3(LANESW(attnout),
-                       N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
+                       N_HEAD, HEAD_DIM, HEAD_DIM, true, st, vw);
     }
     // -- split point: back to the weight sweep (sigmoid gate is pure per-lane
     //    elementwise; mix wrote attnout_L in place, the view aliases it) --
@@ -1180,7 +1186,7 @@ struct Engine {
     }
     void attn_pair(int il, const LaneView& v) {
         attn_pre(il, v);
-        attn_mix(il);
+        attn_mix(il, stm);
         attn_post(il, v);
     }
 
@@ -1297,8 +1303,15 @@ struct Engine {
     // P0 batching: forward + per-lane argmax read the view; the mask pool
     // (d_mask_pool/d_mask_ids/d_amax) and finish_round stay MEMBER-based --
     // the tail is per-engine forever (design 2026-07-14).
-    void spec_verify_launches(const LaneView& v) {
-        spec_verify_forward(v);
+    // P1 batching split: the greedy TAIL (per-lane argmax + finish_round)
+    // factored out of spec_verify_launches so the fused round can run ONE
+    // union forward and then each engine's own tail. The tail reads width and
+    // stream from the view (fused: granted width + the conductor stream;
+    // solo: solo_view() where v.vw == vw and v.stm == stm, so the composed
+    // function emits the bit-identical launch sequence -- addendum A8). The
+    // mask pool (d_mask_pool/d_mask_ids/d_amax) and finish_round's commit
+    // state stay MEMBER-based -- the tail is per-engine forever.
+    void spec_verify_tail(const LaneView& v) {
         // P7: slot 0 (the post-pending lane) is the constrained one; the rest
         // keep id -1 (v1 caps acceptance in-grammar instead of chasing
         // draft-dependent states the host cannot know pre-launch).
@@ -1316,7 +1329,11 @@ struct Engine {
         q27k::finish_round(d_P, d_token, drafts,
                            LANESW(d_v),
                            LANESW(x1),
-                           h_next, d_outcome, N_EMBD, d_accept_cap, vw - 1, stm);
+                           h_next, d_outcome, N_EMBD, d_accept_cap, v.vw - 1, v.stm);
+    }
+    void spec_verify_launches(const LaneView& v) {
+        spec_verify_forward(v);
+        spec_verify_tail(v);
     }
 
     // Phase 2: sampled verify tail. Same forward; replace the 5 argmax lanes +
@@ -1327,8 +1344,10 @@ struct Engine {
     // P0 batching: forward + per-lane nucleus read the view; spec_accept/
     // sample_stop/finish_sampled stay MEMBER-based (they take logits2 as a
     // flat base pointer -- per-engine tail state, per-engine forever).
-    void spec_verify_launches_sampled(const LaneView& v) {
-        spec_verify_forward(v);
+    // P1 batching split: sampled TAIL, same seam as spec_verify_tail. Width
+    // and stream come from the view (solo: == members, bit-identical); the
+    // flat logits2 base and the accept/finish commit state stay MEMBER-based.
+    void spec_verify_tail_sampled(const LaneView& v) {
         // P14: width-vw sampled verify -- nucleus stats + accept walk over the
         // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
@@ -1337,10 +1356,15 @@ struct Engine {
         for (int k = 0; k < v.vw; k++)
             q27k::nucleus(v.lg[k], VOCAB, d_samp, d_nuc + k * 4, v.stm);
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
-                          d_accept_cap, vw - 1, VOCAB, d_spec, stm);
-        q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
+                          d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+        q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
         q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
-                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD, stm);
+                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD,
+                             v.stm);
+    }
+    void spec_verify_launches_sampled(const LaneView& v) {
+        spec_verify_forward(v);
+        spec_verify_tail_sampled(v);
     }
 
     void spec_round_launches() {
@@ -1792,6 +1816,64 @@ struct Engine {
             for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
             fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1], sfx_round ? 1 : 0);
         }
+        perm = (perm + (n - 1)) % W_MAX;
+        return n;
+    }
+
+    // ---- P1 continuous-batching conductor surface (addendum A4) ----
+    // The conductor drives a fused round through THESE entrypoints plus the
+    // pre/mix/post trio, ffn_pair, solo_view() and the split verify tails --
+    // no friend access, no raw member reaches from conductor.h. Everything
+    // below is host bookkeeping the solo path already runs inside spec_round;
+    // spec_round itself is left untouched (it owns telemetry/adaptive-depth
+    // extras the P1 fixed-ladder conductor does not use).
+    //
+    // Set the granted verify width for the NEXT (eager, fused) round. vw is
+    // capture-time state for the graph zoo, so this must only be called on
+    // the conductor path, never between graph replays.
+    void set_round_width(int w) {
+        assert(w >= 2 && w <= W_MAX);
+        vw = w;
+    }
+    // Draft phase of one GATED greedy round on THIS engine's stm: the P14
+    // dexit margin loop of spec_round verbatim (per-step draft graphs, D2H
+    // margin, stop at first sub-theta), including the width-floor top-up.
+    // Returns the WANT width (cap+1, floored 2) -- the conductor trims the
+    // union, calls set_round_width(granted), then the fused verify. P1 scope:
+    // requires the gated dexit config (pmin_theta > 0, dexit_on, no tool
+    // split); the fixed ladder (Q27_MAXD=4/5) keeps md_used constant so no
+    // depthctl state diverges between solo and fused runs.
+    int draft_and_gate() {
+        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
+        const int md_used = maxd_auto ? dctl.cur : gate_maxd;
+        int cap = 0, launched = 0;
+        for (int k = 0; k < md_used; k++) {
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+            launched++;
+            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                       cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            if (h_draft_margin[k] < pmin_theta) break;
+            cap++;
+        }
+        int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+        // Width-floor top-up (see spec_round): a width-W verify walks W-1
+        // drafts, so W draft rows must exist. Only fires at cap==0.
+        for (int k = launched; k < W && k < md_used; k++)
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        return W;
+    }
+    // Post-verify host commit for one fused round: EXACTLY what spec_round
+    // does after its outcome sync -- em[] extraction, last_pending, suffix
+    // arming, perm advance. oc = this engine's d_outcome, already on host
+    // (the conductor does one D2H + sync per round for the whole batch).
+    // Deliberately NOT here: gate_cap/dctl telemetry (P1 conductor is
+    // fixed-ladder; adaptive-depth feedback under trim is a Task 9 concern).
+    int commit_outcome(const int* oc, int* emit) {
+        int n = oc[0];
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        last_pending = oc[OUTCOME_INTS - 1];
+        sfx_valid = true;
         perm = (perm + (n - 1)) % W_MAX;
         return n;
     }
