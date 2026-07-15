@@ -22,6 +22,7 @@
 
 #include <cassert>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
@@ -208,7 +209,26 @@ struct ConductorCore {
         }
         // trim mutates only on overflow (sum > cap): under the cap, granted
         // == want and untrimmed lanes keep the bitwise contract.
+        // Q27_BATCH_DBG=1 (Task 10, A5 trim-active gate): one stderr line per
+        // fused round, want->granted per lane (s=suffix, g=gated) -- the
+        // trim-fired evidence the gate reads. Single buffered write so lines
+        // stay whole against concurrent request-thread stderr.
+        static const bool dbg = [] {
+            const char* e = getenv("Q27_BATCH_DBG");
+            return e && atoi(e) != 0;
+        }();
+        int want0[MAX_K];
+        if (dbg)
+            for (int i = 0; i < k; i++) want0[i] = want[i];
         trim_widths(want, sfx, k, cap);
+        if (dbg) {
+            char line[256];
+            int off = snprintf(line, sizeof line, "[bat] k=%d cap=%d", k, cap);
+            for (int i = 0; i < k && off < (int)sizeof line - 16; i++)
+                off += snprintf(line + off, sizeof line - off, " %d->%d%c", want0[i],
+                                want[i], sfx[i] ? 's' : 'g');
+            fprintf(stderr, "%s\n", line);
+        }
         for (int i = 0; i < k; i++) ms[i]->set_granted(want[i]);
         fused_round(ms, want, sfx, k, done);
         // leave-on-done at the boundary (EOS/budget/client-stop this round)
@@ -491,7 +511,15 @@ public:
     // pushes each emitted token; pushes are non-blocking (A7). Client-stop
     // is expressed via t->cancel (A3), never via the sink's return value.
     // The join lands at the next round boundary.
-    void register_member(Engine* e, Engine::DecodeTask* t, TokenQueue* q) {
+    // on_emit (Task 10, nullable): runs on the CONDUCTOR thread inside
+    // post_round, per token, BEFORE the queue push -- i.e. between the
+    // on_round scan and on_pending, the exact slot the solo on_token body
+    // occupies. The server routes tool-constrain grammar feeding (tc.on_id)
+    // here so its ordering against scan_round/on_pending is unchanged AND
+    // its engine mutations (set_tool_constraint's async copies) keep running
+    // under the GPU gate, now held by the conductor's round lease.
+    void register_member(Engine* e, Engine::DecodeTask* t, TokenQueue* q,
+                         std::function<void(int)> on_emit = nullptr) {
         assert(!t->force_plain_sample); // plain-sample rounds have no fused
                                         // path; Q27_SAMPLE_PLAIN is an A/B
                                         // lever, unsupported in batch mode
@@ -500,10 +528,17 @@ public:
         mm->t = t;
         mm->q = q;
         mm->sampled = t->sampling;
-        t->on_token = [q](int id) {
-            q->push(&id, 1);
-            return true;
-        };
+        if (on_emit)
+            t->on_token = [q, oe = std::move(on_emit)](int id) {
+                oe(id);
+                q->push(&id, 1);
+                return true;
+            };
+        else
+            t->on_token = [q](int id) {
+                q->push(&id, 1);
+                return true;
+            };
         CUDA_CHECK(cudaEventCreateWithFlags(&mm->draft_done, cudaEventDisableTiming));
         {
             std::lock_guard<std::mutex> lk(m);
@@ -573,8 +608,15 @@ private:
 
     // Solo fallthrough (k==1): decode_step IS today's path -- captured round
     // graphs, spec_round's own bookkeeping/telemetry, tokens through the
-    // queue sink. true = done.
-    bool solo_round(Member& mm) { return !mm.e->decode_step(*mm.t); }
+    // queue sink. true = done. bat telemetry: a solo round contributes k=1
+    // per round that actually RAN (pre_round exits inside decode_step do not
+    // advance t->rounds, so the delta is the ran-count).
+    bool solo_round(Member& mm) {
+        long r0 = mm.t->rounds;
+        bool done = !mm.e->decode_step(*mm.t);
+        mm.t->bat_members += mm.t->rounds - r0;
+        return done;
+    }
 
     // One fused round over k >= 2 members (under the caller's Lease).
     // Sequence per the plan: drafts already ran inside want_width() on each
@@ -613,6 +655,11 @@ private:
             int n = es[i]->commit_outcome(oc[i], em, ms[i]->sampled, sfx[i],
                                           ms[i]->gate_cap, ms[i]->md_used);
             done[i] = !es[i]->post_round(*ms[i]->t, em, n);
+            // Task 10 [req] bat= telemetry: this member's round ran k-wide
+            // (post_round above advanced t->rounds unconditionally), and
+            // k >= 2 here by the core's dispatch.
+            ms[i]->t->bat_members += k;
+            ms[i]->t->bat_r2++;
         }
     }
 

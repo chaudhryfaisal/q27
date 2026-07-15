@@ -2551,6 +2551,14 @@ struct Engine {
         // teardown land exactly like a natural exit. Nothing sets it yet --
         // it lands with the struct; consumers arrive with the conductor.
         std::atomic<bool> cancel{false};
+        // P1 Task 10 [req] telemetry, CONDUCTOR-filled (solo generate()
+        // leaves both 0): bat_members sums the round's member count k over
+        // every decode round this task ran GPU work in (mean batch width =
+        // bat_members / rounds); bat_r2 counts the rounds with k >= 2, i.e.
+        // actually fused. Plain longs on purpose: only the conductor thread
+        // writes them, and the request thread reads them after the queue
+        // closes (the close is the synchronization edge).
+        long bat_members = 0, bat_r2 = 0;
     };
 
     // R1b preemption point (no-op when the hook is unset or nobody waits).
@@ -2739,16 +2747,17 @@ struct Engine {
         return post_round(t, em, n);
     }
 
-    // Prompt + speculative generation. Calls on_token(id) for each generated
-    // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
-    // path (requires build_spec_graphs()). MTP KV warmed during prompt.
-    // stable_len (P8): token index of the stable-prefix boundary (end of the
-    // last input message). The GDN snapshot is taken THERE instead of at the
-    // prompt tail, so the next turn's re-rendered history prefix-matches and
-    // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
-    template <typename F>
-    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
-                 int stable_len = -1) {
+    // P1 Task 10 (continuous batching): the prefill/setup half of generate()
+    // -- everything from its entry through the d_P epilogue, moved VERBATIM
+    // so the server's batch mode (Q27_BATCH=1) can run prefill on the request
+    // thread under its own scoped gate lease and hand ONLY the decode loop to
+    // the conductor. Returns false on the refused path (gs.end = "refused",
+    // nothing prefilled); on success *P_out = prompt.size()-1, the host
+    // position mirror make_decode_task() takes. generate() below composes
+    // generate_prefill + make_decode_task + decode_step unchanged, so the
+    // solo path (and the graphs it replays, A8) is byte-identical by
+    // construction -- gated by the canonical/sampled/replay gates as always.
+    bool generate_prefill(const std::vector<int>& prompt, int stable_len, int* P_out) {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
@@ -2776,7 +2785,7 @@ struct Engine {
             // prior request's token (Security #2); NP>max_ctx overruns the cache.
             fprintf(stderr, "[gen] prompt %d out of range (1..%d) -- refusing\n", NP, max_ctx);
             gs.end = "refused";
-            return 0;
+            return false;
         }
         // 07-05 audit (c), clear-at-claim: a non-CUDA throw between a prior
         // generate() and its tc.end() can leave a stale lane-0 mask +
@@ -2904,6 +2913,22 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
+        *P_out = P;
+        return true;
+    }
+
+    // Prompt + speculative generation. Calls on_token(id) for each generated
+    // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
+    // path (requires build_spec_graphs()). MTP KV warmed during prompt.
+    // stable_len (P8): token index of the stable-prefix boundary (end of the
+    // last input message). The GDN snapshot is taken THERE instead of at the
+    // prompt tail, so the next turn's re-rendered history prefix-matches and
+    // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
+    template <typename F>
+    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
+                 int stable_len = -1) {
+        int P = 0;
+        if (!generate_prefill(prompt, stable_len, &P)) return 0;
         // Decode: pre-loop state lives in DecodeTask, one round per
         // decode_step (P1: the conductor drives the same step function for
         // several engines). finish_decode() runs inside the step that
