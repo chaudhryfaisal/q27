@@ -42,11 +42,16 @@
 //     src/loader.cpp -o build/fused_smoke
 //
 // Run: build/fused_smoke [model.q27]   (default: the canonical vanilla qwen)
-// Success line: "FUSED SMOKE PASS: streamA identical, streamB identical".
+// Success lines: "FUSED SMOKE PASS: streamA identical, streamB identical"
+// (leg B), "CONDUCTOR SMOKE PASS: ..." (leg C), "A2 ERROR-PATH SMOKE PASS"
+// (leg D: one member's host bookkeeping throws; the other member, the
+// conductor thread and the process all survive).
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -350,5 +355,80 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("CONDUCTOR SMOKE PASS: streamA identical, streamB identical\n");
+
+    // ---- Leg D: A2 error injection (review pass 2 stress gate) ----
+    // Same conductor construction as leg C, but member B's on_emit -- the
+    // Task 10 hook the server routes tc.on_id through; it runs on the
+    // CONDUCTOR thread inside post_round's queue sink, i.e. inside exactly
+    // the code the A2 catch (solo_round/fused_round) wraps -- throws after
+    // 8 delivered tokens. Claims under test:
+    //   (a) B's queue FAILS: its drain ends, error_or_null() carries the
+    //       injected message, finish_reason() == "error", and B delivered
+    //       exactly the 8 pre-throw tokens (solo-prefix-identical);
+    //   (b) A is untouched: all 32 tokens byte-identical to leg A's solo;
+    //   (c) the conductor THREAD survives the throw: a second registration
+    //       through the SAME conductor still serves (short 8-token rerun of
+    //       A, byte-identical prefix, natural n_max finish);
+    //   (d) the process exits 0 (drains return -- no crash, no deadlock).
+    prefill_serial(eA, pa);
+    prefill_serial(eB, pb);
+    {
+        q27::GpuGate gate;
+        q27::Conductor cond(gate, W_MAX);
+        Engine::DecodeTask tA, tB;
+        auto dummy = [](int) { return true; }; // replaced by the queue sink
+        eA.make_decode_task(tA, N_GEN, /*eos=*/-1, dummy, (int)pa.size() - 1);
+        eB.make_decode_task(tB, N_GEN, /*eos=*/-1, dummy, (int)pb.size() - 1);
+        q27::TokenQueue qA, qB;
+        int nB = 0; // conductor-thread-only until qB closes (the sync edge)
+        cond.register_member(&eA, &tA, &qA);
+        cond.register_member(&eB, &tB, &qB, [&nB](int) {
+            if (++nB > 8) throw std::runtime_error("injected A2 smoke error");
+        });
+        std::vector<int> outA, outB;
+        while (qA.pop(outA)) {}
+        while (qB.pop(outB)) {}
+        // (a) B failed with the injected message
+        const char* err = qB.error_or_null();
+        if (!err || !strstr(err, "injected A2 smoke error") ||
+            strcmp(qB.finish_reason(), "error") != 0) {
+            printf("A2 ERROR-PATH SMOKE FAIL: B error slot (err=%s reason=%s)\n",
+                   err ? err : "<null>", qB.finish_reason());
+            return 1;
+        }
+        if (outB.size() != 8 ||
+            !std::equal(outB.begin(), outB.end(), refB.begin())) {
+            printf("A2 ERROR-PATH SMOKE FAIL: B delivered %zu tokens "
+                   "(want the 8 pre-throw tokens, solo-prefix-identical)\n",
+                   outB.size());
+            return 1;
+        }
+        // (b) A byte-identical to solo, full budget, natural finish
+        if (outA.size() != refA.size() ||
+            !std::equal(outA.begin(), outA.end(), refA.begin())) {
+            printf("A2 ERROR-PATH SMOKE FAIL: A diverged after B's failure "
+                   "(%zu tokens, %s)\n",
+                   outA.size(), qA.finish_reason());
+            return 1;
+        }
+        fprintf(stderr, "[leg D] B failed at 8 tokens (%s); A %zu tokens intact\n",
+                err, outA.size());
+        // (c) conductor survives: short second run through the SAME conductor
+        prefill_serial(eA, pa);
+        Engine::DecodeTask tA2;
+        eA.make_decode_task(tA2, 8, /*eos=*/-1, dummy, (int)pa.size() - 1);
+        q27::TokenQueue qA2;
+        cond.register_member(&eA, &tA2, &qA2);
+        std::vector<int> outA2;
+        while (qA2.pop(outA2)) {}
+        if (outA2.size() != 8 ||
+            !std::equal(outA2.begin(), outA2.end(), refA.begin()) ||
+            strcmp(qA2.finish_reason(), "n_max") != 0) {
+            printf("A2 ERROR-PATH SMOKE FAIL: post-error rerun (%zu tokens, %s)\n",
+                   outA2.size(), qA2.finish_reason());
+            return 1;
+        }
+    } // ~Conductor: request_stop + join -- (d) clean teardown, exit 0 below
+    printf("A2 ERROR-PATH SMOKE PASS\n");
     return 0;
 }

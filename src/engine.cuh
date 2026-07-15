@@ -2663,7 +2663,12 @@ struct Engine {
 
     // Decode epilogue (generate()'s old `done` lambda): closes the optional
     // profiler bracket, finalizes GenStats, prints [gen-done]. Runs EXACTLY
-    // ONCE per task, from the decode_step call that returns false.
+    // ONCE per task: from the decode_step call that returns false, or --
+    // when host bookkeeping THREW mid-round under the conductor -- from the
+    // A2 catch epilogue (Conductor::fail_member, conductor.h) with
+    // why="error"; the two are exclusive (every finish_decode call inside
+    // pre_round/post_round/decode_step is followed by a non-throwing
+    // return, so a throwing round cannot have already finished).
     void finish_decode(DecodeTask& t, const char* why) {
         if (t.prof_decode) {
             CUDA_CHECK(cudaStreamSynchronize(stm));

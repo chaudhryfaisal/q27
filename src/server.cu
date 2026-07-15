@@ -598,6 +598,15 @@ int main(int argc, char** argv) {
     // fusion where solo runs the full-width monolithic graph -- the mask +
     // accept-cap still apply in the per-engine tail, a documented P1
     // divergence class, not a gate target.
+    // Lifecycle (review pass 2, VERIFIED against the vendored httplib
+    // 0.18.3): conductor.reset() at main's end runs only after srv.listen()
+    // returns, and listen_internal() calls task_queue->shutdown()
+    // (third_party/httplib.h:6821), which joins EVERY ThreadPool worker --
+    // in-flight handler threads included -- before returning (t.join(),
+    // httplib.h:789); svr.stop() itself only closes the listen socket
+    // (:6337-6346). So no request thread can reach register_member() after
+    // the reset, and the conductor's M4 refusal stays an embedder guard,
+    // not a server path.
     std::unique_ptr<q27::Conductor> conductor;
     {
         const char* e = getenv("Q27_BATCH");
@@ -672,10 +681,17 @@ int main(int argc, char** argv) {
     //    as exempt, and it is stream-ordered ahead of the slot's next work.
     // Returns t.emitted -- solo generate()'s return value for every natural
     // finish (on cancel it counts tokens delivered before the cut).
+    // err_out (nullable): receives the queue's error slot when the member
+    // FAILED (A2 host-exception unwind or the M4 registration refusal)
+    // instead of finishing -- the caller's honest-surfacing hook (500 when
+    // nothing was emitted / Anthropic SSE error event); gs.end="error" is
+    // stamped either way so the [req] line never reports a failed
+    // generation as a normal finish.
     auto batch_generate = [&](Engine& eng, const std::vector<int>& prompt, int nm,
                               std::function<bool(int)> on_token,
                               std::function<void(int)> on_emit, int stable_len, double& qw,
-                              const ReqTrace& rt, Engine::DecodeTask& t) -> int {
+                              const ReqTrace& rt, Engine::DecodeTask& t,
+                              std::string* err_out) -> int {
         q27::TokenQueue q;
         {
             q27::GpuGate::Lease lk(gpu_gate);
@@ -709,6 +725,21 @@ int main(int argc, char** argv) {
             ids.clear();
             while (q.pop(ids)) ids.clear();
             throw;
+        }
+        // Error surfacing (review pass 2): a non-null error slot means the
+        // A2 unwind failed the queue (host exception in this member's
+        // bookkeeping) or registration was refused (M4) -- no normal finish
+        // reason exists. Stamp gs.end for the [req] line (the A2 path
+        // already stamped it conductor-side via finish_decode; the refusal
+        // path never reached a finish), log the what() -- the queue copy is
+        // the ONLY place it survives -- and hand it to the caller. Safe to
+        // touch eng.gs here: the queue observed closed, the conductor's
+        // fail() was its last access to this request's state (close-edge
+        // rule, conductor.h fail_member).
+        if (const char* err = q.error_or_null()) {
+            eng.gs.end = "error";
+            fprintf(stderr, "[req-error] rid=%ld %s\n", rt.rid, err);
+            if (err_out) *err_out = err;
         }
         return t.emitted;
     };
@@ -853,12 +884,25 @@ int main(int argc, char** argv) {
                 return true;
             };
             Engine::DecodeTask bt;
+            std::string berr;
             int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
-                                               qw, rt, bt)
+                                               qw, rt, bt, &berr)
                               : eng.generate(prompt, n_max, EOS, on_tok);
             eng.on_round_gap = nullptr;
             text += ugate.flush();
             req_log(rt, qw, eng, sl.id, bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = an
+            // honest 500 in the OpenAI error envelope; if tokens WERE
+            // produced, keep the 200 with the partial text -- end=error is
+            // already in the [req] line either way.
+            if (!berr.empty() && n == 0) {
+                res.status = 500;
+                res.set_content(json{{"error", {{"message", berr},
+                                                {"type", "api_error"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             json choice;
             if (chat)
                 choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
@@ -909,8 +953,13 @@ int main(int argc, char** argv) {
                     return send(piece_chunk(ugate.feed(tok.decode_one(id))));
                 };
                 Engine::DecodeTask bt;
+                // TODO(batch error surfacing): on a failed queue (A2) this
+                // stream just ends with a normal finish_reason -- the OpenAI
+                // SSE shape has no standard mid-stream error event, so none
+                // is invented; end=error lands in the [req] line and
+                // [req-error] carries the what().
                 int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                          -1, qw, rt, bt)
+                                                          -1, qw, rt, bt, nullptr)
                                          : eng.generate(prompt, nm, EOS, on_tok);
                 eng.on_round_gap = nullptr;
                 std::string tailp = ugate.flush();
@@ -1052,12 +1101,13 @@ int main(int argc, char** argv) {
                 return true;
             };
             Engine::DecodeTask bt;
+            std::string berr;
             // batch: tc.on_id rides on_emit -- the CONDUCTOR thread, between
             // scan_round and on_pending, its exact solo slot (driver contract)
             int n = conductor
                         ? batch_generate(eng, prompt, n_max, on_tok,
                                          [&](int id) { tc.on_id(id); }, stable_len, qw,
-                                         rt, bt)
+                                         rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
                               return on_tok(id);
@@ -1068,6 +1118,17 @@ int main(int argc, char** argv) {
             eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = an
+            // honest 500 in the Anthropic error envelope (api_error, NOT
+            // invalid_request_error: 400s tell Claude Code to compact/give
+            // up, 500s are retryable). Tokens produced = keep the 200 with
+            // partial content; end=error is in the [req] line either way.
+            if (!berr.empty() && n == 0) {
+                res.status = 500;
+                res.set_content(q27::anthropic_error_json("api_error", berr),
+                                "application/json");
+                return;
+            }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
@@ -1229,12 +1290,13 @@ int main(int argc, char** argv) {
                     return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
+                std::string berr;
                 // batch: tc.on_id rides on_emit (conductor thread, solo slot);
                 // a dead client flips `alive` -> the drain cancels (A3)
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
                                                     [&](int id) { tc.on_id(id); },
-                                                    stable_len, qw, rt, bt)
+                                                    stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
                                          return on_tok(id);
@@ -1284,6 +1346,16 @@ int main(int argc, char** argv) {
                                                {"content_block", {{"type", "text"}, {"text", ""}}}});
                 }
                 close_block();
+                // batch error surfacing (review pass 2): the Anthropic SSE
+                // shape has a first-class `error` event -- emit it through
+                // the existing ev() writer (envelope = anthropic_error_json's
+                // shape) so clients learn the generation FAILED instead of
+                // reading a silent early end_turn. message_delta/message_stop
+                // still follow: error-aware clients abort at the event,
+                // naive ones still get a well-formed stream.
+                if (!berr.empty())
+                    ev("error", {{"type", "error"},
+                                 {"error", {{"type", "api_error"}, {"message", berr}}}});
                 const char* sr = any_call ? "tool_use"
                                           : (produced >= nm ? "max_tokens" : "end_turn");
                 ev("message_delta", {{"type", "message_delta"},
@@ -1501,11 +1573,23 @@ int main(int argc, char** argv) {
                 return true;
             };
             Engine::DecodeTask bt;
+            std::string berr;
             int produced = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr,
-                                                      -1, qw, rt, bt)
+                                                      -1, qw, rt, bt, &berr)
                                      : eng.generate(prompt, n_max, EOS, on_tok);
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = 500
+            // (retryable-class for codex; 400 is fatal, header comment).
+            // Tokens produced = keep the 200 with partial items.
+            if (!berr.empty() && produced == 0) {
+                res.status = 500;
+                res.set_content(json{{"error", {{"code", "internal_error"},
+                                                {"message", berr}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) flush_tool();
@@ -1655,8 +1739,14 @@ int main(int argc, char** argv) {
                     return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
+                // TODO(batch error surfacing): no mid-stream error event is
+                // emitted here -- codex-rs (v0.143) keys only off the item /
+                // completed types this handler already sends and defines no
+                // error shape we could mirror without inventing protocol;
+                // end=error lands in the [req] line and [req-error] carries
+                // the what().
                 int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                          -1, qw, rt, bt)
+                                                          -1, qw, rt, bt, nullptr)
                                          : eng.generate(prompt, nm, EOS, on_tok);
                 eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id, bat_stats(bt));

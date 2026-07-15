@@ -12,8 +12,10 @@
 //
 // The Conductor (Task 9: registry, round loop, token queues) calls a THIN
 // ENGINE-OWNED surface only: the entrypoints (solo_view()/pre/mix/post/
-// tails/T()/set_round_width/draft_and_gate/suffix_propose/commit_outcome/
-// pre_round/post_round/decode_step) plus the named ACCESSORS engine.cuh
+// ffn_pair/qx5/mm5/tails/T()/set_round_width/draft_and_gate/suffix_propose/
+// commit_outcome/pre_round/post_round/decode_step/finish_decode -- the last
+// only from the A2 catch epilogue, fail_member below) plus the named
+// ACCESSORS engine.cuh
 // declares for the conductor (shared_dm/is_attn_layer/fast_head_on/
 // vgemm_ws/round_width/stream/outcome_dev/end_reason, each with a why-
 // comment at its declaration). No friends; every raw-member need is met by
@@ -72,8 +74,11 @@ inline void trim_widths(int* want, const bool* is_suffix, int k, int cap) {
 // gate-ownership invariant A7 -- the conductor must never block on a request
 // thread while holding the GPU gate. Error slot: A2 keeps CUDA failures
 // process-fatal, so `error` only ever carries a HOST-side failure the request
-// thread should surface instead of a normal finish (nothing sets it at Task
-// 9; the server wiring may -- it rides the same close() wakeup).
+// thread should surface instead of a normal finish. Setters: the conductor's
+// A2 unwind (fail_member -- member bookkeeping threw) and the M4 registration
+// refusal; the server's batch_generate reads it back and surfaces it
+// (gs.end="error" in the [req] line, 500 when nothing was emitted, an SSE
+// `error` event on the Anthropic stream). It rides the same close() wakeup.
 struct TokenQueue {
     void push(const int* ids, int n) {
         if (n <= 0) return;
@@ -574,14 +579,20 @@ public:
         mm->t = t;
         mm->q = q;
         mm->sampled = t->sampling;
+        // The owning queue sink is BUILT here but installed over t->on_token
+        // only on the accepted path below (review pass 2): on the M4 refusal
+        // the caller unblocks off fail() and may destroy q immediately, so a
+        // sink installed before the stop-check would leave t->on_token
+        // dangling over the dead queue.
+        std::function<bool(int)> sink;
         if (on_emit)
-            t->on_token = [q, oe = std::move(on_emit)](int id) {
+            sink = [q, oe = std::move(on_emit)](int id) {
                 oe(id);
                 q->push(&id, 1);
                 return true;
             };
         else
-            t->on_token = [q](int id) {
+            sink = [q](int id) {
                 q->push(&id, 1);
                 return true;
             };
@@ -595,13 +606,16 @@ public:
             // Refuse under the same lock the drain takes: fail the queue so
             // the caller unblocks with a surfaced error instead of a hang.
             // Unreachable in the current server (it destroys the Conductor
-            // only after the HTTP listener stops taking requests), but this
-            // class is server-agnostic and embedders deserve the check.
+            // only after the HTTP listener stops taking requests -- stop
+            // semantics of the vendored httplib verified, see the conductor
+            // construction comment in server.cu), but this class is
+            // server-agnostic and embedders deserve the check.
             if (stop) {
                 CUDA_CHECK(cudaEventDestroy(mm->draft_done));
                 q->fail("conductor stopping: registration refused");
                 return;
             }
+            t->on_token = std::move(sink);
             join_q.push_back(std::move(mm));
         }
         cv.notify_one();
@@ -658,6 +672,16 @@ private:
             }
             join_q.clear();
         }
+        // Review pass 2 (sibling window of the M4 refusal): core.join() only
+        // STAGES into core.joins -- the boundary drain in round() is what
+        // promotes them to members, and no further round will run. Merge the
+        // staged joins into the member set BEFORE the cancel pass or it
+        // would skip them (it walks core.members only), leaving their
+        // request threads blocked forever on queues nobody closes.
+        // request_stop()'s contract: NO request thread is left blocking,
+        // whether its member was live, staged pre-stop, or refused post-stop.
+        for (Member* mm : core.joins) core.members.push_back(mm);
+        core.joins.clear();
         for (Member* mm : core.members) {
             mm->t->cancel.store(true);
             mm->pre_round(); // runs finish_decode("cancelled")
@@ -666,35 +690,57 @@ private:
         core.members.clear();
     }
 
+    // A2 catch epilogue, shared by solo_round/fused_round below. A throwing
+    // round cannot have run finish_decode (every finish_decode call inside
+    // pre_round/post_round/decode_step is immediately followed by a
+    // non-throwing return), so run it here with "error": it closes the
+    // Q27_PROF_DECODE profiler bracket if open, finalizes GenStats and
+    // stamps gs.end = "error" -- the request thread's [req] line and the
+    // server's error surfacing key off that stamp. finish_decode's body is
+    // non-throwing host bookkeeping (chrono + fprintf; its CUDA_CHECK exits,
+    // never throws -- the A2 fatal posture).
+    // CLOSE-EDGE RULE (review pass 2, same LIFETIME class as TokenQueue's
+    // H1 rule): fail() closes the queue, and the close is the
+    // synchronization edge after which the request thread may destroy BOTH
+    // the queue and the frame-local DecodeTask (engine.cuh, the
+    // DecodeTask::bat_members comment). So fail() must be the LAST access
+    // to q AND t on every catch path: the finish_decode epilogue and all
+    // counter updates run strictly before it, and mm.q is nulled first so
+    // leave() -- which runs after the member's removal -- cannot touch the
+    // dead queue either.
+    void fail_member(Member& mm, const char* what) {
+        mm.e->finish_decode(*mm.t, "error");
+        TokenQueue* q = mm.q;
+        mm.q = nullptr;
+        q->fail(what); // copies what(); LAST q/t access -- rule above
+    }
+
     // Solo fallthrough (k==1): decode_step IS today's path -- captured round
     // graphs, spec_round's own bookkeeping/telemetry, tokens through the
     // queue sink. true = done. bat telemetry: a solo round contributes k=1
     // per round that actually RAN (pre_round exits inside decode_step do not
-    // advance t->rounds, so the delta is the ran-count).
+    // advance t->rounds, so the delta is the ran-count); the update runs in
+    // EVERY arm before any queue op (fail_member's close-edge rule).
     // A2 unwind (addendum A2, review M1): CUDA failures stay process-fatal
     // (CUDA_CHECK exits, never throws -- deliberately not wrapped); a HOST
     // exception from the bookkeeping half (post_round -> on_emit/queue sink,
     // grammar scan, ...) must kill only THIS member, not the conductor
-    // thread. Fail its queue (copies what()), null it so leave() -- which
-    // runs after the member's removal -- cannot close a queue the request
-    // thread may already have observed closed and destroyed (H1 lifetime
-    // rule), and report done so core.round() erases the member.
+    // thread. fail_member runs the error epilogue + queue fail; returning
+    // true reports done so core.round() erases the member.
     bool solo_round(Member& mm) {
         long r0 = mm.t->rounds;
-        bool done;
         try {
-            done = !mm.e->decode_step(*mm.t);
+            bool done = !mm.e->decode_step(*mm.t);
+            mm.t->bat_members += mm.t->rounds - r0;
+            return done;
         } catch (const std::exception& ex) {
-            mm.q->fail(ex.what());
-            mm.q = nullptr;
-            done = true;
+            mm.t->bat_members += mm.t->rounds - r0;
+            fail_member(mm, ex.what());
         } catch (...) {
-            mm.q->fail("unknown host exception in solo round bookkeeping");
-            mm.q = nullptr;
-            done = true;
+            mm.t->bat_members += mm.t->rounds - r0;
+            fail_member(mm, "unknown host exception in solo round bookkeeping");
         }
-        mm.t->bat_members += mm.t->rounds - r0;
-        return done;
+        return true; // failed member leaves this round
     }
 
     // One fused round over k >= 2 members (under the caller's Lease).
@@ -730,34 +776,36 @@ private:
                                        cudaMemcpyDeviceToHost, cstm));
         CUDA_CHECK(cudaStreamSynchronize(cstm)); // ONE sync for the batch
         for (int i = 0; i < k; i++) {
+            // Task 10 [req] bat= telemetry FIRST: this member's round ran
+            // k-wide (k >= 2 by the core's dispatch; on the catch path the
+            // GPU work also already ran -- the throw is host bookkeeping).
+            // The counters must be updated BEFORE any queue op: fail_member
+            // in the catch arms closes the queue, the synchronization edge
+            // after which the request thread may destroy the frame-local
+            // DecodeTask (fail_member's close-edge rule) -- a post-catch
+            // increment was a write-after-close UAF.
+            ms[i]->t->bat_members += k;
+            ms[i]->t->bat_r2++;
             // A2 unwind (addendum A2, review M1): per-member host bookkeeping
             // (commit_outcome + post_round, whose sink runs on_emit + the
-            // queue push). A throw here fails THIS member's queue (fail()
-            // copies what()), removes the member via done[i], and lets the
-            // loop continue to members i+1..k-1 -- the conductor thread
-            // stays alive for everyone else. CUDA errors are NOT wrapped:
-            // CUDA_CHECK exits the process (A2 keeps them fatal). q is
-            // nulled so leave() cannot touch a queue the request thread may
-            // already have observed closed and destroyed (H1 lifetime rule).
+            // queue push). A throw here fails THIS member's queue via
+            // fail_member (error epilogue, then fail() as the LAST q/t
+            // access), removes the member via done[i], and lets the loop
+            // continue to members i+1..k-1 -- the conductor thread stays
+            // alive for everyone else. CUDA errors are NOT wrapped:
+            // CUDA_CHECK exits the process (A2 keeps them fatal).
             try {
                 int em[W_MAX];
                 int n = es[i]->commit_outcome(oc[i], em, ms[i]->sampled, sfx[i],
                                               ms[i]->gate_cap, ms[i]->md_used);
                 done[i] = !es[i]->post_round(*ms[i]->t, em, n);
             } catch (const std::exception& ex) {
-                ms[i]->q->fail(ex.what());
-                ms[i]->q = nullptr;
+                fail_member(*ms[i], ex.what());
                 done[i] = true;
             } catch (...) {
-                ms[i]->q->fail("unknown host exception in fused round bookkeeping");
-                ms[i]->q = nullptr;
+                fail_member(*ms[i], "unknown host exception in fused round bookkeeping");
                 done[i] = true;
             }
-            // Task 10 [req] bat= telemetry: this member's round ran k-wide
-            // (post_round above advanced t->rounds unconditionally), and
-            // k >= 2 here by the core's dispatch.
-            ms[i]->t->bat_members += k;
-            ms[i]->t->bat_r2++;
         }
     }
 
