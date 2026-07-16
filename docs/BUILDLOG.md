@@ -5932,3 +5932,50 @@ of ceiling unrealized; fdmma smem suspected), eager launch (~1.9ms, P3).
 Plans: docs/plans/2026-07-15-batch-p2-overlap.md +
 2026-07-16-batch-p2c-draft-fusion.md. Exit phase (reviews, CC sanity,
 merge) next; Q27_BATCH remains default-off.
+
+**2026-07-16 -- P3 S1: real-round capture byte spike + key census. Byte gate
+PASS (16/16 like-composition positions, 623 replayed rounds); census at the
+bar (28 keys/KV, top-16 ~85%, alphabet fits LRU-32) -- GO for T3 approach
+A.** Q27_P3_SPIKE=1 env hack (written, gated, REVERTED -- not merged; diff +
+full evidence in scratchpad/p3_s1/): Conductor::fused_round wrapped the REAL
+fused_verify_round in stream capture EVERY fused round -- draft_done waits
+hoisted onto cstm before BeginCapture (waits on externally-recorded events
+are capture-illegal), phase-timing records hoisted outside,
+BeginCapture(Relaxed) -> the whole verify body incl. the P2b side-stream
+fork/join (T0's proven topology) -> EndCapture -> Instantiate -> launch the
+exec for the SAME round (capture-without-execute; the round happens once,
+via replay); outcome D2Hs + the one host sync stay outside behind the graph
+launch; destroy per round after the sync. No capture rejection ever fired:
+623/623 rounds (both KVs, mixed suffix+gated and trim-active shapes
+included, up to 3574 nodes) captured, instantiated and replayed clean.
+BYTES: master-refs procedure (batch_ab LEGS=B REPS=1 MAXTOK=512, fp8 +
+turbo3, systemd-run, GPU idle-checked) vs scratchpad/p2_baseline/refs.md5
+(trailing-newline md5 convention): turbo3 8/8 EXACT; fp8 dbg pass 4/4 EXACT;
+fp8 measured leg drew the known docs-first arrival composition and matches
+the like-composition pre-spike reference (p2_exit/fp8: codegen 905c96d5,
+docs a9f1e759) bitwise -- an arrival fork reproduced exactly, not a capture
+leak. Zero byte deviations anywhere = no capture-semantics state leak.
+COSTS (fresh capture per round, throwaway pattern): body+capture ~1.0-1.1ms
++ EndCapture ~0.03 + instantiate ~1.4-1.6ms (first-call ~9ms) = ~2.4-2.7ms
+median/round at 2462 (fp8) / 2526 (t3) median nodes; T0's 3.5ms @2192
+number was the warmup-inclusive analog. Served aggregate under the spike:
+fp8 220.4 vs 221.6 eager (-0.5%), t3 209.0 vs 214.6 (-2.6%) -- the replay
+saving (~3.5-4.3ms arithmetic) nearly pays the every-round capture tax
+already, live corroboration that cached execs (tax -> first-sight only)
+clear the T4 bar arithmetic. CENSUS (9 Bdbg logs: p2c_t3, p2_exit x3, p2_t4
+x2, p3_s1 x2; key = engine tuple + granted width vector + sfx class + gemm
+family + sampled mask + kv_kind): fp8 795 rounds / 28 distinct keys, top-16
+= 84.9%, top-32 = 100%; turbo3 611 / 28, top-16 = 85.3%, top-32 = 100%.
+Sampled mask (0,0) throughout (greedy payloads); gemm family gemv99
+throughout (29 mixed suffix+gated rounds, no all-suffix round observed);
+kv_kind partitions the table per server config; engine tuple constant (0,1)
+by the md5 composition witness -- NOTE the [gen] prefill-start order is NOT
+that witness (p2_exit/t3 dbg: docs-first [gen], canonical bytes). VERDICT:
+per-KV top-16 sits at the ~85% bar, and the stronger fact decides -- the
+full per-KV alphabet (28) fits the T3 LRU-32 with headroom, so steady-state
+hit rate is 100% after ~28 first-sight captures (~2.4ms each, warmup-class).
+GO: T1 gates pass, proceed to T2 (conv/delta table twins) + T3 approach A
+(whole-round shape-keyed exec cache); fallback D (segmented capture) NOT
+triggered. T3 caveat banked: a mid-server composition flip (member re-join)
+flips the tuple and can double the live alphabet past 32; LRU + cheap
+recapture keeps it benign, revisit the cap under multi-tenant churn.
