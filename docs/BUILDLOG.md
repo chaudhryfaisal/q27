@@ -6006,3 +6006,29 @@ to the P2 references held through every phase. Landing at the top of the
 design workflow's 1.39-1.44x projection. Remaining shelf: mixer
 co-residency (~3.5 ms, the biggest unexplored pool), draft pool 0.27 ms,
 twins' 0.2-0.3 ms eager cost (moot under graphs -- rounds replay).
+
+**2026-07-16 -- P4 MIXER CO-RESIDENCY: MEASURED NO-GO (closed-architectural,
+nothing built).** The post-P3 shelf said ~3.5 ms of unrealized mixer overlap.
+Attribution (nsys, scratchpad/p4_measure/ATTRIBUTION.md) decomposed it: the
+figure was mostly LAUNCH TAX DOUBLE-COUNTED -- P3's graphs already harvested
+the GDN share (loss 1.04 -> 0.16 ms/round, node-level profile) -- leaving a
+true residual of ~0.7-0.8 ms/round concentrated in fdmma/fd2 WAVE
+SERIALIZATION: each engine's verify attention fills exactly one full GPU
+wave by design (ns=85 x 4 heads = 340 CTAs = 2/SM x 170 SMs, third CTA
+forbidden by regs AND smem), so two engines board only in each other's
+drain tails. The one candidate lever (k-aware half-wave split, ns=85/k) was
+mechanism-probed at ns=42 vs 85 on like-shape fused rounds (trajectory-clean;
+fd2 controls identical): co-residency becomes TOTAL (both/min 53% -> 98%,
+wall collapses onto max) BUT per-kernel time inflates 1.3-1.6x (each engine
+streams its KV pass through half the machine), netting -13.7 us/window =
+~0.10 ms/round live -- 3-4x short of the +1.5% bar, at the price of the
+batched-vs-solo bitwise gate on attn rounds. The free end-to-end spike
+(process-wide NS=42 batch_ab) was discarded as confounded: the tolerance
+fork re-rolled the codegen trajectory (dec 512->397, fused rounds 159->72),
+a caution for any future numeric-knob A/B. CLOSING PHYSICS, completing the
+P2 lesson: weight-BW-bound work -> fusion only; state-latency-bound work ->
+overlap; SATURATED work (attn KV streaming at depth) -> neither. The
+continuous-batching campaign ends at fp8 1.41x / turbo3 1.40x (2 slots,
+solo 0%), with the residual ~0.6 ms/round booked closed-architectural and
+the remaining shelf (draft pool 0.27 ms, kernel-fusion node floor ~0.3 ms)
+priced below build cost.
