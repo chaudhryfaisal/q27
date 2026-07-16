@@ -547,11 +547,22 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     // one host sync stays in the caller. The stream argument is the ONLY
     // delta vs the serial path: same kernels, same launch params, same
     // per-engine buffers, so per-lane bytes must be identical (B1 gate).
+    // P3 T2: GDN mixers in the FUSED path run the TABLE TWINS
+    // (use_tables=true -- conv_step_t/delta_step_t, engine.cuh gdn_mix):
+    // identical math, but the role pointers resolve ON DEVICE as
+    // tab[(role + *d_perm_scalar) % W_MAX], so the launch sequence carries no
+    // host-resolved per-perm pointers and one captured graph exec can serve
+    // every perm rotation (T3). CALLER CONTRACT: every member's
+    // stage_perm_async(cstm) must have been enqueued on cstm before this
+    // round (Conductor::fused_round does; fused_smoke leg B does) -- in T3
+    // that copy stays OUTSIDE the captured graph, it is the round's mutable
+    // input. The solo path (gdn_pair and the engines' captured graphs) never
+    // sets the flag and keeps the direct kernels bit-for-bit untouched.
     auto mix_all = [&](int il, bool attn) {
         if (!mf) { // serial P1 path (smoke leg B / embedders without a pool)
             for (int m = 0; m < k; m++) {
                 if (attn) es[m]->attn_mix(il, cstm);
-                else      es[m]->gdn_mix(il, cstm);
+                else      es[m]->gdn_mix(il, cstm, /*use_tables=*/true);
             }
             return;
         }
@@ -559,7 +570,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
         for (int m = 0; m < k; m++) {
             CUDA_CHECK(cudaStreamWaitEvent(mf->side[m], mf->fork, 0));
             if (attn) es[m]->attn_mix(il, mf->side[m]);
-            else      es[m]->gdn_mix(il, mf->side[m]);
+            else      es[m]->gdn_mix(il, mf->side[m], /*use_tables=*/true);
             CUDA_CHECK(cudaEventRecord(mf->mix[m], mf->side[m]));
         }
         for (int m = 0; m < k; m++)
@@ -1256,6 +1267,16 @@ private:
             evs[i] = ms[i]->draft_done;
             CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stream()));
         }
+        // P3 T2: land each member's CURRENT perm in its device scalar --
+        // pinned staging + cudaMemcpyAsync on cstm (plan T2's exact recipe:
+        // pinned so no new pageable-blocking semantics enter the round).
+        // fused_verify_round's gdn table twins resolve roles from
+        // *d_perm_scalar, so this must be stream-ordered before the verify
+        // body. In T3 this call stays OUTSIDE the captured graph (the perm
+        // is the round's mutable input; everything else the graph bakes is
+        // init-fixed). The ONE host sync below fences the pinned rewrite --
+        // at most one copy per engine is ever in flight.
+        for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
         // P2 Task 1: coarse per-round phase walls, bracketed by timing
         // events on cstm (records on an in-order stream do not reorder or
         // synchronize any work -- they only timestamp):
