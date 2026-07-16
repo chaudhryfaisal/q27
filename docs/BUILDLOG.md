@@ -5979,3 +5979,30 @@ GO: T1 gates pass, proceed to T2 (conv/delta table twins) + T3 approach A
 triggered. T3 caveat banked: a mid-server composition flip (member re-join)
 flips the tuple and can double the live alphabet past 32; LRU + cheap
 recapture keeps it benign, revisit the cap under multi-tenant churn.
+
+**2026-07-16 -- P3 T4: THE BAR PASSES. fp8 1.41x / turbo3 1.40x (bar 1.38x),
+solo regression 0.00%.** Full battery at 3500a9c: clean rebuild; test_kernels/
+test_conductor/ninv (NINV+SEAM+TWIN legs, both arches) ALL PASS; canonical +
+sampled-seed EXACT; fused_smoke all legs incl. the graph leg, fp16+turbo3;
+master refs graphs-ON 32/32 EXACT (B4 x2 both KVs, all canonical
+composition); memcheck small-footprint with Q27_BATCH_GRAPH=1: 0 errors, 64
+fused graph-replay rounds under the tool. THE BAR (batch_ab REPS=3 legs
+A/B/D, MAXTOK=512):
+
+  KV       leg A    leg B (graphs)  ratio   solo delta
+  fp8      168.8    237.5 t/s       1.41x   +0.00/+0.00%
+  turbo3   158.7    221.6 t/s       1.40x   +0.00/-0.06%
+
+The P3 arc: eager dispatch tax measured 3.4 ms/round (2,610 launches x
+~1.66us GPU starvation, nsys attribution) -> T2 table twins make rounds
+perm-invariant (+0.2-0.3 ms eager cost, accepted) -> T3 shape-keyed LRU-32
+exec cache (28-key alphabet, 100% steady-state hits, always-on stale-key
+guard, first-sight capture ~10 ms warmup-class) -> steady phv/round -2.9 ms
+-> aggregate 221.6 -> 237.5 (fp8). T5 draft micro-graphs SKIPPED (bar
+exceeded; the +0.27 ms draft pool stays on the shelf). Cumulative
+continuous-batching arc at 2 slots: FIFO 1.00x -> P1 1.21x -> P2 1.31x ->
+P3 1.41x (fp8; turbo3 1.40x), solo cost zero at every stage, byte-identity
+to the P2 references held through every phase. Landing at the top of the
+design workflow's 1.39-1.44x projection. Remaining shelf: mixer
+co-residency (~3.5 ms, the biggest unexplored pool), draft pool 0.27 ms,
+twins' 0.2-0.3 ms eager cost (moot under graphs -- rounds replay).
