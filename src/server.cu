@@ -218,6 +218,27 @@ int main(int argc, char** argv) {
         setenv("Q27_BATCH_GRAPH", "1", 0);
         setenv("Q27_BATCH_GRAPH_CAP", "64", 0);
     }
+    // Q27_SAMPLED=0 (issue #1, small-VRAM greedy boots): the engine skips the
+    // sampled graph set; this server refuses temperature>0 requests with a
+    // 400 up front. Contradiction guard (two-tier precedent): forcing
+    // sampling onto a boot that cannot sample is a config error -- refuse
+    // loudly at boot, not per-request.
+    const bool sampled_on = [] {
+        const char* e = getenv("Q27_SAMPLED");
+        return !e || atoi(e) != 0;
+    }();
+    if (!sampled_on) {
+        const char* ft = getenv("Q27_FORCE_TEMP");
+        if (ft && atof(ft) > 0.0) {
+            fprintf(stderr,
+                    "q27-server: FATAL -- Q27_SAMPLED=0 with Q27_FORCE_TEMP=%s: every "
+                    "request would be forced onto the disabled sampled path\n",
+                    ft);
+            exit(1);
+        }
+        fprintf(stderr,
+                "sampled graphs OFF (Q27_SAMPLED=0): temperature>0 requests get 400\n");
+    }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
             "think=%d\n",
@@ -288,7 +309,16 @@ int main(int argc, char** argv) {
             const double gw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
             const double gwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
             const double graphs = gw8 * 0.13e9 + (Q27_W_MAX - gw8) * gwx;
-            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + graphs;
+            // Capture-gate deductions (issue #1, measured 2026-07-17 at ctx
+            // 8192, full-zoo control on the same binary): boots without
+            // --constrain-tools skip the mono D/V set (sm_120 0.08 / sm_86
+            // 0.15 GB); Q27_SAMPLED=0 also skips the sampled set (0.34 /
+            // 0.60 GB). The base constants were calibrated on the full zoo.
+            const double mono_save = cc_arch >= 89 ? 0.08e9 : 0.15e9;
+            const double samp_save = cc_arch >= 89 ? 0.34e9 : 0.60e9;
+            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + graphs -
+                                 (constrain_tools ? 0.0 : mono_save) -
+                                 (sampled_on ? 0.0 : samp_save);
             // slack absorbs kv-kind fixed variance and boot-to-boot driver
             // drift; the 4096 floor adds 0-0.3GB more. 1.0GB (pre-07-17)
             // was sized for the stat-based weight estimate this replaced.
@@ -365,6 +395,9 @@ int main(int argc, char** argv) {
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
         s.eng->fast_head = fast;
+        // graph-zoo capture gate (issue #1): without --constrain-tools the
+        // P11 monolithic draft/verify graphs are unreachable -- skip capture.
+        s.eng->capture_constrained = constrain_tools;
         s.eng->build_graph();
         s.eng->build_spec_graphs();
         slots.push_back(std::move(s));
@@ -979,6 +1012,20 @@ int main(int argc, char** argv) {
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
+        // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
+        // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
+        // request-absent default here is genuinely greedy.)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            res.status = 400;
+            res.set_content(json{{"error",
+                                  {{"message", "sampling disabled: server booted with "
+                                               "Q27_SAMPLED=0 (greedy-only)"},
+                                   {"type", "invalid_request_error"},
+                                   {"code", "sampling_disabled"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         long created = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
@@ -1186,6 +1233,13 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[ctx-limit] prompt=%zu max=%d -> 400\n", prompt.size(),
                     max_prompt);
             anthropic_400(res, q27::ctx_limit_error_message((int)prompt.size(), max_prompt));
+            return;
+        }
+        // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            anthropic_400(res,
+                          "sampling disabled: server booted with Q27_SAMPLED=0 "
+                          "(greedy-only)");
             return;
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
@@ -1604,6 +1658,14 @@ int main(int argc, char** argv) {
         if ((int)prompt.size() > max_prompt) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
             res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}",
+                            "application/json");
+            return;
+        }
+        // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"code\":\"sampling_disabled\",\"message\":"
+                            "\"sampling disabled: server booted with Q27_SAMPLED=0\"}}",
                             "application/json");
             return;
         }

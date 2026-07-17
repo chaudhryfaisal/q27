@@ -7187,3 +7187,47 @@ now either shipped (TTFT, turbo3 default, auto-ctx cals) or closed
 with data (occupancy, W12, vgemm<9, depth/pmin policy, prefill
 constants). Remaining: memory OC (hardware), 3090 2-slot batching
 (throughput), quant ladder (the floor).
+
+## 2026-07-17 -- graph-zoo capture gates (issue #1): sampled set env-gated, mono D/V auto-skipped
+
+The two in-thread promises from issue #1, landed. The zoo had two
+capture-unconditional sets with narrow consumers:
+
+1. **Sampled set** (sample_graph + spec_sample_graph[12] +
+   verify_sample_graph_w[4][12]): serves ONLY temperature>0 requests.
+   Now Q27_SAMPLED=0 skips capture entirely. The server refuses
+   temp>0 with a 400 (code sampling_disabled, all three API shapes,
+   preflight before slot claim); Q27_SAMPLED=0 + Q27_FORCE_TEMP>0 is
+   a boot-time FATAL (two-tier precedent: contradictory explicit
+   config refuses loudly); make_decode_task carries a belt that
+   forces any slipped-through sampled task GREEDY with a stderr line
+   (task-filler layer: never half-build, never null-launch).
+2. **Monolithic draft pair + verify_graph** (P11 split set): consumers
+   are exactly the constrained-tool path and the Q27_DEXIT=0 A/B
+   (header map; sampled-gated-dexit uses per-step graphs only, line
+   ~2482). The server now clears capture_constrained when booted
+   without --constrain-tools, so STANDARD boots skip them
+   automatically -- no new knob. CLI leaves both gates default-true:
+   the canonical zoo is byte-identical.
+
+MEASURED (same binary, full-zoo --constrain-tools control, ctx 8192):
+  sm_120: mono 80 MB, sampled 340 MB (combined 420 MB)
+  sm_86:  mono 150 MB, sampled 600 MB (combined 750 MB = ~55K turbo3
+          tokens -- the sm_86 sampled graphs are fatter, consistent
+          with the W12 zoo finding)
+auto-ctx now deducts the measured savings per arch (constrain_tools /
+sampled_on aware). Verified on the 3090: bare boot auto 262144 with
+0.81 GB at ready (was 0.67); Q27_SAMPLED=0 boot 262144 with 1.42 GB.
+For the A10 in issue #1 the arithmetic says a greedy-only boot now
+reaches the full 262144 native window (his 212,992 + ~55K, capped).
+
+GATES -- ALL PASS: canonical a2982c51 + f64e7c02 EXACT; sampled-seed
+anchor 900031e9 EXACT (the sampled zoo is untouched when on);
+test_kernels + fused_smoke (graph legs byte-identical); serving
+matrix: DEFAULT boot serves greedy+sampled with mono skipped;
+SAMPLED=0 400s temp>0, greedy byte-deterministic 2x; FORCE_TEMP
+contradiction FATALs; DEXIT=0 boot captures mono D and serves (the
+banner's three-state marker covers D/V independently). One false
+alarm en route: a "determinism DIVERGE" that was md5-of-full-JSON
+(created timestamp) -- text-only extraction passes; harness lesson
+re-learned same-day.

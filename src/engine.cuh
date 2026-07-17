@@ -188,6 +188,19 @@ struct Engine {
     // as modulus >= max commit n). Invariant: role 0 = the last-committed
     // state.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
+    // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
+    //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
+    //   sample_graph + spec_sample_graph[12] + verify_sample_graph_w[4][12]
+    //   -- serves ONLY temperature>0 requests. =0 skips capture; the server
+    //   refuses temp>0 with a 400 and generate() refuses as the belt.
+    //   capture_constrained (default true; the server clears it when booted
+    //   without --constrain-tools): draft_graph/draft_graph_lo/verify_graph
+    //   serve only the P11 constrained-tool path and the Q27_DEXIT=0 A/B.
+    //   With dexit on and no --constrain-tools they are provably
+    //   unreachable, so standard server boots skip them automatically.
+    //   The CLI leaves both true: the canonical zoo is byte-identical.
+    bool sampled_graphs = true;
+    bool capture_constrained = true;
     bool batched_prefill = true;
     // Minimum prompt tokens for the chunked prefill path (Q27_PF_BATCH_MIN).
     // Below it, prefill walks the prompt serially: two ungraphed forwards +
@@ -563,6 +576,9 @@ struct Engine {
         A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
         A((void**)&d_mask_ids, W_MAX * 4);
         if (const char* ce = getenv("Q27_CKPT_INTERVAL")) ckpt_interval = atoi(ce);
+        // read here (not build_spec_graphs): sample_graph captures in
+        // build_graph, which runs first
+        if (const char* se = getenv("Q27_SAMPLED")) sampled_graphs = atoi(se) != 0;
         if (const char* cs = getenv("Q27_CKPT_SLOTS")) ckpt_slots = std::max(1, atoi(cs));
         A((void**)&d_accept_cap, 4);
         CUDA_CHECK(cudaMemset(d_mask_ids, 0xFF, W_MAX * 4)); // all -1 = unconstrained
@@ -1874,12 +1890,19 @@ struct Engine {
             // halves reference the identical buffers, so launching D then V
             // back-to-back on stm equals the monolithic graph; the host reads
             // drafts + stages masks between them in the constrained path.
+            // 2026-07-17 (issue #1): the monolithic draft pair's ONLY
+            // consumers are the constrained-tool path and the Q27_DEXIT=0
+            // fallback (greedy 2469-area + sampled 2500-area both branch on
+            // dexit_on). Skip capture when neither can be reached.
+            const bool need_mono_draft = !dexit_on || capture_constrained;
             cudaGraph_t gd, gv;
+            if (need_mono_draft) {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_draft_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
             CUDA_CHECK(cudaGraphInstantiate(&draft_graph[p], gd, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gd));
+            }
             // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
             // so spec_round can pick draft depth per round. gate_maxd is forced to
             // 5 under auto, so draft_graph[p] above is the depth-5 (hi) graph.
@@ -1888,7 +1911,7 @@ struct Engine {
             // needs the depth-4 graph even under fixed depth-5. One extra graph per
             // perm, no new buffers; greedy still selects draft_graph_lo only under
             // maxd_auto (spec_round unchanged), so its behavior is untouched.
-            if (gate_maxd >= 5) {
+            if (need_mono_draft && gate_maxd >= 5) {
                 dmax = 4;
                 cudaGraph_t gdl;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -1910,11 +1933,15 @@ struct Engine {
                 CUDA_CHECK(cudaGraphInstantiate(&draft_step_graph[k][p], gs, nullptr, nullptr, 0));
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
+            // verify_graph's only consumer is the P11 constrained-tool path
+            // (header map) -- skip with the same rationale.
+            if (capture_constrained) {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
             CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gv));
+            }
             // P12/P12b: per-width verify graphs (W = cap+1 lanes, 2..6). Same
             // buffers as the widest verify; only ntok/nbatch shrink + finish caps
             // at W-1, so committed state and emitted tokens are width-invariant.
@@ -1947,6 +1974,14 @@ struct Engine {
         // Phase 2: sampled graph set -- identical draft half, rejection-sampling
         // verify tail. Warm with dummy params (the greedy graphs above are
         // already instantiated and independent of the device state churned here).
+        // Q27_SAMPLED=0 skips the whole phase (~60 graphs): greedy-only boots
+        // reclaim the VRAM; the server 400s temperature>0 requests and
+        // generate() refuses as the belt. Skipping the warm block too is safe:
+        // captures do not execute, so post-phase state equals post-phase-1.
+        if (!sampled_graphs) {
+            perm = 0;
+            fprintf(stderr, "sampled spec graphs SKIPPED (Q27_SAMPLED=0, greedy-only)\n");
+        } else {
         q27k::SampleParams warm{1.f, 1.f, 0ull};
         CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
         dmax = 4; vw = 5; // sampling stays depth-4 (5-lane) in this phase
@@ -1979,6 +2014,7 @@ struct Engine {
             vw = 5;
         }
         perm = 0;
+        } // sampled_graphs
         // P12: confidence-gated depth. Q27_PMIN=theta engages the gate (drafter
         // top1-top2 margin >= theta extends the verify one lane deeper). <=0 or
         // unset = off (always full width 5 = the canonical depth-4 round).
@@ -1990,11 +2026,20 @@ struct Engine {
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
                     sfx_L, sfx_width());
         fprintf(stderr,
-                "spec graphs captured (%d perms, depth-4; +split D/V; +per-width verify "
-                "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
+                "spec graphs captured (%d perms, depth-4%s; +per-width verify "
+                "2..%d%s%s; +per-step draft 0..%d); "
                 "Q27_PMIN=%.3f (%s), gate_maxd=%d%s, dexit=%d\n",
                 W_MAX, // was the literal "12" -- the capture loop is over W_MAX
-                gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", gate_maxd - 1,
+                capture_constrained
+                    ? "; +split D/V"
+                    : (dexit_on ? "; mono D/V SKIPPED (dexit on, no --constrain-tools)"
+                                : "; +mono D (V SKIPPED: no --constrain-tools)"),
+                gate_maxd + 1,
+                (maxd_auto && (!dexit_on || capture_constrained)) ? "; +P13 depth-4 draft"
+                                                                  : "",
+                sampled_graphs ? "; +P14 sampled per-width verify 2..5"
+                               : "; sampled set SKIPPED (Q27_SAMPLED=0)",
+                gate_maxd - 1,
                 pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd,
                 maxd_auto ? (gate_maxd >= 6 ? (gate_maxd == 7 ? " (auto: ladder 4..7)"
                                                                  : " (auto: ladder 4..6)")
@@ -3060,6 +3105,17 @@ struct Engine {
         // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
         // here (prefill's last advance), so the first eager draw keys the token
         // at position NP with kind 0.
+        // Q27_SAMPLED=0 belt (the server 400s temp>0 up front; this catches
+        // any path that slips through): the sampled graphs were never
+        // captured, so launching them would be a null-exec crash. This layer
+        // fills a task rather than answering a request, so the safe move is
+        // to force the round greedy, loudly -- not to half-build the task.
+        if (samp.inv_temp > 0.f && !sampled_graphs) {
+            fprintf(stderr,
+                    "[gen] sampled request on a Q27_SAMPLED=0 boot (no sampled "
+                    "graphs) -- serving GREEDY instead\n");
+            samp = q27k::SampleParams{0.f, 1.f, 0ull};
+        }
         const bool sampling = samp.inv_temp > 0.f;
         // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
         // spec) even under sampling -- the A/B lever for the spec==non-spec
@@ -3456,13 +3512,17 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(S[il], 0, (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
             }
-        cudaGraph_t sgraph;
-        CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-        token_launches_sampled();
-        CUDA_CHECK(cudaStreamEndCapture(stm, &sgraph));
-        CUDA_CHECK(cudaGraphInstantiate(&sample_graph, sgraph, nullptr, nullptr, 0));
-        CUDA_CHECK(cudaGraphDestroy(sgraph));
-        fprintf(stderr, "sample graph captured\n");
+        if (sampled_graphs) {
+            cudaGraph_t sgraph;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            token_launches_sampled();
+            CUDA_CHECK(cudaStreamEndCapture(stm, &sgraph));
+            CUDA_CHECK(cudaGraphInstantiate(&sample_graph, sgraph, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(sgraph));
+            fprintf(stderr, "sample graph captured\n");
+        } else {
+            fprintf(stderr, "sample graph SKIPPED (Q27_SAMPLED=0)\n");
+        }
     }
 
     // feed one known token (prompt phase): set d_token, replay graph
