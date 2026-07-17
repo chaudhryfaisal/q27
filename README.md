@@ -30,6 +30,13 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
   free suffix drafter through one shared-KV MMA verify -- 5.3-5.8
   accepted tokens per weight read on live traffic (231-246 t/s
   aggregate on a 5090).
+- **Continuous batching on top of it** (serving default since
+  2026-07-16): concurrent slots decode through ONE fused weight sweep,
+  whole fused-verify rounds replayed as shape-keyed CUDA graphs --
+  2-slot aggregate **1.41x** over round-interleaving (fp8 237.7 /
+  turbo3 224.2 t/s), solo cost <=0.07%, byte-identity gated. Zero
+  config: a bare `q27-server` spot-checks at 234-239 t/s aggregate on
+  two ~26K Claude-Code-shaped streams (90.9% graph-cache hits).
 - **Receipts for everything**: bitwise canonical gates, negative
   results logged at the same rate as wins, and every number in this
   README traceable to a dated BUILDLOG entry. (The BUILDLOG is the
@@ -267,34 +274,113 @@ The server is single-model, so the model name in requests is accepted
 as-is. Expect ~170-230 t/s decode on a 5090 depending on traffic shape
 (see Reference numbers), warm multi-turn prefills served from the
 prefix cache, and `count_tokens` + Anthropic-shaped context-limit
-errors so Claude Code compacts correctly.
+errors so Claude Code compacts correctly. Concurrent sessions
+(`--slots N`) batch through one weight sweep by default -- 234-239 t/s
+aggregate at 2 slots, zero config (see Serving).
 
-## State of the engine (2026-07-10)
+## State of the engine (2026-07-16)
 
-Five stages shipped in one day, each gated; the full entries (and their
-negatives) are the 2026-07-10 BUILDLOG block. Headlines:
+The headline of the 2026-07-14..16 block is the continuous-batching
+campaign: from "multi-slot = round-granularity time-slicing, aggregate
+~1.0x" to "2 slots through one weight sweep at **1.41x**, on by
+default". The arc at 2 slots (fp8 aggregate): FIFO 1.00x -> P1 1.21x ->
+P2 1.31x -> P3 1.41x, solo cost ~0% at every stage. Full entries and
+their negatives are the 2026-07-14..16 BUILDLOG block. Headlines:
 
-- **Width-12 verify**: lanes 8 -> 12; widths 9..12 belong to the suffix
-  drafter (live agentic-session AL 10.61 on 61.6% of decode -- the predicted cap
-  release). Byte-identical at old widths by construction.
-- **fdmma tuned 5.6x over fd2** at 61K W12 (2-CTA STAGES=1 + computed
-  split count); three orchestration negatives filed with a do-not-retry
-  bar (CTA count dominates intra-CTA choreography here).
-- **`__grid_constant__`** on struct-param kernels: the short-bench suite
-  caught an 8% engine-wide param-copy tax the depth gates missed; suite
-  172.2, above the pre-regression baseline. The suite is the standing
-  launch-overhead canary.
-- **Zero-config serving**: bare `q27-server model tok` = the full
-  measured stack; CLI keeps reference defaults (bitwise world untouched).
-- **Deep-MTP closed by pricing**: ceilings 9/10 negative, 8 NO-BUILD;
-  the wide-lane marginal is GEMV-N-bound (mma16 GEMM-verify is the filed
-  pivot, not commissioned).
+- **07-14 -- external perf-review triage priced everything first.** The
+  review's top-3 items all measured <=0.5%: GPU-side draft-depth NO-GO
+  (the entire per-step launch+sync+staging tax is ~8us/step = 0.15% of
+  decode wall -- a device-side continuation flag has nothing to
+  recover); tokenizer prefix cache LOW (re-encode runs 2.8-3.7M tok/s, a
+  perfect cache saves ~20ms TTFT/turn); ckpt traffic + reset clears LOW.
+  Decode wall split (codegen @26.8K warm): verify 83% / draft 15% /
+  suffix 2.5%. Continuous batching across slots was the one structurally
+  real item left -- designed, then built in three phases.
+- **P0+P1 (07-15): lane views + lockstep conductor + fused verify =
+  1.21x.** Per-lane engine state behind `LaneView`, `generate()`
+  decomposed into prefill + `DecodeTask` decode steps, and a conductor
+  that fuses concurrent slots' verify rounds through one weight sweep
+  (union GEMM-family policy keeps solo-matching numerics). 2-slot
+  aggregate 169.1 -> 204.0 fp8 -- the 1.3x bar MISSED, but the miss
+  fully attributed: serial mixers ~4.6ms + eager launches ~1.9ms +
+  serial drafts ~2.8ms per round, i.e. exactly the P2/P3 levers. Solo
+  regression 0% (the k==1 fallthrough is free). Live CC validation PASS
+  (180 reqs, zero errors; W12 2x48K = the fp8 CC-viable batch shape);
+  turbo3 x batching validated the same day (byte-identity 4/4, 2x96K
+  capacity on 32GB, an n=1 quality scare retired as basin lottery at
+  n=3).
+- **P2 (07-16): fusion where BW-bound, overlap where state-bound =
+  1.31x.** P2a draft OVERLAP realized ~0 -- draft steps are
+  weight-BW-bound, and two engines reading the same MTP weights share
+  one bandwidth stream, so only FUSION recovers draft time (the
+  campaign's first physics lesson). P2b mixer fork/join bought ~1ms of
+  its ~4.5ms ceiling (co-residency-limited). P2c fused draft steps (one
+  MTP weight sweep per draft step across active engines, `MtpLaneView`)
+  passed the bar: fp8 1.31x / turbo3 1.35x, solo 0%.
+- **P3 (07-16): the eager-launch tax, graph-replayed away = 1.41x.**
+  nsys attribution put the fused round's dispatch tax at 3.4ms (2,610
+  launches x ~1.66us GPU starvation). Conv/delta TABLE TWINS make fused
+  rounds permutation-invariant; a shape-keyed LRU exec cache then
+  replays whole fused-verify rounds as CUDA graphs (bench alphabet 28
+  keys/KV -> 100% steady-state hits). Bar PASSED: fp8 1.41x / turbo3
+  1.40x (bar 1.38x), solo 0.00%. Live CC A/B: TRANSFERS -- depth-matched
+  fused phv/round -17..-19%, fused tps +15-17%, zero errors both legs;
+  one live finding: real CC traffic draws 44+ graph keys vs the bench's
+  28, outrunning LRU-32 (churn benign at <1% tax -- hence cap 64 in the
+  defaults).
+- **P4 (07-16): mixer co-residency = measured NO-GO, nothing built.**
+  The ~3.5ms post-P3 shelf was mostly launch tax P3 had already
+  harvested (double-count); the true residual (~0.7-0.8ms/round) is
+  fdmma WAVE SERIALIZATION -- each engine's verify attention fills
+  exactly one full GPU wave by design. A half-wave split achieves total
+  co-residency but inflates per-kernel time 1.3-1.6x, netting
+  ~0.1ms/round, 3-4x under the bar. Closing physics, completing the
+  triad: weight-BW-bound work -> fusion; state-latency-bound work ->
+  overlap; SATURATED work -> neither. The campaign ends here.
+- **Defaults flipped ON (07-16, `c0c5c5e`).** The serving profile sets
+  `Q27_BATCH=1 Q27_BATCH_GRAPH=1 Q27_BATCH_GRAPH_CAP=64` with a
+  two-tier guard: user-EXPLICIT `Q27_BATCH=1` + incompatible env stays
+  fail-fast FATAL, profile-DEFAULT + incompatible env auto-disables
+  with one banner line and serves exactly as pre-P1 (a default must
+  never kill a formerly-working invocation). Kill switches:
+  `Q27_BATCH=0`, `Q27_BATCH_GRAPH=0`, `Q27_PROFILE=ref`. The CLI binary
+  is untouched -- every bitwise canonical gate rides the CLI.
+- **v0.2.0 benchmark refresh (07-16, measured at `c0c5c5e`).** Suite
+  177.4 t/s (lands on the 07-13 number exactly), canonical 144.2; the
+  2-slot bar re-run with defaults-on as the measured leg: fp8 168.9 ->
+  **237.7 (1.41x)**, turbo3 158.5 -> **224.2 (1.41x)**, solo <=0.07%;
+  zero-config spot check **234-239 t/s** aggregate at 90.9% gcache hit,
+  0 evictions, 0 errors.
+- **The byte-identity discipline held throughout**: master-refs md5
+  procedure at every phase boundary, the ninv N-invariance gate (the
+  bitwise-when-untrimmed contract for every fused lane family) plus its
+  seam and twin legs, canonical + sampled-seed EXACT at every merge.
+  The only text forks are the documented tolerance classes (A1
+  suffix-trim, turbo3 concurrency tie re-rolls).
 
-(2026-07-11/12 shipped the turbo3 KV arc and the h16 Ampere verify --
-see the features list above and BUILDLOG.)
+(The same 07-14/15 block also produced the 5-engine SWE-bench
+cross-engine study -- see Benchmarks -- and a second security-review
+triage. Single-stream context: 07-13 shipped the k_vgemm GEMM-verify +
+GEMV retiers + GDN delta-fusion pass -- suite 177.4 -- and 07-14 the
+prefill ldmatrix-B + short-tail NT-dispatch pair; see the header block
+above. 2026-07-11/12 shipped the turbo3 KV arc and the h16 Ampere
+verify.)
 
-**Carried state (pre-2026-07-10, still load-bearing):**
+**Carried state (pre-campaign, still load-bearing):**
 
+- Width-12 verify (07-10): lanes 8 -> 12; widths 9..12 belong to the
+  suffix drafter (live agentic AL 10.61 on 61.6% of decode);
+  byte-identical at old widths by construction. Same day: fdmma tuned
+  5.6x over fd2 at 61K W12 (three orchestration negatives filed with a
+  do-not-retry bar -- CTA count dominates intra-CTA choreography there),
+  and the `__grid_constant__` param fix (the short-bench suite is the
+  standing launch-overhead canary -- it caught the 8% param-copy tax the
+  depth gates missed). Deep-MTP closed by pricing (ceilings 9/10
+  negative); its filed mma16 GEMM-verify pivot SHIPPED 07-13 as
+  `k_vgemm`.
+- Zero-config serving (07-10): bare `q27-server model tok` = the full
+  measured stack; CLI keeps reference defaults (bitwise world
+  untouched).
 - Adaptive draft ladder 4..7 (`Q27_MAXD=auto7`, now server default): 3-bar
   controller (`src/depthctl.h`), emitted text byte-identical at every
   ceiling. docs/maxd6-decision.md has the NO-GO -> GO-IF -> build trail.
@@ -309,17 +395,18 @@ see the features list above and BUILDLOG.)
   drift modes plus the 07-11 inference tie-break; CC 0.00 -> 0.55 was a
   parser ceiling, not quant. `--constrain-tools` stays opt-in (in-call
   cost).
-- Multi-slot serving (`--slots N`) with R1b round-granularity GPU
-  time-slicing; P9 same-session checkpoint ring; P8 stable-prefix snapshot
-  (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`. turbo3
-  fits TWO full 131K slots on the 5090, and since 07-16 the slots also
-  BATCH: `Q27_BATCH=1 Q27_BATCH_GRAPH=1` fuses concurrent decodes through
-  one weight sweep + shape-keyed CUDA-graph replay -- 1.41x (fp8,
-  168.9 -> 237.7) / 1.41x (turbo3, 158.5 -> 224.2) aggregate at 2 slots
-  (re-measured 2026-07-16 at v0.2.0 `c0c5c5e`), solo cost <=0.07%,
-  byte-identity gated (BUILDLOG 07-14..16; serving defaults since
-  2026-07-16 -- `Q27_BATCH=0` disables, `Q27_PROFILE=ref` = conservative
-  reference).
+- Multi-slot serving (`--slots N`): concurrent slots BATCH by default
+  since 07-16 -- the conductor fuses their decode rounds through one
+  weight sweep + shape-keyed CUDA-graph replay, 1.41x (fp8, 168.9 ->
+  237.7) / 1.41x (turbo3, 158.5 -> 224.2) aggregate at 2 slots (v0.2.0
+  at `c0c5c5e`), solo cost <=0.07%, byte-identity gated (BUILDLOG
+  07-14..16). `Q27_BATCH=0` restores R1b round-granularity GPU
+  time-slicing (the pre-campaign behavior and the measured FIFO
+  baseline); `Q27_PROFILE=ref` = conservative reference. P9 same-session
+  checkpoint ring; P8 stable-prefix snapshot (warm turns ~1.3s);
+  `/v1/messages` native incl `count_tokens`. turbo3 fits TWO full 131K
+  slots on the 5090 (measured pre-batching; the batched CC shapes of
+  record are fp8 2x48K and turbo3 2x96K on 32GB, W12 build).
 - Long-context: needle 6/6 at 361K on both fp8 and turbo3; measured
   allocation ceilings fp8 294,912 / turbo3 655,360 (W12 build, 5090).
 - turbo3 3-bit KV (2026-07-11, `Q27_KV=turbo3`): full stack incl. the
@@ -444,8 +531,13 @@ stretches hit 9-10.6), which is how 231 t/s clears a ~105 t/s plain
 ceiling on the 5090 and 102 clears ~52 on the 3090. Corollary, twice
 proven now: every decode win is (a) fewer bytes per step (quant policy,
 fp8 KV, turbo3 KV) or (b) more accepted positions per weight read
-(ladder, suffix width) -- there is no third lever at batch 1, and
-docs/multislot-throughput.md is what happens when you ask for one.
+(ladder, suffix width) -- at batch 1 there is no third lever.
+docs/multislot-throughput.md priced the 2026-07-11 reality (time-sliced
+slots, aggregate ~1.0x); the 07-14..16 continuous-batching campaign
+changed that answer the only way this napkin allows -- by making
+concurrent slots SHARE the weight read (lever (b), pointed across users):
+2-slot aggregate 1.41x, while the per-stream arithmetic above still
+holds inside each fused round.
 
 ### Decode methodology (canonical, 2026-07-02)
 
@@ -463,7 +555,7 @@ These numbers are NOT interchangeable -- each answers a different question:
   the depth gates missed (07-10).
 - **Canonical prompt** (bitwise gate, NOT a benchmark): 128 tokens from the
   5-token canonical prompt -- vanilla baseline md5 `a2982c51...` (the
-  standard; ~140 t/s on 07-10 trajectory), Qwopus `4c4120c7...` for
+  standard; 144.2 t/s, 2.61 t/round at v0.2.0), Qwopus `4c4120c7...` for
   fine-tune gating (~168-170 t/s fd2-era). Held bitwise through fd2,
   P12-P15, fp8q prefill, verify-gemv, the maxd6/7 widenings, the FULL
   width-12 widening (8 -> 12 lanes, perm mod 12), fdmma STAGES=1, and
@@ -540,6 +632,16 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
   two latent bugs found en route: flash-decode scratch under-allocation at
   ctx<4128, and missing ctx guard letting spec rounds write KV rows past
   max_ctx (silent corruption the prefix cache could then reuse).
+- **CB (P0-P3)** DONE 2026-07-15/16 -- continuous batching across slots:
+  P0 `LaneView` state split (07-15), P1 lockstep conductor + fused
+  verify sweep (07-15, **1.21x** 2-slot aggregate), P2a/b/c
+  overlap-vs-fusion attribution + fused draft steps (07-16, **1.31x**),
+  P3 table twins + shape-keyed CUDA-graph round replay (07-16,
+  **1.41x** both KVs, live-CC-validated). Solo cost ~0% and
+  byte-identity (ninv + seam + twin legs) at every stage; serving
+  default since 07-16. **P4 mixer co-residency: measured NO-GO**
+  (07-16) closes the campaign -- saturated-work physics, ~0.1ms/round
+  net for a numerics-gate price.
 
 ## Serving
 
@@ -548,7 +650,7 @@ make build/q27-server
 ./build/q27-server model.q27 model.tok --port 8080
 ```
 
-**Defaults (2026-07-10) = the measured Claude-Code stack.** A bare server
+**Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV itself needs sm_89+, older parts default fp16 KV),
 `Q27_PMIN=0.5`, `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head,
@@ -620,9 +722,11 @@ wire_api = "responses"
 
 Model tool protocol: tools rendered as JSON in the system `<tools>` block per
 the qwen35 chat template; `<tool_call>` output parsed by a streaming splitter
-(src/stream_split.h) that also routes `<think>`. Multi-slot (`--slots N`) with
-R1b round-granularity GPU time-slicing (FIFO gate + yield hooks; byte-identical
-solo vs interleaved). Greedy (spec decode) by default; `temperature>0` routes to
+(src/stream_split.h) that also routes `<think>`. Multi-slot (`--slots N`):
+concurrent decodes batch by default (fused conductor rounds + graph replay,
+see Defaults above); `Q27_BATCH=0` falls back to R1b round-granularity GPU
+time-slicing (FIFO gate + yield hooks; byte-identical solo vs interleaved).
+Greedy (spec decode) by default; `temperature>0` routes to
 sampled SPEC decode -- top-p nucleus + Gumbel-max with rejection-sampled spec
 acceptance (Phase 2, at spec speed), seeded and reproducible, greedy left
 bitwise-unchanged (docs/sampling-design.md, Phases 1-2). The exit-gate A/B passed
@@ -744,7 +848,44 @@ P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Recently shipped (2026-07-11/12):** the turbo3 KV arc (port -> prefill
+**Shipped 2026-07-14..16: the continuous-batching campaign** (full
+narrative in State): P0/P1 lane views + lockstep conductor + fused
+verify (1.21x), P2 fused draft steps (1.31x), P3 shape-keyed CUDA-graph
+round replay (1.41x, live-CC-validated), defaults flipped ON 07-16,
+v0.2.0 benchmark refresh. CLOSED with it, all measured: **mixer
+co-residency** (P4 NO-GO -- fdmma wave serialization; the half-wave
+split nets ~0.1ms/round at a numerics-gate price); **device-side
+draft-depth / conditional graph nodes** (07-14 triage: the whole
+per-step launch+sync tax is ~8us = 0.15%, nothing to recover);
+**tokenizer prefix cache** (~20ms TTFT ceiling, LOW). Also shipped
+07-13/14 on the single-stream side: k_vgemm GEMM-verify + GEMV
+occupancy retiers + GDN delta-fusion (suite 177.4), prefill ldmatrix-B
++ short-tail NT dispatch (+13-16% short prefill).
+
+**Open items (2026-07-16, the honest list):**
+- **turbo3-vs-fp8 quality gate**: the dedicated PPL+needle A/B owed
+  since the 07-11 port is still open; the 07-15 CC runs were
+  shape-confounded and cannot answer it. fp8 stays the CC serving
+  default meanwhile.
+- **Saguaro-style 3090 off-path drafting** -- the one uncommissioned
+  engine idea left standing from 07-10.
+- **Prefill follow-ons**: the serial-threshold policy call (4x on
+  <32-token prompts, but it moves them from exact-serial to the
+  tolerance-class batched path and re-baselines the canonical --
+  deferred as policy, not a bug; BUILDLOG 07-14) and the retired
+  Phase-3's filed successor (async producer/consumer + mbarrier
+  rewrite of the prefill-attention kernel).
+- **Strict-parser zero-rescue config**: engage the constrain grammar on
+  a bare `{"name"` opener too, closing the wrapper-less bypass (see
+  Open quality gates below).
+- **`--slots N` does not auto-size `--ctx`** (v0.2.0 sharp edge: ctx
+  defaults to 8192 + a warning, so a >8K prompt serializes onto slot 1
+  and nothing fuses). Ergonomics fix candidate.
+- **Graph-cache cap under churn**: live CC already draws 44+ keys vs
+  the bench's 28; cap 64 swallows today's alphabet, revisit
+  `Q27_BATCH_GRAPH_CAP` if multi-tenant composition churn widens it.
+
+**Previously shipped (2026-07-11/12):** the turbo3 KV arc (port -> prefill
 -> fdmma leg -> ctx sweeps -> 2-slot -> 3090 promotion) and fdmma-h16;
 BUILDLOG has the dozen entries.
 
@@ -754,9 +895,11 @@ W12); `__grid_constant__` param fix (suite 172.2, above the old baseline);
 zero-config CC serving defaults + auto `--ctx` + `Q27_PROFILE=ref`; P3
 verdicts (MTP 9/10 NO-GO, 8 NO-BUILD, GDN chunk shelved -- wide marginal is
 GEMV-N-bound; mma16 GEMM-verify pivot is the filed lever); vanilla + llama
-cross-engine A/Bs. Open engine ideas, none commissioned: Saguaro-style
-3090 off-path drafting; mma16 GEMM verify; W=16 revisit if live suffix AL
-ever jams at 11.
+cross-engine A/Bs. Of that day's open engine ideas: the mma16 GEMM verify
+SHIPPED 07-13 as `k_vgemm`; the W=16 revisit RESOLVED 07-13 (reopens on
+the flat GEMM for file-re-emission traffic only -- `q27-server-w16`; W12
+stays the per-token optimum and the default); Saguaro-style 3090 off-path
+drafting remains open (see Open items).
 
 **Previously shipped (2026-07-05 -> 08):** `/v1/messages/count_tokens` + the
 Anthropic-shaped context-limit error; sampling Phases 1-2 + the exit-gate A/B
@@ -770,9 +913,10 @@ crossover, `Q27_MAXD=auto` production rec); and the **maxd6 adaptive ladder
 
 **P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
 interleaving; whole-generation queue waits gone; analysis in
-docs/P10-decision.md). A2 fused batch-10 verify stays CONDITIONAL: build
-only if engine-claim telemetry says conversations outnumber slots in real
-use (light no-spec utility slots are the smaller lever first).
+docs/P10-decision.md). A2 (fused cross-sequence verify) is SUPERSEDED in
+mechanism by the 07-14..16 continuous-batching conductor -- fused verify
+across active slots, default-on; the conversations-outnumber-slots
+trigger it waited on now just means raising `--slots`.
 
 **Sampling -- DONE (07-06).** temperature/top-p with rejection-sampled
 spec acceptance, at spec speed; greedy stays bitwise. Exit-gate A/B
