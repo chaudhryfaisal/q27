@@ -6998,3 +6998,31 @@ philosophy as the ctor guard; the 4x49152/cap-64 shape is the natural
 regression test. Second finding: rep 1 of a fresh 4-lane server ran
 95.3 t/s vs 221 steady (graph-capture warmup tax at 4-lane alphabet
 size); W12 3-lane showed no such dip.
+
+## 2026-07-17 -- gcache instantiate-OOM fixed: evict-at-cap reorder + shrink-never-abort retry
+
+The 4-lane crash (previous entry) root-caused and fixed in
+conductor.h's graph_round miss path. TWO defects:
+1. Evict-AFTER-instantiate: at the cap boundary the path held cap+1
+   execs transiently, so the ctor headroom guard's shrunk cap (176 MB
+   -> cap 20) still overflowed by one exec instantiating entry 21.
+   Eviction now runs BEFORE capture/instantiate.
+2. No OOM recovery: cudaGraphInstantiate ran under CUDA_CHECK =
+   process abort. Now: on cudaErrorMemoryAllocation, clear the sticky
+   error, evict LRU, retry; if the cache is EMPTY and it still OOMs,
+   destroy the capture, banner, graphs_on_ = false for the rest of the
+   run, re-stage perms (M1 posture) and serve the round eagerly --
+   the same recovery shape as the guard trip, extending the ctor's
+   shrink-never-abort contract to runtime growth. Non-OOM instantiate
+   errors keep the loud-abort contract.
+
+GATES: fused_smoke ALL PASS (A2 error leg + graph legs byte-identical
+to solo, both passes). REGRESSION (the exact crashing shape, 4x49152
+default cap): 16/16 served, ZERO OOM events -- the reorder alone
+covers it; the retry/disable path stays as armor for per-exec-size
+drift (4-lane execs can exceed the 8 MB estimate). Aggregate
+reproduced 221.4 vs 221.2 protocol-matched. S1 solo 162.0 vs 161.9
+EXACT. S2/S4 medians moved -2..-3% across reruns but the FIXED binary's
+own protocol/run-to-run spread spans the delta (S4 221.4 vs 216.9 same
+binary same hour; S2 229.5 fresh-boot vs 242.4 after-S1): harness
+variance, hit path untouched by the diff.
