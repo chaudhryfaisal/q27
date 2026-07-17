@@ -7250,3 +7250,31 @@ multislot 2-cap rationale, notes fp8-opt-in) -- all fixed in e8a6e46.
 Assets: q27-v0.3.0-linux-x86_64.tar.gz (4 binaries + MIT LICENSE,
 sha256 af7118e4...) + SHA256SUMS-0.3.0. Release-binary canonical
 a2982c51 EXACT re-verified at package time.
+
+## 2026-07-17 -- issue #1 receipts: A10 confirms 262144; brim-serving verified; the "identical VRAM" anomaly is malloc granularity
+
+Field results at a31108a (chaudhryfaisal): **q4s + Q27_SAMPLED=0 +
+maxd4 boots the FULL 262144 on the 22.6 GiB A10** (prediction held);
+v1.4 doubled to 102400 (was 49152). His v1.4 106496 OOM died at the
+suffix verify instantiate (engine.cuh:1968) -- the solo-zoo
+no-runtime-recovery edge, already on the books.
+
+He also reported a runtime OOM under live Claude Code at ctx 212992
+on the OLDER build (666b7d9 era, 22-31 MiB boot spare). Reproduction
+attempt on the 3090, CURRENT build, his exact recipe at 262144 with a
+1.2 GB balloon pinning free to 154 MiB: 200K-token cache-busted
+prefill (2m28s) AND 1024-token generation at 200K depth both served
+cleanly -- free VRAM byte-identical before/after (zero runtime
+allocation; boots = serves holds on this build). His old build
+predates the gcache evict-order fix and the capture gates and ran at
+5-7x less headroom; ask for the crash's "at src/..." line if it
+recurs on a31108a.
+
+His "used_after identical at 258048 vs 262144" observation SOLVED,
+exactly: turbo3 KV per buffer = ctx x 400 B; at 262144 that is
+EXACTLY 100 MiB, at 258048 it is 98.44 MiB -- and cudaMalloc's 2 MiB
+granularity rounds both to the same 100 MiB granule across all 36
+buffers (delta = 0). His 253952 row confirms: 96.88 -> 98 MiB granule,
+a 72 MiB step (he measured 68). Reproduced on the 3090: both ctx
+values read 1.70 GB at ready. The window's last 4096 tokens are
+allocation-free. Benign; physics, not engine.
