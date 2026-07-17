@@ -6394,6 +6394,18 @@ fastest) / default 5.25 (reference, canonical a2982c51) / q6 6.0 /
 q6k 6.8. Shipped: README tier row + small-cards rewrite, CHECKSUMS,
 HF upload alongside the existing tiers.
 
+FIELD CONFIRMATION (07-17, issue #1, same A10, commit 666b7d9): the
+reporter downloaded q4s off HF before the announcement even posted
+and ran his own ladder. Measured: v1.4+maxd4 49,152 re-confirmed
+(30 MiB spare); **q4s+maxd4 212,992** (22,567 MiB used, 22 MiB
+spare; 217,088 OOMs at the sampled-verify instantiate) = 7.4x his
+stock 28,672. Predicted 219K vs measured 213K -- the delta is the
+new gcache exec reserve, whose headroom guard his logs show working
+as designed at the brim (cap 64 -> 2 with LRU recapture). Boot also
+dropped 18.1s -> 6.0s on the smaller weight stream. Scored tasks
+(07-17, 5090): HOLD at default-tier level, tier-dome precedent
+repeats. q4s A10 row promoted to the README.
+
 ## 2026-07-16 -- q4s-v1 REPACK VALIDATION: full ladder GREEN, anchors minted, club-3090 matched-bpw rerun (both GPUs)
 
 Independent validation ladder on the q4s artifact above (master

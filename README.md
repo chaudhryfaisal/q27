@@ -192,9 +192,10 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
   vs default's 8.0409 (-0.26%, the third measured error-cancellation
   win), suite +5.2% (186.2 vs 177.0 t/s same-day) -- smaller, faster,
   AND lower perplexity. Exists for VRAM-starved cards: the 2.27 GB it
-  returns is ~167K tokens of turbo3 KV budget. Sub-24GB cloud cards
-  (A10 22.6 GiB usable) measured 28K ctx ceiling on default weights;
-  q4s arithmetic puts the same card past 200K.
+  returns is ~167K tokens of turbo3 KV budget. Field-measured on an
+  A10 (22.6 GiB usable, issue #1, 07-17): default weights ceiling
+  28,672 stock / 49,152 with `Q27_MAXD=4`; **q4s 212,992** same card
+  same knobs -- 7.4x, with 22 MiB to spare.
 
 ### Carried state (pre-campaign, still in force)
 
