@@ -73,13 +73,20 @@ EXACT; the 2026-07-10 aggregate numbers below predate these and tick up):
   prefill is 34% of request wall at the median (88-96% for large-prompt/short-
   output reads), decode dominates the aggregate.
 
-**Reference numbers** (2026-07-10, master, vanilla model, 5090; full
-tables in BUILDLOG):
+**Reference numbers** (2026-07-10, single-stream + 2-slot lines
+re-measured 2026-07-16 at `c0c5c5e` for v0.2.0; master, vanilla model,
+5090; full tables in BUILDLOG):
 
-- Short-bench suite **172.2 t/s** (fp16 stock CLI, 5-prompt mean; canonical
-  `a2982c51` EXACT). History: 161.8 (07-09) -> 149.5 (width-12 param-copy
-  regression, caught by this suite) -> 172.2 (`__grid_constant__` fix --
-  ABOVE the old baseline; the per-thread param copy predated width-12).
+- Short-bench suite **177.4 t/s** (2026-07-16, v0.2.0 refresh; fp16 stock
+  CLI, 5-prompt mean; canonical `a2982c51` EXACT, stock clocks). History:
+  161.8 (07-09) -> 149.5 (width-12 param-copy regression, caught by this
+  suite) -> 172.2 (`__grid_constant__` fix) -> 177.4 (07-13 ladder retier
+  + GDN delta-fusion; the 07-16 re-measure lands on 177.4 exactly).
+- 2-slot continuous-batching aggregate (2026-07-16, v0.2.0, w16 serving
+  build; `tools/batch_ab.sh` A/B/D, 2x512-tok codegen+docs @~26K,
+  defaults-on profile as the measured leg): fp8 168.9 -> **237.7 t/s
+  (1.41x)**, turbo3 158.5 -> **224.2 t/s (1.41x)** over the FIFO
+  round-interleave baseline; solo regression <=0.07% both KVs.
 - Decode @26K (server replay, constructed cctx payload, fp8 basin):
   classic config 143.0 / **full default stack 176.3 t/s** (+23%).
 - Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
@@ -307,10 +314,12 @@ see the features list above and BUILDLOG.)
   (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`. turbo3
   fits TWO full 131K slots on the 5090, and since 07-16 the slots also
   BATCH: `Q27_BATCH=1 Q27_BATCH_GRAPH=1` fuses concurrent decodes through
-  one weight sweep + shape-keyed CUDA-graph replay -- 1.41x (fp8) / 1.40x
-  (turbo3) aggregate at 2 slots, solo cost 0%, byte-identity gated
-  (BUILDLOG 07-14..16; serving defaults since 2026-07-16 -- `Q27_BATCH=0`
-  disables, `Q27_PROFILE=ref` = conservative reference).
+  one weight sweep + shape-keyed CUDA-graph replay -- 1.41x (fp8,
+  168.9 -> 237.7) / 1.41x (turbo3, 158.5 -> 224.2) aggregate at 2 slots
+  (re-measured 2026-07-16 at v0.2.0 `c0c5c5e`), solo cost <=0.07%,
+  byte-identity gated (BUILDLOG 07-14..16; serving defaults since
+  2026-07-16 -- `Q27_BATCH=0` disables, `Q27_PROFILE=ref` = conservative
+  reference).
 - Long-context: needle 6/6 at 361K on both fp8 and turbo3; measured
   allocation ceilings fp8 294,912 / turbo3 655,360 (W12 build, 5090).
 - turbo3 3-bit KV (2026-07-11, `Q27_KV=turbo3`): full stack incl. the
@@ -444,9 +453,10 @@ These numbers are NOT interchangeable -- each answers a different question:
 
 - **Short-bench suite** (SOTA-comparable): 5 fixed genre-diverse short
   prompts x 128 tokens, `--spec`, STOCK clocks -- `tools/shortbench_suite.sh`.
-  **Current (2026-07-10, vanilla baseline): 172.2 t/s mean** (per-prompt
-  143.9-179.9; vanilla series 161.8 on 07-09 -> 172.2 post
-  `__grid_constant__`). Qwopus-era historical mean: 179.7 (07-08). The
+  **Current (2026-07-16, v0.2.0 at `c0c5c5e`, vanilla baseline): 177.4
+  t/s mean** (per-prompt 170.7-185.5; vanilla series 161.8 on 07-09 ->
+  172.2 post `__grid_constant__` -> 177.4 on 07-13, re-measured exactly
+  177.4 at v0.2.0). Qwopus-era historical mean: 179.7 (07-08). The
   per-prompt spread is trajectory/acceptance variance, which is exactly why
   no single short prompt may carry a cross-engine number. It is also the
   param/launch-overhead CANARY: it caught the width-12 param-copy regression
@@ -555,6 +565,18 @@ reference behavior (fp16, ungated, no suffix, fd2, no batching), and the
 **CLI binary keeps reference defaults** so the bitwise canonical gates are
 untouched. Escapes: `--kv-fp16 --no-fast-head --think`, any individual
 `Q27_*`.
+
+Zero-config spot check (v0.2.0, 2026-07-16, `c0c5c5e`): a bare
+`q27-server model tok --ctx 32768 --slots 2 --slot1-ctx 32768` with NO
+env serves the full measured stack -- banner "continuous batching: ON
+(serving default since 2026-07-16, union cap 12)", graph cache ON at cap
+64; two concurrent 512-token replays (codegen+docs, ~26K prompts,
+snapshot-warmed) aggregate **234-239 t/s** with `bat=2.0/1.9` (159 fused
+rounds per request) and warm turns prefilling from the prefix snapshot
+(`pf=1`); gcache 90.9% hit over 318 fused rounds, 0 evictions, 0 guard
+trips; zero errors. One sharp edge: `--slots N` does NOT auto-size
+`--ctx` (it defaults to 8192 and warns) -- pass the slot-0 window you
+want, or a >8K prompt serializes onto slot 1 and nothing fuses.
 
 Behavior note (`--think`): the default serving profile is no-think for
 speed -- it prefills an empty `<think></think>` block, which is what

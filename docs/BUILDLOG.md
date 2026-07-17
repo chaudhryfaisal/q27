@@ -6141,3 +6141,46 @@ untouched); bare-server W12 codegen replay position-wise == p0_baseline r1
 with bat= present (k=1 solo fallthrough byte-identity); kill switches +
 both guard tiers exercised live; 2-slot smoke (32K+32K, concurrent
 codegen/docs) bat>=1.5 fused, gcache ON at cap 64, zero errors.
+
+**2026-07-16 -- v0.2.0 BENCHMARK REFRESH (master c0c5c5e, rebuilt
+binaries; first re-run of the records with continuous batching DEFAULT-ON
+in the server profile).** Gates first, fresh build/q27 at stock clocks
+(mem offset verified 0): canonical a2982c5197c627551b27d76a0a94b220 EXACT
++ sampled-seed 8b6aacf912d8e4c7a50a021623c6c276 EXACT vs p0_baseline.
+Single-stream: shortbench suite mean **177.4 t/s** (hash-table 170.7 /
+merge-sorted 172.1 / planets 185.5 / translate-fr 173.5 / tcp-vs-udp
+185.0; canonical prompt 144.2 t/s, 2.61 t/round) -- lands on the 07-13
+delta-fusion number EXACTLY; the README's 172.2 reference line was stale
+and is refreshed. THE BAR re-run (batch_ab LEGS="A B D" REPS=3
+MAXTOK=512, w16 build; leg B is the bare-defaults path: Q27_BATCH=1
+explicit + GRAPH/CAP=64 riding in from the profile -- GATEENV audited,
+it sets only KV/PMIN/MAXD, none in the incompatible set):
+
+  KV      leg A    leg B (graphs)  ratio   solo delta (D)
+  fp8     168.9    237.7 t/s       1.41x   +0.06% / +0.00%
+  turbo3  158.5    224.2 t/s       1.41x   +0.07% / -0.06%
+
+vs T4 (3500a9c): fp8 168.8/237.5 -> 168.9/237.7 (unchanged, noise);
+turbo3 B 221.6 -> 224.2 (+1.2%), ratio 1.40x -> 1.41x -- both KVs now at
+1.41x. Banner proof per leg: A/D0 "continuous batching: OFF
+(Q27_BATCH=0)"; B/D1 "ON (Q27_BATCH=1 explicit env, union cap 16)" +
+"[gcache] fused-verify graph cache ON (Q27_BATCH_GRAPH=1, cap 64)".
+bat_med=2.0 both KVs (fused_med 159 fp8 / 154 turbo3); debug passes show
+trim lines (4 fp8 / 2 turbo3) and non-zero phd/phv/phs on fused [req].
+Text: docs A==B both KVs; codegen forks through the documented A1
+suffix-trim (fp8 B-only; turbo3 rep-NONDET on BOTH legs -- concurrency
+re-rolls quantized-KV ties, the docs md5 SETS still match A vs B).
+
+ZERO-CONFIG SPOT CHECK (the release claim): bare `q27-server model tok
+--ctx 32768 --slots 2 --slot1-ctx 32768`, NO env (W12 binary): banners
+"continuous batching: ON (serving default since 2026-07-16, union cap
+12)" + gcache ON at cap 64; concurrent codegen+docs 512-tok reps
+aggregate **234.3 / 238.7 t/s**, bat=2.0/1.9 (159 fused rounds/req),
+warm turns pf=1 off the prefix snapshots, zero errors; DBG pass gcache
+h=289 m=29 (90.9% hit) ev=0 gt=0 over 318 fused rounds -- CAP=64 swallows
+the 2-slot alphabet with zero evictions. ONE EDGE found by running it
+bare-bare (no --ctx at all): --slots N does not auto-size --ctx (8192
+default + a "pass --ctx" warning), so a ~26K prompt serializes onto
+slot 1 and nothing fuses -- documented in README Serving. Docs refreshed
+with these numbers: README reference/State/Serving lines +
+docs/BENCHMARKING.md 2-slot aggregate table.
