@@ -22,6 +22,11 @@ carries the `qwen35` arch and the Anthropic `/v1/messages` endpoint; a fresh
 rebuild risks the known sm_120 toolchain traps and would not move the base-kernel
 number materially.)
 
+> **Serving headline (2026-07-16, v0.2.0):** 2 slots batch through one
+> fused weight sweep + graph replay -- **1.41x aggregate over FIFO on both
+> KV formats**, solo cost <=0.07%, zero-config. Full table + methodology:
+> "Single-box serving: 2-slot continuous-batching aggregate" below.
+
 ## Fairness controls (every cross-engine run)
 
 - **Single GPU, RTX 5090 only.** llama is pinned with `CUDA_VISIBLE_DEVICES=0` —

@@ -1,5 +1,16 @@
 # Why q27 multi-slot doesn't scale aggregate throughput like vLLM
 
+> **SUPERSEDED 2026-07-16.** The limitation documented below was real on
+> 07-11 -- and was then ELIMINATED by the continuous-batching campaign
+> (P1-P3, BUILDLOG 2026-07-14..16): concurrent slots now decode through one
+> fused weight sweep with shape-keyed CUDA-graph replay, and the 2-slot
+> aggregate measures **1.41x over FIFO on both KV formats** (fp8 168.9 ->
+> 237.7 t/s, turbo3 158.5 -> 224.2; solo cost <=0.07%), on by default since
+> v0.2.0. Current numbers: docs/BENCHMARKING.md, "Single-box serving:
+> 2-slot continuous-batching aggregate". This document stays as the record
+> of WHY the FIFO design could not scale and what the campaign had to
+> change (per-request decode preserved, engine-busy ceiling shared).
+
 2026-07-11, written against the day's 2-slot turbo3 measurements. Companion
 to docs/P10-decision.md (which priced the alternative and rejected it).
 
