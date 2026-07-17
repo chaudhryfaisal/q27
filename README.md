@@ -62,9 +62,13 @@ default width-12 build OOMs at graph setup on 24GB. turbo3 is the
 default on Ampere (no env needed); prefer the q4s tier: its
 2.27GB-smaller weight file goes straight to KV budget (~74K tokens/GB at turbo3 rates).
 Cards with less than a true 24 GiB (A10-class cloud parts, ECC
-reserve, decimal-GB VRAM) can also add `Q27_MAXD=4`, which trims the
-captured graph zoo by ~280MB. The card must be otherwise idle: ~2.7GB
-of other resident VRAM is the difference between boot and OOM.
+reserve, decimal-GB VRAM) can also add `Q27_MAXD=4` (trims the graph
+zoo ~280MB) and `Q27_SAMPLED=0` for greedy-only serving (skips the
+sampled graph set, ~600MB on sm_86; temperature>0 requests get a 400).
+Field-measured on a 22.6 GiB cloud A10 (issue #1, a31108a): q4s +
+both knobs boots the FULL 262,144 native window; default weights
+reach 102,400. The card must be otherwise idle: ~2.7GB of other
+resident VRAM is the difference between boot and OOM.
 
 Pick a quant first. Four tiers, one repo
 ([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27))
@@ -197,9 +201,10 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
   win), suite +5.2% (186.2 vs 177.0 t/s same-day) -- smaller, faster,
   AND lower perplexity. Exists for VRAM-starved cards: the 2.27 GB it
   returns is ~167K tokens of turbo3 KV budget. Field-measured on an
-  A10 (22.6 GiB usable, issue #1, 07-17): default weights ceiling
-  28,672 stock / 49,152 with `Q27_MAXD=4`; **q4s 212,992** same card
-  same knobs -- 7.4x, with 22 MiB to spare.
+  A10 (22.6 GiB usable, issue #1): the arc ran 28,672 stock ->
+  49,152 with `Q27_MAXD=4` -> 212,992 on q4s -> **262,144** (the full
+  native window) at a31108a with the v0.3.0 capture gates
+  (`Q27_SAMPLED=0`); default weights reach 102,400 on the same card.
 
 ### Carried state (pre-campaign, still in force)
 
