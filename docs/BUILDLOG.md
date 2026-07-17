@@ -6184,3 +6184,209 @@ default + a "pass --ctx" warning), so a ~26K prompt serializes onto
 slot 1 and nothing fuses -- documented in README Serving. Docs refreshed
 with these numbers: README reference/State/Serving lines +
 docs/BENCHMARKING.md 2-slot aggregate table.
+
+**2026-07-16 -- TURBO3 AGENTIC QUALITY GATE (master eccc641 / v0.2.0).**
+The open question from the 07-15 turbo3 x batching validation: turbo3 CC
+scores pooled below the fp8-131K-era bands in SHAPE-CONFOUNDED runs (fp8
+ran 131K windows, turbo3 ran 2x96K/2x48K squeezes). Already measured, NOT
+redone here: generic-corpus (wikitext-2) position-bucket NLL turbo3 vs fp8
++0.65-1.2%/bucket flat to 297K (07-11); needle 6/6 @361K (07-11);
+acceptance TIES fp8 on basin-matched CC replay (07-11 accept_kv_ab). What
+was never measured: NLL on AGENTIC-shaped text (ChatML + tools + code +
+tool_response blocks) and a shape-MATCHED CC score comparison.
+
+PRE-DECLARED DECISION RULE (written before any result was collected):
+turbo3 PASSES as agentic-quality-safe unless
+  (a) agentic-corpus NLL delta (turbo3 vs fp8) at CC depths (16-100K
+      buckets) substantially exceeds the +0.87% generic figure -- i.e.
+      >+2% in any CC-depth bucket, sustained across buckets; OR
+  (b) the shape-matched CC study (n=3/leg) shows a gross consistent
+      deficit: BOTH tasks' medians lower by >0.15 with matched
+      ctx-squeeze.
+Per the standing statistical register, n=3/leg cannot separate small
+effects -- anything short of (a)/(b) reads "no detectable tax; the 07-15
+band gap attributed to shape confound", reported descriptively.
+
+LEG 1 -- agentic-corpus position-bucket NLL A/B (deterministic). Corpus:
+the LARGEST captured real CC conversation (scratchpad/ccreplay
+req_0031.json, 2026-07-14 capture_proxy traffic) rendered to its full
+ChatML token sequence by the server's OWN code path (anthropic_msgs ->
+anthropic_tools_json -> chatml_prompt think=false, then
+Tokenizer::encode; renderer = scratchpad/t3_quality/render_req.cpp
+including src/api_common.h verbatim): 15 messages, 615,147 chars ->
+**154,160 tokens**, one contiguous stream, no concatenation (provenance +
+sha256 in scratchpad/t3_quality/corpus/). Run: `--nll <corpus> --nll-long
+154160 --ctx 163840`, CUDA_VISIBLE_DEVICES=0, one pass, no resets,
+Q27_KV=fp8 vs turbo3 (the two serving formats), vanilla qwen:
+
+  bucket      n      fp8 NLL  turbo3   dNLL     dPPL%
+  0-2k        2047   2.8235   2.8810   +0.0575  +5.92
+  2k-8k       6144   1.9144   1.9022   -0.0122  -1.21
+  8k-16k      8192   2.1390   2.1461   +0.0071  +0.71
+  16k-32k    16384   2.1347   2.1386   +0.0039  +0.39   << CC range
+  32k-48k    16384   0.0248   0.0280   +0.0032  +0.32   << CC range
+  48k-64k    16384   0.0016   0.0020   +0.0004  +0.04   << CC range
+  64k-96k    32768   0.0016   0.0022   +0.0006  +0.06   << CC range
+  96k-128k   32768   0.0002   0.0002   +0.0000  +0.00
+  128k-160k  23088   0.0113   0.0120   +0.0007  +0.07
+
+Rule (a): NOT triggered -- every CC-depth bucket is far under +2%; the
+worst CC-depth bucket (16k-32k, the only content-diverse one, n=16384)
+is +0.39%, UNDER even the +0.87% generic short-context figure. Shape
+notes, reported descriptively: buckets >=32k are echo-dominated (NLL
+0.0002-0.028 -- the transcript's depth is one ~252K-char assistant turn,
+i.e. model-generated text that teacher-forcing re-predicts near-argmax;
+0% duplicate 2K-char chunks, so this is own-output echo, not copy-paste
+repetition). That IS the agentic serving regime at depth, and turbo3
+does not disturb it (absolute dNLL <= +0.0032 everywhere past 32k). The
+0-2k +5.92% and 2k-8k -1.21% wiggle (n=2047/6144, system-preamble +
+task-statement content) is outside the rule's CC-depth scope and
+sign-flips, i.e. content noise, consistent with the known ~+1% short-ctx
+class. Novel-content-at-depth coverage stays with the 07-11 generic
+corpus (+0.65-1.2%/bucket flat to 297K) -- the two corpora are
+complementary and BOTH clear their bars.
+
+[leg 2 results follow]
+
+## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
+
+The README carried these from the start of the project; they moved here
+in the 2026-07-16 editorial slim-down. Each row/block reflects the state
+of knowledge at the time; current canonical numbers live in the README
+("State of the engine", "Decode methodology").
+
+### Milestones
+
+- **M0** DONE -- repack tool: BF16 GGUF -> q27 4-bit format (policy v1.2)
+- **M1** DONE -- correctness: greedy decode, output verified vs llama.cpp
+- **M2** DONE -- dp4a GEMVs + CUDA-graph decode: 80.1 t/s plain
+- **M3** DONE -- MTP speculative pipeline, lossless (token-identical):
+  depth-2 drafting, batched verify, 3-perm cyclic state graphs. **146.0 t/s**
+  (llama.cpp MTP fork on same model/GPU: 101.5). Stretch target was 165;
+  verify-GEMV bandwidth floor makes the remaining gap ~1-2%/iteration work.
+- **M4** DONE -- dual lm_head (Q4 draft / Q8 verify), grid merges, device-side
+  round bookkeeping. `--fast-head` opt-in: **156.5 t/s**
+- **M5** DONE -- HTTP serving: OpenAI + Anthropic + OpenAI Responses, exact
+  byte-level BPE tokenizer (gated 21/21 vs llama-tokenize), tool calling
+- **E6** DONE -- ungated depth-3 speculation: measured p(d3 | d1,d2 correct)
+  = 83.7% offline (docs/E6-design.md), so the round always drafts 3 and
+  batch-4-verifies {pending, d1, d2, d3}. 4 GDN buffers under a mod-4 role
+  permutation, 4 captured graphs. 3.12 tok/round, **188.9 t/s** @2k
+  (204.8 long-gen) [superseded -- P3 depth-4; see the README's Decode
+  methodology]; 8000-token output bit-identical to depth-2. Also fixed
+  two latent bugs found en route: flash-decode scratch under-allocation at
+  ctx<4128, and missing ctx guard letting spec rounds write KV rows past
+  max_ctx (silent corruption the prefix cache could then reuse).
+- **CB (P0-P3)** DONE 2026-07-15/16 -- continuous batching across slots:
+  P0 `LaneView` state split (07-15), P1 lockstep conductor + fused
+  verify sweep (07-15, **1.21x** 2-slot aggregate), P2a/b/c
+  overlap-vs-fusion attribution + fused draft steps (07-16, **1.31x**),
+  P3 table twins + shape-keyed CUDA-graph round replay (07-16,
+  **1.41x** both KVs, live-CC-validated). Solo cost ~0% and
+  byte-identity (ninv + seam + twin legs) at every stage; serving
+  default since 07-16. **P4 mixer co-residency: measured NO-GO**
+  (07-16) closes the campaign -- saturated-work physics, ~0.1ms/round
+  net for a numerics-gate price.
+
+### Progress log (tg t/s, greedy, token-identical output verified each step)
+
+Chronological -- each row supersedes the previous. Current canonical numbers
+live in the README ("Decode methodology").
+
+| change | t/s |
+|---|---|
+| reference kernels e2e | 43.4 |
+| dp4a int8-activation GEMVs | 58.8 |
+| coalesced delta state + wide norms + multiblock argmax | 66.5 |
+| CUDA-graph token replay, device-chained decode | 75.9 |
+| delta_step i-parallel v2 | 80.1 |
+| + speculative decode depth-1 (host-driven) | 84.2 |
+| + direct-write batched GEMV | 92.2 |
+| + parity-pair captured graphs | 109.3 |
+| + depth-2 drafting (2.13 tok/round) | 107.3 |
+| + grid-merged 3-token small kernels | 115.1 |
+| + dual lm_head: Q4 drafts, Q8 verify (v1.3 repack) | 121.1 |
+| steady state (128-token bench, 2.39 tok/round) | **133.5** |
+| `--fast-head` opt-in (Q4 verify; output differs, coherent) | 143.0 |
+| + full grid merges (l2/f16/gates/rope/kv/attn/sigmoid/embed x3) | 145.8 lossless / 156.5 fast |
+| + device-side round bookkeeping (1 sync + 16B readback/round) | 146.0 lossless / 156.5 fast |
+| E1: display compositor off GPU 0 (cosmic-comp/Xwayland stole ~10%) | **157.4** lossless / **168.5** fast |
+| warp-cooperative decode attention (coalesced K/V) | **168.6** lossless @2k; 65.8 @8k ctx (~2x long-ctx) |
+| flash-decode (split-K, K/V shared across GQA heads) | **173.1** @2k / **159.6** @8k ctx lossless; 178.1 fast |
+| fp16 KV cache (attn + MTP) | 169.7 @2k / 159.7 @8k; halves KV bytes, -2.1GB @32k ctx |
+| E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
+| E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
+| P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
+| P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
+| v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
+| P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
+| P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
+| P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
+| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [re-measured 2026-07-06: current 128K prefill is ~71-80s (fp8 g64 71.5 / fp16 exact 80.4); both this 57s and P6's 117.6s superseded]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
+| P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method) [superseded 2026-07-06: current 128K prefill ~71-80s after g64 regroup + delta-WY tiling]; split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
+| fd2: register-accumulator flash-decode (SM-starvation/occupancy fix #3, attn was 99% of depth cost at 5% DRAM BW) | 61K depth **78.0 -> 126.2 t/s** (+62%, 47.2 -> 29.2 ms/round); 16K **-18%/round**; instance 0.768 -> 0.156 ms @61K (45% DRAM BW); 2K +1.3%/round; acceptance parity exact; PPL in noise both KV modes; nll-long 160K bucket-identical; CANONICAL RE-DERIVED 4c4120c7 (old 58b6ae85 under Q27_FD=v1) |
+| P12: confidence-gated depth (`p_min` equiv; `Q27_PMIN=theta`) -- gate verify width on the drafter's top1-top2 margin, skip the deep-KV verify when unconfident | decode **grows with ctx: 2K neutral / 16K +5.8% / 60K +10.8%** (theta 1.0; +7.0% theta 0.5); greedy output BITWISE-IDENTICAL (lanes are independent grid indices -> only round count + verify width change); higher theta wins at longer ctx (context-adaptive theta confirmed). P12b depth-5 (`Q27_MAXD=5`, opt-in): agentic +2.6% but docs -8% (always drafts to max, so the 5th MTP pass is pure cost at low acceptance) -> depth-4 stays default; adaptive maxd is the follow-on |
+| P14 Task 2: fuse draft argmax+margin (`k_argmax_top2`) -- kills the dead ungated `k_margin` scan | -0.545 ms/round @61K (the removed scan); canonical 4c4120c7 EXACT (bitwise); test_kernels +3 fused assertions (token==argmax, margin==CPU top1-top2, all err 0) |
+| P14 Task 3: P12 confidence gate ported to the sampled spec path (per-width sampled verify graphs, capped accept walk) | sampled verify-narrowing ALONE is a wash @61K docs (+0.0% theta0.5 -- a low-margin draft the sampler may accept gets skipped, tok/round drops, extra rounds offset the cheaper round); greedy cross-check healthy on the same binary (+6.6% theta1.0); substrate for Task 4; canonical 4c4120c7 EXACT (greedy untouched) |
+| P14 Task 4: draft early-exit (`Q27_DEXIT`, margin-gated per-step draft graphs, `min(W,md_used)` width-floor top-up) | same-binary A/B @61K docs: greedy **+3.2%** (theta1.0), sampled **+5.4%**; emitted bytes + round counts bitwise-identical to the monolithic draft in all 8 identity cells; sampled gated+dexit now **+3.6% over ungated** (Task 3's sampled wash resolved); canonical 4c4120c7 EXACT |
+| P14 Task 5: fd2 lane-innermost grid order (partial cross-lane KV L2 reuse; R~4.25 measured) | same-session pre/post A/B @61K ungated **116.1 -> 119.3 t/s (+2.7%, MARGINAL-KEPT)**; verify fd2 per-instance -10% toward the draft floor; 2K neutral (+0.0%); canonical 4c4120c7 EXACT (2-line index remap, bitwise on the full fd2 matrix) |
+| prefill-attn Phase 1: cp.async K/V double-buffered prefetch (fp8 path) | fp8 128K prefill **72.1 -> 68.2s (+5.4%)**; bitwise (convert-on-consume of identical bytes); first "neutral" reading was an fp16-KV test artifact -- cp.async is dead code off the fp8 path |
+| prefill-attn Phase 2: fp8 QK^T MMA (`mma.sync.e4m3`, Q staged fp8, bank-conflict padding) -- DEFAULT-ON on fp8 KV | 128K prefill **68.3 -> 59.6s (+11.8%**, ~2200 t/s); logit cosine 0.9999827 + argmax MATCH @131K; needle **6/6 to ~301K**; fp16 path + canonical untouched; `Q27_PF_FP8MMA=0` opts out |
+| verify-gemv: activation reads 4x uint2 -> 2x uint4 in `k_gemv_q4_n` (+ single-col) | decode @61K **163.2 -> 172.9 t/s (+5.9%)** on 2026-07-08 fixtures; GEMV was LATENCY-bound (long_scoreboard 90%, 39-47% DRAM peak) -- weights were fine, the per-column activation loads hammered L1TEX; bitwise BY CONSTRUCTION (same bytes, same dp4a order); tensor-core verify NOT justified |
+| accept-gate Phase 1: conditional lane-5 yield + `maxd_lo` 0.10 -> 0.35 (the measured d5 crossover) | `Q27_MAXD=auto` becomes the production rec: **+2.7% geomean over d4-gated** across the 5-payload envelope, beats BOTH fixed ceilings; the old unconditional yield EMA sat above the demote bar on traffic where fixed-d5 measured -1.7% |
+| maxd6: adaptive ladder 4..6 (7-lane verify, perm mod-7, +157 MB; 3-bar depthctl hi/hi6/flo6) | real-CC-transcript @25.8K: d4 202.6 / d5 216.1 / d6 222.0 (7-tok rounds on 64%); **auto 220.7 vs d5 211.9 = +4.2% same-harness** (2026-07-09 review rerun; original +4.7% claim mixed harnesses); text byte-identical at every ceiling; canonical 4c4120c7 EXACT; non-saturating flavors never promote past 5 |
+
+2K-soak series (2000-token generation, the long-generation methodology
+tier; headline for agentic reply-length outputs): **209.2 t/s STOCK
+fd2-era** (4.32 t/round; pre-fd2 213.2/4.36 -- the ~2% is the short-ctx
+split tax).
+
+k_vgemm T8 figure carried only in the README until 2026-07-16: real T8
+agentic suffix rounds measured 24.76 -> 20.85 ms on the live harness
+(the echo/W12 replay figure of record is 24.76 -> 19.96 ms; see the
+2026-07-13 GEMM-verify entries).
+
+Headline numbers from E2 onward include a GDDR7 offset. Consumer GDDR7
+has no ECC and weights load once, so a marginal OC can plant a persistent
+silent error the token-identity gates can't see. That happened on
+2026-07-02 at +4000 (one wrong canonical run after 30 min of heat, then
+clean again -- binary confirmed innocent). Daily offset is +3000 since:
+the band above it bought ~0.4% and produced the soft error. +4000 only
+for short supervised benches; `--verify-weights` / `/health?verify=1` is
+the detector; offset is volatile across reboots.
+
+### Prefill (M6)
+
+Batched prefill: 256-token chunks, smem-staged dp4a GEMM (16 rows/block share
+one activation tile; per-lane accumulation order matches the serial GEMV
+exactly, so prefill is bitwise-identical to the serial path -- gated on
+identical continuations). GDN state scans sequentially inside one kernel with
+S resident in shared memory; attention runs two-pass softmax in 32-token
+sub-batches; MTP warm skips attention/FFN (only the K/V stores matter).
+
+| prompt | serial | batched | speedup |
+|---|---|---|---|
+| 512 | 76 t/s | 567 t/s | 7.5x |
+| 4096 | 53 t/s | 453 t/s | 8.5x |
+
+**Prefix cache (M6.5)**: GDN state + conv rings snapshotted after prefill
+(attention/MTP KV rows are append-only, so prefix rows stay valid); next
+request LCP-matches the snapshot and prefills only the suffix. Claude Code
+turn 2 on a 26.7k-token context: **1.3s** (26,670/26,693 tokens reused)
+[superseded -- see P8: this gate replayed raw tokens, a flow no real client
+takes; re-rendering clients missed the cache 100% of the time until the P8
+stable-prefix snapshot]. Unconditionally correct: any mismatch falls back to
+full prefill; warm-vs-cold continuations gated identical.
+
+Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
+| | TTFT |
+|---|---|
+| pre-M6 (serial prefill) | 15-min timeout, 0 tokens |
+| M6 (batched) | 139s |
+| + coalesced attention prefill | 90s |
+| + GEMM tuning + FA-lite attention | 61s |
+| turn 2+ with prefix cache | **1.3s** |
+
+[historical -- cold 28.5K TTFT is ~15.0s after P1-P6 and cold 128K is 59.6s
+after the 2026-07-07/08 prefill-attn pair; the warm-turn number required the
+P8 stable-prefix snapshot to hold on real re-rendering traffic]
