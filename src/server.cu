@@ -250,13 +250,28 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1);
 
-    // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17) so it
-    // works from MEASURED free VRAM instead of a stat-based weight estimate.
-    if (ctx < 0 && n_slots > 1) {
-        ctx = 8192; // legacy default; multi-slot should pass --ctx
-        fprintf(stderr, "--ctx not set with --slots %d: using %d (pass --ctx)\n", n_slots, ctx);
-    }
+    // Per-engine non-KV reserve, the single source of truth shared by
+    // auto-ctx (below) and the multi-slot skip loop. roles + graph zoo +
+    // scratch, arch/width/gate scaled. Calibrated to the known-good 2x48K
+    // fp8 anchor on a 32GB 5090 (~5.8 GB/slot on W12). See the auto-ctx
+    // comment for the term-by-term rationale.
+    const double kEngGw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
+    const double kEngGwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
+    const double kEngGraphs = kEngGw8 * 0.13e9 + (Q27_W_MAX - kEngGw8) * kEngGwx;
+    const double kEngMonoSave = cc_arch >= 89 ? 0.08e9 : 0.15e9;
+    const double kEngSampSave = cc_arch >= 89 ? 0.34e9 : 0.60e9;
+    const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+    // per-slot non-KV = single-engine stack + co-residency scratch (the
+    // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
+    // this + KV so it agrees with what auto-ctx sized for.
+    const size_t ENG_FIXED_BYTES =
+        (size_t)(kEngBase + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 + 2.2e9 -
+                 (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
+    // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
+    // multi-slot-aware since 2026-07-18: each borrowing engine carries its
+    // own role sets + graph zoo + KV, so N slots divide the budget. Sized in
+    // the post-upload block below; no legacy 8192 fallback.
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
     fprintf(stderr, "loading model...\n");
@@ -285,6 +300,13 @@ int main(int argc, char** argv) {
     // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3. MIRROR WARNING: matches
     // Engine::kv_bytes -- update together.
     {
+        // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
+        // 8 = the conductor's hard MAX_K/2 fusion limit (W_PLUMB=16 lane
+        // slots, floor-2 trim); slots past what VRAM fits are skipped in the
+        // build loop below. Raised from 4 (2026-07-18): the 96GB PRO 6000
+        // fit 4x262144 with 28.9 GB idle -- 4 was a VRAM guess, 8 is the
+        // real plumbing ceiling.
+        n_slots = std::max(1, std::min(8, n_slots));
         size_t free_b = 0, total_b = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
         fprintf(stderr, "vram: free %.2f GB post-weights\n", free_b / 1e9);
@@ -307,30 +329,39 @@ int main(int argc, char** argv) {
             // deliberately shares sm_86's fat slope below (under-pick beats
             // a dead boot).
             const double base = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
-            // Graph-zoo term: 0.13 GB/width holds on sm_120 and on sm_86 up
-            // to width 8, but sm_86's width-9..12 graphs cost 0.43 GB/width
-            // (measured 2026-07-17: W12 non-KV fixed 6.57 GB vs w8's 4.22 on
-            // the same card -- the unpatched estimate picked 217088 and died
-            // in build_spec_graphs). Piecewise slope from the two points.
-            const double gw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
-            const double gwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
-            const double graphs = gw8 * 0.13e9 + (Q27_W_MAX - gw8) * gwx;
-            // Capture-gate deductions (issue #1, measured 2026-07-17 at ctx
-            // 8192, full-zoo control on the same binary): boots without
-            // --constrain-tools skip the mono D/V set (sm_120 0.08 / sm_86
-            // 0.15 GB); Q27_SAMPLED=0 also skips the sampled set (0.34 /
-            // 0.60 GB). The base constants were calibrated on the full zoo.
-            const double mono_save = cc_arch >= 89 ? 0.08e9 : 0.15e9;
-            const double samp_save = cc_arch >= 89 ? 0.34e9 : 0.60e9;
-            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + graphs -
-                                 (constrain_tools ? 0.0 : mono_save) -
-                                 (sampled_on ? 0.0 : samp_save);
-            // slack absorbs kv-kind fixed variance and boot-to-boot driver
-            // drift; the 4096 floor adds 0-0.3GB more. 1.0GB (pre-07-17)
-            // was sized for the stat-based weight estimate this replaced.
-            const double slack = 0.25e9;
-            long budget = (long)((double)free_b - fixed - slack);
-            long c = budget > 0 ? (long)(budget / per_tok) : 0;
+            // SINGLE-slot non-KV stack (base + roles + graph zoo - capture
+            // saves), unchanged and calibrated: this is what N==1 uses, and
+            // it must stay exact (drives the 262144/57344/... single-slot
+            // picks). Reuses the hoisted width/arch-scaled terms.
+            const double single_fixed = base + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 -
+                                        (constrain_tools ? 0.0 : kEngMonoSave) -
+                                        (sampled_on ? 0.0 : kEngSampSave);
+            long budget, c;
+            if (n_slots <= 1) {
+                const double slack = 0.25e9;
+                budget = (long)((double)free_b - single_fixed - slack);
+                c = budget > 0 ? (long)(budget / per_tok) : 0;
+            } else {
+                // MULTI-slot: every slot is a full co-resident engine.
+                // PER_SLOT = single_fixed + ~2.2 GB fragmentation/scratch that
+                // co-residency adds (calibrated to the shipped 2x48K fp8
+                // anchor on a 32GB 5090 == ~6.6 GB/slot on W12). Reduce the
+                // slot count first so the picked ctx and the log are HONEST
+                // (the build-loop skip is then a pure safety net), then split.
+                const double per_slot = single_fixed + 2.2e9;
+                int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
+                if (fit < 1) fit = 1;
+                if (fit < n_slots) {
+                    fprintf(stderr,
+                            "--ctx auto: only %d of %d requested slots fit in %.1f GB "
+                            "(~%.1f GB/slot fixed) -- sizing for %d\n",
+                            fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
+                    n_slots = fit;
+                }
+                const double slack = 0.25e9 * n_slots;
+                budget = (long)((double)free_b - n_slots * per_slot - slack);
+                c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
+            }
             // cap: native window (262144) for the compact KV formats
             // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
             // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
@@ -347,12 +378,14 @@ int main(int argc, char** argv) {
                         Q27_W_MAX);
                 if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
             } else {
-                fprintf(stderr, "--ctx auto: %d (free %.1fGB post-weights, %s KV, W_MAX=%d)\n",
-                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16",
-                        Q27_W_MAX);
+                fprintf(stderr,
+                        "--ctx auto: %d%s (free %.1fGB post-weights, %s KV, W_MAX=%d)\n", ctx,
+                        n_slots > 1 ? " per slot" : "", free_b / 1e9,
+                        t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
                 if (ctx < 16384)
                     fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
             }
+            if (n_slots > 1) slot1_ctx = ctx; // auto: every slot gets the same window
         }
     }
     // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
@@ -372,7 +405,9 @@ int main(int argc, char** argv) {
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
-    n_slots = std::max(1, std::min(4, n_slots));
+    // n_slots already clamped to [1,8] above (before auto-ctx divided the
+    // budget by it); the conductor's MAX_K/2 fusion ceiling is 8.
+    n_slots = std::max(1, std::min(8, n_slots));
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
@@ -389,8 +424,12 @@ int main(int argc, char** argv) {
             size_t row_b = (slots[0].eng->kv_bytes(false) + slots[0].eng->kv_bytes(true)) /
                            slots[0].eng->max_ctx;
             size_t kvb = (size_t)sctx * row_b * (slots[0].eng->kcache.size() + 1);
-            size_t need = slots[0].eng->gdn_state_bytes + (700ull << 20) + kvb + (kvb >> 3) +
-                          (512ull << 20);
+            // Per-engine non-KV reserve = ENG_FIXED_BYTES (the same constant
+            // auto-ctx sizes with, so the two estimators agree) + KV + margin.
+            // The old need[] used a hardcoded ~1.2 GB that omitted the
+            // graph zoo, so a slot could pass here and then OOM building its
+            // own zoo (2026-07-18: aligned to ENG_FIXED_BYTES).
+            size_t need = ENG_FIXED_BYTES + kvb + (kvb >> 3) + (256ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);

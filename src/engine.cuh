@@ -1748,6 +1748,32 @@ struct Engine {
         spec_verify_launches_sampled(sv);
     }
 
+    // Instantiate a boot-time spec graph, turning an OOM into an ACTIONABLE
+    // refusal instead of a raw "CUDA error at engine.cuh:NNNN" (2026-07-18,
+    // issue #1 A10 class): the solo zoo is all-needed, so there is nothing
+    // to evict -- the honest move is to tell the operator exactly which
+    // levers free VRAM. Non-OOM errors keep the loud-abort contract.
+    void inst_or_advise(cudaGraphExec_t* x, cudaGraph_t g, const char* what) {
+        cudaError_t e = cudaGraphInstantiate(x, g, nullptr, nullptr, 0);
+        if (e == cudaSuccess) return;
+        if (e == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            fprintf(stderr,
+                    "q27: OUT OF MEMORY building the spec-graph zoo (%s), %.2f GB free.\n"
+                    "  the graph set is captured whole at boot -- lower the footprint:\n"
+                    "    --ctx <smaller>            (KV scales with context)\n"
+                    "    Q27_MAXD=4                 (drops the depth-5/6 draft graphs)\n"
+                    "    Q27_SAMPLED=0              (drops the sampled set, greedy-only)\n"
+                    "    build/q27-server-w8        (24GB-class: narrower role/graph set)\n"
+                    "  or free co-resident VRAM (other processes on this GPU).\n",
+                    what, fb / 1e9);
+            exit(1);
+        }
+        CUDA_CHECK(e); // non-OOM: original loud abort
+    }
+
     void build_spec_graphs() {
         // one warm (executing) round to initialize lazy CUDA state, then reset.
         // seed + reset are factored so the Phase-2 sampled graph set warms the
@@ -1882,7 +1908,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
+            inst_or_advise(&spec_graph[p], gr, "greedy round");
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P12b: the gated draft graph produces gate_maxd drafts + margins.
             dmax = gate_maxd;
@@ -1900,7 +1926,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_draft_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
-            CUDA_CHECK(cudaGraphInstantiate(&draft_graph[p], gd, nullptr, nullptr, 0));
+            inst_or_advise(&draft_graph[p], gd, "mono draft");
             CUDA_CHECK(cudaGraphDestroy(gd));
             }
             // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
@@ -1917,7 +1943,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_launches();
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gdl));
-                CUDA_CHECK(cudaGraphInstantiate(&draft_graph_lo[p], gdl, nullptr, nullptr, 0));
+                inst_or_advise(&draft_graph_lo[p], gdl, "mono draft-lo");
                 CUDA_CHECK(cudaGraphDestroy(gdl));
                 dmax = gate_maxd;
             }
@@ -1930,7 +1956,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_step_launches(k);
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs));
-                CUDA_CHECK(cudaGraphInstantiate(&draft_step_graph[k][p], gs, nullptr, nullptr, 0));
+                inst_or_advise(&draft_step_graph[k][p], gs, "draft step");
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
             // verify_graph's only consumer is the P11 constrained-tool path
@@ -1939,7 +1965,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
-            CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
+            inst_or_advise(&verify_graph[p], gv, "mono verify");
             CUDA_CHECK(cudaGraphDestroy(gv));
             }
             // P12/P12b: per-width verify graphs (W = cap+1 lanes, 2..6). Same
@@ -1953,7 +1979,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
+                inst_or_advise(&verify_graph_w[W][p], gw, "per-width verify");
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             // width-12 P1: the suffix drafter's wide verify. Suffix rounds
@@ -1965,8 +1991,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
-                CUDA_CHECK(
-                    cudaGraphInstantiate(&verify_graph_w[sfx_w][p], gs_, nullptr, nullptr, 0));
+                inst_or_advise(&verify_graph_w[sfx_w][p], gs_, "suffix verify");
                 CUDA_CHECK(cudaGraphDestroy(gs_));
             }
             vw = 5;
@@ -1995,7 +2020,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_sample_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            CUDA_CHECK(cudaGraphInstantiate(&spec_sample_graph[p], gr, nullptr, nullptr, 0));
+            inst_or_advise(&spec_sample_graph[p], gr, "sampled round");
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
             // verify_graph_w loop. The sampled tail is always depth-4, so the
@@ -2007,8 +2032,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches_sampled(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                CUDA_CHECK(
-                    cudaGraphInstantiate(&verify_sample_graph_w[W][p], gw, nullptr, nullptr, 0));
+                inst_or_advise(&verify_sample_graph_w[W][p], gw, "sampled per-width verify");
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             vw = 5;

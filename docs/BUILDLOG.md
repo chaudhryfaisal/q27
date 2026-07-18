@@ -7499,3 +7499,42 @@ clocks tax exactly the bandwidth decode lives on. Fleet reading:
 4090 = the fp8 midpoint; 3090 = the 262K value card. Same-card tier
 read: q8 costs 22% decode vs q4s for 84% more weight bytes --
 acceptance recovery holds it sublinear. Pod work complete.
+
+## 2026-07-18 -- fix program (4 of 7 code defects): fixtures, spec-graph OOM guidance, multi-slot auto-ctx, slot clamp
+
+Batch of the bounded fixes from the 7-defect list (early-eos
+investigation, sm_89 slope, v0.3.1 release are separate):
+
+- **#5 tier fixtures.** test_kernels' gemv10 leg and ninv_test's
+  head rows hardcoded the Q8 head / output_q4 -- they aborted on
+  q4s/q8 single-head tiers. Both now dtype-dispatch: gemv10 times
+  whichever head kernel the tier uses (Q4 or Q8) and bitwise-checks
+  it; ninv picks output_q4 -> output.weight@Q4 -> skip (pure-Q8) and
+  keeps Q4 kernel coverage via ffn_down. VERIFIED on q4s: test_kernels
+  ALL PASS, NINV ALL PASS (were: abort).
+- **#2 spec-graph OOM guidance.** build_spec_graphs' 9 instantiate
+  sites hard-aborted with a raw "CUDA error at engine.cuh:NNNN" (the
+  A10 issue-#1 boot-death). New inst_or_advise() turns an OOM into an
+  ACTIONABLE refusal naming the levers (--ctx, Q27_MAXD=4,
+  Q27_SAMPLED=0, w8 build, free co-resident VRAM); non-OOM keeps the
+  loud abort. VERIFIED: a forced 655360 turbo3 boot prints the
+  guidance instead of the bare error.
+- **#3 multi-slot auto-ctx.** --slots >1 without --ctx used to pin
+  8192 + a warning. Now it sizes per-slot from measured free VRAM:
+  N==1 is BITWISE-unchanged (single_fixed formula; 5090 q4s still
+  262144); N>1 splits the budget with a per-slot reserve calibrated
+  to the shipped 2x48K fp8 anchor (~6.6 GB/slot W12), reduces the
+  effective slot count to what fits (HONEST log, not a silent
+  build-loop skip), and sets every slot's window. Skip-loop reserve
+  aligned to the same constant (ENG_FIXED_BYTES) so a slot can't pass
+  admission then OOM its own zoo. VERIFIED 5090: 2xfp8 40960/slot,
+  2xturbo3 106496/slot -- both ready=2 skipped=0, ~4.5 GB spare;
+  4xturbo3 on 32GB honestly sizes to 2.
+- **#4 slot clamp 4 -> 8.** The conductor's hard fusion ceiling is
+  MAX_K/2 = 8 (W_PLUMB=16 lane slots, fixed on every build). The old
+  --slots clamp of 4 was a 32GB VRAM guess; the PRO 6000 fit 4x262144
+  with 28.9 GB idle. Raised to 8, the real plumbing limit; VRAM is
+  handled by the per-slot fit reduction + skip.
+
+Gates: canonical a2982c51 EXACT, fused_smoke byte-identical, single-
+slot picks unchanged on the 5090.
