@@ -7424,3 +7424,37 @@ club prefill legs all clean + sanitizer-clean runs elsewhere).
 REPRODUCER: compute-sanitizer --tool memcheck build/q27 <model>
 --nll wiki.test.raw --ctx 2048 (fires in <60s). Scope: quality
 measurement only; serving unaffected. OPEN, top of tomorrow's list.
+
+## 2026-07-18 -- nll "bug 2" RETRACTED: wrong input file; one real fix shipped (step_with) + input guards
+
+Resolution of yesterday's "batched --nll latent OOB": there was no
+batched-path bug. The --nll flag reads RAW INT32 TOKEN IDS; the house
+corpus is wiki.test.qwopus.i32 (tokenizer byte-identical across
+vanilla/qwopus). I fed wiki.test.raw -- raw TEXT -- on both machines:
+ASCII reinterpreted as int32 yields ~540M "token ids" (the guard now
+names it: id 540876810 at offset 0), embed reads emb + id*cols
+terabytes out of bounds. Same bytes = same addresses everywhere
+(the "deterministic OOB"); usually lands on mapped memory (the six
+"clean" runs read silent garbage); occasionally unmapped (the
+natural crashes, incl. both pod tiers). The 07-16 PPL anchors used
+the correct .i32 and are untouched.
+
+What the chase surfaced anyway, both kept:
+1. **step_with stack-lifetime fix (REAL bug, independent):**
+   cudaMemcpyAsync(d_token, &token) from the parameter's stack slot
+   with no sync -- a driver that defers pageable staging reads a dead
+   frame. Now a synchronous 4-byte copy (cold paths only; ordering
+   note documented: relies on stm being a BLOCKING stream). step_taps
+   same fix. Canonical a2982c51 + f64e7c02 + sampled-seed 900031e9
+   all EXACT after.
+2. **--nll input guards:** both int32 loaders now scan ids against
+   VOCAB and refuse with a diagnostic naming the first bad id --
+   raw text can never masquerade as a corpus again. (First guard
+   attempt landed twice in the wrong loader -- regex patching; the
+   verify caught it because the text file still "worked".)
+
+Method lesson for the ledger: the bisect chased two phantom
+correlations (commit suspects, tri-vs-dual fatbin) that n=1 crash
+observations manufactured. The sanitizer's DETERMINISTIC address was
+the only honest witness, and its "nearest allocation 512 B" line was
+pointing at input data, not engine state, from the first report.

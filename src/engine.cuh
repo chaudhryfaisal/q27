@@ -3525,9 +3525,24 @@ struct Engine {
         }
     }
 
-    // feed one known token (prompt phase): set d_token, replay graph
+    // feed one known token (prompt phase): set d_token, replay graph.
+    // SYNCHRONOUS copy on purpose (2026-07-18): the async version read
+    // &token -- this frame's stack slot -- after return when the driver
+    // deferred the pageable staging. Guaranteed-synchronous-looking on our
+    // r580/13.2 stack (a once-in-many-runs lottery), reliably deferred on
+    // r570/12.8 (the PRO 6000 pod): garbage token -> k_embed_row_q8 reads
+    // emb + garbage*cols, terabytes out of bounds. Found by
+    // compute-sanitizer on the --nll paths (the only unsynced
+    // back-to-back step_with callers); every other stack-source
+    // cudaMemcpyAsync in this file syncs in-scope before the source dies.
+    // A 4-byte sync copy costs ~us on cold paths only (serial prefill,
+    // nll, warmups) -- decode never calls this.
+    // (Ordering note: the legacy-NULL-stream sync copy also waits for any
+    // inflight graph still READING d_token because stm is a BLOCKING
+    // stream (plain cudaStreamCreate). If stm ever becomes non-blocking,
+    // this must become event-ordered instead.)
     void step_with(int token) {
-        CUDA_CHECK(cudaMemcpyAsync(d_token, &token, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpy(d_token, &token, 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaGraphLaunch(graph_exec, stm));
     }
     // generation step: d_token already holds the model's own prediction
@@ -3538,7 +3553,7 @@ struct Engine {
     float* d_taps = nullptr; // [5][N_EMBD]
     void step_taps(int token) {
         if (!d_taps) CUDA_CHECK(cudaMalloc((void**)&d_taps, 5 * N_EMBD * 4));
-        CUDA_CHECK(cudaMemcpyAsync(d_token, &token, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpy(d_token, &token, 4, cudaMemcpyHostToDevice)); // same stack-lifetime fix as step_with
         token_launches(d_taps);
     }
     void step_taps_free() {
