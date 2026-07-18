@@ -974,7 +974,16 @@ int main(int argc, char** argv) {
         res.set_content(j.dump(), "application/json");
     });
 
-    // ---------------- OpenAI chat/completions (text only) ----------------
+    // ---------------- OpenAI chat/completions ----------------
+    // Tool calling: only /v1/chat/completions with a "messages" body gets the
+    // think/tool-aware path below (routed_chat) -- /v1/completions and any
+    // chat body that falls back to a raw "prompt" keep the ORIGINAL text-only
+    // behavior byte-for-byte (build_prompt, unchanged). This mirrors the
+    // /v1/messages tool pipeline exactly (chatml_prompt + tools_preamble +
+    // ToolConstrainer + StreamSplitter + parse_tool_call/parse_bare_tool_calls);
+    // only the request/response bridging (openai_msgs/openai_tools_json in
+    // api_common.h) and the output envelope (OpenAI tool_calls[] shape,
+    // finish_reason="tool_calls") are new.
 
     auto build_prompt = [&](const json& body) -> std::vector<int> {
         if (body.contains("messages")) {
@@ -1023,9 +1032,52 @@ int main(int argc, char** argv) {
             inc_usage = so.contains("include_usage") && so["include_usage"].is_boolean() &&
                         so["include_usage"].get<bool>();
         }
+        // Tool-calling admission: gate strictly on chat==true AND an actual
+        // "messages" array, so /v1/completions and the raw-"prompt" chat
+        // fallback are provably untouched by anything below (they never
+        // enter any of the branches this flag guards).
+        const bool routed_chat = chat && body.contains("messages") && body["messages"].is_array();
+        json tools = json::array();
+        q27::ToolChoice tchoice;
+        std::vector<std::string> tool_names_v;
+        if (routed_chat) {
+            tchoice = q27::parse_tool_choice(body);
+            tools = tchoice.mode == q27::ToolChoice::NONE ? json::array() : q27::openai_tools_json(body);
+            if (constrain_tools && tools.is_array())
+                for (auto& t : tools)
+                    if (t.contains("function") && t["function"].contains("name"))
+                        tool_names_v.push_back(t["function"]["name"].get<std::string>());
+            // named-forced tool_choice restricts the grammar to that one name;
+            // "required" (no name) leaves every registered tool eligible.
+            if (tchoice.mode == q27::ToolChoice::FORCED && !tchoice.forced_name.empty())
+                tool_names_v = {tchoice.forced_name};
+        }
+        long rid = req_counter++;
         auto tk0 = std::chrono::steady_clock::now();
-        std::vector<int> prompt = build_prompt(body);
-        ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
+        std::vector<int> prompt;
+        int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        if (routed_chat) {
+            bool think = body.value("enable_thinking", true);
+            if (body.contains("chat_template_kwargs"))
+                think = body["chat_template_kwargs"].value("enable_thinking", think);
+            if (no_think_srv) think = false;
+            size_t stable_off = 0;
+            std::string rendered =
+                q27::chatml_prompt(q27::openai_msgs(body), tools, think, &stable_off);
+            // FORCED tool_choice: inject the opener into the volatile tail
+            // (past stable_off, alongside the assistant-open/think-prefill --
+            // P8 prefix-cache reuse is unaffected). The stream router below
+            // is pre-seeded straight into the TOOL channel since the marker
+            // itself never appears in the GENERATED text this way.
+            if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
+            prompt = tok.encode(rendered.substr(0, stable_off));
+            stable_len = (int)prompt.size();
+            std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
+            prompt.insert(prompt.end(), tailv.begin(), tailv.end());
+        } else {
+            prompt = build_prompt(body);
+        }
+        ReqTrace rt{rid, chat ? "oai" : "cmpl", conv_fp(body),
                     std::chrono::steady_clock::now(), ms_since(tk0)};
         // Reject an empty prompt before slot selection: reuse_len() would run
         // ckpt_best() over an empty vector, and (pre-fix) a zero-token prompt
@@ -1082,6 +1134,9 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
+                                  // are never set on that path, so the clear
+                                  // on scope-exit is a no-op (P15 M1 pattern)
             eng.samp = parse_sample(body);
             // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
             // its prefill lease inside batch_generate (A7) and re-stamps qw.
@@ -1092,41 +1147,141 @@ int main(int argc, char** argv) {
             // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
             // in ctx; reserve derived from the engine's active max depth)
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
-            std::string text;
+
+            if (!routed_chat) {
+                // ORIGINAL text-only behavior, byte-for-byte unchanged.
+                std::string text;
+                q27::Utf8Gate ugate;
+                auto on_tok = [&](int id) {
+                    text += ugate.feed(tok.decode_one(id));
+                    return true;
+                };
+                Engine::DecodeTask bt;
+                std::string berr;
+                int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
+                                                   qw, rt, bt, &berr)
+                                  : eng.generate(prompt, n_max, EOS, on_tok);
+                eng.on_round_gap = nullptr;
+                text += ugate.flush();
+                req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                // batch error surfacing (review pass 2): nothing emitted = an
+                // honest 500 in the OpenAI error envelope; if tokens WERE
+                // produced, keep the 200 with the partial text -- end=error is
+                // already in the [req] line either way.
+                if (!berr.empty() && n == 0) {
+                    res.status = 500;
+                    res.set_content(json{{"error", {{"message", berr},
+                                                    {"type", "api_error"}}}}
+                                        .dump(),
+                                    "application/json");
+                    return;
+                }
+                json choice;
+                if (chat)
+                    choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
+                              {"message", {{"role", "assistant"}, {"content", text}}}};
+                else
+                    choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
+                              {"text", text}};
+                json out = {{"id", "q27-0"}, {"object", obj}, {"created", created},
+                            {"model", served_name}, {"choices", json::array({choice})},
+                            {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                       {"completion_tokens", n},
+                                       {"total_tokens", (int)prompt.size() + n}}}};
+                res.set_content(jdump(out), "application/json");
+                return;
+            }
+
+            // routed_chat: think/tool-aware path, an exact mechanical twin of
+            // the /v1/messages non-stream handler above, OpenAI-shaped output.
+            StreamSplitter sp;
             q27::Utf8Gate ugate;
+            std::string think, text, tool_buf;
+            std::vector<q27::ToolCall> calls;
+            auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
+                if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
+                if (!tool_buf.empty()) { // tool segment closed
+                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                    tool_buf.clear();
+                }
+                (ch == StreamSplitter::THINK ? think : text) += t;
+            };
+            ToolConstrainer tc;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.host2dev = &sl.tool_mask_host2dev;
+            // FORCED requests are prompt-injected past the <tool_call> marker
+            // (above) -- scan_round's engage trigger scans GENERATED text for
+            // that marker and will never fire, so grammar masking is skipped
+            // for those (documented limitation, api_common.h ToolChoice
+            // comment); AUTO (the default) and NONE are unaffected.
+            tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
+                        eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
+            tc.begin(tool_names_v);
+            // FORCED: the opener was injected into the PROMPT, not generated,
+            // so the splitter must start already inside the TOOL channel or
+            // the call body would be read back as ordinary text.
+            if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+            eng.on_pending = [&](int id) { tc.on_pending(id); };
+            eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+            if (tc.enabled)
+                eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
             auto on_tok = [&](int id) {
-                text += ugate.feed(tok.decode_one(id));
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             };
             Engine::DecodeTask bt;
             std::string berr;
-            int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
-                                               qw, rt, bt, &berr)
-                              : eng.generate(prompt, n_max, EOS, on_tok);
+            int n = conductor
+                        ? batch_generate(eng, prompt, n_max, on_tok,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
+                                         rt, bt, &berr)
+                        : eng.generate(prompt, n_max, EOS, [&](int id) {
+                              tc.on_id(id);
+                              return on_tok(id);
+                          }, stable_len);
+            tc.end();
+            eng.on_pending = nullptr;
+            eng.on_drafts = nullptr;
+            eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
-            text += ugate.flush();
-            req_log(rt, qw, eng, sl.id, bat_stats(bt));
-            // batch error surfacing (review pass 2): nothing emitted = an
-            // honest 500 in the OpenAI error envelope; if tokens WERE
-            // produced, keep the 200 with the partial text -- end=error is
-            // already in the [req] line either way.
+            req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
             if (!berr.empty() && n == 0) {
                 res.status = 500;
-                res.set_content(json{{"error", {{"message", berr},
-                                                {"type", "api_error"}}}}
+                res.set_content(json{{"error", {{"message", berr}, {"type", "api_error"}}}}
                                     .dump(),
                                 "application/json");
                 return;
             }
-            json choice;
-            if (chat)
-                choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
-                          {"message", {{"role", "assistant"}, {"content", text}}}};
-            else
-                choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
-                          {"text", text}};
-            json out = {{"id", "q27-0"}, {"object", obj}, {"created", created},
-                        {"model", served_name}, {"choices", json::array({choice})},
+            for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
+            for (auto& [ch, t] : sp.flush()) route(ch, t);
+            if (!tool_buf.empty())
+                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+
+            std::string tx = q27::strip_ws2(text);
+            for (auto& c : calls)
+                if (!c.ok) tx += (tx.empty() ? "" : "\n") + c.raw;
+            if (tools.is_array() && !tools.empty()) {
+                // wrapper-less call recovery (see parse_bare_tool_calls)
+                std::string pre;
+                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
+                if (!bcs.empty()) {
+                    fprintf(stderr,
+                            "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                            bcs.size());
+                    tx = pre;
+                    for (auto& bc : bcs) calls.push_back(bc);
+                }
+            }
+            bool any_call = false;
+            for (auto& c : calls)
+                if (c.ok) any_call = true;
+            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            json choice = {{"index", 0},
+                          {"finish_reason", any_call ? "tool_calls" : (n >= n_max ? "length" : "stop")},
+                          {"message", msg}};
+            json out = {{"id", "chatcmpl-q27-" + std::to_string(rid)}, {"object", obj},
+                        {"created", created}, {"model", served_name},
+                        {"choices", json::array({choice})},
                         {"usage", {{"prompt_tokens", (int)prompt.size()},
                                    {"completion_tokens", n},
                                    {"total_tokens", (int)prompt.size() + n}}}};
@@ -1135,13 +1290,16 @@ int main(int argc, char** argv) {
         }
 
         res.set_header("Content-Type", "text/event-stream");
+        const bool has_tools = tools.is_array() && !tools.empty();
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
+             tools, tool_names_v, tchoice, stable_len, has_tools, rid](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
@@ -1153,52 +1311,178 @@ int main(int argc, char** argv) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
+
+                if (!routed_chat) {
+                    // ORIGINAL text-only streaming behavior, byte-for-byte unchanged.
+                    q27::Utf8Gate ugate;
+                    auto piece_chunk = [&](const std::string& piece) {
+                        json delta = chat ? json{{"content", piece}} : json{};
+                        json choice = chat
+                            ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
+                            : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
+                        return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                    {"model", served_name}, {"choices", json::array({choice})}};
+                    };
+                    auto on_tok = [&](int id) {
+                        // empty pieces (control tokens, gate holdbacks) still probe
+                        // the socket so a disconnected client stops generation
+                        return send(piece_chunk(ugate.feed(tok.decode_one(id))));
+                    };
+                    Engine::DecodeTask bt;
+                    // TODO(batch error surfacing): on a failed queue (A2) this
+                    // stream just ends with a normal finish_reason -- the OpenAI
+                    // SSE shape has no standard mid-stream error event, so none
+                    // is invented; end=error lands in the [req] line and
+                    // [req-error] carries the what().
+                    int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
+                                                              -1, qw, rt, bt, nullptr)
+                                             : eng.generate(prompt, nm, EOS, on_tok);
+                    eng.on_round_gap = nullptr;
+                    std::string tailp = ugate.flush();
+                    if (!tailp.empty()) send(piece_chunk(tailp));
+                    // Terminal chunk with a real finish_reason (OpenAI streaming spec):
+                    // clients otherwise never learn whether generation hit EOS or the
+                    // token cap. produced >= nm == the length cap; else a stop.
+                    {
+                        const char* fr = produced >= nm ? "length" : "stop";
+                        json fchoice = chat ? json{{"index", 0}, {"delta", json::object()},
+                                                   {"finish_reason", fr}}
+                                            : json{{"index", 0}, {"text", ""}, {"finish_reason", fr}};
+                        send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                  {"model", served_name}, {"choices", json::array({fchoice})}});
+                    }
+                    // stream_options.include_usage: final usage chunk (empty
+                    // choices) mirroring the non-stream usage body above.
+                    if (inc_usage)
+                        send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                  {"model", served_name}, {"choices", json::array()},
+                                  {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                             {"completion_tokens", produced},
+                                             {"total_tokens", (int)prompt.size() + produced}}}});
+                    req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                    std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                }
+
+                // routed_chat: think/tool-aware streaming path, an exact
+                // mechanical twin of the /v1/messages SSE handler above.
+                const std::string cid = "chatcmpl-q27-" + std::to_string(rid);
+                ToolConstrainer tc;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.host2dev = &sl.tool_mask_host2dev;
+                tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
+                            eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
+                tc.begin(tool_names_v);
+                StreamSplitter sp;
+                if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
                 q27::Utf8Gate ugate;
-                auto piece_chunk = [&](const std::string& piece) {
-                    json delta = chat ? json{{"content", piece}} : json{};
-                    json choice = chat
-                        ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
-                        : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
-                    return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
-                                {"model", served_name}, {"choices", json::array({choice})}};
+                bool alive = true; // cleared when a write fails (client disconnected)
+                int tool_idx = 0;
+                bool any_call = false;
+                std::string tool_buf, text_accum;
+                auto emit_tool = [&]() {
+                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    tool_buf.clear();
+                    if (!c.ok) { // malformed: surface as text so nothing is lost
+                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                           json{{"content", c.raw}})))
+                            alive = false;
+                        return;
+                    }
+                    any_call = true;
+                    std::string tid =
+                        "call_q27_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
+                    bool ok = send(q27::openai_stream_chunk(
+                        cid, objd, created, served_name,
+                        q27::openai_tool_call_delta(tool_idx, tid, c)));
+                    tool_idx++;
+                    if (!ok) alive = false;
                 };
+                auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
+                    if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
+                    if (!tool_buf.empty()) emit_tool();
+                    if (t.empty()) return;
+                    // reasoning_content (no official OpenAI field for this;
+                    // matches the vLLM/SGLang/llama.cpp convention -- see
+                    // openai_reasoning_delta) rather than leaking raw <think>
+                    // tags into `content` (the bug this whole path also
+                    // happens to fix).
+                    if (ch == StreamSplitter::THINK) {
+                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                            q27::openai_reasoning_delta(t))))
+                            alive = false;
+                        return;
+                    }
+                    text_accum += t;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       json{{"content", t}})))
+                        alive = false;
+                };
+                eng.on_pending = [&](int id) { tc.on_pending(id); };
+                eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+                if (tc.enabled)
+                    eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
                 auto on_tok = [&](int id) {
-                    // empty pieces (control tokens, gate holdbacks) still probe
-                    // the socket so a disconnected client stops generation
-                    return send(piece_chunk(ugate.feed(tok.decode_one(id))));
+                    for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
+                    return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
-                // TODO(batch error surfacing): on a failed queue (A2) this
-                // stream just ends with a normal finish_reason -- the OpenAI
-                // SSE shape has no standard mid-stream error event, so none
-                // is invented; end=error lands in the [req] line and
-                // [req-error] carries the what().
-                int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                          -1, qw, rt, bt, nullptr)
-                                         : eng.generate(prompt, nm, EOS, on_tok);
+                int produced = conductor
+                                   ? batch_generate(eng, prompt, nm, on_tok,
+                                                    [&](int id) { tc.on_id(id); },
+                                                    stable_len, qw, rt, bt, nullptr)
+                                   : eng.generate(prompt, nm, EOS, [&](int id) {
+                                         tc.on_id(id);
+                                         return on_tok(id);
+                                     }, stable_len);
+                tc.end();
+                eng.on_pending = nullptr;
+                eng.on_drafts = nullptr;
+                eng.on_round = nullptr;
                 eng.on_round_gap = nullptr;
-                std::string tailp = ugate.flush();
-                if (!tailp.empty()) send(piece_chunk(tailp));
-                // Terminal chunk with a real finish_reason (OpenAI streaming spec):
-                // clients otherwise never learn whether generation hit EOS or the
-                // token cap. produced >= nm == the length cap; else a stop.
-                {
-                    const char* fr = produced >= nm ? "length" : "stop";
-                    json fchoice = chat ? json{{"index", 0}, {"delta", json::object()},
-                                               {"finish_reason", fr}}
-                                        : json{{"index", 0}, {"text", ""}, {"finish_reason", fr}};
-                    send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
-                              {"model", served_name}, {"choices", json::array({fchoice})}});
+                req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
+                for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
+                for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
+                if (!tool_buf.empty()) emit_tool();
+                if (has_tools) {
+                    // wrapper-less call recovery: text already streamed as a
+                    // content delta (cosmetic); the tool_calls delta still fires
+                    std::string pre;
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    if (!bcs.empty()) {
+                        fprintf(stderr,
+                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                bcs.size());
+                        any_call = true;
+                        for (auto& bc : bcs) {
+                            std::string tid = "call_q27_" + std::to_string(rid) + "_" +
+                                              std::to_string(tool_idx);
+                            bool ok = send(q27::openai_stream_chunk(
+                                cid, objd, created, served_name,
+                                q27::openai_tool_call_delta(tool_idx, tid, bc)));
+                            tool_idx++;
+                            if (!ok) alive = false;
+                        }
+                    }
                 }
-                // stream_options.include_usage: final usage chunk (empty
-                // choices) mirroring the non-stream usage body above.
+                // TODO(batch error surfacing): no standard OpenAI mid-stream
+                // error chunk exists (matches the plain-text leg's TODO
+                // above); end=error lands in the [req] line, [req-error]
+                // carries the what() (batch_generate logs it unconditionally
+                // when err_out is null, same as that leg's nullptr err_out).
+                {
+                    const char* fr = any_call ? "tool_calls" : (produced >= nm ? "length" : "stop");
+                    send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                  json::object(), fr));
+                }
                 if (inc_usage)
-                    send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                    send(json{{"id", cid}, {"object", objd}, {"created", created},
                               {"model", served_name}, {"choices", json::array()},
                               {"usage", {{"prompt_tokens", (int)prompt.size()},
                                          {"completion_tokens", produced},
                                          {"total_tokens", (int)prompt.size() + produced}}}});
-                req_log(rt, qw, eng, sl.id, bat_stats(bt));
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
