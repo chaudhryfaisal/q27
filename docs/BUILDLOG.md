@@ -7279,7 +7279,7 @@ a 72 MiB step (he measured 68). Reproduced on the 3090: both ctx
 values read 1.70 GB at ready. The window's last 4096 tokens are
 allocation-free. Benign; physics, not engine.
 
-## 2026-07-18 -- first 4090 (sm_89): field test on a RunPod pod; tri-arch fatbin ships
+## 2026-07-17 (late) -- first 4090 (sm_89): field test on a RunPod pod; tri-arch fatbin ships
 
 Gabe spun up a RunPod 4090 for q27's first Ada run. Everything below
 was executed remotely over SSH on the pod.
@@ -7326,3 +7326,29 @@ overlay disk between download (listed, 7.2 MB) and first use
 ("cannot open"). Re-downloaded + checksummed, did not recur. Cloud
 overlay-fs distrust noted; CHECKSUMS verification is now part of the
 pod recipe.
+
+## 2026-07-17 (late) -- external review of BENCHMARKING.md: label + claim fixes; q8-v1 repacked
+
+Review feedback (via Gabe) on the five-engine doc, all points taken:
+1. "NVFP4" mislabel FIXED everywhere it described q27's own tiers --
+   v1.4/q4s/q6/q6k are q27's Q4_G64/Q8_G128 integer group quant, NOT
+   NVIDIA's e2m1+fp8-scale NVFP4; only vLLM's unsloth checkpoint is
+   literally NVFP4. Now labeled "q27 4-bit, 5.25 bpw effective".
+2. "Quality is engine-independent" softened to "quality converged to
+   the model once both tool protocols were validated" -- the
+   strict-parser episode (T8 0.00) proved engines DO move quality
+   through tool-protocol failures.
+3. 4090 addendum re-dated 07-17-late (UTC slip).
+4. "vLLM has no /v1/messages" annotated: current vLLM Python frontend
+   serves it natively (Anthropic->OpenAI double adapter, ~04/2026);
+   our 07-14 run used the litellm shim; native-endpoint rerun flagged.
+5. Method B n=1 disclosure -> n=3 seal RUNNING tonight (q27 +
+   llama+MTP ceiling legs).
+
+Also tonight: q8-v1 tier repacked (--q8 '.*', 28.45 GB / ~8.1 bpw,
+867 tensors, worst Q8 rel-RMSE 0.0153; keeps the v1.3-style Q4
+draft-head copy -- a --q8-head acceptance variant is the obvious
+follow-up). UNVALIDATED: no card in the house fits it (weights +
+fixed stack > 32 GB); upload to HF in progress; the ladder runs on
+rented 48 GB+ hardware (PRO 6000 / RTX 6000 Ada -- doubles as those
+cards' field test).

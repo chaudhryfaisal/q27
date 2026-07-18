@@ -527,7 +527,9 @@ With the *same* MTP head, enabling MTP nearly doubles stock llama.cpp, and
 -- yet q27 is a further ~1.73x on top: the residual is the engine, not the
 drafter choice. ngram-mod adds ~nothing on real coding; vLLM's wall/inst
 is worst because its prefix caching is dead on this hybrid-GDN arch.
-Quality is engine-independent (11-12/12 edited-gold-file).
+Quality converged to the model across engines (11-12/12
+edited-gold-file; both tool protocols validated first -- unvalidated
+tool parsing is how engines DO move quality).
 
 Full methodology, fairness controls, the payload microbench, and reproduce
 steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,

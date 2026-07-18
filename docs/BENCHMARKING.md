@@ -6,14 +6,14 @@ comparison against the [llama-cpp-turboquant](https://github.com/) fork with
 
 | engine | build | quant | spec-decode |
 |---|---|---|---|
-| **q27** | git `94e645a` | NVFP4 **5.25 bpw** | MTP head + SuffixDraft (fused verify) |
+| **q27** | git `94e645a` | q27 4-bit (Q4_G64/Q8_G128 mix) **5.25 bpw effective** | MTP head + SuffixDraft (fused verify) |
 | **llama-cpp-turboquant** (TheTom fork) | git `c3e6dbb13` | Q5_K_M **~5.5 bpw** | `--spec-type ngram-mod` (n_match=24, n_max=64, n_min=48) |
 | **llama.cpp mainline** | git `13e67386` (2026-07-01) | Q5_K_M **~5.5 bpw** | run two ways: none (stock), and `--spec-type draft-mtp --spec-draft-n-max 6` (same MTP head as q27) |
 | **vLLM** | `vllm/vllm-openai:nightly` | NVFP4 (`unsloth/Qwen3.6-27B-NVFP4`, compressed-tensors) | `speculative-config {method:mtp, num_speculative_tokens:3}` — the model's MTP head |
 
 All three serve the **same base model** (Qwen3.6-27B-MTP; the `qwen35` GGUF arch,
 which mainline supports as `LLM_ARCH_QWEN35`). The only unavoidable confound is
-quantization (both llama builds carry ~0.25 bpw more than q27's NVFP4); it is
+quantization (both llama builds carry ~0.25 bpw more than q27's 4-bit tier); it is
 disclosed on every result and it favors llama, so any q27 win is conservative.
 Mainline is the **stock, no-drafter floor**: it isolates how much of the gap is
 the base decode kernel vs the drafter, and shows exactly what `ngram-mod` adds
@@ -67,7 +67,7 @@ Three regimes, chosen to bracket drafter behavior:
    climbs run-to-run (novel 56 → 79 → 97 t/s). Use the **cold** run (first call,
    or restart the server between prompts). q27 keeps no server-side table, so its
    number is request-invariant.
-2. **Cross-quant divergence.** Q5 vs NVFP4 can pick a different greedy token on
+2. **Cross-quant divergence.** Q5 vs q27's 4-bit tier can pick a different greedy token on
    the same prompt, after which the two engines generate different text (and
    different token counts). Such a payload is no longer a like-for-like
    comparison — drop it (this is why `echo_ctx26k` is excluded).
@@ -154,8 +154,14 @@ bash bench/swebench/run.sh llamamain     # -> results.llamamain.jsonl (unit llam
 #       ...same launch... --spec-type draft-mtp --spec-draft-n-max 6
 bash bench/swebench/run.sh llamammtp     # -> results.llamammtp.jsonl (unit llamammtp-eval)
 
-# 4c. (vLLM) needs two extra pieces: vLLM has no /v1/messages, so Claude Code talks
+# 4c. (vLLM) needs two extra pieces: vLLM's 07-14 nightly ran without a working /v1/messages for
+#     this setup, so Claude Code talks
 #     to a litellm Anthropic->OpenAI shim on :8081 that forwards to vLLM on :8080.
+#     (2026-07-17 note: current vLLM's Python frontend now serves
+#     /v1/messages natively via an Anthropic->OpenAI double adapter;
+#     the Rust frontend still lacks it. A native-endpoint rerun would
+#     remove the shim hop -- unmeasured, flagged for the next vLLM
+#     pass.)
 #     - vLLM (5090-only, single-seq, MTP, qwen3_coder tool parser for the XML tool format):
 #         docker run --gpus '"device=0"' -p 8080:8000 -v <hf_cache>:/root/.cache/huggingface \
 #           vllm/vllm-openai:nightly --model unsloth/Qwen3.6-27B-NVFP4 --served-model-name vllm-qwen \
@@ -216,7 +222,7 @@ The five engines decompose the gap cleanly (all same model + MTP head available)
   for a mainstream engine on this model, not a one-off.
 - **On that same MTP head, q27 is still ~1.73× faster than both** (202.7 vs
   ~117). That residual is q27's engine — the fused shared-KV MTP+SuffixDraft
-  verify, NVFP4 kernels, and tie/tolerance discipline — not the drafter *choice*.
+  verify, the Q4/Q8 dp4a kernels, and tie/tolerance discipline — not the drafter *choice*.
   It matches Method A, where q27 leads llama+MTP on novel generation (157 vs 92
   t/s) but ties on echo (178 vs 184).
 - **vLLM pays a wall-time tax this benchmark exposes.** Its decode (117) is
@@ -227,7 +233,10 @@ The five engines decompose the gap cleanly (all same model + MTP head available)
   reuse prefix/checkpoint state across turns, so they convert competitive decode
   into far lower wall time. This is an arch-support gap, not raw kernel speed, but
   it's real for anyone serving this model agentically on vLLM today.
-- **Quality is engine-independent** (11–12/12 edited-gold-file across all five) —
+- **Quality converged to the model once both tool protocols were validated**
+  (11–12/12 edited-gold-file across all five) — engines CAN move quality
+  through tool-protocol failures (the strict-parser episode scored a 0.00
+  on exactly that class before the tolerant parser landed) —
   the model is identical; the engine only changes speed. The 1-instance spread is
   agentic noise.
 
@@ -379,7 +388,7 @@ Caveats, theirs and ours, stated plainly:
   the sm_86 serving default at the FULL 262144 window -- see the
   addendum below.)*
 - **Quant tiers differ across all rows** (theirs: AutoRound-INT4,
-  Q4_K_M, IQ4_KS, Q5_K_S; q27: its nvfp4-family v1.4 tier, 17.73 GB) --
+  Q4_K_M, IQ4_KS, Q5_K_S; q27: its own Q4_G64/Q8_G128 v1.4 tier, 17.73 GB --
   same model family, not identical checkpoints. And their rows are dated
   2026-05..07 on the engine pins of those days; engines move.
 
@@ -491,7 +500,7 @@ class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
 tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
 sm_86 (bare boot = turbo3 @ 262144 on a 3090).
 
-### Addendum 2026-07-18 -- first 4090 (sm_89) numbers, RunPod field test
+### Addendum 2026-07-17 -- first 4090 (sm_89) numbers, RunPod field test
 
 q27's first run on Ada silicon (RunPod RTX 4090 24GB, CUDA 12.6
 toolkit -- 12.4+ is a hard floor, older ptxas rejects the sm_89 e4m3
@@ -526,7 +535,8 @@ captures on public tasks.
 ## Honest caveats
 
 - Quantization confound: the two llama builds are Q5_K_M (+0.25 bpw vs q27's
-  NVFP4, favors llama); vLLM is NVFP4 (the *same* quant family as q27, so the
+  q27's 4-bit, favors llama); vLLM is NVFP4 proper -- e2m1 + fp8 block scales,
+  a different format than q27's integer group quant but the same bit class, so the
   cleanest comparison), but from a different checkpoint (`unsloth`, the multimodal
   variant — its unused vision tower costs VRAM, which is why vLLM ran at 131072
   ctx not higher).
