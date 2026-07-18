@@ -311,6 +311,120 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
     return msgs;
 }
 
+// OpenAI chat/completions tools -> the same {"type":"function","function":{...}}
+// shape tools_preamble/chatml_prompt expect. Unlike anthropic_tools_json this
+// is nearly a pass-through (the wire shape already matches); entries missing
+// "type":"function" or a function.name are dropped rather than failing the
+// whole request, mirroring the Responses bridge's tolerance of hosted tool
+// types it doesn't model (review parity: a malformed ONE tool must not take
+// down an otherwise-valid request).
+inline json openai_tools_json(const json& body) {
+    json out = json::array();
+    if (body.contains("tools") && body["tools"].is_array())
+        for (auto& t : body["tools"]) {
+            if (!t.is_object() || t.value("type", "") != "function") continue;
+            if (!t.contains("function") || !t["function"].is_object()) continue;
+            const json& fn = t["function"];
+            if (!fn.contains("name") || !fn["name"].is_string()) continue;
+            out.push_back({{"type", "function"},
+                           {"function", {{"name", fn["name"]},
+                                         {"description", fn.value("description", "")},
+                                         {"parameters", fn.contains("parameters")
+                                                            ? fn["parameters"]
+                                                            : json::object()}}}});
+        }
+    return out;
+}
+
+// OpenAI chat/completions messages -> Msg list, the /v1/chat/completions twin
+// of anthropic_msgs. Two bridges the flat "content is a string" reading
+// misses entirely (silently dropping the model's own tool use from history,
+// which breaks any multi-turn agentic loop after the first call):
+//   - assistant.tool_calls[] (OpenAI shape: function.arguments is a JSON
+//     STRING) -> reconstructed <tool_call> marker(s), appended after any
+//     sibling content text (order matches anthropic_msgs' text-then-tool_use
+//     handling).
+//   - role:"tool" (tool_call_id + content) -> folded into a <tool_response>-
+//     wrapped USER turn, same as anthropic_msgs' tool_result bridge. The
+//     call_id is intentionally not echoed into the prompt text: the chat
+//     template's <tool_response> carries no id, and the fine-tune associates
+//     a result with the immediately preceding call by POSITION.
+//   - role:"developer" (the newer OpenAI system-role alias) -> "system",
+//     matching the /v1/responses bridge.
+inline std::vector<Msg> openai_msgs(const json& body) {
+    std::vector<Msg> msgs;
+    if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
+    for (auto& m : body["messages"]) {
+        if (!m.is_object()) continue;
+        std::string role = m.value("role", "user");
+        if (role == "developer") role = "system";
+        std::string content;
+        if (m.contains("content")) {
+            if (m["content"].is_string()) content = m["content"];
+            else if (m["content"].is_array())
+                for (auto& part : m["content"])
+                    if (part.is_object() && part.value("type", "") == "text")
+                        content += part.value("text", "");
+        }
+        if (role == "tool") {
+            msgs.push_back({"user", tool_response_text(content)});
+            continue;
+        }
+        if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            for (auto& tc : m["tool_calls"]) {
+                if (!tc.is_object() || !tc.contains("function") || !tc["function"].is_object())
+                    continue;
+                const json& fn = tc["function"];
+                std::string name = fn.value("name", std::string());
+                json args = json::object();
+                if (fn.contains("arguments")) {
+                    if (fn["arguments"].is_string()) {
+                        // OpenAI wire shape: a JSON-encoded string. Keep the
+                        // raw string (rather than dropping the call) if it
+                        // fails to parse -- same "never lose a turn" stance
+                        // as parse_tool_call's double-encode tolerance.
+                        try { args = json::parse(fn["arguments"].get<std::string>()); }
+                        catch (...) { args = fn["arguments"]; }
+                    } else args = fn["arguments"];
+                }
+                if (!content.empty() && content.back() != '\n') content += "\n";
+                content += tool_call_text(name, args);
+            }
+        }
+        msgs.push_back({role, content});
+    }
+    return msgs;
+}
+
+// tool_choice (OpenAI shape): "auto"/absent -> AUTO (unchanged behavior);
+// "none" -> NONE (tools stripped from the prompt entirely -- the model gets
+// no tool definitions and cannot call anything this turn); "required" or a
+// named {"type":"function","function":{"name":...}} -> FORCED. FORCED is a
+// soft force (prompt-injected <tool_call> opener + pre-seeded stream router,
+// see server.cu) -- it is NOT combined with --constrain-tools grammar
+// masking (documented limitation: the grammar's engage trigger scans
+// GENERATED text for the <tool_call> marker, which never appears in the
+// output when it was injected into the PROMPT instead).
+struct ToolChoice {
+    enum Mode { AUTO, NONE, FORCED } mode = AUTO;
+    std::string forced_name; // empty = any registered tool eligible
+};
+inline ToolChoice parse_tool_choice(const json& body) {
+    ToolChoice tc;
+    if (!body.contains("tool_choice")) return tc;
+    const json& v = body["tool_choice"];
+    if (v.is_string()) {
+        if (v == "none") tc.mode = ToolChoice::NONE;
+        else if (v == "required") tc.mode = ToolChoice::FORCED;
+        // "auto" or any other/unknown string: default AUTO
+    } else if (v.is_object() && v.value("type", "") == "function" && v.contains("function") &&
+               v["function"].is_object()) {
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["function"].value("name", std::string());
+    }
+    return tc;
+}
+
 // Parsed model tool call. `ok` false if the JSON was malformed (raw kept).
 struct ToolCall {
     bool ok = false;
@@ -890,5 +1004,73 @@ inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* pr
     return v.front();
 }
 
+// ---- OpenAI /v1/chat/completions response shaping -------------------------
+// Pulled out of server.cu (same rationale as the Anthropic helpers above):
+// pure JSON assembly, unit-tested without CUDA. server.cu's job is only to
+// wire the engine callbacks that feed `calls`/`text` -- an exact mechanical
+// twin of the already-shipped /v1/messages plumbing.
+
+inline json openai_tool_call_json(const std::string& id, const ToolCall& c) {
+    return {{"id", id}, {"type", "function"},
+            {"function", {{"name", c.name}, {"arguments", c.arguments.dump()}}}};
+}
+
+// Non-streaming choices[0].message. content is null ONLY when there is at
+// least one tool call and no leftover text (matches real OpenAI's
+// convention); otherwise content is always the string (possibly empty),
+// never null, so a plain content-only turn never confuses a strict client.
+// `calls` may include ok==false entries (malformed calls) -- the caller is
+// expected to have already folded those into `text` (matching the
+// /v1/messages precedent) before calling this. `reasoning` (optional):
+// non-empty adds a `reasoning_content` field -- not part of the official
+// OpenAI schema, but the de facto convention vLLM/SGLang/llama.cpp's server
+// all converged on for surfacing a reasoning model's thinking trace over the
+// chat/completions wire; unknown fields are inert to clients that don't
+// look for it.
+inline json openai_chat_message_json(const std::string& text, const std::vector<ToolCall>& calls,
+                                     long rid, const std::string& reasoning = std::string()) {
+    json msg = {{"role", "assistant"}};
+    json tool_calls = json::array();
+    int i = 0;
+    for (auto& c : calls)
+        if (c.ok)
+            tool_calls.push_back(openai_tool_call_json(
+                "call_q27_" + std::to_string(rid) + "_" + std::to_string(i++), c));
+    bool any_call = !tool_calls.empty();
+    msg["content"] = (any_call && text.empty()) ? json(nullptr) : json(text);
+    if (any_call) msg["tool_calls"] = tool_calls;
+    if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+    return msg;
+}
+
+// Streamed reasoning_content delta (see openai_chat_message_json's comment
+// for the convention this matches).
+inline json openai_reasoning_delta(const std::string& t) {
+    return {{"reasoning_content", t}};
+}
+
+// One SSE chunk envelope (chat.completion.chunk), shared by every delta this
+// endpoint emits (content, tool_calls, or the terminal empty-delta chunk).
+inline json openai_stream_chunk(const std::string& id, const std::string& obj, long created,
+                                const std::string& model, const json& delta,
+                                const char* finish_reason = nullptr) {
+    json choice = {{"index", 0}, {"delta", delta},
+                   {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
+    return {{"id", id}, {"object", obj}, {"created", created}, {"model", model},
+            {"choices", json::array({choice})}};
+}
+
+// One streamed tool_calls[] delta entry. Whole-shot (id+name+full arguments
+// in a single chunk) rather than incremental-argument streaming -- matches
+// the existing /v1/messages input_json_delta precedent (one full
+// partial_json chunk per call, not char-by-char) and is spec-valid: a client
+// that expects incremental fragments just accumulates a single fragment.
+inline json openai_tool_call_delta(int index, const std::string& id, const ToolCall& c) {
+    return {{"tool_calls", json::array({{{"index", index},
+                                         {"id", id},
+                                         {"type", "function"},
+                                         {"function", {{"name", c.name},
+                                                       {"arguments", c.arguments.dump()}}}}})}};
+}
 
 } // namespace q27
