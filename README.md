@@ -55,9 +55,8 @@ Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.4+ at
 e4m3 MMA forms), and gcc. `make` builds ONE tri-arch binary (sm_86 +
 sm_89 + sm_120: 3090, 4090/Ada, and 5090 class); arch dispatch is at
 runtime -- fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80)
-runs the fp16-MMA verify (h16) and fp16/turbo3 KV. NOTE: the v0.3.0
-release binaries predate the sm_89 target -- on a 4090 either build
-from source or pass `Q27_KV=turbo3` explicitly until the next release.
+runs the fp16-MMA verify (h16) and fp16/turbo3 KV. (v0.3.1+
+release binaries include the sm_89 target; v0.3.0 did not.)
 
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
@@ -100,10 +99,10 @@ huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
 # verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5 --ignore-missing)
 
 # 2. build (CLI + server + test suites) -- or skip the toolchain and
-#    grab prebuilt linux x86_64 binaries (CUDA runtime statically
-#    linked; NEEDS NVIDIA driver r580+/CUDA 13 -- on older drivers
-#    build from source with your driver's toolkit, 12.4+ for sm_89,
-#    12.8+ for sm_120) from https://github.com/signalnine/q27/releases
+#    grab prebuilt linux x86_64 binaries (sm_86/89/120 fatbin, CUDA
+#    runtime statically linked; NEEDS NVIDIA driver r580+ -- on older
+#    drivers build from source with your driver's toolkit, 12.4+ for
+#    sm_89, 12.8+ for sm_120) from https://github.com/signalnine/q27/releases
 git clone https://github.com/signalnine/q27 && cd q27
 make
 
