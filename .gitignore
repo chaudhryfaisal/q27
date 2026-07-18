@@ -2,3 +2,4 @@
 __pycache__/
 build/
 scratchpad/
+bench/swebench/*.journal
