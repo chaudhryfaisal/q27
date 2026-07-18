@@ -7538,3 +7538,34 @@ investigation, sm_89 slope, v0.3.1 release are separate):
 
 Gates: canonical a2982c51 EXACT, fused_smoke byte-identical, single-
 slot picks unchanged on the 5090.
+
+## 2026-07-18 -- fix #1: flask-5014 early-eos ROOT-CAUSED = tool-parser drift mode 10 (dropped opener)
+
+The n=3 seal's deterministic early-quit was NOT a basin -- it's a tool-
+call parser miss, the [drift] first-tool-call rescue the dome flagged.
+Raw capture (temp Q27_RAWDUMP, since removed): on flask-5014 the model
+emits its FIRST call as
+    I'll investigate... implementation.\n\nRead", "file_path": "..."}
+-- it dropped the ENTIRE `{"name": "` opener. No `{`, so the bare-call
+scanner found no candidate, the JSON tail leaked into text, and the
+agent ended at turn 1 with a text-only "response" (num_turns=1,
+nonempty-diff 0). Byte-identical x3 because greedy.
+
+Fix (api_common.h, two parts):
+1. DRIFT MODE 10: when nothing else rescued and a REGISTERED tool name
+   is followed by the `", "` arg-separator with no opening brace,
+   splice `{"name": "` back and re-parse once (allow_o10=false in the
+   recursion -- no loop). 
+2. FLAT name+args: the spliced (and wrapper-less) object {"name":"X",
+   <sibling arg keys>} matched no mode (shaped needs "arguments",
+   mode-6 needs name-as-object, mode-8 needs alias keys). Added: a
+   string "name" validated against the registry, siblings become the
+   arguments. Registry validation keeps prose JSON with a "name" field
+   out.
+
+VERIFIED: unit test (flask string -> Read{file_path}, prose-unknown ->
+0, wrapped call -> 1 unchanged); END-TO-END flask-5014 now 13 turns
+(was 1), nonempty-diff 1/1, edited-gold-file 1/1. Canonical a2982c51
+EXACT (parser is host-side, CLI path untouched). This is the serving-
+quality half of the n=3 seal's 10-11/12; a full re-seal is the
+measurement to confirm the fleet number moves.

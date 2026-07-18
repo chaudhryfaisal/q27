@@ -624,7 +624,8 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // the first recovered call. `tools` (optional) enables mode-6 name inference.
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
-                                                   const json* tools = nullptr) {
+                                                   const json* tools = nullptr,
+                                                   bool allow_o10 = true) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -768,6 +769,30 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 continue;
             }
         } else if (m8cand && tools) {
+            // mode 10 tail (2026-07-18): flat name+args -- a STRING "name"
+            // matching a registered tool, with the arguments as SIBLING keys
+            // instead of nested under "arguments" ({"name":"Read","file_path":
+            // ...}). This is what the mode-10 opener-splice produces, and
+            // the model also emits it wrapper-less. Validate the name against
+            // the registry so prose JSON with a "name" field can't match.
+            if (j8.contains("name") && j8["name"].is_string()) {
+                const std::string cand = j8["name"].get<std::string>();
+                bool known = false;
+                for (const auto& t : *tools)
+                    if (t.contains("function") &&
+                        t["function"].value("name", std::string()) == cand) { known = true; break; }
+                if (known && !cand.empty()) {
+                    json args = json::object();
+                    for (auto it = j8.begin(); it != j8.end(); ++it)
+                        if (it.key() != "name") args[it.key()] = it.value();
+                    ToolCall tc; tc.ok = true; tc.name = cand; tc.arguments = std::move(args);
+                    if (first == std::string::npos) first = i;
+                    out.push_back(std::move(tc));
+                    m8 = true;
+                    i = text.find('{', end + 1);
+                    continue;
+                }
+            }
             // mode 8: alias-named call object ({"function": "Read", ...});
             // registered-name validation inside keeps prose JSON out
             std::string an;
@@ -798,6 +823,37 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (p.size() >= 8 && p.compare(p.size() - 8, 8, "{\"name\":") == 0)
             p = strip_ws2(p.substr(0, p.size() - 8));
         *prefix = p;
+    }
+    // Drift mode 10 (2026-07-18, SWE-bench flask-5014 first-tool-call
+    // rescue miss): the model drops the ENTIRE `{"name": "` opener, emitting
+    // `NAME", "key": val ...}` with no brace at all -- so the {-scanner above
+    // finds no candidate. When nothing else rescued and a KNOWN tool name is
+    // followed by the `", "` argument-separator signature (and is not already
+    // properly quoted), splice the opener back and re-parse ONCE (allow_o10
+    // false in the recursion so a still-broken splice cannot loop). This is
+    // the deterministic early-quit the n=3 seal caught: a missed first call
+    // ends the agent turn with a leaked-JSON text response.
+    if (out.empty() && allow_o10 && tools && tools->is_array()) {
+        for (const auto& t : *tools) {
+            std::string nm = t.contains("function")
+                                 ? t["function"].value("name", std::string())
+                                 : std::string();
+            if (nm.empty()) continue;
+            const std::string sig = nm + "\", \"";
+            size_t p = text.find(sig);
+            if (p == std::string::npos) continue;
+            if (p > 0 && text[p - 1] == '"') continue; // already `"name": "NAME"`
+            std::string synth = text.substr(0, p) + "{\"name\": \"" + text.substr(p);
+            if (synth.find('}') == std::string::npos) synth += "}";
+            std::string pre2;
+            auto rec = parse_bare_tool_calls(synth, &pre2, tools, /*allow_o10=*/false);
+            if (!rec.empty()) {
+                out = std::move(rec);
+                if (prefix) *prefix = pre2;
+                fprintf(stderr, "[drift] mode-10 dropped-opener rescue: %s\n", nm.c_str());
+                break;
+            }
+        }
     }
     // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
     // drift mode(s) the fallback chain rescued, or flag an intended call it could
