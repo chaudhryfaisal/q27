@@ -748,6 +748,80 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // out. Handles content-last and scalar-args-before-content; a scalar AFTER the
 // big value (rare ordering) over-captures -- accepted vs the current total
 // failure (the UN-RESCUED session death). Only runs when nothing else parsed.
+// Escape ONLY what's actually unescaped in a nearly-valid JSON string body:
+// a valid \-escape is kept verbatim, a bare `"` or raw control char is
+// escaped, a lone `\` is doubled. Unlike json(s).dump() this does NOT double-
+// escape content the model already escaped correctly (\n \t \" ...), which is
+// the mostly-escaped-with-sparse-errors case (issue #4, 2026-07-20:
+// {"content":"...\"fmt\"...\"strings"..."} -- most quotes escaped, one not).
+inline std::string minimal_escape_body(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            if (i + 1 < s.size()) {
+                char n = s[i + 1];
+                if (n == '"' || n == '\\' || n == '/' || n == 'b' || n == 'f' || n == 'n' ||
+                    n == 'r' || n == 't' || n == 'u') {
+                    out += '\\';
+                    out += n;
+                    i++;
+                    continue;
+                }
+            }
+            out += "\\\\";
+            continue;
+        }
+        if (c == '"') {
+            out += "\\\"";
+            continue;
+        }
+        if (c < 0x20) {
+            switch (c) {
+                case '\n': out += "\\n"; break;
+                case '\t': out += "\\t"; break;
+                case '\r': out += "\\r"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                default: {
+                    char buf[8];
+                    snprintf(buf, sizeof buf, "\\u%04x", c);
+                    out += buf;
+                }
+            }
+            continue;
+        }
+        out += (char)c;
+    }
+    return out;
+}
+
+// Return the first top-level balanced {...} (JSON string/escape aware), so
+// trailing junk after the call object -- </tool_call>, prose, a second blob --
+// doesn't make json::parse reject an otherwise-valid reconstruction.
+inline std::string first_balanced_object(const std::string& s) {
+    size_t start = s.find('{');
+    if (start == std::string::npos) return "";
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (size_t i = start; i < s.size(); i++) {
+        char ch = s[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (ch == '\\') esc = true;
+            else if (ch == '"') in_str = false;
+            continue;
+        }
+        if (ch == '"') in_str = true;
+        else if (ch == '{') depth++;
+        else if (ch == '}') {
+            if (--depth == 0) return s.substr(start, i - start + 1);
+        }
+    }
+    return "";
+}
+
 inline bool recover_raw_value_call(const std::string& text, const json& tools,
                                    std::vector<ToolCall>& out) {
     size_t mo = text.rfind("{\"name\"");
@@ -792,9 +866,13 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
         if (opener == std::string::npos) continue;
         for (size_t cand = text.find('"', opener + 1); cand != std::string::npos;
              cand = text.find('"', cand + 1)) {
-            // json(str).dump() yields a fully-escaped, quoted JSON string
-            const std::string esc = json(text.substr(opener + 1, cand - opener - 1)).dump();
-            const std::string recon = text.substr(mo, opener - mo) + esc + text.substr(cand + 1);
+            // Minimal-escape the value body (don't double-escape already-valid
+            // \-escapes) and trim trailing junk by taking the first balanced
+            // object, so both fully-raw and mostly-escaped content recover.
+            const std::string body = minimal_escape_body(text.substr(opener + 1, cand - opener - 1));
+            const std::string recon = first_balanced_object(
+                text.substr(mo, opener - mo) + "\"" + body + "\"" + text.substr(cand + 1));
+            if (recon.empty()) continue;
             json obj;
             try { obj = json::parse(recon); } catch (...) { continue; }
             if (!obj.is_object() || obj.value("name", std::string()) != nm) continue;

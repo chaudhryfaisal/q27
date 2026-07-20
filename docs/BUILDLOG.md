@@ -7873,3 +7873,20 @@ test_kernels/ninv/fused_smoke/tool-drift/drift-corpus PASS, tri-arch
 binaries + MIT LICENSE, sha256 6bcbd783) + SHA256SUMS-0.3.4. Driver floor r580+
 unchanged. Also this session: club-3090 8-pack canonical 110/150 (q4s+turbo3,
 into the W4A16 band), issue #741; sm_86/89 ntx measurement still open.
+
+## 2026-07-20 -- tool-drift mode 11 refinement: mostly-escaped content (issue #4)
+
+@chaudhryfaisal 2nd UN-RESCUED case (Kilocode `write`): content is MOSTLY-valid
+JSON-escaped (\n \t \" all escaped) with ONE sparse escape error (\"strings" --
+bare closing quote) + a trailing </tool_call>. Mode 11 missed it two ways:
+(1) json(span).dump() DOUBLE-escapes already-escaped content (would write
+literal backslashes into the file), (2) the trailing tag made every recon's
+json::parse fail. Fix (api_common.h): minimal_escape_body (escape ONLY
+unescaped quotes/controls, keep valid \-escapes -- handles both fully-raw
+[mode 11 original] and mostly-escaped) + first_balanced_object (take the first
+top-level {...}, dropping </tool_call>/prose trailers). Recovers name=write +
+correct content ("fmt" quotes preserved). Regression: test_tool_drift.cpp
+"mode11 mostly-escaped content + trailing tag"; all modes 10/11/12 + corpus
+green. Kilocode tools confirmed lowercase (write/read/bash/...). Distinct from
+the truncated raw-shell-in-name case (still genuinely unrecoverable). NOT in
+v0.3.4 -- needs v0.3.5 or build-from-master.

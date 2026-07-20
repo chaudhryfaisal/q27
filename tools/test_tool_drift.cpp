@@ -77,6 +77,21 @@ int main() {
                !v[0].arguments.value("content", std::string()).empty(),
            "mode11 scalar-before-content");
     }
+    // mode 11 refinement (issue #4, 2026-07-20, @chaudhryfaisal): content is
+    // MOSTLY-escaped JSON (\n \" all escaped) with ONE sparse escape error
+    // (\"x" -- bare closing quote) AND a trailing </tool_call>. json().dump()
+    // would double-escape the already-escaped body, and the trailing tag broke
+    // the reconstruction's parse -> UN-RESCUED. minimal-escape + first-balanced-
+    // object recover it with the CORRECT content ("fmt" quotes preserved).
+    {
+        auto v = call("{\"name\": \"Write\", \"arguments\": {\"content\":\"package main\\n"
+                      "import \\\"fmt\\\"\\nvar s = \\\"x\"\\n\",\"file_path\":\"m.go\"}}\n"
+                      "</tool_call>");
+        ok(v.size() == 1 && v[0].name == "Write" &&
+               v[0].arguments.value("file_path", std::string()) == "m.go" &&
+               v[0].arguments.value("content", std::string()).find("\"fmt\"") != std::string::npos,
+           "mode11 mostly-escaped content + trailing tag");
+    }
     // mode 12: unquoted tool-name value {"name": Read, "arguments": {...}}
     // (club-3090 cli-40: the model emitted {"name": bash, ...} and the whole
     // call went UN-RESCUED -> agent turn stopped at turnsUsed=0).
