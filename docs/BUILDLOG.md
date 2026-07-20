@@ -7798,3 +7798,27 @@ test_kernels/ninv/fused_smoke PASS, split-K NLL gate +0.018%. Tri-arch build
 (sm_86/89/120 cuobjdump-confirmed on all 4 binaries). Assets: tarball (4
 binaries + MIT LICENSE, sha256 bfa0f366) + SHA256SUMS-0.3.3. Driver floor r580+
 unchanged. Q27_GEMM_SPLITK=0 opts out.
+
+## 2026-07-19 -- prefill GEMM ntx M-minitile (+3.4%, bitwise, sm_120)
+
+The int8 59%->SoL tuning pass. ncu on the shipped B-ldm k_gemm_mma_T (5090):
+49% Compute SoL, but the bound is NOT occupancy (register-cap to force 2/3
+blocks/SM = 0.619ms flat -- the register-pipeline hides latency, more warps
+just queue on the same pipes) and NOT dequant (ALU 17%, FMA 11%). It's LSU:
+50% pipe (top), mio_throttle a top-3 stall. Levers RE-CONFIRMED dead: A-side
+ldmatrix -3.8% (amortized 8x), forced occupancy flat. The one open lever =
+MMQ's ntx: each warp computes 2 row-minitiles (MR 64->128) and SHARES one B
+ldmatrix load across both -> LSU-loads/MMA 1.5->1.0. Accumulator regs double
+(occupancy-irrelevant here, so free). Sweep: NT=96 best (+3.4%), NT=128 spills
+acc (+1.7%), NT=64 loses A-reuse (-0.8%) -- all BITWISE (per-output FP order
+unchanged). tools/gemm_ntx_spike.cu. Ported as k_gemm_mma_ntx<Q4IN,96>
+(MR=128, g64, no split-K -- serves the SATURATED large-T grid, the opposite
+regime from split-K's underfill). Dispatch: g64 + nt-auto + T>=96 + blocks_mr64
+>= 2*SMs. Gated to sm_120+ (major>=12): the win is 5090-measured and Ampere
+kernel wins don't always transfer (GEMV sweep was sm_86-NEGATIVE); Q27_PF_NTX=0
+opts out. IN-ENGINE: NLL bitwise-identical on/off (1.914814 both, q4+q8 layers),
+fires on q4 rows=10240 + q8 rows=5120 at T=1024; --nll 40x1024 wall 13.41->12.52s
+(~6%, amplified by the big head GEMM). GATES green: canonical a2982c51 +
+f64e7c02 + sampled 900031e9 EXACT, test_kernels/ninv/fused_smoke PASS. Cold-
+prefill lever (warm turns skip prefill via the checkpoint); stacks with split-K.
+Not yet released; sm_86/89 ntx measurement open (needs 3090/4090).

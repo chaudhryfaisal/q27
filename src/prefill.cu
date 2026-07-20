@@ -497,6 +497,179 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
     }
 }
 
+// ntx=2 M-minitile variant of the XG64 (g64) weight GEMM. Each warp computes
+// TWO 16-row minitiles (MR=128) and SHARES one B ldmatrix load across both,
+// cutting LSU-loads-per-MMA from 1.5 to 1.0 -- the fix for the LSU-pipe bound
+// (ncu 2026-07-19: LSU 50% top pipe, tensor 30%, occupancy flat). NT=96 is the
+// measured sweet spot (NT=128 spills acc, NT=64 loses A-reuse); +3.4% bitwise
+// on ffn_gate T=1024 vs the MR=64 kernel. Per-output FP accumulation order is
+// identical to k_gemm_mma_T -> BITWISE. No split-K: this path serves the
+// SATURATED large-T grid, the opposite regime from split-K's underfill.
+template <bool Q4IN, int NT>
+__global__ void k_gemm_mma_ntx(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                               const int8_t* __restrict__ nat, const float* __restrict__ xs,
+                               float* __restrict__ y, int64_t rows, int64_t cols, int T) {
+    constexpr int MR = 128, KS = 128, XGS = 64, XSC = KS / XGS, TS = NT / 16, LDW = KS + 16,
+                  LDX = KS + 16;
+    extern __shared__ unsigned char smem_raw[];
+    int8_t* s_w = (int8_t*)smem_raw;
+    int8_t* s_x = (int8_t*)(s_w + MR * LDW);
+    float* s_ws = (float*)(s_x + NT * LDX);
+    float* s_xs = (float*)(s_ws + MR * (Q4IN ? 2 : 1));
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int wm = warp % 4, wn = warp / 4, gid = lane >> 2, tg = lane & 3;
+    const int64_t r0 = (int64_t)blockIdx.y * MR;
+    const int t0 = blockIdx.x * NT;
+    const int n_stages = (int)(cols / KS);
+    float acc[2][TS][4]; // [minitile][token-subtile][frag]
+#pragma unroll
+    for (int m = 0; m < 2; m++)
+        for (int s = 0; s < TS; s++)
+            for (int e = 0; e < 4; e++) acc[m][s][e] = 0.f;
+    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : MR * KS / 4 / 256;
+    constexpr int XLD = NT * KS / 4 / 256;
+    constexpr int XSL = (NT * XSC + 255) / 256;
+    const int tid = threadIdx.x;
+    const int nws = Q4IN ? MR * 2 : MR;
+    uint32_t rw[WLD], rx[XLD];
+    float rws = 0.f, rxs[XSL];
+    auto load_stage = [&](int st) {
+        const int64_t k0 = (int64_t)st * KS;
+        if (Q4IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid, rr = idx / 16, pb4 = idx % 16;
+                rw[i] = r0 + rr < rows
+                            ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) + pb4)
+                            : 0x88888888u;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid, rr = idx / (KS / 4), u = idx % (KS / 4);
+                rw[i] = r0 + rr < rows ? __ldg((const uint32_t*)(W + (r0 + rr) * cols + k0) + u) : 0u;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < XLD; i++) {
+            int idx = i * 256 + tid, tt = idx / (KS / 4), u = idx % (KS / 4);
+            rx[i] = t0 + tt < T ? __ldg((const uint32_t*)(nat + (size_t)(t0 + tt) * cols + k0) + u)
+                                : 0u;
+        }
+        if (tid < nws) {
+            if (Q4IN) {
+                int rr = tid / 2, g = tid % 2;
+                rws = r0 + rr < rows ? __half2float(__ldg(S + (r0 + rr) * (cols / 64) + k0 / 64 + g))
+                                     : 0.f;
+            } else {
+                rws = r0 + tid < rows ? __half2float(__ldg(S + (r0 + tid) * (cols / 128) + k0 / 128))
+                                      : 0.f;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < XSL; i++) {
+            int idx = i * 256 + tid, tt = idx / XSC, cc = idx % XSC;
+            rxs[i] = (idx < NT * XSC && t0 + tt < T)
+                         ? __ldg(xs + (size_t)(t0 + tt) * (cols / XGS) + k0 / XGS + cc)
+                         : 0.f;
+        }
+    };
+    auto store_stage = [&]() {
+        if (Q4IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid, rr = idx / 16, pb4 = idx % 16;
+                int8_t* dst = s_w + rr * LDW + pb4 * 8;
+                const uint32_t p = rw[i], lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
+                *(uint32_t*)dst = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
+                *(uint32_t*)(dst + 4) = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid, rr = idx / (KS / 4), u = idx % (KS / 4);
+                *(uint32_t*)(s_w + rr * LDW + u * 4) = rw[i];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < XLD; i++) {
+            int idx = i * 256 + tid, tt = idx / (KS / 4), u = idx % (KS / 4);
+            *(uint32_t*)(s_x + tt * LDX + u * 4) = rx[i];
+        }
+        if (tid < nws) s_ws[tid] = rws;
+#pragma unroll
+        for (int i = 0; i < XSL; i++) {
+            int idx = i * 256 + tid;
+            if (idx < NT * XSC) s_xs[idx] = rxs[i];
+        }
+    };
+    load_stage(0);
+    for (int st = 0; st < n_stages; st++) {
+        __syncthreads();
+        store_stage();
+        if (st + 1 < n_stages) load_stage(st + 1);
+        __syncthreads();
+#pragma unroll
+        for (int gg = 0; gg < 2; gg++) {
+            const int kb = gg * 64;
+            uint32_t A[2][8];
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                const int8_t* w0 = s_w + (wm * 32 + mt * 16 + gid) * LDW + kb;
+                A[mt][0] = *(const uint32_t*)(w0 + tg * 4);
+                A[mt][1] = *(const uint32_t*)(w0 + 8 * LDW + tg * 4);
+                A[mt][2] = *(const uint32_t*)(w0 + tg * 4 + 16);
+                A[mt][3] = *(const uint32_t*)(w0 + 8 * LDW + tg * 4 + 16);
+                A[mt][4] = *(const uint32_t*)(w0 + tg * 4 + 32);
+                A[mt][5] = *(const uint32_t*)(w0 + 8 * LDW + tg * 4 + 32);
+                A[mt][6] = *(const uint32_t*)(w0 + tg * 4 + 48);
+                A[mt][7] = *(const uint32_t*)(w0 + 8 * LDW + tg * 4 + 48);
+            }
+            float wsc[2][2];
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                const int rw0 = wm * 32 + mt * 16 + gid;
+                wsc[mt][0] = s_ws[rw0 * (Q4IN ? 2 : 1) + (Q4IN ? gg : 0)];
+                wsc[mt][1] = s_ws[(rw0 + 8) * (Q4IN ? 2 : 1) + (Q4IN ? gg : 0)];
+            }
+#pragma unroll
+            for (int s = 0; s < TS; s++) {
+                const int tb = wn * (NT / 2) + s * 8;
+                uint32_t b0, b1, b2, b3;
+                const int8_t* xr = s_x + (tb + (lane & 7)) * LDX + kb + ((lane & 15) >> 3) * 16;
+                ldm_x2(b0, b1, xr);
+                ldm_x2(b2, b3, xr + 32); // ONE B-load, shared across both minitiles
+                const float xs0 = s_xs[(tb + tg * 2) * 2 + gg];
+                const float xs1 = s_xs[(tb + tg * 2 + 1) * 2 + gg];
+#pragma unroll
+                for (int mt = 0; mt < 2; mt++) {
+                    int d0, d1, d2, d3;
+                    mma_s8(d0, d1, d2, d3, A[mt][0], A[mt][1], A[mt][2], A[mt][3], b0, b1);
+                    mma_s8_acc(d0, d1, d2, d3, A[mt][4], A[mt][5], A[mt][6], A[mt][7], b2, b3);
+                    acc[mt][s][0] += wsc[mt][0] * xs0 * (float)d0;
+                    acc[mt][s][1] += wsc[mt][0] * xs1 * (float)d1;
+                    acc[mt][s][2] += wsc[mt][1] * xs0 * (float)d2;
+                    acc[mt][s][3] += wsc[mt][1] * xs1 * (float)d3;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++) {
+        const int64_t row0 = r0 + wm * 32 + mt * 16 + gid;
+#pragma unroll
+        for (int s = 0; s < TS; s++) {
+            const int tok0 = t0 + wn * (NT / 2) + s * 8 + tg * 2;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int64_t row = row0 + (e >= 2 ? 8 : 0);
+                int tok = tok0 + (e & 1);
+                if (row < rows && tok < T) y[(size_t)tok * rows + row] = acc[mt][s][e];
+            }
+        }
+    }
+}
+
 // Ordered split-K reduce: y[i] = sum_{sp=0..nsp-1} tmp[sp*stride + i], fixed
 // sp order so the (non-bitwise vs nsp==1) result is at least reproducible.
 __global__ void k_gemm_splitk_reduce(const float* __restrict__ tmp, float* __restrict__ y,
@@ -520,6 +693,22 @@ static int cur_nsm() {
     int n = p.multiProcessorCount;
     if (dev >= 0 && dev < 16) cache[dev] = n;
     return n;
+}
+
+// SM major version for the current device, cached. ntx is gated on this: the
+// +3.4% was measured only on sm_120 (Blackwell 5090). 5090 kernel wins don't
+// always transfer to Ampere (the GEMV occupancy sweep was sm_86-NEGATIVE), so
+// ntx stays off on sm_86/89 until measured there.
+static int cur_sm_major() {
+    static int cache[16] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16 && cache[dev]) return cache[dev];
+    cudaDeviceProp p;
+    cudaGetDeviceProperties(&p, dev);
+    int maj = p.major;
+    if (dev >= 0 && dev < 16) cache[dev] = maj;
+    return maj;
 }
 
 // Split count for the prefill GEMM. DEFAULT ON (auto) since 2026-07-19: the
@@ -625,6 +814,35 @@ static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, 
     }
 }
 
+template <bool Q4IN, int NT>
+static void launch_gemm_ntx(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
+                            int64_t rows, int64_t cols, int T, cudaStream_t st) {
+    constexpr int MR = 128, KS = 128, LDW = KS + 16, LDX = KS + 16, XSC = 2;
+    const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * XSC) * 4;
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_ntx<Q4IN, NT>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+        attr = true;
+    }
+    dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR));
+    static bool announced = false;
+    if (!announced && getenv("Q27_PF_NTX_DBG")) {
+        fprintf(stderr, "ntx: engaged (first fire Q4=%d NT=%d T=%d rows=%ld)\n", (int)Q4IN, NT, T,
+                (long)rows);
+        announced = true;
+    }
+    k_gemm_mma_ntx<Q4IN, NT><<<grid, 256, SM, st>>>(W, S, xq.nat64, xq.s64, y, rows, cols, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Q27_PF_NTX: unset/1 = ntx M-minitile ON for the saturated large-T g64 grid,
+// 0 = off (force the MR=64 kernel). Bitwise-invariant, so on by default.
+static bool prefill_ntx() {
+    const char* e = getenv("Q27_PF_NTX");
+    return !(e && !strcmp(e, "0"));
+}
+
 // Short-tail dispatch (P2): the NT=128 tile collapses below T~32 (mostly-empty
 // tile + high smem -> low occupancy). Pick the smallest tile that fits T, so a
 // prefix-cache suffix or short prompt runs at 1.5-3x (measured, ffn_gate Q4).
@@ -639,6 +857,19 @@ static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& x
         exit(1);
     }
     int nt = prefill_nt();
+    // ntx M-minitile: only the g64 serving path, only when the MR=64 grid is
+    // clearly SATURATED (blocks >= 2x SMs) so the MR=128 tile is still full and
+    // this is the opposite regime from split-K's underfill. +3.4% bitwise; the
+    // small-T / underfill path keeps the MR=64 kernel (+ split-K).
+    if constexpr (XG64) {
+        if (nt == 0 && prefill_ntx() && cur_sm_major() >= 12 && T >= 96 && xq.nat64) {
+            int64_t blk = (int64_t)((T + 127) / 128) * ((rows + 63) / 64);
+            if (blk >= 2 * (int64_t)cur_nsm()) {
+                launch_gemm_ntx<Q4IN, 96>(W, S, xq, y, rows, cols, T, st);
+                return;
+            }
+        }
+    }
     if (nt == 0) nt = T <= 16 ? 16 : T <= 32 ? 32 : T <= 64 ? 64 : 128;
     switch (nt) {
         case 16: launch_gemm_nt<Q4IN, XG64, 16>(W, S, xq, y, rows, cols, T, st, sk); break;
