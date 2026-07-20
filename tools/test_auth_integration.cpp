@@ -4,7 +4,7 @@
 // exercises the exact same handler shape wired into server.cu's main(),
 // verbatim, against real HTTP requests over a real loopback socket --
 // not a mock of the HTTP layer.
-//
+// NOTE: this test keeps a verbatim copy of the server.cu handler and must stay in sync with server.cu would still pass the test if only the copy were correct.
 // Build+run: g++ -std=c++17 -I src -I third_party -pthread tools/test_auth_integration.cpp -o build/test_auth_integration && ./build/test_auth_integration
 #include "api_common.h"
 #include "../third_party/httplib.h"
