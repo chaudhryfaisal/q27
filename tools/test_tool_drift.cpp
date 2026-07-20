@@ -77,6 +77,21 @@ int main() {
                !v[0].arguments.value("content", std::string()).empty(),
            "mode11 scalar-before-content");
     }
+    // mode 12: unquoted tool-name value {"name": Read, "arguments": {...}}
+    // (club-3090 cli-40: the model emitted {"name": bash, ...} and the whole
+    // call went UN-RESCUED -> agent turn stopped at turnsUsed=0).
+    {
+        auto v = call("{\"name\": Read, \"arguments\": {\"file_path\": \"/x/y.py\"}}");
+        ok(v.size() == 1 && v[0].name == "Read" &&
+               v[0].arguments.value("file_path", std::string()) == "/x/y.py",
+           "mode12 unquoted-name");
+    }
+    // mode 12 negative: an unquoted name that is NOT a registered tool must be
+    // left untouched (never quote arbitrary barewords).
+    {
+        auto v = call("{\"name\": notatool, \"arguments\": {\"file_path\": \"/x\"}}");
+        ok(v.empty(), "mode12 unknown unquoted-name rejected");
+    }
     // negative: well-formed call recovers via the normal path (not a drift mode)
     {
         auto v =

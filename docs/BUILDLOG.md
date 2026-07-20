@@ -7822,3 +7822,35 @@ fires on q4 rows=10240 + q8 rows=5120 at T=1024; --nll 40x1024 wall 13.41->12.52
 f64e7c02 + sampled 900031e9 EXACT, test_kernels/ninv/fused_smoke PASS. Cold-
 prefill lever (warm turns skip prefill via the checkpoint); stacks with split-K.
 Not yet released; sm_86/89 ntx measurement open (needs 3090/4090).
+
+## 2026-07-19 -- club-3090 quality 8-pack + tool-drift mode 12 (cli-40 35%->48%)
+
+Ran noonghunna/benchlocal-cli quality-test.sh --full (8 packs, /150) against
+q27 q4s (4.55bpw) + turbo3 3-bit KV, no-think, for the club-3090 cross-engine
+table (issue #741). Quality is card-independent (kernels), run on the 5090.
+BASELINE 101/150 (67%): toolcall 14/15, structout/dataextract/bugfind 13/15,
+instruct/reasonmath 12/15, hermes 10-13/20 (agentic variance), cli-40 14/40.
+The 6 non-agentic packs = 77/90 (85%, W4A16-band) -> turbo3+q4s behavioral
+quality is SOUND (the maintainer's open question answered: 3-bit KV + 4.55bpw
+does not crater quality). Two artifacts + one real fix:
+- hermesagent-20 first scored 0/20 = ALL "model unreachable at
+  host.docker.internal Connection refused": q27 binds 127.0.0.1 (loopback
+  default since v0.1.1), unreachable from the in-container agent. --host 0.0.0.0
+  fixed it (13/20). Networking, not quality.
+- q27 is NO-THINK by design (ignores request enable_thinking): deterministic
+  packs score IDENTICALLY under default-thinking and NO_THINKING=1 (toolcall
+  14/15, instruct 12/15 both) -> one /150, no think-off/on split. [6] with data.
+- cli-40 14/40 (35%) = the real weak spot. Server log showed the drift: the
+  model emits {"name": bash, "arguments": {...}} -- UNQUOTED tool-name value.
+  Invalid JSON -> UN-RESCUED -> agent turn stops (turnsUsed=0). DRIFT MODE 12
+  (api_common.h fix_unquoted_name): quote a bareword after "name": IFF it
+  EXACTLY matches a registered tool; args are already valid JSON so the object
+  then parses on the normal path. SAFE (prose/null/numbers/unknown names
+  untouched; test_tool_drift.cpp mode12 + negative). MEASURED: cli-40 35% ->
+  48% (14->19/40), 0 UN-RESCUED across the run (was 3-4). Remaining cli-40
+  failures are now real capability misses (agent runs a command and stops on
+  its own), not parser drops. Distinct from Faisal's issue #4 (raw shell cmd in
+  the name slot, truncated, unrecoverable). Fixed /150 ~106+. MTP accept (card-
+  independent): code 2.91 tok/round (~48% @depth-4), prose 2.46 (~37%); adaptive
+  ceiling holds at 4 (deeper drafts don't promote) -- the 116/89 code/narrative
+  mechanism. gemm/ntx binaries unaffected; drift fix is api_common.h only.

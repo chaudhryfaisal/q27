@@ -845,7 +845,47 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         }
         return s;
     };
-    const std::string text = fix_arg_quote(escape_content_tags(text_in));
+    // drift mode 12 (2026-07-19, club-3090 cli-40 agent): the model drops the
+    // QUOTES around the tool-NAME value -- {"name": bash, "arguments": {...}}.
+    // Invalid JSON, so the whole call went UN-RESCUED and the agent's turn
+    // stopped (turnsUsed=0). The arguments are valid JSON, so once the bare
+    // name is quoted the object parses on the normal path. SAFE because we only
+    // quote a bareword that EXACTLY matches a registered tool name -- prose,
+    // non-tool JSON, null/numbers, and unknown names are left untouched.
+    auto fix_unquoted_name = [](std::string s, const json* tools) {
+        if (!tools || !tools->is_array()) return s;
+        size_t p = 0;
+        while ((p = s.find("\"name\":", p)) != std::string::npos) {
+            size_t c = p + 7;
+            while (c < s.size() && (s[c] == ' ' || s[c] == '\t' || s[c] == '\n' || s[c] == '\r'))
+                c++;
+            if (c < s.size() && s[c] != '"' &&
+                (isalpha((unsigned char)s[c]) || s[c] == '_')) {
+                size_t e = c;
+                while (e < s.size() && (isalnum((unsigned char)s[e]) || s[e] == '_' ||
+                                        s[e] == '-' || s[e] == '.'))
+                    e++;
+                const std::string word = s.substr(c, e - c);
+                bool match = false;
+                for (const auto& t : *tools)
+                    if (t.contains("function") &&
+                        t["function"].value("name", std::string()) == word) {
+                        match = true;
+                        break;
+                    }
+                if (match) {
+                    s.insert(e, "\"");
+                    s.insert(c, "\"");
+                    p = e + 2;
+                    continue;
+                }
+            }
+            p = c;
+        }
+        return s;
+    };
+    const std::string text =
+        fix_unquoted_name(fix_arg_quote(escape_content_tags(text_in)), tools);
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
     const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
     size_t first = std::string::npos;
