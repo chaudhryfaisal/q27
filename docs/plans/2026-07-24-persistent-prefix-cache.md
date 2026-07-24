@@ -272,8 +272,57 @@ fused_smoke PASS.
 - **P16b**: an entry cut inside the system block so a NEW conversation hits
   (see the scope correction above) -- either a `sys_off` split or promoting a
   ring checkpoint; plus boot prefetch of the most recent entry.
-- **P16c** (only if a and b hold): host-RAM tier between VRAM and disk, the
-  item already on the engine-survey shortlist.
+- **P16c (DONE, but a measured near-NO-GO -- default OFF)**: host-RAM tier
+  between VRAM and disk, `--prefix-cache-ram-gb`. See below.
+
+## P16c result: the page cache was already doing the job
+
+Sizing the lever before building it turned out to be the whole story. A restore
+is `alloc + read + import`:
+
+| | 1.09 GB entry | 0.51 GB entry |
+|---|---|---|
+| import (H2D from pinned) | 38 ms | 18 ms |
+| read, page cache warm | 206 ms | 36-39 ms |
+| read, page cache cold | 681 ms | (n/a) |
+
+**Import is the floor and no tier can beat it.** That left the read as the only
+thing a RAM tier could remove -- and the boot prefetch (below) already removes
+most of it by making the first read warm. Measured first-restore-after-restart,
+page cache evicted before each boot, n=3 per leg:
+
+| leg | wall | alloc | read |
+|---|---|---|---|
+| RAM tier OFF | 0.47-0.48 s | 75-84 ms | 36-39 ms |
+| RAM tier ON | 0.53-0.54 s | 133-141 ms | 36-39 ms |
+
+The tier makes the first restore **slower**, because its slot (sized for
+`max_tokens`) is a bigger pinned allocation than the exact-fit staging buffer,
+and there is no read left to save. Where it does win is a repeat restore on a
+DIFFERENT slot: 18 ms (import only) vs 52-127 ms from a warm-page-cache read.
+That is 40-110 ms, on a path that already costs ~0.5 s against the 8.15 s cold
+prefill it replaced.
+
+Verdict: shipped, `--prefix-cache-ram-gb 0` (off) by default. Worth enabling
+only when the page cache is under pressure from other work, where the
+alternative is a genuinely cold read on every hit. Bitwise verified either way.
+
+**Boot prefetch is the real win here, and it needed a rewrite.** The first
+implementation used `posix_fadvise(POSIX_FADV_WILLNEED)`; measured, it did
+NOTHING for a 1 GB entry (cold restore still read for 681 ms) -- the call is
+advisory and the kernel declines a readahead that size. Replacing it with an
+explicit chunked read on a detached thread, which runs under the cover of the
+weight upload, takes the first post-restart read from 681 ms to **36-39 ms**.
+
+**One unreproduced outlier, recorded rather than hidden:** two first-reads in a
+single gate run took 12.7 s and 17.9 s for a 0.51 GB file that reads at
+3.3 GB/s with O_DIRECT moments later. Both were the first read of a file
+written seconds earlier and then evicted from page cache. Never reproduced
+(3/3 repeats at 36-39 ms). Consistent with QLC garbage collection after a large
+write on a 77%-full drive, not with anything in this code path -- but it is the
+reason the restore timing log now splits alloc / read / import instead of
+reporting one number, since the original single number had folded a
+first-touch `cudaMallocHost` into what it called "read".
 
 ## Known limits of P16a
 

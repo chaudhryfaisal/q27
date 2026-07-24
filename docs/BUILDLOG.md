@@ -8365,3 +8365,62 @@ aa7d94e0 + SHA256SUMS-0.6.0. Driver floor r580+ unchanged.
 NOTE: a cache directory holds conversation content in plaintext -- the token
 IDs are the verification payload, so prompt text is recoverable with the
 tokenizer alone. docs/SECURITY-MODEL.md addendum 2026-07-24 covers it.
+
+## 2026-07-24 -- P16c (host-RAM tier) + the loose ends: measure first, then decide
+
+Four follow-ons to v0.6.0. One is a real win, one is a near-NO-GO shipped
+off-by-default, and the instrumentation that told them apart was itself wrong
+at first.
+
+**Boot prefetch: the actual win, after a rewrite.** v1 called
+`posix_fadvise(POSIX_FADV_WILLNEED)` on the most recent entries at startup.
+MEASURED: it did nothing -- a cold restore still read for 681 ms. The call is
+advisory and the kernel declines a readahead that size. v2 does an explicit
+chunked read on a detached thread, which runs under the cover of the weight
+upload (10-40 s of free time). First read after a restart: **681 ms -> 36-39
+ms**, n=3, page cache evicted before each boot.
+
+**P16c host-RAM tier (`--prefix-cache-ram-gb`): built, measured, defaulted
+OFF.** Sizing the lever first was the whole story. A restore is alloc + read +
+import; import (H2D from pinned) is 38 ms/GB and is a floor no tier can beat,
+and the prefetch above already takes the read to 36-39 ms. Result, first
+restore after restart, n=3/leg:
+
+    RAM OFF   wall 0.47-0.48 s   alloc 75-84 ms    read 36-39 ms
+    RAM ON    wall 0.53-0.54 s   alloc 133-141 ms  read 36-39 ms
+
+The tier makes the FIRST restore slower -- its slot is sized for max_tokens, so
+the pinned allocation is bigger than the exact-fit staging buffer, and there is
+no read left to remove. It wins only on a repeat restore landing on a DIFFERENT
+slot: 18 ms (import only) vs 52-127 ms warm-page-cache read, i.e. 40-110 ms on
+a path already down to ~0.5 s from 8.15 s. Shipped opt-in, recommended only
+under page-cache pressure. Implementation is a fixed-slot pinned pool with
+shared_ptr entries (eviction cannot free a blob a restore is copying from) that
+doubles as the staging buffer, so a disk read lands straight in the tier at
+zero extra copy.
+
+**Two instrumentation lessons.** (1) The restore log folded a first-touch
+`cudaMallocHost` into what it called "read", which made a 140 ms allocation
+look like disk time; the log now splits alloc / read / import. (2) A single
+gate run showed two first-reads at 12.7 s and 17.9 s for a 0.51 GB file that
+reads at 3.3 GB/s with O_DIRECT moments later. Never reproduced (3/3 at
+36-39 ms). Both were first reads of a file written seconds earlier then
+evicted -- consistent with QLC garbage collection on a 77%-full drive, not with
+this code path. Recorded rather than dropped, because a 20 s stall on the
+feature's headline path would matter if it ever does reproduce.
+
+**Write amplification (flagged at v0.6.0) fixed.** A disk restore now sets
+`pfx_last_persist = L`, so a fresh process no longer restores L and then
+immediately writes a SECOND ~1 GB entry for the same conversation at
+stable_len on every boot. The step gate covers it from there.
+
+**`/v1/responses` now persists the system-block entry.** That shape computes no
+stable_off (so no P16a entry, unchanged), but a system+tools block is a
+system+tools block and codex re-sends one every session -- it gets P16b via the
+same length-only encode used elsewhere.
+
+GATES: full slate re-run (engine.cuh changed): tri-arch x4, 11 CPU suites +
+auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), ninv ALL PASS, fused_smoke PASS. RAM-tier restores are bitwise
+identical to the cache-off reference (A f7e71a5f4df7a4ad, B 9594eec95be70e7b
+across every leg).

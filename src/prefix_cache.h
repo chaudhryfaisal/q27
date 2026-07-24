@@ -37,6 +37,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace q27 {
@@ -116,7 +117,45 @@ class PrefixCache {
         }
         enabled_ = true;
         rescan();
+        prefetch_recent();
         return true;
+    }
+
+    // Boot prefetch: pull the most recently used entries into the page cache
+    // while the server is still uploading weights (~10-40 s of free cover). A
+    // cold read of a 1.09 GB entry measured 681 ms vs 206 ms warm, and that
+    // 475 ms lands on the FIRST request after a restart -- exactly the request
+    // this feature exists to make fast.
+    //
+    // This READS the file rather than calling posix_fadvise(WILLNEED). MEASURED
+    // 2026-07-24: fadvise did nothing for a 1 GB entry (restore still took the
+    // full 681 ms cold) -- it is advisory, and the kernel declines a readahead
+    // request that size. An explicit chunked read is the only way to actually
+    // guarantee the pages. Runs on a detached thread; if the entry is never
+    // used the cost is background I/O the page cache would drop anyway.
+    void prefetch_recent(int max_entries = 2) {
+        std::vector<Entry> es;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            es = index_;
+        }
+        std::sort(es.begin(), es.end(),
+                  [](const Entry& a, const Entry& b) { return a.mtime > b.mtime; });
+        if (es.size() > (size_t)max_entries) es.resize((size_t)max_entries);
+        if (es.empty()) return;
+        size_t total = 0;
+        for (const auto& e : es) total += e.bytes;
+        fprintf(stderr, "prefix-cache: warming %.2f GB of recent entries in the background\n",
+                total / 1e9);
+        std::thread([es] {
+            std::vector<char> buf(8u << 20);
+            for (const auto& e : es) {
+                int fd = ::open(e.path.c_str(), O_RDONLY);
+                if (fd < 0) continue;
+                while (::read(fd, buf.data(), buf.size()) > 0) {}
+                ::close(fd);
+            }
+        }).detach();
     }
 
     bool enabled() const { return enabled_; }

@@ -25,6 +25,7 @@
 #include "kernels.cuh"
 #include "loader.h"
 #include "prefix_cache.h"
+#include "prefix_ram.h"
 #include "turbo3.cuh"
 #include "vgemm.cuh"
 
@@ -3026,6 +3027,10 @@ struct Engine {
     // can hit -- the stable prefix ends inside the first user message, which is
     // exactly what differs between conversations.
     int pfx_sys_len = 0;
+    double pfx_read_ms = 0;  // last disk-read cost, logged with the import split
+    double pfx_alloc_ms = 0; // pinned-staging allocation, counted separately
+    q27::PrefixRam* pram = nullptr;   // P16c host-RAM tier (null/off = disk only)
+    q27::PrefixRam::BlobPtr pfx_ram_hit;  // held across the restore so it can't be evicted
 
     size_t pfx_gdn_bytes() const {
         size_t n = 0;
@@ -3137,19 +3142,29 @@ struct Engine {
     // Stage the state for [0,L) and hand it to a background writer. The D2H
     // (~50 ms at 1 GB) is on the critical path; the file write is not.
     void pfx_persist(const std::vector<int>& prompt, int L) {
-        if (!pfx_stage_ensure(L)) return;
+        pfx_wait_writer();  // never reassign a joinable std::thread
+        // Export into a RAM-tier slot when the tier is on and one is free, so
+        // the blob we just built is resident for the next restore at no extra
+        // copy; the writer then streams it to disk from there. `slot` is
+        // captured by the writer thread, so the pinned memory outlives any
+        // eviction that happens mid-write.
+        q27::PrefixRam::BlobPtr slot;
+        if (pram && pram->enabled()) slot = pram->acquire(pfx_bytes(L));
+        char* dst = slot ? slot->p : (pfx_stage_ensure(L) ? pfx_stage : nullptr);
+        if (!dst) return;
         auto t0 = std::chrono::steady_clock::now();
-        pfx_export(L, pfx_stage);
+        pfx_export(L, dst);
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0).count();
         const size_t gn = pfx_gdn_bytes(), kn = pfx_kv_bytes(L);
         std::vector<int> toks(prompt.begin(), prompt.begin() + L);
         pfx_last_persist = L;
+        if (slot) pram->publish(slot, prompt, L);
         pfx_busy.store(true);
-        fprintf(stderr, "[pfx] persisting L=%d (%.2f GB, export %.0f ms)\n", L,
-                (gn + kn) / 1e9, ms);
-        pfx_thr = std::thread([this, toks = std::move(toks), L, gn, kn] {
-            pcache->write(toks, L, pfx_stage, gn, pfx_stage + gn, kn);
+        fprintf(stderr, "[pfx] persisting L=%d (%.2f GB, export %.0f ms%s)\n", L,
+                (gn + kn) / 1e9, ms, slot ? ", RAM-resident" : "");
+        pfx_thr = std::thread([this, toks = std::move(toks), L, gn, kn, dst, slot] {
+            pcache->write(toks, L, dst, gn, dst + gn, kn);
             pfx_busy.store(false);
         });
     }
@@ -3550,17 +3565,50 @@ struct Engine {
             // state; a failed read falls through to a normal cold prefill.
             q27::PrefixCache::Entry pe;
             bool pfx_hit = false;
-            if (base == 0 && ck < 0 && pcache && pcache->enabled() && pcache->find(prompt, &pe)) {
+            pfx_ram_hit.reset();
+            // P16c: the host-RAM tier sits between the VRAM tiers and disk.
+            // Same verification rule (full token compare, inside find()).
+            if (base == 0 && ck < 0 && pram && pram->enabled()) {
+                pfx_read_ms = 0;
+                if ((pfx_ram_hit = pram->find(prompt))) {
+                    base = (int)pfx_ram_hit->toks.size();
+                    pfx_hit = true;
+                    pfx_last_persist = base;
+                }
+            }
+            if (!pfx_hit && base == 0 && ck < 0 && pcache && pcache->enabled() &&
+                pcache->find(prompt, &pe)) {
+                // Time the ALLOCATION separately from the read. Folding them
+                // together made a first-touch cudaMallocHost look like a
+                // 12-20 s disk read (2026-07-24) -- pinned host allocation of
+                // ~1 GB is not free, and it is a one-time cost per buffer, not
+                // per restore.
+                auto ta = std::chrono::steady_clock::now();
+                // Read STRAIGHT into a RAM-tier slot when one is free: the blob
+                // is then already resident for the next restore at zero extra
+                // copy. Falls back to the engine's own staging buffer when the
+                // tier is off or every slot is busy.
+                q27::PrefixRam::BlobPtr slot;
+                if (pram && pram->enabled()) slot = pram->acquire(pfx_bytes(pe.L));
+                char* dst = slot ? slot->p : (pfx_stage_ensure(pe.L) ? pfx_stage : nullptr);
+                pfx_alloc_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - ta).count();
                 auto t0 = std::chrono::steady_clock::now();
-                if (pfx_stage_ensure(pe.L) &&
-                    pcache->read_state(pe, pfx_stage, pfx_bytes(pe.L))) {
+                if (dst && pcache->read_state(pe, dst, pfx_bytes(pe.L))) {
                     base = pe.L;
                     pfx_hit = true;
-                    fprintf(stderr, "[pfx] restore L=%d (%.2f GB, read %.0f ms) <- %s\n", pe.L,
-                            pfx_bytes(pe.L) / 1e9,
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - t0).count(),
-                            pe.path.c_str());
+                    if (slot) {
+                        pram->publish(slot, prompt, pe.L);
+                        pfx_ram_hit = slot;
+                    }
+                    pfx_read_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                    // A restored prefix counts as already-persisted for the step
+                    // gate. Without this a fresh process restores L and then
+                    // immediately writes a SECOND ~1 GB entry for the same
+                    // conversation at stable_len, every boot (the amplification
+                    // flagged at v0.6.0).
+                    pfx_last_persist = pe.L;
                 } else {
                     fprintf(stderr, "[pfx] read FAILED for %s -- cold prefill\n", pe.path.c_str());
                 }
@@ -3598,7 +3646,18 @@ struct Engine {
                 // past the prefix (never read, but a trap for the next reader).
                 reset();
                 ckpt_clear();
-                pfx_import(base, pfx_stage);
+                auto ti = std::chrono::steady_clock::now();
+                pfx_import(base, pfx_ram_hit ? pfx_ram_hit->p : pfx_stage);
+                // read vs import split: read is what the RAM tier removes,
+                // import (H2D, ~38 ms/GB pinned) is the floor.
+                fprintf(stderr,
+                        "[pfx] restore L=%d (%.2f GB, %s, alloc %.0f ms + read %.0f ms + "
+                        "import %.0f ms)\n",
+                        base, pfx_bytes(base) / 1e9, pfx_read_ms == 0 ? "RAM" : "disk",
+                        pfx_alloc_ms, pfx_read_ms,
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - ti).count());
+                pfx_ram_hit.reset();
             }
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }

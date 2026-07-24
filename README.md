@@ -516,12 +516,27 @@ than coerced. Tuning: `--prefix-cache-max-gb 20` (LRU eviction),
 `--prefix-cache-min 4096`, `--prefix-cache-max-tokens 32768` (also sizes the
 pinned staging buffer, ~1.3 GB at fp8), `--prefix-cache-step 8192`.
 
+On boot the most recent entries are read into the page cache on a background
+thread, under the cover of the weight upload: that takes the first restore
+after a restart from a 681 ms cold read to 36-39 ms. (`posix_fadvise
+(WILLNEED)` was measured doing nothing at this size -- it is advisory and the
+kernel declines a 1 GB readahead -- so the prefetch does a real chunked read.)
+
+`--prefix-cache-ram-gb N` adds a pinned host-RAM tier above the disk. It is
+**off by default on measured grounds**: a restore is alloc + read + import,
+import (H2D) is a hard floor of ~38 ms/GB, and the boot prefetch already makes
+the read 36-39 ms, so the tier makes the FIRST restore slightly slower (bigger
+pinned slot) and saves 40-110 ms only on a repeat restore landing on a
+different slot. Turn it on when the page cache is under pressure from other
+work; otherwise leave it alone. Full numbers in
+`docs/plans/2026-07-24-persistent-prefix-cache.md`.
+
 Costs and limits: an entry is ~36 KiB/token at fp8 (~1.1 GB for 25K tokens,
 ~14 KiB/token at turbo3); persisting costs ~38 ms of D2H on the one turn
-that pays it plus a background write; `/v1/responses` and raw
-`/v1/completions` can restore but never persist (no stable boundary is
-computed there). It stores conversation content on disk in plaintext --
-see `docs/SECURITY-MODEL.md`.
+that pays it plus a background write; raw `/v1/completions` can restore but
+never persists, and `/v1/responses` writes only the system-block entry (it
+computes no stable boundary). It stores conversation content on disk in
+plaintext -- see `docs/SECURITY-MODEL.md`.
 
 **Auth.** Off by default -- loopback-only binding is the actual safety net
 (see `docs/SECURITY-MODEL.md`); this is a convenience for the cases that

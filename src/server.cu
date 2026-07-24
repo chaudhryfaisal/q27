@@ -129,7 +129,10 @@ int main(int argc, char** argv) {
                 "  conversation restores instead of re-prefilling. Tuning:\n"
                 "  --prefix-cache-max-gb 20 --prefix-cache-min 4096\n"
                 "  --prefix-cache-max-tokens 32768 --prefix-cache-step 8192.\n"
-                "  max-tokens also sizes the pinned staging buffer.\n",
+                "  max-tokens also sizes the pinned staging buffer.\n"
+                "  --prefix-cache-ram-gb 0 adds a pinned host-RAM tier above the\n"
+                "  disk; off by default (the boot prefetch already makes reads\n"
+                "  36-39 ms, so it saves little -- see the plan doc).\n",
                 argv[0]);
         return 1;
     }
@@ -150,6 +153,7 @@ int main(int argc, char** argv) {
     bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
     std::vector<std::string> api_keys;
     q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
+    double pfx_ram_gb = 0;       // P16c: host-RAM tier budget (0 = off)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -178,6 +182,8 @@ int main(int argc, char** argv) {
             pfx_cfg.max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefix-cache-step") && i + 1 < argc)
             pfx_cfg.step_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-ram-gb") && i + 1 < argc)
+            pfx_ram_gb = atof(argv[++i]);
         // Auth config is fail-LOUD in both directions: an empty key can never
         // authenticate anything (api_key_valid rejects an empty `provided`
         // before comparing), so accepting one would stand up a server that
@@ -499,6 +505,7 @@ int main(int argc, char** argv) {
     // engines: an engine's destructor joins its writer thread, and that thread
     // calls into this object. Off unless --prefix-cache names a directory.
     q27::PrefixCache pfx_cache;
+    q27::PrefixRam pfx_ram;
     if (!pfx_cfg.root.empty()) {
         const char* kve = getenv("Q27_KV");
         const int kvk = kve && !strcmp(kve, "fp8")       ? KV_FP8
@@ -552,7 +559,10 @@ int main(int argc, char** argv) {
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
         s.eng->fast_head = fast;
-        if (pfx_cache.enabled()) s.eng->pcache = &pfx_cache; // P16 disk tier
+        if (pfx_cache.enabled()) {
+            s.eng->pcache = &pfx_cache;  // P16 disk tier
+            s.eng->pram = &pfx_ram;      // P16c host-RAM tier (no-op when 0 slots)
+        }
         // graph-zoo capture gate (issue #1): without --constrain-tools the
         // P11 monolithic draft/verify graphs are unreachable -- skip capture.
         s.eng->capture_constrained = constrain_tools;
@@ -561,6 +571,10 @@ int main(int argc, char** argv) {
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
     }
+    // P16c sizing needs an engine: pfx_bytes() depends on the KV format and
+    // the layer geometry. Slots are built by now, so ask slot 0.
+    if (pfx_cache.enabled() && pfx_ram_gb > 0 && !slots.empty())
+        pfx_ram.init((size_t)(pfx_ram_gb * 1e9), slots[0].eng->pfx_bytes(pfx_cfg.max_tokens));
     {
         // headroom line (also the auto-ctx calibration probe: this minus the
         // post-weights line minus exact KV = the non-KV fixed stack)
@@ -2174,11 +2188,17 @@ int main(int argc, char** argv) {
         // P16 does not apply to this shape (no stable_off / sys_off is computed
         // here), but the engine field is per-engine state -- set it so a
         // previous request's value cannot leak into this one.
-        const int sys_len = 0;
+        int sys_len = 0; // P16b: set below if this request carries a system block
         auto tk0 = std::chrono::steady_clock::now();
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
-        std::vector<int> prompt =
-            tok.encode(q27::chatml_prompt(merged, tools, thinking));
+        size_t sys_off = 0;
+        const std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
+        std::vector<int> prompt = tok.encode(rendered);
+        // P16b applies here even though P16a does not: this shape computes no
+        // stable_off (so it never persists a stable entry), but a system+tools
+        // block is a system+tools block, and codex re-sends one every session.
+        if (pfx_cache.enabled() && sys_off > 0)
+            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
         // review follow-up 2026-07-09 #3: the bound includes the spec-round
