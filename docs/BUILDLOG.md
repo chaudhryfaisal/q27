@@ -8330,3 +8330,38 @@ request-derived content past process lifetime, and a cache directory is
 conversation content in plaintext (token IDs are the verification payload, so
 prompt text is recoverable with the tokenizer alone). "Cross-session checkpoint
 pool" retired from the parked-levers list in README/notes.md.
+
+## 2026-07-24 -- v0.6.0 RELEASED (tag @ 45c2cf4)
+
+github.com/signalnine/q27/releases/tag/v0.6.0. One feature since v0.5.0, plus
+the serving audit that preceded it.
+
+**P16 persistent prefix cache (`--prefix-cache DIR`, opt-in, off by default).**
+The first tier of prefix reuse that survives the process. P16a persists the P8
+stable prefix (restart case): 26,700-token prompt, restart TTFT **8.15 s ->
+1.20 s** with the page cache cold, bitwise identical output. P16b adds an entry
+cut inside the system+tools block, which a DIFFERENT conversation can restore:
+proven with two conversations sharing an 11,029-token system block on a 2-slot
+server, B restoring the entry A wrote (`hit=10240 pf=796`) on the other slot.
+Verification is by exact token comparison, never by hash. Multi-slot and
+continuous batching proven under real k>=2 fusion (`bat=2.0,65`), bitwise
+identical to the cache-off reference with an identical fusion histogram.
+
+**Serving audit fixes (2026-07-24, pre-P16).** A dangling `thinking` reference
+in ALL THREE streaming handlers (a handler local read from the SSE provider
+after the frame died -- benign only by stack-layout luck); present-but-null
+request fields 500ing instead of defaulting (`{"max_tokens": null}` is how many
+OpenAI-compatible clients spell "unset"); two `is_object()` guards sitting one
+line after the `value()` call they guarded; `--api-key-file` silently
+disabling auth when the file opened but yielded no usable key.
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS, plus the six P16-specific gates
+(bitwise restore, forged-collision refusal, compat refusal, truncation
+refusal, no-solo-regression, restart proof). Assets: tarball sha256
+aa7d94e0 + SHA256SUMS-0.6.0. Driver floor r580+ unchanged.
+
+NOTE: a cache directory holds conversation content in plaintext -- the token
+IDs are the verification payload, so prompt text is recoverable with the
+tokenizer alone. docs/SECURITY-MODEL.md addendum 2026-07-24 covers it.
