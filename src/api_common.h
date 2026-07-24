@@ -21,6 +21,45 @@
 namespace q27 {
 using json = nlohmann::json;
 
+// ---- tolerant request-field readers ---------------------------------------
+// json::value() THROWS type_error.302 when a key is PRESENT but null or
+// wrong-typed, and httplib turns any throw out of a handler into a 500 with an
+// EXCEPTION_WHAT header (the routing() try/catch in third_party/httplib.h).
+// "Present and null" is how a large share of OpenAI-compatible clients spell
+// "unset" -- {"max_tokens": null, "temperature": null, "stream": null} comes
+// straight out of LangChain/LiteLLM-class request builders. Answering those
+// with a 500 is wrong twice over: wrong actor (the request was fine), and
+// wrong status class (500 is retryable, so the client loops the same body).
+// These read null / wrong-typed exactly like ABSENT, which is what the field
+// means on the wire. Numbers are read through double so an integer field sent
+// as 8192.0 still works, and clamped to int range so a nonsense magnitude
+// can't overflow the int the callers assign into.
+inline double jnum(const json& b, const char* key, double dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_number()) ? it->get<double>() : dflt;
+}
+inline long jint(const json& b, const char* key, long dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    if (it == b.end() || !it->is_number()) return dflt;
+    const double v = it->get<double>();
+    if (v >= 2147483647.0) return 2147483647L;
+    if (v <= -2147483648.0) return -2147483648L;
+    return (long)v;
+}
+inline bool jbool(const json& b, const char* key, bool dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_boolean()) ? it->get<bool>() : dflt;
+}
+inline std::string jstr(const json& b, const char* key,
+                        const std::string& dflt = std::string()) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_string()) ? it->get<std::string>() : dflt;
+}
+
 // Incremental UTF-8 boundary gate for streaming token pieces. BPE token
 // boundaries can split a multi-byte character (em dash E2 80 94 is a Qwopus
 // favorite), the raw piece is then invalid UTF-8, and nlohmann json::dump
@@ -300,9 +339,9 @@ inline std::string ctx_limit_error_message(int n_prompt, int n_max_prompt) {
 // /v1/messages request mapping; count_tokens must count the same bytes).
 inline json anthropic_tools_json(const json& body) {
     json out = json::array();
-    if (body.contains("tools"))
+    if (body.contains("tools") && body["tools"].is_array())
         for (auto& t : body["tools"]) {
-            if (!t.contains("name")) continue;
+            if (!t.is_object() || !t.contains("name")) continue;
             out.push_back({{"type", "function"},
                            {"function", {{"name", t["name"]},
                                          {"description", t.value("description", "")},
@@ -322,7 +361,11 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         if (body["system"].is_string()) sys = body["system"];
         else if (body["system"].is_array())
             for (auto& b : body["system"])
-                if (b.value("type", "") == "text") sys += b.value("text", "");
+                // is_object() FIRST: value() on a non-object throws 306, which
+                // httplib reports as a 500 -- a bare string in the array is a
+                // client-side shape error, not a server fault (same guard
+                // openai_msgs has always had on its content parts).
+                if (b.is_object() && b.value("type", "") == "text") sys += b.value("text", "");
         if (!sys.empty()) {
             normalize_cc_billing_header(sys);
             msgs.push_back({"system", sys});
@@ -330,13 +373,19 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
     }
     if (!body.contains("messages")) return msgs;
     for (auto& m : body["messages"]) {
+        // is_object() BEFORE the first value() call: value() on a non-object
+        // (messages:["hi"]) throws 306 -- which the old ordering did one line
+        // ahead of the guard meant to prevent exactly that. A non-object
+        // element is skipped, matching openai_msgs.
+        if (!m.is_object()) continue;
         std::string role = m.value("role", "user"), think, content;
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
-        if (!m.is_object() || !m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (!m.contains("content")) { msgs.push_back({role, content}); continue; }
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
+                if (!part.is_object()) continue; // bare string in a content array
                 std::string ty = part.value("type", "");
                 if (ty == "text") content += part.value("text", "");
                 else if (ty == "thinking") think += part.value("thinking", "");
@@ -351,7 +400,8 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                         if (part["content"].is_string()) rc = part["content"];
                         else if (part["content"].is_array())
                             for (auto& b : part["content"])
-                                if (b.value("type", "") == "text") rc += b.value("text", "");
+                                if (b.is_object() && b.value("type", "") == "text")
+                                    rc += b.value("text", "");
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_response_text(rc);
@@ -1414,8 +1464,9 @@ inline std::string extract_api_key(const std::string& authorization_header,
 // (no early return on the first match) so total compare time depends only
 // on key count/length, not on which key -- if any -- matched, or how far
 // into it a wrong guess got. An empty `provided` is always rejected without
-// comparing (an empty key is never configured -- see set_api_keys below --
-// so this is a fast path, not a security-relevant branch).
+// comparing; an empty KEY is never configured either (load_api_key_file drops
+// blank lines, and server.cu's arg parser refuses an empty --api-key /
+// Q27_API_KEY at boot), so this is a fast path, not a security-relevant branch.
 inline bool api_key_valid(const std::string& provided, const std::vector<std::string>& keys) {
     if (provided.empty()) return false;
     bool any = false;
@@ -1440,6 +1491,9 @@ inline std::string auth_error_json(bool anthropic_shape) {
 // ignored, surrounding whitespace trimmed). Returns false (and leaves `out`
 // untouched) if the file can't be opened, so the caller can fail loudly
 // with the actual path rather than silently starting with no auth.
+// A file that OPENS but yields no keys (all blank/comment) also returns true
+// with `out` unchanged -- the caller must compare sizes and refuse, or an
+// operator who asked for auth gets a server with none (server.cu does).
 inline bool load_api_key_file(const std::string& path, std::vector<std::string>* out) {
     std::ifstream f(path);
     if (!f.is_open()) return false;

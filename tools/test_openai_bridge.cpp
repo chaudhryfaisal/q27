@@ -148,6 +148,92 @@ static void test_msgs_content_less_message_no_crash() {
     CHECK(msgs[0].content.empty());
 }
 
+// ---- tolerant request-field readers (jnum/jint/jbool/jstr) ----------------
+// json::value() throws type_error.302 on a PRESENT-but-null key, and httplib
+// turns a handler throw into a 500 -- but {"max_tokens": null} is how a large
+// share of OpenAI-compatible clients spell "unset". null / wrong-typed must
+// read exactly like absent.
+static void test_jread_null_reads_as_absent() {
+    json body = json::parse(R"({"max_tokens":null,"stream":null,"temperature":null,
+                                "top_p":null,"prompt":null})");
+    CHECK(q27::jint(body, "max_tokens", 8192) == 8192);
+    CHECK(!q27::jbool(body, "stream", false));
+    CHECK(q27::jbool(body, "stream", true));
+    CHECK(q27::jnum(body, "temperature", 0.0) == 0.0);
+    CHECK(q27::jnum(body, "top_p", 1.0) == 1.0);
+    CHECK(q27::jstr(body, "prompt", "dflt") == "dflt");
+}
+
+static void test_jread_wrong_type_reads_as_absent() {
+    json body = json::parse(R"({"max_tokens":"512","stream":"yes","temperature":{},"prompt":7})");
+    CHECK(q27::jint(body, "max_tokens", 8192) == 8192);
+    CHECK(!q27::jbool(body, "stream", false));
+    CHECK(q27::jnum(body, "temperature", 0.0) == 0.0);
+    CHECK(q27::jstr(body, "prompt", "dflt") == "dflt");
+}
+
+static void test_jread_present_values_win() {
+    json body = json::parse(R"({"max_tokens":512,"stream":true,"temperature":0.7,
+                                "top_p":0.95,"prompt":"hi"})");
+    CHECK(q27::jint(body, "max_tokens", 8192) == 512);
+    CHECK(q27::jbool(body, "stream", false));
+    CHECK(q27::jnum(body, "temperature", 0.0) == 0.7);
+    CHECK(q27::jnum(body, "top_p", 1.0) == 0.95);
+    CHECK(q27::jstr(body, "prompt", "dflt") == "hi");
+}
+
+static void test_jint_float_and_absurd_magnitude() {
+    // an integer field sent as a float still works; a nonsense magnitude
+    // clamps instead of overflowing the int the callers assign into
+    json body = json::parse(R"({"a":8192.0,"big":1e30,"neg":-1e30})");
+    CHECK(q27::jint(body, "a", 0) == 8192);
+    CHECK(q27::jint(body, "big", 0) == 2147483647L);
+    CHECK(q27::jint(body, "neg", 0) == -2147483648L);
+    CHECK(q27::jint(json::array(), "a", 5) == 5); // non-object body
+}
+
+// ---- malformed-shape robustness (must not throw -> no spurious 500) -------
+static void test_anthropic_msgs_non_object_message_skipped() {
+    json body = json::parse(R"({"messages":["hi",3,{"role":"user","content":"real"}]})");
+    auto msgs = q27::anthropic_msgs(body);
+    CHECK(msgs.size() == 1);
+    if (msgs.size() == 1) CHECK(msgs[0].content == "real");
+}
+
+static void test_anthropic_msgs_bare_string_content_part_skipped() {
+    json body = json::parse(
+        R"({"messages":[{"role":"user","content":["bare",{"type":"text","text":"kept"}]}]})");
+    auto msgs = q27::anthropic_msgs(body);
+    CHECK(msgs.size() == 1);
+    if (msgs.size() == 1) CHECK(msgs[0].content == "kept");
+}
+
+static void test_anthropic_msgs_system_array_of_strings() {
+    json body = json::parse(R"({"system":["bare",{"type":"text","text":"sys"}],"messages":[]})");
+    auto msgs = q27::anthropic_msgs(body);
+    CHECK(msgs.size() == 1);
+    if (msgs.size() == 1) {
+        CHECK(msgs[0].role == "system");
+        CHECK(msgs[0].content == "sys");
+    }
+}
+
+static void test_anthropic_msgs_tool_result_bare_string_content() {
+    json body = json::parse(R"({"messages":[{"role":"user","content":[
+        {"type":"tool_result","content":["bare",{"type":"text","text":"out"}]}]}]})");
+    auto msgs = q27::anthropic_msgs(body);
+    CHECK(msgs.size() == 1);
+    if (msgs.size() == 1) CHECK(msgs[0].content.find("out") != std::string::npos);
+}
+
+static void test_anthropic_tools_non_array_and_non_object_entries() {
+    json body = json::parse(R"({"tools":["str",7,{"name":"Read","input_schema":{}}]})");
+    json out = q27::anthropic_tools_json(body);
+    CHECK(out.size() == 1);
+    json body2 = json::parse(R"({"tools":{"not":"an array"}})");
+    CHECK(q27::anthropic_tools_json(body2).empty());
+}
+
 static void test_tool_choice_absent_is_auto() {
     json body = json::object();
     auto tc = q27::parse_tool_choice(body);
@@ -315,6 +401,15 @@ int main() {
     test_msgs_malformed_arguments_string_kept_not_dropped();
     test_msgs_no_messages_key();
     test_msgs_content_less_message_no_crash();
+    test_jread_null_reads_as_absent();
+    test_jread_wrong_type_reads_as_absent();
+    test_jread_present_values_win();
+    test_jint_float_and_absurd_magnitude();
+    test_anthropic_msgs_non_object_message_skipped();
+    test_anthropic_msgs_bare_string_content_part_skipped();
+    test_anthropic_msgs_system_array_of_strings();
+    test_anthropic_msgs_tool_result_bare_string_content();
+    test_anthropic_tools_non_array_and_non_object_entries();
     test_tool_choice_absent_is_auto();
     test_tool_choice_none();
     test_tool_choice_required();

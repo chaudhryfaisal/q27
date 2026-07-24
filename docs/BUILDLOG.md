@@ -8164,3 +8164,55 @@ SHA256SUMS-0.5.0. Driver floor r580+ unchanged. NOTE (harness lesson): the
 q4s sampled anchor REQUIRES `--ctx 2048 --spec` -- sampled spec-vs-plain
 trajectories are different-but-both-valid, so omitting --spec yields a
 plausible-looking wrong md5.
+
+## 2026-07-24 -- serving audit: dangling `thinking` capture + 3 robustness fixes
+
+Post-v0.5.0 read-through of the serving layer, no new features. Four defects,
+all found by inspection, all fixed and verified live on the 5090.
+
+**#1 (the real one) `thinking` was a DANGLING REFERENCE in all three streaming
+handlers.** fee3b27 added `bool thinking` as a handler local and read it inside
+the SSE providers -- but every provider capture list enumerates its handler
+locals BY VALUE precisely because httplib runs the provider from
+`write_response()`, a sibling call of `routing()` in `Server::process_request`
+(third_party/httplib.h:7136 vs :6474): the handler frame is dead by then.
+`thinking` was the one local that missed all three lists (/v1/chat/completions,
+/v1/messages, /v1/responses), so every streamed request since 2026-07-20 read a
+byte of a dead stack frame. It has not visibly misbehaved -- a standalone
+repro against the same httplib shows the slot surviving intact both ways -- but
+that is stack-layout luck, not correctness, and the failure mode when it flips
+is the whole answer routing to the wrong channel (reasoning_content / a
+thinking block, empty content) on the CC path. Fixed by adding `thinking` to
+the three capture lists.
+
+**#2 present-but-null request fields 500'd.** `json::value()` throws
+type_error.302 when a key exists but is null or wrong-typed, and httplib turns
+a handler throw into a 500 -- yet `{"max_tokens": null, "temperature": null,
+"stream": null}` is how LangChain/LiteLLM-class clients spell "unset". New
+tolerant readers `jnum/jint/jbool/jstr` (api_common.h) read null/wrong-typed as
+ABSENT; all 11 request-field sites across the three API shapes converted.
+jint also reads 8192.0 correctly and clamps absurd magnitudes.
+
+**#3 two guards sat one line AFTER the call they were guarding.**
+anthropic_msgs read `m.value("role", ...)` before its own `!m.is_object()`
+check (same in server.cu's build_prompt), so `messages:["hi"]` threw 306 ->
+500. Also added the `is_object()` check openai_msgs always had to the Anthropic
+content-part loop, the `system:[...]` loop, the tool_result content loop,
+anthropic_tools_json, text_of, and the /v1/responses input+tools loops.
+
+**#4 `--api-key-file` could silently disable auth.** A file that opens but
+yields no usable key (all blank/#comment) returned true with zero keys added
+-> the pre-routing handler was never installed -> auth OFF while the operator
+believed it on. Now compares sizes and refuses to boot; `--api-key ""` (a key
+that can never match, so the server would 401 everything) refuses too.
+
+VERIFIED live (5090, vanilla a2982c51, port 8099): no-think server streams text
+blocks only; `--think --request-think` streams a real thinking block (1
+content_block_start + 96 thinking_deltas) and honors a request-level
+`thinking:{type:"disabled"}` (text only); zero `</think>` leakage into content;
+null-field bodies 200 (were 500); `messages:["bogus",7,{...}]` + bare-string
+content parts 200 with the malformed elements skipped; all three auth
+mis-config paths exit 1 with a specific message. CPU suites 8/8 PASS
+(test_openai_bridge +9 cases, test_auth +1). No kernel, prompt-construction or
+sampling change -- the CLI canonical gates are untouched by construction
+(build/q27 does not compile api_common.h or server.cu).

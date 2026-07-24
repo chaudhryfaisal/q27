@@ -62,10 +62,13 @@ static q27k::SampleParams parse_sample(const json& body) {
     static std::atomic<unsigned long long> force_seed_ctr{0};
 
     q27k::SampleParams s{0.f, 1.f, 0ull};
-    double temp = body.value("temperature", force_temp);
+    // jnum/jint/jbool (api_common.h), not value(): a present-but-null field is
+    // how many OpenAI-compatible clients spell "unset", and value() throws on
+    // it -> httplib 500. Read null/wrong-typed as absent.
+    double temp = q27::jnum(body, "temperature", force_temp);
     if (temp > 0.0) {
         s.inv_temp = (float)(1.0 / temp);
-        double tp = body.value("top_p", force_tp);
+        double tp = q27::jnum(body, "top_p", force_tp);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
@@ -158,10 +161,30 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
-        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) api_keys.push_back(argv[++i]);
+        // Auth config is fail-LOUD in both directions: an empty key can never
+        // authenticate anything (api_key_valid rejects an empty `provided`
+        // before comparing), so accepting one would stand up a server that
+        // 401s every request; and a key FILE that opens but yields nothing
+        // usable would stand up a server with auth silently OFF, which is the
+        // opposite of what the operator asked for. Refuse both at boot.
+        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) {
+            if (!argv[++i][0]) {
+                fprintf(stderr, "error: --api-key: empty key (an empty key can never match)\n");
+                return 1;
+            }
+            api_keys.push_back(argv[i]);
+        }
         else if (!strcmp(argv[i], "--api-key-file") && i + 1 < argc) {
+            const size_t before = api_keys.size();
             if (!q27::load_api_key_file(argv[++i], &api_keys)) {
                 fprintf(stderr, "error: --api-key-file %s: could not open\n", argv[i]);
+                return 1;
+            }
+            if (api_keys.size() == before) {
+                fprintf(stderr,
+                        "error: --api-key-file %s: no keys found (every line blank or a "
+                        "#comment) -- refusing to start with auth silently disabled\n",
+                        argv[i]);
                 return 1;
             }
         }
@@ -555,6 +578,7 @@ int main(int argc, char** argv) {
         std::string out;
         if (v.is_array())
             for (auto& p : v) {
+                if (!p.is_object()) continue; // bare string in a content array
                 std::string ty = p.value("type", "");
                 if (ty == "text" || ty == "input_text" || ty == "output_text")
                     out += p.value("text", "");
@@ -1069,16 +1093,20 @@ int main(int argc, char** argv) {
         if (body.contains("messages")) {
             std::vector<std::pair<std::string, std::string>> msgs;
             for (auto& m : body["messages"]) {
+                // is_object() BEFORE any value() call: value() on a non-object
+                // element throws 306 -> httplib 500 (same ordering fix as
+                // anthropic_msgs).
+                if (!m.is_object()) continue;
                 std::string role = m.value("role", "user");
                 std::string content;
                 // const operator[] on a missing key aborts (json.hpp assertion) --
                 // a content-less message must not kill the server (Security #1;
                 // mirrors the Anthropic-path guard in api_common.h).
-                if (m.is_object() && m.contains("content")) {
+                if (m.contains("content")) {
                     if (m["content"].is_string()) content = m["content"];
                     else if (m["content"].is_array())
                         for (auto& part : m["content"])
-                            if (part.value("type", "") == "text")
+                            if (part.is_object() && part.value("type", "") == "text")
                                 content += part.value("text", "");
                 }
                 msgs.push_back({role, content});
@@ -1090,7 +1118,7 @@ int main(int argc, char** argv) {
             bool think = q27::resolve_think(body, !no_think_srv, req_think);
             return tok.apply_chat_template(msgs, think);
         }
-        return tok.encode(body.value("prompt", std::string()));
+        return tok.encode(q27::jstr(body, "prompt"));
     };
 
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
@@ -1101,9 +1129,10 @@ int main(int argc, char** argv) {
         // across all three API shapes. Clamped to the context window below, so a
         // big default can't over-reserve; 8192 covers a real answer plus a short
         // think trace. A long *thinking* request should still set max_tokens
-        // explicitly (a grad-level trace wants 16K+).
-        int n_max = body.value("max_tokens", 8192);
-        bool stream = body.value("stream", false);
+        // explicitly (a grad-level trace wants 16K+). jint/jbool: a
+        // present-but-null field reads as absent (see parse_sample).
+        int n_max = (int)q27::jint(body, "max_tokens", 8192);
+        bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
         // usage totals -- goes out after the finish_reason chunk, before
@@ -1198,7 +1227,7 @@ int main(int argc, char** argv) {
         // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
         // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
         // request-absent default here is genuinely greedy.)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             res.status = 400;
             res.set_content(json{{"error",
                                   {{"message", "sampling disabled: server booted with "
@@ -1385,8 +1414,15 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            // EVERY handler local this lambda reads must be captured BY VALUE:
+            // httplib runs the provider from write_response(), long after this
+            // handler's frame is dead (routing() and write_response() are
+            // sibling calls in Server::process_request). `thinking` shipped as
+            // a by-reference read of that dead frame from 2026-07-20 until the
+            // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
-             tools, tool_names_v, tchoice, stable_len, has_tools, rid](size_t, httplib::DataSink& sink) {
+             tools, tool_names_v, tchoice, stable_len, has_tools, rid,
+             thinking](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
@@ -1617,8 +1653,8 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
-        int n_max = body.value("max_tokens", 8192); // unified default (see /v1/chat/completions)
-        bool stream = body.value("stream", false);
+        int n_max = (int)q27::jint(body, "max_tokens", 8192); // unified default (see /v1/chat/completions)
+        bool stream = q27::jbool(body, "stream", false);
         json tools = q27::anthropic_tools_json(body);
         std::vector<std::string> tool_names_v;
         if (constrain_tools && tools.is_array())
@@ -1659,7 +1695,7 @@ int main(int argc, char** argv) {
             return;
         }
         // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             anthropic_400(res,
                           "sampling disabled: server booted with Q27_SAMPLED=0 "
                           "(greedy-only)");
@@ -1790,8 +1826,9 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt](
-                size_t, httplib::DataSink& sink) {
+            // by-value or dangling: see the /v1/chat/completions twin
+            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt,
+             thinking](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
@@ -1998,8 +2035,9 @@ int main(int argc, char** argv) {
         // types (web_search etc.) are skipped, never rejected.
         json tools = json::array();
         std::set<std::string> custom_names;
-        if (body.contains("tools"))
+        if (body.contains("tools") && body["tools"].is_array())
             for (auto& t : body["tools"]) {
+                if (!t.is_object()) continue; // value() on a non-object throws 306
                 std::string ty = t.value("type", "");
                 if (ty == "function") {
                     tools.push_back({{"type", "function"},
@@ -2034,21 +2072,23 @@ int main(int argc, char** argv) {
                 msgs.push_back({"user", body["input"]});
             } else if (body["input"].is_array()) {
                 for (auto& it : body["input"]) {
-                    std::string ty = it.value("type", "message");
+                    if (!it.is_object()) continue; // value() on a non-object throws 306
+                    std::string ty = q27::jstr(it, "type", "message");
                     if (ty == "message") {
-                        std::string role = it.value("role", "user");
+                        std::string role = q27::jstr(it, "role", "user");
                         if (role == "developer") role = "system";
-                        msgs.push_back({role, text_of(it["content"])});
+                        msgs.push_back(
+                            {role, it.contains("content") ? text_of(it["content"]) : std::string()});
                     } else if (ty == "function_call" || ty == "custom_tool_call") {
                         json args;
                         if (ty == "function_call") {
-                            try { args = json::parse(it.value("arguments", "{}")); }
-                            catch (...) { args = it.value("arguments", ""); }
+                            try { args = json::parse(q27::jstr(it, "arguments", "{}")); }
+                            catch (...) { args = q27::jstr(it, "arguments"); }
                         } else {
-                            args = {{"input", it.value("input", "")}};
+                            args = {{"input", q27::jstr(it, "input")}};
                         }
                         msgs.push_back({"assistant",
-                                        q27::tool_call_text(it.value("name", ""), args)});
+                                        q27::tool_call_text(q27::jstr(it, "name"), args)});
                     } else if (ty == "function_call_output" || ty == "custom_tool_call_output") {
                         std::string out;
                         if (it.contains("output")) {
@@ -2071,7 +2111,7 @@ int main(int argc, char** argv) {
                 merged.push_back(m);
         }
 
-        int n_max = body.value("max_output_tokens", 8192); // unified default (see /v1/chat/completions)
+        int n_max = (int)q27::jint(body, "max_output_tokens", 8192); // unified default (see /v1/chat/completions)
         auto tk0 = std::chrono::steady_clock::now();
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         std::vector<int> prompt =
@@ -2088,7 +2128,7 @@ int main(int argc, char** argv) {
             return;
         }
         // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             res.status = 400;
             res.set_content("{\"error\":{\"code\":\"sampling_disabled\",\"message\":"
                             "\"sampling disabled: server booted with Q27_SAMPLED=0\"}}",
@@ -2097,7 +2137,7 @@ int main(int argc, char** argv) {
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
-        bool stream = body.value("stream", false);
+        bool stream = q27::jbool(body, "stream", false);
 
         // shared generation -> output items
         struct GenOut { json items = json::array(); int produced = 0; };
@@ -2228,7 +2268,9 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt](size_t, httplib::DataSink& sink) {
+            // by-value or dangling: see the /v1/chat/completions twin
+            [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
+             thinking](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
