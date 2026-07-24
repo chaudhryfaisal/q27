@@ -313,6 +313,14 @@ q27 treats the GDN summary as a first-class object instead of a cache miss:
 - **P9 checkpoint ring**: pinned-host copies every 4096 tokens during
   prefill, so mid-history divergence rewinds to the nearest checkpoint
   instead of position 0.
+- **P16 persistent prefix cache** (v0.6.0, opt-in): both tiers above die
+  with the process, so a restart re-prefills everything. `--prefix-cache
+  DIR` writes the GDN state plus the attention/MTP rows to a file keyed on
+  the token prefix. Measured: restart TTFT **8.15 s -> 1.20 s** on a
+  26,700-token prompt, bitwise identical output. A second entry cut inside
+  the system+tools block is shared across conversations, so a NEW
+  conversation restores the part it has in common with an old one -- the
+  thing a block cache would have given a pure-attention model for free.
 - Attention KV needs neither: rows below the divergence point are
   append-only and stay valid in place.
 
@@ -483,6 +491,38 @@ gets the same computed window (logged `--ctx auto: <ctx> per slot`). Pass an
 explicit `--ctx` to set slot 0 by hand and `--slot1-ctx` for the background
 slots.
 
+**Persistent prefix cache (P16).** Off by default; `--prefix-cache DIR` turns
+it on. The P8 snapshot and P9 ring are process-lifetime, so restarting the
+server (or starting a fresh conversation) re-prefills work already done.
+This writes the recurrent state plus the attention/MTP rows for a prefix to
+a file and restores it on a later boot. Measured on a 5090, 26,700-token
+prompt: cold prefill 8.15 s, restart with a disk restore **1.20 s** (6.8x)
+with the page cache cold, 0.72 s warm, output bitwise identical either way.
+
+Two kinds of entry get written, both keyed on the token prefix itself:
+
+- at the **P8 stable boundary**, which is what a later turn of the SAME
+  conversation matches after a restart;
+- at the last prefill-chunk boundary inside the **system+tools block**,
+  which is what a DIFFERENT conversation matches -- Claude Code re-sends
+  an identical 20-25K-token system prompt every session.
+
+Lookup happens only after both RAM tiers miss. A candidate is chosen by a
+filename hash but **verified by comparing the stored token vector element by
+element** before any state is read, so a hash collision or a stale file can
+never continue the wrong conversation. Entries carry a compat hash over the
+model bytes, buffer geometry, and KV format; a mismatch is invisible rather
+than coerced. Tuning: `--prefix-cache-max-gb 20` (LRU eviction),
+`--prefix-cache-min 4096`, `--prefix-cache-max-tokens 32768` (also sizes the
+pinned staging buffer, ~1.3 GB at fp8), `--prefix-cache-step 8192`.
+
+Costs and limits: an entry is ~36 KiB/token at fp8 (~1.1 GB for 25K tokens,
+~14 KiB/token at turbo3); persisting costs ~38 ms of D2H on the one turn
+that pays it plus a background write; `/v1/responses` and raw
+`/v1/completions` can restore but never persist (no stable boundary is
+computed there). It stores conversation content on disk in plaintext --
+see `docs/SECURITY-MODEL.md`.
+
 **Auth.** Off by default -- loopback-only binding is the actual safety net
 (see `docs/SECURITY-MODEL.md`); this is a convenience for the cases that
 doc's own recommendation (put a real reverse proxy in front) is overkill
@@ -627,8 +667,7 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   the bench's 28; cap 64 swallows today's alphabet, revisit
   `Q27_BATCH_GRAPH_CAP` if multi-tenant composition churn widens it.
 
-Measured-and-parked levers (chunked-WY delta scan, cross-session
-checkpoint pool, AWQ-style scales, P11 split path, and friends):
+Measured-and-parked levers (chunked-WY delta scan, AWQ-style scales, P11 split path, and friends):
 [docs/notes.md](docs/notes.md).
 
 ## History

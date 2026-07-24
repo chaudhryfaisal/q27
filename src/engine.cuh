@@ -3021,6 +3021,11 @@ struct Engine {
     std::thread pfx_thr;
     std::atomic<bool> pfx_busy{false};
     int pfx_last_persist = 0;  // step gate: last L this engine wrote (0 = none)
+    // P16b: tokens in this request's system+tools block (server-set, 0 = none).
+    // An entry cut inside that block is the only kind a DIFFERENT conversation
+    // can hit -- the stable prefix ends inside the first user message, which is
+    // exactly what differs between conversations.
+    int pfx_sys_len = 0;
 
     size_t pfx_gdn_bytes() const {
         size_t n = 0;
@@ -3111,6 +3116,24 @@ struct Engine {
         perm = 0;
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
+    // Shared write policy for both entry kinds (P16a stable, P16b system).
+    bool pfx_should_persist(const std::vector<int>& prompt, int L) const {
+        return pcache && pcache->enabled() && !pfx_busy.load() &&
+               L >= pcache->cfg().min_tokens && L <= pcache->cfg().max_tokens &&
+               (pfx_last_persist == 0 || L - pfx_last_persist >= pcache->cfg().step_tokens) &&
+               !pcache->has(prompt, L);
+    }
+    // P16b: the LAST prefill-chunk boundary at or before the system block ends.
+    // Cutting ON a chunk boundary is deliberate -- stopping the loop at an
+    // arbitrary sys_len would re-chunk the prefill, and chunk size is not a
+    // free variable (PF_T is tuned, and a different reduction order could move
+    // results). At most PF_T-1 tokens of the block get re-prefilled on a hit,
+    // which costs ~0.3 s against the ~6 s the entry saves.
+    bool pfx_sys_cut_here(int base, int boundary) const {
+        return base == 0 && pfx_sys_len > 0 && boundary <= pfx_sys_len &&
+               boundary + (int)PF_T > pfx_sys_len;
+    }
+
     // Stage the state for [0,L) and hand it to a background writer. The D2H
     // (~50 ms at 1 GB) is on the critical path; the file write is not.
     void pfx_persist(const std::vector<int>& prompt, int L) {
@@ -3599,6 +3622,9 @@ struct Engine {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
                 }
+                // P16b: system-block entry, at most one per cold prefill.
+                if (pfx_sys_cut_here(base, c0 + Tc) && pfx_should_persist(prompt, c0 + Tc))
+                    pfx_persist(prompt, c0 + Tc);
                 round_gap();
             }
             snap_save(prompt, snap_upto);
@@ -3611,11 +3637,7 @@ struct Engine {
             // restored request persisted a second 1.09 GB entry at NP-1 that
             // nothing would ever hit again (P16 gate run 1, 2026-07-24).
             const bool pfx_stable_boundary = stable_len > base && stable_len < NP;
-            if (pcache && pcache->enabled() && pfx_stable_boundary && !pfx_busy.load() &&
-                snap_upto >= pcache->cfg().min_tokens && snap_upto <= pcache->cfg().max_tokens &&
-                (pfx_last_persist == 0 ||
-                 snap_upto - pfx_last_persist >= pcache->cfg().step_tokens) &&
-                !pcache->has(prompt, snap_upto))
+            if (pfx_stable_boundary && pfx_should_persist(prompt, snap_upto))
                 pfx_persist(prompt, snap_upto);
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);

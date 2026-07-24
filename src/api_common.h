@@ -226,8 +226,15 @@ inline std::string tools_preamble(const json& tools) {
 // stable_off (P8): char offset where the trailing assistant-open begins.
 // Everything before it re-renders identically next turn (snapshot-safe);
 // everything after (assistant open + think prefill) is per-turn volatile.
+// sys_off (P16b): char offset just past the system+tools block, or 0 when the
+// request has neither. That block is the part MULTIPLE conversations share --
+// Claude Code re-sends the same 20-25K-token system + tool definitions every
+// session -- so it is the only boundary a cross-conversation cache entry can
+// usefully be cut at. Like stable_off it abuts an <|im_start|>, so the same
+// split-invariance argument applies.
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
-                                 bool think = true, size_t* stable_off = nullptr) {
+                                 bool think = true, size_t* stable_off = nullptr,
+                                 size_t* sys_off = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -248,6 +255,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     } else if (!sys.empty()) {
         p += "<|im_start|>system\n" + sys + "<|im_end|>\n";
     }
+    if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
     for (size_t i = start; i < msgs.size(); i++)
         p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
              "<|im_end|>\n";

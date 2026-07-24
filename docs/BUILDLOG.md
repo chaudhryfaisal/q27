@@ -8281,3 +8281,52 @@ suites + auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 /
 683f7f44 / 2a4d22ea), ninv, fused_smoke. Harness note: the scratchpad gate
 script's sampled-anchor helper was still missing `--ctx 2048 --spec` and
 reported a false q4s mismatch -- the same v0.5.0 gotcha, now fixed there too.
+
+## 2026-07-24 -- P16b: the cross-conversation entry + multi-slot/batching proof
+
+P16a persisted the P8 stable prefix, which covers RESTART but not a new
+conversation: the stable boundary ends inside the first USER message, and an
+entry only helps if its L tokens are an exact prefix of the new prompt (a
+recurrent state cannot be partially restored at a shorter length). The shared
+part is the system+tools block -- Claude Code re-sends an identical 20-25K
+token system prompt every session -- so the entry has to be cut in there.
+
+**Implementation.** `chatml_prompt` now reports `sys_off`, the char offset past
+the system block (0 when there is none); the server sizes it in tokens with a
+third encode used ONLY for its length, so no request's prompt bytes change.
+The engine persists at the last prefill-CHUNK boundary at or before `sys_len`.
+Cutting on a chunk boundary is deliberate: stopping the loop at an arbitrary
+`sys_len` would re-chunk the prefill, and chunk size is not a free variable
+(PF_T is tuned, and a different reduction order could move results). At most
+PF_T-1 tokens get re-prefilled on a hit, ~0.3 s against the ~6 s an entry
+saves. Natural cadence falls out: turn 1 of a cold conversation writes the
+SYSTEM entry, turn 2+ writes the STABLE entry (one write in flight per engine,
+so they never contend).
+
+**RESULT (2 slots, batching on, 11,037-token prompts sharing an 11,029-token
+system block):** conversation A cold-prefilled and wrote the system entry at
+L=10240 (= floor(11029/1024)*1024, exactly the design). Conversation B --
+different user message, never seen before, routed to the OTHER slot -- restored
+A's entry: `hit=10240 pf=796`, `[pfx] restore L=10240`. A block cache would
+give a pure-attention model this for free; on hybrid GDN it took the state.
+Restart of the same 2-slot server: A 0.59 s, B 0.25 s, both from disk.
+
+**MULTI-SLOT + CONTINUOUS BATCHING (asked for explicitly, and the first run did
+not prove it).** The first concurrency attempt logged `bat=1.0,0` -- zero fused
+rounds, because 48-token decodes finish before they overlap. Re-ran with 400
+token decodes: `bat=2.0,65` and `bat=1.4,64/65`, i.e. real k>=2 fusion over
+64-65 rounds. Both slots restored from disk and decoded through fused rounds,
+and output was **bitwise identical to the cache-off reference** (A
+5eadd9c88df04ec2, B 8cf964b7ee52fb5b across all four runs) with an IDENTICAL
+fusion histogram in both legs -- restoring from disk perturbs neither the
+numerics nor the batching behavior. Tier order confirmed too: a second request
+on a warm slot took the in-RAM P9 ring (`hit=8192 ckpt=1`) rather than the
+disk, which is correct -- disk is consulted only after both RAM tiers miss.
+
+Docs: README serving section (both entry kinds, verification rule, costs,
+limits), the paged-KV section (P16 as the third tier under P8/P9), and
+docs/SECURITY-MODEL.md addendum -- this is the first q27 feature that persists
+request-derived content past process lifetime, and a cache directory is
+conversation content in plaintext (token IDs are the verification payload, so
+prompt text is recoverable with the tokenizer alone). "Cross-session checkpoint
+pool" retired from the parked-levers list in README/notes.md.

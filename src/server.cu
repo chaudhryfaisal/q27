@@ -1213,6 +1213,7 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        int sys_len = 0;     // P16b: system-block tokens (0 = none/feature off)
         bool thinking = false; // request wants a real <think> block; seeds the splitter below
         if (routed_chat) {
             thinking = q27::resolve_think(body, !no_think_srv, req_think);
@@ -1220,9 +1221,15 @@ int main(int argc, char** argv) {
             // injects <tool_call>\n into the tail (below), leaving no room for a
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
-            size_t stable_off = 0;
+            size_t stable_off = 0, sys_off = 0;
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+            // P16b: token length of the system+tools block. Measured with a
+            // THIRD encode used only for its length -- the prompt itself is
+            // still built from the same two pieces, so no request's bytes
+            // change when the cache is on.
+            if (pfx_cache.enabled() && sys_off > 0)
+                sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
@@ -1297,6 +1304,7 @@ int main(int argc, char** argv) {
                                   // are never set on that path, so the clear
                                   // on scope-exit is a no-op (P15 M1 pattern)
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
             // its prefill lease inside batch_generate (A7) and re-stamps qw.
             std::optional<q27::GpuGate::Lease> lk;
@@ -1466,12 +1474,13 @@ int main(int argc, char** argv) {
             // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, tchoice, stable_len, has_tools, rid,
-             thinking](size_t, httplib::DataSink& sink) {
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -1707,9 +1716,11 @@ int main(int argc, char** argv) {
                     tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
+        int sys_len = 0; // P16b: system-block tokens (0 = none/feature off)
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
-        std::string rendered =
-            q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking, &stable_off);
+        size_t sys_off = 0;
+        std::string rendered = q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking,
+                                                  &stable_off, &sys_off);
         auto tk1 = std::chrono::steady_clock::now();
         // P8: split-encode at the stable boundary. Both turns encode the
         // shared history with the same split (the boundary always abuts the
@@ -1721,6 +1732,8 @@ int main(int argc, char** argv) {
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
         }
+        if (pfx_cache.enabled() && sys_off > 0)
+            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size(); // P16b, see twin
         auto tk2 = std::chrono::steady_clock::now();
         fprintf(stderr, "[timing] render %.1fms encode %.1fms (%zu chars -> %zu toks)\n",
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
@@ -1758,6 +1771,7 @@ int main(int argc, char** argv) {
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
@@ -1872,12 +1886,13 @@ int main(int argc, char** argv) {
             "text/event-stream",
             // by-value or dangling: see the /v1/chat/completions twin
             [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt,
-             thinking](size_t, httplib::DataSink& sink) {
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -2156,6 +2171,10 @@ int main(int argc, char** argv) {
         }
 
         int n_max = (int)q27::jint(body, "max_output_tokens", 8192); // unified default (see /v1/chat/completions)
+        // P16 does not apply to this shape (no stable_off / sys_off is computed
+        // here), but the engine field is per-engine state -- set it so a
+        // previous request's value cannot leak into this one.
+        const int sys_len = 0;
         auto tk0 = std::chrono::steady_clock::now();
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         std::vector<int> prompt =
@@ -2246,6 +2265,7 @@ int main(int argc, char** argv) {
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
@@ -2314,11 +2334,12 @@ int main(int argc, char** argv) {
             "text/event-stream",
             // by-value or dangling: see the /v1/chat/completions twin
             [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
-             thinking](size_t, httplib::DataSink& sink) {
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
