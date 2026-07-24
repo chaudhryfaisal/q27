@@ -123,7 +123,13 @@ int main(int argc, char** argv) {
                 "  Any configured key is accepted via 'Authorization: Bearer <key>'\n"
                 "  (OpenAI/llama.cpp convention) or 'x-api-key: <key>' (Anthropic\n"
                 "  convention, what Claude Code sends) on every endpoint except\n"
-                "  /health.\n",
+                "  /health.\n"
+                "  Prefix cache (P16, opt-in, writes to disk): --prefix-cache DIR\n"
+                "  persists the P8 stable prefix so a RESTART or a fresh\n"
+                "  conversation restores instead of re-prefilling. Tuning:\n"
+                "  --prefix-cache-max-gb 20 --prefix-cache-min 4096\n"
+                "  --prefix-cache-max-tokens 32768 --prefix-cache-step 8192.\n"
+                "  max-tokens also sizes the pinned staging buffer.\n",
                 argv[0]);
         return 1;
     }
@@ -143,6 +149,7 @@ int main(int argc, char** argv) {
     bool constrain_tools = false;
     bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
     std::vector<std::string> api_keys;
+    q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -161,6 +168,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
+        // P16 persistent prefix cache (opt-in: it writes to the user's disk)
+        else if (!strcmp(argv[i], "--prefix-cache") && i + 1 < argc) pfx_cfg.root = argv[++i];
+        else if (!strcmp(argv[i], "--prefix-cache-max-gb") && i + 1 < argc)
+            pfx_cfg.max_bytes = (size_t)(atof(argv[++i]) * 1e9);
+        else if (!strcmp(argv[i], "--prefix-cache-min") && i + 1 < argc)
+            pfx_cfg.min_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-max-tokens") && i + 1 < argc)
+            pfx_cfg.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-step") && i + 1 < argc)
+            pfx_cfg.step_tokens = atoi(argv[++i]);
         // Auth config is fail-LOUD in both directions: an empty key can never
         // authenticate anything (api_key_valid rejects an empty `provided`
         // before comparing), so accepting one would stand up a server that
@@ -478,6 +495,28 @@ int main(int argc, char** argv) {
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
+    // P16 persistent prefix cache. Declared BEFORE `slots` so it outlives the
+    // engines: an engine's destructor joins its writer thread, and that thread
+    // calls into this object. Off unless --prefix-cache names a directory.
+    q27::PrefixCache pfx_cache;
+    if (!pfx_cfg.root.empty()) {
+        const char* kve = getenv("Q27_KV");
+        const int kvk = kve && !strcmp(kve, "fp8")       ? KV_FP8
+                        : kve && !strcmp(kve, "turbo3")  ? KV_T3
+                        : kve && !strcmp(kve, "turbo3v") ? KV_T3V
+                                                         : KV_F16;
+        size_t model_bytes = 0;
+        { struct stat st; if (::stat(model.c_str(), &st) == 0) model_bytes = (size_t)st.st_size; }
+        const uint64_t compat =
+            q27::pfx_compat_hash(model, model_bytes, N_LAYER, N_KV, HEAD_DIM, GDN_HEADS, GDN_DIM,
+                                 GDN_CH, kvk, q27::PFX_VERSION);
+        if (pfx_cache.init(pfx_cfg, compat))
+            fprintf(stderr,
+                    "prefix-cache: %s (%zu entr%s indexed, %.2f/%.2f GB, min %d, max %d, step %d)\n",
+                    pfx_cfg.root.c_str(), pfx_cache.size(), pfx_cache.size() == 1 ? "y" : "ies",
+                    pfx_cache.bytes() / 1e9, pfx_cfg.max_bytes / 1e9, pfx_cfg.min_tokens,
+                    pfx_cfg.max_tokens, pfx_cfg.step_tokens);
+    }
     // n_slots already clamped to [1,8] above (before auto-ctx divided the
     // budget by it); the conductor's MAX_K/2 fusion ceiling is 8.
     n_slots = std::max(1, std::min(8, n_slots));
@@ -513,6 +552,7 @@ int main(int argc, char** argv) {
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
         s.eng->fast_head = fast;
+        if (pfx_cache.enabled()) s.eng->pcache = &pfx_cache; // P16 disk tier
         // graph-zoo capture gate (issue #1): without --constrain-tools the
         // P11 monolithic draft/verify graphs are unreachable -- skip capture.
         s.eng->capture_constrained = constrain_tools;
@@ -642,7 +682,7 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[96], gatebuf[512], phbuf[352], sfxbuf[48];
+        char p13buf[96], gatebuf[512], phbuf[352], sfxbuf[48], pfxbuf[32];
         // Q27_SUFFIX: engine-cumulative suffix-round counters (fired, tokens
         // committed by suffix rounds), appended after end= like gch/glf.
         if (e.suffix_on)
@@ -670,7 +710,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s%s\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
@@ -707,6 +747,10 @@ int main(int argc, char** argv) {
                                 e.gate_lane_acc[6], e.gate_lane_acc[7]),
                        gatebuf)
                     : "",
+                // P16: tokens restored from the disk prefix cache. Emitted only on
+                // an actual disk hit, so the line stays byte-identical when the
+                // feature is off (same rule as the md/gch/ph optionals above).
+                g.pfx > 0 ? (snprintf(pfxbuf, sizeof pfxbuf, " pfx=%d", g.pfx), pfxbuf) : "",
                 phbuf, sfxbuf, extra.c_str());
     };
     // R1b routing: claim a FREE engine (Slot::busy=false) that can take the

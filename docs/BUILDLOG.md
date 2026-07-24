@@ -8216,3 +8216,68 @@ mis-config paths exit 1 with a specific message. CPU suites 8/8 PASS
 (test_openai_bridge +9 cases, test_auth +1). No kernel, prompt-construction or
 sampling change -- the CLI canonical gates are untouched by construction
 (build/q27 does not compile api_common.h or server.cu).
+
+## 2026-07-24 -- P16a: persistent stable-prefix cache (opt-in disk tier)
+
+Design note: docs/plans/2026-07-24-persistent-prefix-cache.md. Prompted by a
+read of fewtarius/CachyLLama (MIT llama.cpp fork) whose SSD-backed KV cache
+targets the same miss; upstream llama.cpp already ships the persistence
+primitives (--ctx-checkpoints in RAM, --slot-save-path manual save/restore,
+--cache-reuse), so what is actually missing everywhere is automatic
+conversation-keyed lookup. Their headline 23-144x is cold-vs-warm on a 7840U
+where cold prefill runs ~110 t/s, which is a statement about iGPU prefill, not
+about caching.
+
+**The gap.** P8's snapshot and P9's ring both die with the process, so every
+server restart re-prefills the whole conversation. MEASURED first (5090,
+vanilla a2982c51, fp8, --ctx 65536): prefill runs 3,578 t/s at 15.4K tokens and
+3,351 t/s at 30.7K, so a 25K-token Claude Code system prefix costs ~7.3 s that
+we have already paid once.
+
+**What ships.** `--prefix-cache DIR` (off by default; it writes to the user's
+disk). One file per entry, header + tokens + [GDN state | attention+MTP KV
+rows], published by rename so a torn write can never be indexed. The P8
+`stable_off` boundary is the key: everything before it re-renders identically
+next session. `src/prefix_cache.h` is host-only and unit-tested; the device
+copies are `Engine::pfx_export/pfx_import`; the disk tier is consulted only
+after both RAM tiers miss.
+
+**Verification is by exact tokens, never by hash.** The filename key only
+narrows candidates; every load reads the stored token vector back and compares
+it element by element, the rule ckpt_best() already applies in RAM. CachyLLama
+shipped hash-keyed SSD restore and spent 2026-07-23 patching it (outside PR
+fix/ssd-cache-prefix-verification); a collision there silently continues
+another conversation's state. test_prefix_cache.cpp forges that exact hazard
+and asserts the refusal.
+
+**RESULT: restart TTFT 8.15 s -> 1.20 s (6.8x, ~7.0 s saved) on a 26,700-token
+prompt, bitwise identical output (md5 ae23ddeb8ce9b350 across all five runs).**
+The 1.09 GB blob reads in 726 ms with the page cache COLD (1.5 GB/s, matching
+the drive) and 246 ms warm. Persisting costs 38 ms of D2H on the critical path
+plus a background write: 8.15 -> 8.33 s on the one turn that pays it.
+
+**Two defects found by implementing, both fixed and both invisible to a bitwise
+gate.** (1) MTP KV rows run one longer than the attention side -- mtp_warm_T
+stores at base+1, so [0,L) restores a stale row L; that decodes CORRECTLY
+because bad drafts are rejected by verify, it just costs acceptance silently.
+(2) The first gate run persisted a SECOND 1.09 GB entry at the NP-1 fallback
+boundary on every restore (a restored request has base == stable_len, so the
+stable branch does not fire). Blobs cut at NP-1 sit past the assistant-open and
+can never prefix-match a later turn -- permanently unhittable. Persist is now
+gated on the boundary actually being the stable one.
+
+**Scope correction to the note.** Pre-implementation it claimed cross-
+conversation reuse comes free from keying on the token prefix. It does not:
+an entry only helps if its L tokens are an exact prefix of the new prompt, and
+turn 1's stable prefix ends inside the first USER message. The shared win needs
+an entry cut inside the system block -- P16b, not claimed here. The
+per-token KV figure in the draft was also 2x low (fp8 is 36.0 KiB/token, not
+18.0); corrected in place.
+
+GATES: bitwise restore, forged-collision refusal, compat refusal, truncation
+refusal, no-solo-regression ([req] byte-identical when off), restart proof --
+all PASS. Full slate re-run because engine.cuh changed: tri-arch x4, 10 CPU
+suites + auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 /
+683f7f44 / 2a4d22ea), ninv, fused_smoke. Harness note: the scratchpad gate
+script's sampled-anchor helper was still missing `--ctx 2048 --spec` and
+reported a false q4s mismatch -- the same v0.5.0 gotcha, now fixed there too.

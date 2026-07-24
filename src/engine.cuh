@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -23,6 +24,7 @@
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
+#include "prefix_cache.h"
 #include "turbo3.cuh"
 #include "vgemm.cuh"
 
@@ -491,6 +493,15 @@ struct Engine {
         : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/false);
     }
+    // P16 only: a detached prefix-cache writer would outlive its pinned
+    // staging buffer at shutdown. Everything else this class owns is still
+    // released by process exit as before.
+    ~Engine() {
+        if (pfx_thr.joinable()) pfx_thr.join();
+        if (pfx_stage) cudaFreeHost(pfx_stage);
+    }
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
 
   private:
     void init(int ctx, bool own_weights) {
@@ -2985,6 +2996,141 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
 
+    // ---- P16: persistent stable-prefix cache (disk tier) --------------------
+    // The P8 snapshot and the P9 ring both die with the process. This tier
+    // writes the same state to a file keyed on the token prefix, so a restart
+    // (or a fresh conversation sharing CC's system block) restores instead of
+    // re-prefilling. See docs/plans/2026-07-24-persistent-prefix-cache.md.
+    //
+    // What has to travel, and why it is exactly this:
+    //   GDN  -- S[il] + conv_ring[il] for every recurrent layer. Same content
+    //           ckpt_save copies; sized independently of L.
+    //   ATTN -- kcache/vcache rows [0,L). kv_store_T writes row-major with
+    //           stride N_KV*HEAD_DIM, so a prefix is one CONTIGUOUS chunk at
+    //           the head of each buffer -- no gather, and it reloads into an
+    //           engine with a different max_ctx.
+    //   MTP  -- mtp_k/mtp_v rows [0,L+1). One row longer than the attention
+    //           side on purpose: mtp_warm_T stores at base+1, so prefilling
+    //           through L leaves MTP rows [1,L] populated. Copying only [0,L)
+    //           would restore a stale row L, which decodes CORRECTLY (bad
+    //           drafts are rejected by verify) but silently costs acceptance
+    //           -- a bitwise gate would never catch it.
+    q27::PrefixCache* pcache = nullptr;  // borrowed, server-owned; null = feature off
+    char* pfx_stage = nullptr;      // pinned staging: [gdn | attn+mtp kv]
+    size_t pfx_stage_bytes = 0;
+    std::thread pfx_thr;
+    std::atomic<bool> pfx_busy{false};
+    int pfx_last_persist = 0;  // step gate: last L this engine wrote (0 = none)
+
+    size_t pfx_gdn_bytes() const {
+        size_t n = 0;
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) n += ckpt_layer_floats();
+        return n * 4;
+    }
+    size_t pfx_kv_bytes(int L) const {
+        const size_t rk = kv_bytes(false) / (size_t)max_ctx;
+        const size_t rv = kv_bytes(true) / (size_t)max_ctx;
+        return (size_t)L * kcache.size() * (rk + rv) + (size_t)(L + 1) * (rk + rv);
+    }
+    size_t pfx_bytes(int L) const { return pfx_gdn_bytes() + pfx_kv_bytes(L); }
+
+    // The writer owns pfx_stage while it runs; anything that touches the
+    // buffer waits for it first. Writes are rare (first turn of a
+    // conversation), so blocking here beats skipping a restore.
+    void pfx_wait_writer() {
+        if (pfx_thr.joinable()) pfx_thr.join();
+        pfx_busy.store(false);
+    }
+    bool pfx_stage_ensure(int L) {
+        pfx_wait_writer();
+        const size_t need = pfx_bytes(L);
+        if (pfx_stage_bytes >= need) return true;
+        if (pfx_stage) CUDA_CHECK(cudaFreeHost(pfx_stage));
+        pfx_stage = nullptr;
+        pfx_stage_bytes = 0;
+        if (cudaMallocHost((void**)&pfx_stage, need) != cudaSuccess) {
+            fprintf(stderr, "[pfx] staging alloc %.2f GB FAILED -- prefix cache idle\n",
+                    need / 1e9);
+            pfx_stage = nullptr;
+            return false;
+        }
+        pfx_stage_bytes = need;
+        return true;
+    }
+    // Device -> host. Ordered on stm, so it observes exactly the state the
+    // prefill has written at the call site.
+    void pfx_export(int L, char* dst) const {
+        char* p = dst;
+        const size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4, cb = 3 * GDN_CH * 4;
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(p, S[il], sb, cudaMemcpyDeviceToHost, stm));
+                p += sb;
+                CUDA_CHECK(cudaMemcpyAsync(p, conv_ring[il], cb, cudaMemcpyDeviceToHost, stm));
+                p += cb;
+            }
+        const size_t rk = kv_bytes(false) / (size_t)max_ctx;
+        const size_t rv = kv_bytes(true) / (size_t)max_ctx;
+        for (size_t i = 0; i < kcache.size(); i++) {
+            CUDA_CHECK(cudaMemcpyAsync(p, kcache[i], (size_t)L * rk, cudaMemcpyDeviceToHost, stm));
+            p += (size_t)L * rk;
+            CUDA_CHECK(cudaMemcpyAsync(p, vcache[i], (size_t)L * rv, cudaMemcpyDeviceToHost, stm));
+            p += (size_t)L * rv;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(p, mtp_k, (size_t)(L + 1) * rk, cudaMemcpyDeviceToHost, stm));
+        p += (size_t)(L + 1) * rk;
+        CUDA_CHECK(cudaMemcpyAsync(p, mtp_v, (size_t)(L + 1) * rv, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+    }
+    // Host -> device, byte-for-byte the inverse of pfx_export. Caller has
+    // already reset(), so rows past L are zero rather than another
+    // conversation's (they are never read, but a stale row is a debugging trap).
+    void pfx_import(int L, const char* src) {
+        const char* p = src;
+        const size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4, cb = 3 * GDN_CH * 4;
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(S[il], p, sb, cudaMemcpyHostToDevice, stm));
+                p += sb;
+                CUDA_CHECK(cudaMemcpyAsync(conv_ring[il], p, cb, cudaMemcpyHostToDevice, stm));
+                p += cb;
+            }
+        const size_t rk = kv_bytes(false) / (size_t)max_ctx;
+        const size_t rv = kv_bytes(true) / (size_t)max_ctx;
+        for (size_t i = 0; i < kcache.size(); i++) {
+            CUDA_CHECK(cudaMemcpyAsync(kcache[i], p, (size_t)L * rk, cudaMemcpyHostToDevice, stm));
+            p += (size_t)L * rk;
+            CUDA_CHECK(cudaMemcpyAsync(vcache[i], p, (size_t)L * rv, cudaMemcpyHostToDevice, stm));
+            p += (size_t)L * rv;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtp_k, p, (size_t)(L + 1) * rk, cudaMemcpyHostToDevice, stm));
+        p += (size_t)(L + 1) * rk;
+        CUDA_CHECK(cudaMemcpyAsync(mtp_v, p, (size_t)(L + 1) * rv, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        perm = 0;
+        CUDA_CHECK(cudaMemset(d_P, 0, 4));
+    }
+    // Stage the state for [0,L) and hand it to a background writer. The D2H
+    // (~50 ms at 1 GB) is on the critical path; the file write is not.
+    void pfx_persist(const std::vector<int>& prompt, int L) {
+        if (!pfx_stage_ensure(L)) return;
+        auto t0 = std::chrono::steady_clock::now();
+        pfx_export(L, pfx_stage);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        const size_t gn = pfx_gdn_bytes(), kn = pfx_kv_bytes(L);
+        std::vector<int> toks(prompt.begin(), prompt.begin() + L);
+        pfx_last_persist = L;
+        pfx_busy.store(true);
+        fprintf(stderr, "[pfx] persisting L=%d (%.2f GB, export %.0f ms)\n", L,
+                (gn + kn) / 1e9, ms);
+        pfx_thr = std::thread([this, toks = std::move(toks), L, gn, kn] {
+            pcache->write(toks, L, pfx_stage, gn, pfx_stage + gn, kn);
+            pfx_busy.store(false);
+        });
+    }
+
     // Reset all decode state for a fresh request (positions, GDN recurrent state,
     // conv rings, MTP KV). Weight buffers and captured graphs are unaffected.
     void reset() {
@@ -3016,6 +3162,7 @@ struct Engine {
     // [req] log line. Host-side bookkeeping only -- no device work, no syncs.
     struct GenStats {
         int prompt = 0, hit = 0, ckpt = -1, pf = 0; // tokens
+        int pfx = 0;                               // P16: tokens restored from disk (0 = none)
         double pf_ms = 0, dec_ms = 0, cb_ms = 0;    // cb = time inside on_token
         // (review L3) under Q27_BATCH=1 the sink is the conductor's queue
         // push: cb_ms then times on_emit + TokenQueue::push on the CONDUCTOR
@@ -3374,8 +3521,31 @@ struct Engine {
                 ck = ckpt_best(prompt); // P9: mid-history divergence fallback
                 if (ck >= 0) base = (int)ckpts[ck].toks.size();
             }
-            fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d\n", NP, base,
-                    snap_toks.size(), ck);
+            // P16 disk tier: consulted only when both RAM tiers miss, which is
+            // the restart case and the fresh-conversation case. find() verifies
+            // the stored token vector against this prompt before we read any
+            // state; a failed read falls through to a normal cold prefill.
+            q27::PrefixCache::Entry pe;
+            bool pfx_hit = false;
+            if (base == 0 && ck < 0 && pcache && pcache->enabled() && pcache->find(prompt, &pe)) {
+                auto t0 = std::chrono::steady_clock::now();
+                if (pfx_stage_ensure(pe.L) &&
+                    pcache->read_state(pe, pfx_stage, pfx_bytes(pe.L))) {
+                    base = pe.L;
+                    pfx_hit = true;
+                    fprintf(stderr, "[pfx] restore L=%d (%.2f GB, read %.0f ms) <- %s\n", pe.L,
+                            pfx_bytes(pe.L) / 1e9,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count(),
+                            pe.path.c_str());
+                } else {
+                    fprintf(stderr, "[pfx] read FAILED for %s -- cold prefill\n", pe.path.c_str());
+                }
+            }
+            if (base == 0) pfx_last_persist = 0; // new chain: allow a fresh persist
+            gs.pfx = pfx_hit ? base : 0;
+            fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d pfx=%d\n", NP, base,
+                    snap_toks.size(), ck, gs.pfx);
             gs.hit = base;
             gs.ckpt = ck;
             gs.pf = NP - base;
@@ -3399,6 +3569,14 @@ struct Engine {
                 snap_toks.clear();
             }
             if (ck >= 0) ckpt_restore(ck);
+            else if (pfx_hit) {
+                // reset() first: the disk blob carries rows [0,L) only, and a
+                // zeroed tail beats a previous conversation's rows sitting
+                // past the prefix (never read, but a trap for the next reader).
+                reset();
+                ckpt_clear();
+                pfx_import(base, pfx_stage);
+            }
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }
             if (d_prompt_cap < NP) {
@@ -3424,6 +3602,21 @@ struct Engine {
                 round_gap();
             }
             snap_save(prompt, snap_upto);
+            // P16 write point: the device holds exactly the state for
+            // [0, snap_upto) here. Persist ONLY when that boundary is the P8
+            // STABLE one -- the same condition snap_upto was computed under.
+            // The NP-1 fallback boundary is not re-renderable: it sits past
+            // the assistant-open + think prefill, so the blob could never
+            // prefix-match a later turn. Measured before this gate existed: a
+            // restored request persisted a second 1.09 GB entry at NP-1 that
+            // nothing would ever hit again (P16 gate run 1, 2026-07-24).
+            const bool pfx_stable_boundary = stable_len > base && stable_len < NP;
+            if (pcache && pcache->enabled() && pfx_stable_boundary && !pfx_busy.load() &&
+                snap_upto >= pcache->cfg().min_tokens && snap_upto <= pcache->cfg().max_tokens &&
+                (pfx_last_persist == 0 ||
+                 snap_upto - pfx_last_persist >= pcache->cfg().step_tokens) &&
+                !pcache->has(prompt, snap_upto))
+                pfx_persist(prompt, snap_upto);
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);
                 prefill_chunk(d_prompt + c0, c0, Tc);
