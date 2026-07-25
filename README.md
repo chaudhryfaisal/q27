@@ -677,8 +677,12 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   are suffix-drafted and the draft is already free (0.12 ms/round).
   Realistic win +7-14% single-stream for a weeks-long dual-GPU pipeline,
   against ~90-130 t/s aggregate from simply running the second card as
-  another server. Revisit only if a margin-conditioned predictor clears
-  ~80% (the probe is in-tree: `Q27_NJOINT=1`).
+  another server. The margin-conditioned predictor named as the one
+  thing that could reopen it was then measured too: **58.7%**, not 80%.
+  The drafter's own margin separates accepted from rejected steps at
+  AUC 0.56-0.63, which bounds any predictor built on it -- self-reported
+  confidence is not a proxy for agreement with the full model. Closed.
+  Probes in-tree (`Q27_NJOINT=1`, `Q27_MPROBE=<file>`).
 - **Prefill follow-ons**: the retired Phase-3's filed successor (async
   producer/consumer + mbarrier rewrite of the prefill-attention
   kernel). (The serial-threshold call shipped in v0.3.0 as
