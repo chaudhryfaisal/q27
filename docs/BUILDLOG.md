@@ -8424,3 +8424,33 @@ auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
 2a4d22ea), ninv ALL PASS, fused_smoke PASS. RAM-tier restores are bitwise
 identical to the cache-off reference (A f7e71a5f4df7a4ad, B 9594eec95be70e7b
 across every leg).
+
+## 2026-07-24 -- v0.6.1 RELEASED (tag @ d465e0e)
+
+github.com/signalnine/q27/releases/tag/v0.6.1. Patch release on v0.6.0: one
+real perf fix, one opt-in flag, no change to any default behavior.
+
+**Boot prefetch (the perf fix).** The first read after a restart -- the exact
+request P16 exists to make fast -- went **681 ms -> 36-39 ms**. v0.6.0's
+`posix_fadvise(WILLNEED)` prefetch measured as doing nothing at 1 GB; the
+kernel declines an advisory readahead that size, so it now does a real chunked
+read on a detached thread under the cover of the weight upload.
+
+**P16c host-RAM tier (`--prefix-cache-ram-gb`, default 0 = OFF).** Built and
+measured, and the measurement says leave it off: import (H2D) is a 38 ms/GB
+floor, the prefetch already makes reads 36-39 ms, and the tier's larger pinned
+slot makes the FIRST restore slower (0.53 s vs 0.47 s, n=3/leg). It wins
+40-110 ms only on a repeat restore landing on a different slot. On record as a
+near-NO-GO rather than a feature.
+
+**Loose ends:** a disk restore now sets `pfx_last_persist`, ending the
+second-~1 GB-entry-per-boot write amplification flagged at v0.6.0;
+`/v1/responses` now persists the system-block entry; the restore log splits
+alloc / read / import (it had been folding a first-touch `cudaMallocHost` into
+"read").
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS, RAM-tier restores bitwise identical
+to the cache-off reference. Assets: tarball sha256 cd909131 + SHA256SUMS-0.6.1.
+Driver floor r580+ unchanged.
