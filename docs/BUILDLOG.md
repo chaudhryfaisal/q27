@@ -8652,3 +8652,62 @@ Repro: `Q27_KV=fp8 Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file
 scratchpad/pf_toks.txt --pf 65536 --ctx 67584` under nsys; ncu with
 `-k k_attn_prefill_mma_pv8 --launch-skip 1000` (needs `sudo -n`, full path
 /usr/local/cuda/bin/ncu).
+
+## 2026-07-24 (cont.) -- strict-parser grammar engage: NO-GO (the config it unlocks is dominated) -- but the probe found DRIFT MODE 13, live, and it is fixed
+
+Last open engine item. The 07-08 A/B filed it as: "engage the constrain grammar
+on a bare `{"name"` opener too -- closes the wrapper-less bypass and would make
+strict+constrain the true zero-rescue configuration."
+
+**VERDICT: NO-GO, on the value side.** That A/B's own numbers price the target
+configuration: tolerant T8 **0.837** with 12 rescued calls; strict T8 **0.000**
+(first turn emits wrapper-less, CC one-shot-quits); strict+constrain T8
+**0.549**, where the grammar carried every wrapped call but one mid-session
+wrapper-less turn still bypassed it. So the lever's BEST case is lifting
+strict+constrain from 0.549 toward 0.837 -- parity with the default that
+already works -- while paying `--constrain-tools`' measured 3.1x in-call cost
+at depth. It buys an auditability property (no heuristic ever guesses), not
+quality and not speed, and it is the wrong trade for a default nobody should
+flip.
+
+**False-positive risk: NOT demonstrated, and honestly reported as such.** The
+probe generated the five output classes most likely to emit the trigger bytes
+without meaning a call (JSON Schema, JS object literals, REST docs, an
+explanation of function calling, package.json), all with tools registered. Two
+`{"name"` hits in the text: one inside a markdown fence (which the existing
+`inside_fence` guard already handles), and one that turned out to be a REAL
+wrapper-less call, not an example. Zero confirmed false engages. The structural
+ambiguity stands -- a bare call and a quoted example are byte-identical, and
+the model emitted a real bare call while being asked to *explain* bare calls --
+but it is a risk argument, not a measurement, and the NO-GO does not rest on it.
+
+**What the probe actually bought: DRIFT MODE 13.** The "explain function
+calling" leg came back `stop=max_tokens`, zero tool_use blocks, and
+`[drift] UN-RESCUED (ntools=2)` -- a live, reproducible miss. The model emitted
+a wrapper-less `Write` whose markdown `content` was writing an escaped JSON
+example, and the token cap cut it INSIDE an escape sequence, leaving a dangling
+`\`. The truncation repair then appended its closing quote directly after that
+backslash, which ESCAPED the quote: string still open, object never parsed,
+whole call lost. Confirmed by removing the dangling byte from the captured
+payload -- `recovered=0` -> `recovered=1 name=Write`.
+
+Fix (api_common.h, the mode-2 repair): before closing an open string, trim back
+past an incomplete escape -- a dangling `\`, or a partial `\uXXXX` (a complete
+one is 6 bytes, anything shorter at the cut is partial). The live payload now
+rescues unmodified. Three regression tests in tools/test_tool_drift.cpp,
+including an over-trim guard (a COMPLETE `é` at the cut must still
+round-trip to the right character).
+
+Note this is very likely the class of the pending report from @chaudhryfaisal
+(eos mid-arguments truncation, logged 07-18 as a possible "mode 13") -- we now
+have our own repro and fix, so that no longer waits on his payload.
+
+**Also worth recording from the probe:** 3 of 5 documentation-shaped prompts
+answered with a tool call rather than prose once tools were registered (asked to
+document a REST endpoint, the model called Write). Not a bug, but a reminder
+that tool-registration changes the response distribution, which is why drift
+telemetry has to come from tool-registered traffic.
+
+GATES: 8 CPU suites PASS (drift, drift-corpus, bridge, auth, think, split,
+prefix-cache, toolconstrain) + the full slate. `api_common.h` is not compiled
+into `build/q27`, so the CLI canonical anchors are untouched by construction.

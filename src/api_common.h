@@ -1153,7 +1153,27 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 else if (ch == '{') d2++;
                 else if (ch == '}') d2--;
             }
-            if (s2) r += '"';
+            // Drift mode 13 (2026-07-24): the truncation can land INSIDE an
+            // escape sequence. A trailing "\\" swallows the quote we are about
+            // to append -- the string stays open, the object never parses, and
+            // the whole call goes UN-RESCUED. Observed live: a wrapper-less
+            // Write whose markdown `content` was cut mid-`\\"` while writing an
+            // escaped JSON example. Same for a partial \\uXXXX. Trim back to the
+            // last safe byte before closing.
+            if (s2) {
+                if (e2f) {
+                    r.pop_back();  // dangling backslash
+                } else {
+                    const size_t u = r.find_last_of('\\');
+                    // a COMPLETE \uXXXX is 6 bytes; anything shorter at the very
+                    // end is a partial one. Leading-backslash check avoids
+                    // trimming an escaped backslash that merely precedes a 'u'.
+                    if (u != std::string::npos && u + 1 < r.size() && r[u + 1] == 'u' &&
+                        r.size() - u < 6 && !(u > 0 && r[u - 1] == '\\'))
+                        r.resize(u);
+                }
+                r += '"';
+            }
             for (; d2 > 0; d2--) r += '}';
             bool shaped = false;
             try {

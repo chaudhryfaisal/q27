@@ -696,9 +696,14 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   is 25.4% of prefill at 65K but ~40% at 131K. (The serial-threshold call shipped in v0.3.0 as
   `Q27_PF_BATCH_MIN` -- TTFT 350->31-33ms / 567->53-55ms; the CLI
   default is unchanged, so the canonical still holds.)
-- **Strict-parser zero-rescue config**: engage the constrain grammar on
-  a bare `{"name"` opener too, closing the wrapper-less bypass
-  (strict-parser A/B verdict: BUILDLOG 2026-07-08).
+- ~~**Strict-parser zero-rescue config**~~ **CLOSED 2026-07-24, verdict
+  NO-GO** (BUILDLOG "strict-parser grammar engage"): the configuration it
+  unlocks is dominated. The 07-08 A/B prices it -- tolerant 0.837,
+  strict+constrain 0.549 -- so the lever's best case is parity with the
+  default that already works, at `--constrain-tools`' 3.1x in-call cost.
+  The probe did find and fix **drift mode 13** (a wrapper-less call
+  truncated inside an escape sequence: the repair's closing quote landed
+  after a dangling `\`, escaping it and losing the whole call).
 - **Graph-cache cap under churn**: live CC already draws 44+ keys vs
   the bench's 28; cap 64 swallows today's alphabet, revisit
   `Q27_BATCH_GRAPH_CAP` if multi-tenant composition churn widens it.
