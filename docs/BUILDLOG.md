@@ -8513,3 +8513,64 @@ tradeoff deserves re-pricing. Below that, the answer stays no.
 
 GATES after the probe instrumentation: tri-arch x4, 11 CPU suites +
 auth_integration, canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.
+
+## 2026-07-24 (cont.) -- margin-conditioned predictor probe: 59%, not 80%. Off-path stays closed, and now the reason is information-theoretic.
+
+The cap-conditioned probe earlier today closed off-path drafting at 50-59%
+predictability and named the one thing that could reopen it: "a
+margin-conditioned predictor clearing ~80%". q27 already computes per-step
+top1-top2 draft margins for pmin gating, and they are HOST-RESIDENT before
+verify launches -- exactly the signal, at exactly the right moment. So the
+probe was cheap and the bar was pre-registered. Ran it.
+
+**Data.** `Q27_MPROBE=<file>` logs (cap, n, md, margins[]) per gated round;
+run with `Q27_DEXIT=0` so every step's margin is real (dexit stops drafting at
+the first sub-theta margin, but an off-path drafter has no reason to stop --
+its steps are hidden -- so the full vector is what it would actually see).
+1863 rounds at md=4 over 8 prompts spanning prose, code, and technical Q&A.
+
+**Result: the margin does not carry the information.** Per-step AUC of the
+drafter's own margin for predicting whether that step gets accepted:
+
+    step 1: AUC 0.561    mean margin accepted 2.55 vs rejected 2.02
+    step 2: AUC 0.583    mean margin accepted 2.38 vs rejected 1.71
+    step 3: AUC 0.632    mean margin accepted 2.57 vs rejected 1.61
+
+0.56-0.63 is a weak classifier. That bounds every predictor built on this
+feature, no matter how it is modeled -- and the held-out numbers land where the
+AUC says they must (block split, train 1117 / test 746):
+
+    always-predict-mode (no signal)      36.2%  top-1
+    cap only (leading run @ theta=0.5)   47.1%  top-1   71.6% top-2
+    all margins, median-binned           52.5%  top-1   81.8% top-2
+    leading run @ theta=1.5              58.7%  top-1   77.2% top-2
+    run@1.5 + min-margin bin             58.7%  top-1   78.8% top-2
+
+**Best top-1 is 58.7%, against a pre-registered bar of 80%. The condition
+fails and off-path drafting stays closed.** Retuning the threshold from the
+shipped 0.5 to 1.5 is worth +8pp over the cap baseline; the full margin vector
+adds nothing on top of that for top-1 (52.5%, data-limited on the finer
+tables), though it is the best top-2 at 81.8%.
+
+**Why, structurally:** the margin measures the DRAFTER's certainty, and
+rejection is decided by disagreement with the FULL model. A confident drafter
+can be confidently wrong -- the very first logged rounds show `cap=4, n=2` with
+all four margins well above threshold. Self-reported confidence is simply not a
+proxy for agreement with a bigger model.
+
+**Sharpened payoff, for the record.** 1-branch at 58.7%: +8.1-10.2%. 2-branch
+at ~80% top-2 (two ~4-5 ms sm_86 ladders fit the ~14 ms verify window):
++11.4-14.5%. That is a better estimate than the 07-13 guess of +3-9%, and still
+not worth a weeks-long dual-GPU pipeline against ~90-130 t/s of aggregate from
+simply running the second card as another server.
+
+**Side finding worth its own line:** pmin gating is steering on AUC-0.56-0.63
+information. The shipped theta=0.5 is not even the best operating point for
+predicting acceptance (1.5 is, by 8pp on this corpus) -- though the gate's job
+is trimming cost, not predicting n, so this is not a bug. If depth policy is
+ever revisited, depthctl's realized-acceptance EMA is the stronger signal and
+already shipped.
+
+Probe kept in-tree: `Q27_MPROBE` + `tools/probes/margin_predictor_{analyze,auc}.py`.
+GATES after instrumentation: tri-arch x4, 11 CPU suites + auth_integration,
+canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.

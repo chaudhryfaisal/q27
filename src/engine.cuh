@@ -397,6 +397,20 @@ struct Engine {
     // gate's confidence cap, which is known before verify resolves. Cheap
     // enough to leave in (one increment per round, no device work).
     long gate_joint[W_MAX][W_MAX + 1] = {};
+    // P17 probe 2: the margin VECTOR behind each round, against the realized n.
+    // gate_joint conditions on the cap (a leading-run length, 6 buckets); this
+    // logs the raw top1-top2 margins the cap was derived from, which is the
+    // richest signal an off-path speculation cache could condition on. Run with
+    // Q27_DEXIT=0 so every step's margin is real: dexit stops drafting at the
+    // first sub-theta margin, but an off-path drafter has no reason to stop
+    // (its steps are hidden), so the full vector is what it would actually see.
+    FILE* mprobe = nullptr;  // Q27_MPROBE=<path>
+    void mprobe_log(int cap, int n, int md) {
+        if (!mprobe) return;
+        fprintf(mprobe, "%d,%d,%d", cap, n, md);
+        for (int k = 0; k < md && k < 7; k++) fprintf(mprobe, ",%.5f", h_draft_margin[k]);
+        fputc('\n', mprobe);
+    }
     // acceptance-gate Phase 0: per-draft-lane conditional acceptance on gated
     // rounds. Lane j (1..gate_maxd) FIRED iff cap >= j; ACCEPTED iff n >= j+1.
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
@@ -2064,6 +2078,10 @@ struct Engine {
         // unset = off (always full width 5 = the canonical depth-4 round).
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
+        if (const char* mp = getenv("Q27_MPROBE")) {   // P17 probe 2, off by default
+            mprobe = fopen(mp, "a");
+            if (mprobe) fprintf(stderr, "[mprobe] logging (cap,n,md,margins) to %s\n", mp);
+        }
         phase_stats = getenv("Q27_PHASE_STATS") && atoi(getenv("Q27_PHASE_STATS")) != 0;
         // (suffix envs parsed above, pre-capture -- width-12 P1)
         if (suffix_on)
@@ -2237,6 +2255,7 @@ struct Engine {
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
             if (n <= W_MAX) gate_joint[gate_cap][n]++;
+            mprobe_log(gate_cap, n, md_used);
             for (int j = 1; j <= gate_cap; j++) {
                 gate_lane_fired[j]++;
                 if (n >= j + 1) gate_lane_acc[j]++;
