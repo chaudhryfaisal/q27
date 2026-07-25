@@ -391,6 +391,12 @@ struct Engine {
     // <= W_MAX-1 -- the old [8]/[9] were safe only under the 4..7 policy.
     long gate_cap_hist[W_MAX] = {};    // [cap 0..W_MAX-1]
     long gate_n_hist[W_MAX + 1] = {};  // [n 1..W_MAX]; index 0 unused
+    // P17 probe (2026-07-24, off-path drafting viability): joint (cap, n).
+    // gate_n_hist is the MARGINAL, which understates what an SSD-style
+    // speculation cache could predict -- that cache gets to condition on the
+    // gate's confidence cap, which is known before verify resolves. Cheap
+    // enough to leave in (one increment per round, no device work).
+    long gate_joint[W_MAX][W_MAX + 1] = {};
     // acceptance-gate Phase 0: per-draft-lane conditional acceptance on gated
     // rounds. Lane j (1..gate_maxd) FIRED iff cap >= j; ACCEPTED iff n >= j+1.
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
@@ -2230,6 +2236,7 @@ struct Engine {
         }
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
+            if (n <= W_MAX) gate_joint[gate_cap][n]++;
             for (int j = 1; j <= gate_cap; j++) {
                 gate_lane_fired[j]++;
                 if (n >= j + 1) gate_lane_acc[j]++;
@@ -2486,6 +2493,7 @@ struct Engine {
                 int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
                 gate_cap_hist[cap]++;
                 gate_n_hist[n]++;
+                if (n <= W_MAX) gate_joint[cap][n]++;
                 for (int j = 1; j <= cap; j++) {
                     gate_lane_fired[j]++;
                     if (n >= j + 1) gate_lane_acc[j]++;

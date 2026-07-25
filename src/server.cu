@@ -721,6 +721,13 @@ int main(int argc, char** argv) {
                      g.vw_ms[8], g.sfx_ms, g.sfx_rounds);
         else
             phbuf[0] = '\0';
+        if (getenv("Q27_NJOINT")) {
+            fprintf(stderr, "[njoint] rid=%ld", rt.rid);
+            for (int c = 0; c < Q27_W_MAX; c++)
+                for (int n = 1; n <= Q27_W_MAX; n++)
+                    if (e.gate_joint[c][n]) fprintf(stderr, " %d:%d=%ld", c, n, e.gate_joint[c][n]);
+            fprintf(stderr, "\n");
+        }
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "

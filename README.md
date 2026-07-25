@@ -668,8 +668,17 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   quality asterisk on turbo3; fp8 stays the sm_89+ CC serving default
   on speed alone -- turbo3 is the capacity lever there (2x96K vs 2x48K
   on 32GB) and, since v0.3.0, the outright default on Ampere.
-- **Saguaro-style 3090 off-path drafting** -- the one uncommissioned
-  engine idea left standing from 07-10.
+- ~~**Saguaro-style 3090 off-path drafting**~~ **CLOSED 2026-07-24,
+  verdict NO-GO** (BUILDLOG "off-path 3090 drafting"): the lever and the
+  predictability are anti-correlated. Where the draft is expensive
+  (prose/code, 2.0-2.7 ms of a ~16 ms round) the accepted count is
+  predictable only 50-59% of the time even when conditioned on the gate's
+  confidence cap; where it is perfectly predictable (echo) 96% of rounds
+  are suffix-drafted and the draft is already free (0.12 ms/round).
+  Realistic win +7-14% single-stream for a weeks-long dual-GPU pipeline,
+  against ~90-130 t/s aggregate from simply running the second card as
+  another server. Revisit only if a margin-conditioned predictor clears
+  ~80% (the probe is in-tree: `Q27_NJOINT=1`).
 - **Prefill follow-ons**: the retired Phase-3's filed successor (async
   producer/consumer + mbarrier rewrite of the prefill-attention
   kernel). (The serial-threshold call shipped in v0.3.0 as

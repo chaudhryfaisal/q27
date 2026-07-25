@@ -8454,3 +8454,62 @@ GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
 binaries, ninv ALL PASS, fused_smoke PASS, RAM-tier restores bitwise identical
 to the cache-off reference. Assets: tarball sha256 cd909131 + SHA256SUMS-0.6.1.
 Driver floor r580+ unchanged.
+
+## 2026-07-24 -- Saguaro/SSD off-path 3090 drafting: MEASURED NO-GO (the lever and the predictability are anti-correlated)
+
+The last uncommissioned engine idea from 07-10, and the one open item that
+needed a number rather than an argument. The 2026-07-13 note left it as a
+CONDITIONAL no-go with two pre-registered conditions: build only if "decode t/s
+becomes the headline AND gate_n_hist comes back peaked (it will not, on novel
+prose)." Both were tested today on the shipped engine.
+
+**Condition 1 (decode is the headline): NOW HOLDS.** It did not in July. P16
+took a warm/restored turn's prefill to 40-330 ms, so decode is what is left of
+an agentic turn's wall. This condition flipping is what made the probe worth
+running at all.
+
+**Condition 2 (accepted-count predictability): FAILS.** An off-path drafter
+cannot start round R+1's ladder until it knows how many tokens verify(R)
+accepted, so the whole scheme rests on predicting n before verify lands.
+Measured on the shipped engine, three legs, vanilla model:
+
+    leg     rounds  draft/round  verify/round  draft share  P(n) top-1  P(n|cap)
+    prose      275     2.04 ms      13.88 ms       12.8%       40.0%      50.2%
+    code       176     2.72 ms      14.49 ms       15.8%       30.7%      58.5%
+    echo        52     0.12 ms      (suffix)        0.6%      100.0%     100.0%
+
+The marginal (gate_n_hist) understates what an SSD-style speculation cache
+could do, since that cache gets to condition on the gate's confidence cap --
+so a joint (cap, n) probe was added (`gate_joint`, `Q27_NJOINT=1`; one host
+increment per round, no device work). Conditioning helps (+10pp prose, +28pp
+code) and still lands at **50-59%**, nowhere near the ~90% bonus-token
+prediction SSD reports from drafter logits.
+
+**THE FINDING: the lever and the predictability are anti-correlated.** Where
+the draft is expensive (prose/code, 2.0-2.7 ms/round, 0% suffix fires) n is
+unpredictable at 50-59%. Where n is perfectly predictable (echo, 100%) the
+draft is already FREE -- 96.2% of those rounds are suffix-drafter rounds that
+never run the MTP ladder, so the draft is 0.12 ms/round, a 0.6% share. There is
+no regime in which off-path drafting is both cheap to hide and worth hiding.
+
+**Arithmetic.** Amdahl ceiling with the draft perfectly hidden: +14.7% prose,
++18.8% code. With a 1-branch speculation cache at the measured hit rates:
+**+6.9% prose, +10.2% code**. With 2 branches (the ~14 ms verify window fits
+two ~4-5 ms sm_86 ladders): roughly +10% / +14%. That is the honest band for a
+weeks-long dual-GPU pipeline (speculation cache, branch selection, fallback
+path) on a 3090 that currently runs other work.
+
+**Opportunity cost settles it.** The same 3090 run as an independent second
+server adds ~90-130 t/s of AGGREGATE throughput. Off-path drafting adds +9 to
++20 t/s of single-stream. Off-path only wins if single-stream latency is the
+product goal and the second card is otherwise idle.
+
+**DECISION: do NOT build.** Recorded, with the probe left in-tree so a revisit
+starts with data. WHAT WOULD FLIP IT: a finer predictor. The gate's 6-bucket
+confidence cap gets 50-59%; q27 already computes per-step draft margins for
+pmin gating, and a margin-conditioned predictor is the natural P1 probe (cheap,
+host-side, no build). If it clears ~80%, the win reaches +12-16% and the
+tradeoff deserves re-pricing. Below that, the answer stays no.
+
+GATES after the probe instrumentation: tri-arch x4, 11 CPU suites +
+auth_integration, canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.
