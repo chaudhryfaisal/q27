@@ -683,9 +683,17 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   AUC 0.56-0.63, which bounds any predictor built on it -- self-reported
   confidence is not a proxy for agreement with the full model. Closed.
   Probes in-tree (`Q27_NJOINT=1`, `Q27_MPROBE=<file>`).
-- **Prefill follow-ons**: the retired Phase-3's filed successor (async
-  producer/consumer + mbarrier rewrite of the prefill-attention
-  kernel). (The serial-threshold call shipped in v0.3.0 as
+- ~~**Prefill follow-ons** (async producer/consumer + mbarrier rewrite of
+  the prefill-attention kernel)~~ **CLOSED 2026-07-24, verdict NO-GO as
+  filed** (BUILDLOG "prefill async/mbarrier"): the three shipped phases
+  (cp.async +5.4%, fp8 QK^T +11.8%, fp8 PV +2.4%) already halved the stall
+  profile it was filed against (14.23 -> 7.77 warp-cycles per issue). What
+  binds now is occupancy -- 12.5%, 1 block/SM, limited INDEPENDENTLY by
+  248 regs/thread and 70 KB smem -- and an async pipeline needs more smem
+  stages, not fewer. Reaching 2 blocks/SM needs a 28% smem cut AND a 31%
+  register cut, when the output accumulator alone is 128 registers.
+  Reopens if long-context prefill (131K+) becomes a product goal: attention
+  is 25.4% of prefill at 65K but ~40% at 131K. (The serial-threshold call shipped in v0.3.0 as
   `Q27_PF_BATCH_MIN` -- TTFT 350->31-33ms / 567->53-55ms; the CLI
   default is unchanged, so the canonical still holds.)
 - **Strict-parser zero-rescue config**: engage the constrain grammar on

@@ -8574,3 +8574,81 @@ already shipped.
 Probe kept in-tree: `Q27_MPROBE` + `tools/probes/margin_predictor_{analyze,auc}.py`.
 GATES after instrumentation: tri-arch x4, 11 CPU suites + auth_integration,
 canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.
+
+## 2026-07-24 (cont.) -- prefill async/mbarrier: the filed rewrite targets stalls that are already fixed. NO-GO as specified; the real wall is occupancy, and it is structural.
+
+Re-profiled prefill end to end before touching the last open engine item. Three
+things moved since the 07-07 attribution that filed this rewrite, and together
+they invalidate its premise.
+
+**1. Attention's share GREW, because the GEMM work landed.** nsys, 65,536-token
+prefill, fp8 KV, 5090 (22.40 s, 2925 t/s -- up from 2763 t/s at 07-13):
+
+    k_gemm_mma_ntx<1,96>   10.15 s   45.3%
+    k_attn_prefill_mma_pv8  5.68 s   25.4%   <- was 17.3% at 07-13
+    k_delta_wy (GDN)        1.70 s    7.6%
+    k_gemm_f16_T            1.32 s    5.9%
+    k_gemm_mma_ntx<0,96>    1.05 s    4.7%
+    quant/silu/add/rest     ~2.5 s   ~11%
+
+Attention did not get slower; the GEMM got faster (ntx), so the denominator
+shrank. Attention is O(N^2), so its share keeps climbing: ~40% at 131K.
+
+**2. The stalls the rewrite was filed against are already gone.** 07-07 measured
+14.23 warp-cycles per issued instruction, dominated by long_scoreboard (30%,
+global/L2 latency) and math_pipe_throttle (28%). cp.async prefetch (+5.4%),
+fp8 QK^T MMA (+11.8%) and fp8 PV (+2.4%) shipped against exactly those. TODAY:
+
+    warp cycles / issued instruction   7.77   (was 14.23)
+    Compute (SM) throughput           33.66%  (was 33.2%)
+    schedulers "no eligible"          80.68%
+    active warps / scheduler           1.50   (of 12)
+    eligible warps / scheduler         0.23
+
+Per-issue stalls halved; SoL did not move. The kernel is no longer stall-bound
+per issue, it is **starved of warps to issue from**.
+
+**3. The binding constraint is occupancy, and an mbarrier pipeline does not
+touch it.** 12.5% theoretical / 12.48% achieved, 1 block/SM, and ncu reports
+BOTH limits at 1: `Block Limit Registers = 1` AND `Block Limit Shared Mem = 1`.
+
+    smem  70.02 KB + 1.02 driver = 71.04 KB/block; 2 blocks need 142 KB against
+          a 102.4 KB carveout  ->  must reach <= 50.2 KB (a 28% cut)
+    regs  248/thread x 192 = 47,616; 65536/47616 = 1.38 blocks
+          ->  must reach <= 170 regs/thread (a 31% cut)
+
+A warp-specialized async producer/consumer pipeline wants MORE smem stages, not
+fewer -- it pushes the harder of the two limits the wrong way. And the two
+candidate smem cuts both give back shipped wins: the cp.async K/V ping-pong is
+16.25 KB of the 70 (undoing Phase 1's +5.4%), and s_q is 24.75 KB (halving TT
+halves the MMA tile's arithmetic intensity). On the register side the output
+accumulator `o[32][4]` is 128 registers by itself, so 170 total is not reachable
+without a smaller output tile -- the same structural bind that stopped the
+prefill GEMM at 1 block/SM, where the author already measured double-buffering
+and `__launch_bounds__` occupancy forcing as SLOWER ("local optimum, do not
+retry").
+
+**Amdahl, for whatever a future attempt is worth.** ncu prices full occupancy at
+"Est. Speedup 55.32%":
+
+    attn 25.4% @65K :  1.55x kernel -> +9.0% prefill ;  2.0x -> +12.7%
+    attn ~40% @131K :  1.55x kernel -> +14.2% prefill;  2.0x -> +20.0%
+
+At 65K that is ~+3% of median agentic request wall (prefill is 34% of it) and
+~+9% on the read-heavy class (prefill 88-96%). And P16 moved the denominator
+again: a restored prefix now costs 40-330 ms, so cold prefill only prices
+genuinely-new content.
+
+**DECISION: NO-GO on the async/mbarrier rewrite as filed.** It is aimed at a
+stall profile that three shipped phases already halved, and it cannot move the
+constraint that actually binds. If prefill is ever revisited the honest target
+is the occupancy wall -- a tile redesign hitting BOTH <=50 KB smem and <=170
+regs -- which is a larger, riskier rewrite of a bitwise-gated kernel with
+negative precedent from the GEMM. WHAT WOULD REOPEN IT: a product turn toward
+long-context prefill (131K+), where attention is ~40% of prefill and the same
+kernel win is worth +14-20% instead of +9%.
+
+Repro: `Q27_KV=fp8 Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file
+scratchpad/pf_toks.txt --pf 65536 --ctx 67584` under nsys; ncu with
+`-k k_attn_prefill_mma_pv8 --launch-skip 1000` (needs `sudo -n`, full path
+/usr/local/cuda/bin/ncu).
