@@ -8711,3 +8711,43 @@ telemetry has to come from tool-registered traffic.
 GATES: 8 CPU suites PASS (drift, drift-corpus, bridge, auth, think, split,
 prefix-cache, toolconstrain) + the full slate. `api_common.h` is not compiled
 into `build/q27`, so the CLI canonical anchors are untouched by construction.
+
+## 2026-07-24 -- v0.6.2 RELEASED (tag @ 465afaa)
+
+github.com/signalnine/q27/releases/tag/v0.6.2. Patch release on v0.6.1: one
+serving fix, two opt-in probes, and four measured NO-GOs that close the last
+open engine items. No default behavior changes.
+
+**Drift mode 13 (the fix).** A wrapper-less tool call truncated INSIDE an
+escape sequence was lost entirely: the mode-2 repair appended its closing quote
+straight after a dangling `\`, escaping it, so the string never closed and the
+object never parsed. Found live -- a `Write` whose markdown content was writing
+an escaped JSON example when the token cap hit. The repair now trims past an
+incomplete escape (dangling `\`, or a partial `\uXXXX`) before closing. Three
+regression tests including an over-trim guard.
+
+**Four NO-GOs, all measured, all closing README open items.**
+1. Saguaro/SSD off-path 3090 drafting: the lever and the predictability are
+   anti-correlated. Where the draft costs 2.0-2.7 ms/round the accepted count
+   is predictable 50-59%; where it is 100% predictable (echo) 96% of rounds are
+   suffix-drafted and the draft is already free at 0.12 ms/round.
+2. The margin-conditioned predictor that could have reopened it: 58.7%, not the
+   pre-registered 80%. The drafter's own margin separates accepted from
+   rejected steps at AUC 0.561/0.583/0.632 -- self-reported confidence is not a
+   proxy for agreement with the full model.
+3. Prefill async/mbarrier rewrite: filed against a stall profile that three
+   shipped phases already halved (14.23 -> 7.77 warp-cycles per issue). What
+   binds now is occupancy (1 block/SM, limited INDEPENDENTLY by 248 regs and
+   70 KB smem), which an async pipeline makes worse, not better.
+4. Strict-parser grammar engage: the configuration it unlocks is dominated --
+   tolerant 0.837 vs strict+constrain 0.549, at 3.1x in-call cost.
+
+**Probes kept in-tree** so any revisit starts with data: `Q27_NJOINT=1` (joint
+cap/accepted-count histogram) and `Q27_MPROBE=<file>` (per-round draft margins
+vs realized n), plus tools/probes/margin_predictor_{analyze,auc}.py. Both off
+by default; one host-side increment or fprintf per round when on.
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS. Assets: tarball sha256 d0b7bd5a +
+SHA256SUMS-0.6.2. Driver floor r580+ unchanged.
