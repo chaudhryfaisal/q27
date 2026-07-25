@@ -8751,3 +8751,60 @@ GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
 2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
 binaries, ninv ALL PASS, fused_smoke PASS. Assets: tarball sha256 d0b7bd5a +
 SHA256SUMS-0.6.2. Driver floor r580+ unchanged.
+
+## 2026-07-24 (cont.) -- P16 on REAL Claude Code: the disk tier works, and the run exposed a DEAD billing-header normalizer (CC 2.1.220 changed the format)
+
+Every P16 number until now came from synthetic prompts on a bench. Pointed
+headless Claude Code (2.1.220) at q27 via ANTHROPIC_BASE_URL against an isolated
+scratch repo and measured real traffic.
+
+**P16 works on real CC traffic.** Fresh process, fresh session, after a restart:
+
+    [pfx] restore L=20480 (0.87 GB, disk, alloc 151 ms + read 55 ms + import 31 ms)
+    [req] prompt=25750 hit=20480 ckpt=-1 pf=5270 pf_ms=1945  pfx=20480
+
+First turn: 25,750 tokens of cold prefill (~7.8 s) -> 5,270 tokens (1.95 s),
+restore 237 ms. The boot prefetch held (read 55 ms, not 681). CC's system+tools
+block measures ~21.4K tokens and P16b cut its entry there automatically. Warm
+turns run pf=327 pf_ms=169; same-process cross-conversation reuse goes through
+the P9 RAM ring (hit=20480 ckpt=4, 7.85 -> 2.02 s) with disk consulted only
+after RAM misses -- tier order confirmed on live traffic.
+
+**BUG FOUND AND FIXED: normalize_cc_billing_header was DEAD on CC 2.1.220.**
+Captured what CC actually sends (logging endpoint, tools+system diffed byte for
+byte). The `cch=` field the normalizer keys on IS GONE; the volatile stamp moved
+onto the version itself:
+
+    x-anthropic-billing-header: cc_version=2.1.220.473; cc_entrypoint=sdk-cli;
+    x-anthropic-billing-header: cc_version=2.1.220.c50; cc_entrypoint=sdk-cli;
+                                                  ^^^ differs between sessions
+
+`find("cch=")` returns npos, the function returns early, and nothing is pinned --
+so the first ~15 tokens of every CC system prompt differ and NO tier (P8, P9,
+P16) can share state across conversations. This has been silently degrading the
+prefix-cache story on current CC. Fix pins both forms: the legacy `cch=` value
+and any 4th+ dot-component of `cc_version=` (2.1.220 is the real version,
+.473 the volatile tail). Three regression tests carry the live-captured strings.
+
+**STILL BLOCKED, and it is upstream of q27:** CC's system block is not a
+constant across sessions. Two invocations differing ONLY in their prompt text
+produced system blocks of **90,466 vs 109,069 chars (21,416 vs 23,560 tokens)** --
+a 2,144-token difference, stable within each session (verified per-request via
+the new Q27_SYSBLK=1 diagnostic, mapped against conv= fingerprints). Against a
+passive logging endpoint the same two commands send byte-identical tools (27
+tools, 84,713 chars) and byte-identical system text, so the growth appears only
+when a real conversation proceeds; the mechanism is not yet identified. While
+this holds, cross-SESSION prefix reuse cannot work no matter what q27 does --
+the restart case (same conversation resumed) is unaffected and measured above.
+
+**Also reproduced live: the multi-second pinned allocation.** One restore logged
+`alloc 7016 ms` for a 0.87 GB cudaMallocHost first touch -- the same
+pathological allocation dismissed as an unreproduced outlier during the P16c
+work (3/3 repeats were 75-141 ms). It is real, it lands on the critical path,
+and the fix is to allocate the staging buffer at boot instead of lazily, or to
+route through the RAM tier's preallocated slots. Filed, not built.
+
+New diagnostic: `Q27_SYSBLK=1` logs sys_off / sys_len / stable_off per request --
+the tool for answering "why did cross-session reuse miss" on any client.
+GATES: 8 CPU suites PASS (bridge +3 header cases). api_common.h is not compiled
+into build/q27, so the CLI canonical anchors are untouched by construction.

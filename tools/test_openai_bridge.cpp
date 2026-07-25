@@ -234,6 +234,36 @@ static void test_anthropic_tools_non_array_and_non_object_entries() {
     CHECK(q27::anthropic_tools_json(body2).empty());
 }
 
+// Claude Code's billing header carries a stamp that changes between
+// conversations; if it is not pinned, the first ~15 tokens of every system
+// prompt differ and NO prefix tier (P8 snapshot, P9 ring, P16 disk) can ever
+// share state across sessions. CC 2.1.220 moved that stamp: the `cch=` field is
+// gone and the volatile part rides a 4th component on cc_version. Captured live
+// 2026-07-24 -- these two strings are verbatim from two real sessions.
+static void test_billing_header_2_1_220_shape() {
+    std::string a = "x-anthropic-billing-header: cc_version=2.1.220.473; cc_entrypoint=sdk-cli;You are";
+    std::string b = "x-anthropic-billing-header: cc_version=2.1.220.c50; cc_entrypoint=sdk-cli;You are";
+    q27::normalize_cc_billing_header(a);
+    q27::normalize_cc_billing_header(b);
+    CHECK(a == b);
+    CHECK(a.find("cc_version=2.1.220.fff") != std::string::npos);
+}
+static void test_billing_header_legacy_cch_still_pinned() {
+    std::string a = "x-anthropic-billing-header: cc_version=2.1.1; cc_entrypoint=cli; cch=a5145;X";
+    std::string b = "x-anthropic-billing-header: cc_version=2.1.1; cc_entrypoint=cli; cch=b9e02;X";
+    q27::normalize_cc_billing_header(a);
+    q27::normalize_cc_billing_header(b);
+    CHECK(a == b);
+}
+static void test_billing_header_leaves_other_prompts_alone() {
+    std::string a = "You are a helpful assistant.", a0 = a;
+    q27::normalize_cc_billing_header(a);
+    CHECK(a == a0);
+    std::string b = "x-anthropic-billing-header: cc_version=2.1.220; cc_entrypoint=sdk-cli;X", b0 = b;
+    q27::normalize_cc_billing_header(b);
+    CHECK(b == b0);  // no 4th component -> nothing to pin
+}
+
 static void test_tool_choice_absent_is_auto() {
     json body = json::object();
     auto tc = q27::parse_tool_choice(body);
@@ -401,6 +431,9 @@ int main() {
     test_msgs_malformed_arguments_string_kept_not_dropped();
     test_msgs_no_messages_key();
     test_msgs_content_less_message_no_crash();
+    test_billing_header_2_1_220_shape();
+    test_billing_header_legacy_cch_still_pinned();
+    test_billing_header_leaves_other_prompts_alone();
     test_jread_null_reads_as_absent();
     test_jread_wrong_type_reads_as_absent();
     test_jread_present_values_win();

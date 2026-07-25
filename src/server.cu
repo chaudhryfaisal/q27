@@ -1755,6 +1755,12 @@ int main(int argc, char** argv) {
         }
         if (pfx_cache.enabled() && sys_off > 0)
             sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size(); // P16b, see twin
+        // Q27_SYSBLK=1: system-block geometry per request. The diagnostic for
+        // "why did cross-session prefix reuse miss" -- a client whose system
+        // block changes size between sessions cannot share a prefix at all.
+        if (sys_len && getenv("Q27_SYSBLK"))
+            fprintf(stderr, "[sysblk] sys_off=%zu chars sys_len=%d toks stable_off=%zu\n",
+                    sys_off, sys_len, stable_off);
         auto tk2 = std::chrono::steady_clock::now();
         fprintf(stderr, "[timing] render %.1fms encode %.1fms (%zu chars -> %zu toks)\n",
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),

@@ -183,14 +183,44 @@ struct Msg {
 // (ggml-org/llama.cpp#21793), so both engines canonicalize to the same bytes.
 // Only a header at the very start of the system text is touched, and the stamp
 // is only looked for inside the short header segment.
+//
+// FORMAT DRIFT (measured 2026-07-24 against Claude Code 2.1.220): the `cch=`
+// field is GONE, and the volatile stamp moved onto the version itself --
+//   x-anthropic-billing-header: cc_version=2.1.220.473; cc_entrypoint=sdk-cli;
+//                                                  ^^^ changes between conversations
+// The old `cch=`-only normalizer returns early on that shape and does nothing,
+// so the first ~15 tokens of every CC system prompt differ between sessions.
+// That silently voids CROSS-SESSION reuse for all three tiers at once (P8
+// snapshot, P9 ring, P16 disk) -- captured live: two sessions differing ONLY in
+// their task text produced two distinct 21,504-token cache entries and never
+// hit each other. Within one conversation the stamp is stable, which is why
+// same-session warm turns kept working and this hid.
+// Both stamp forms are now pinned: the legacy `cch=` value, and any 4th+
+// dot-component of `cc_version=` (2.1.220 = the real version; .473 = the
+// volatile tail). Pinning is safe -- this is prompt text an engine only needs
+// to canonicalize, and llama.cpp does the same thing for the same reason.
 inline void normalize_cc_billing_header(std::string& sys) {
     static const char* PFX = "x-anthropic-billing-header:";
     if (sys.rfind(PFX, 0) != 0) return;
+    // legacy: cch=<stamp>;
     size_t cch = sys.find("cch=", 27);
-    if (cch == std::string::npos || cch > 160) return;  // header segment only
-    size_t v = cch + 4, end = sys.find(';', v);
-    if (end == std::string::npos || end == v || end - v > 16) return;
-    for (size_t i = v; i < end; ++i) sys[i] = 'f';
+    if (cch != std::string::npos && cch <= 160) {
+        size_t v = cch + 4, end = sys.find(';', v);
+        if (end != std::string::npos && end != v && end - v <= 16)
+            for (size_t i = v; i < end; ++i) sys[i] = 'f';
+    }
+    // 2.1.220+: cc_version=<a.b.c>.<volatile>;  -- pin everything past the 3rd dot
+    size_t cv = sys.find("cc_version=", 0);
+    if (cv == std::string::npos || cv > 160) return;
+    size_t v = cv + 11, end = sys.find(';', v);
+    if (end == std::string::npos || end <= v || end - v > 64) return;
+    int dots = 0;
+    for (size_t i = v; i < end; ++i) {
+        if (sys[i] == '.' && ++dots == 3) {
+            for (size_t j = i + 1; j < end; ++j) sys[j] = 'f';
+            return;
+        }
+    }
 }
 
 // Strip ChatML role delimiters from untrusted content/roles so they can't forge
