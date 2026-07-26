@@ -27,12 +27,26 @@ int main(int argc, char** argv) {
 
         // size invariants per dtype
         uint64_t r = t.rows(), c = t.cols();
+        uint64_t group = 0;
+        if (t.dtype == q27::DType::Q4_G64) group = 64;
+        else if (t.dtype == q27::DType::Q8_G128 || t.dtype == q27::DType::T2_G128 ||
+                 t.dtype == q27::DType::T3_G128 || t.dtype == q27::DType::B1_G128)
+            group = 128;
+        if (group && c % group) {
+            printf("INVARIANT FAIL %s: cols %" PRIu64 " not divisible by group %" PRIu64 "\n",
+                   t.name.c_str(), c, group);
+            bad++;
+            continue;
+        }
         uint64_t want_data = 0, want_scales = 0;
         switch (t.dtype) {
             case q27::DType::F32:     want_data = r * c * 4; break;
             case q27::DType::F16:     want_data = r * c * 2; break;
             case q27::DType::Q8_G128: want_data = r * c;     want_scales = r * (c / 128) * 2; break;
             case q27::DType::Q4_G64:  want_data = r * c / 2; want_scales = r * (c / 64) * 2;  break;
+            case q27::DType::T2_G128: want_data = r * c / 4; want_scales = r * (c / 128) * 2; break;
+            case q27::DType::T3_G128: want_data = r * (c / 128) * 26; want_scales = r * (c / 128) * 2; break;
+            case q27::DType::B1_G128: want_data = r * c / 8; want_scales = r * (c / 128) * 2; break;
         }
         if (t.data_size != want_data || t.scales_size != want_scales) {
             printf("INVARIANT FAIL %s: data %" PRIu64 " (want %" PRIu64 "), scales %" PRIu64

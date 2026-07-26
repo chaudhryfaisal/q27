@@ -20,6 +20,9 @@ const char* dtype_name(DType t) {
         case DType::F16:     return "F16";
         case DType::Q8_G128: return "Q8_G128";
         case DType::Q4_G64:  return "Q4_G64";
+        case DType::T2_G128: return "T2_G128";
+        case DType::T3_G128: return "T3_G128";
+        case DType::B1_G128: return "B1_G128";
     }
     return "?";
 }

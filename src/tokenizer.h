@@ -3,6 +3,7 @@
 // regex for ASCII + "non-ASCII == letter" approximation; exactness is gated
 // against llama-tokenize on an English/code corpus (see test_tokenizer).
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -16,6 +17,10 @@ class Tokenizer {
     std::vector<int> encode(const std::string& text) const; // handles special tokens
     std::string decode(const std::vector<int>& ids) const;
     std::string decode_one(int id) const;
+
+    // Vocabulary size. Backends that build their own logit buffers need it
+    // without reaching into the tokenizer's internals.
+    size_t vocab_size() const { return tokens_.size(); }
 
     int bos() const { return bos_; }
     int eos() const { return eos_; }

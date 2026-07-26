@@ -7,8 +7,8 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean
-all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
+.PHONY: all clean test-inspect
+all: build/inspect build/test_sampling build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -19,6 +19,12 @@ build:
 
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
+
+test-inspect: build/inspect
+	python3 tools/test_inspect.py ./build/inspect
+
+build/test_sampling: src/test_sampling.cpp src/sampling.h | build
+	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) src/test_tokenizer.cpp src/tokenizer.cpp -o $@

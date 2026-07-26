@@ -7,7 +7,7 @@
 
 namespace q27 {
 
-enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3 };
+enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3, T2_G128 = 4, T3_G128 = 5, B1_G128 = 6 };
 
 const char* dtype_name(DType t);
 
@@ -41,6 +41,11 @@ struct Model {
     ~Model();
 
     static Model open(const std::string& path); // throws std::runtime_error
+
+    // Read-only mapped file range. Backends may wrap page-aligned subranges
+    // without copying; the Model must outlive every such device view.
+    const void* mapping_base() const { return map_base_; }
+    size_t mapping_size() const { return map_size_; }
 
   private:
     void* map_base_ = nullptr;
