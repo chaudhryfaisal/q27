@@ -70,6 +70,42 @@ int main() {
     ok(resolve_think(json{{"thinking", {{"type", "bogus"}}}}, true) == true,
        "unknown thinking.type leaves default (true)");
 
+    // --- BUDGET (2026-07-28). Every convention that can enable thinking must
+    // also be able to bound it; an accepted-and-inert field reads as working
+    // and is worse than an absent one (club-3090 #741). ---
+    auto bud = [](const json& b, int server_budget = -1, bool allow = true) {
+        return q27::resolve_think_cfg(b, true, allow, server_budget).budget;
+    };
+    ok(bud(json::object()) == -1, "budget: silent request -> unbounded (-1)");
+    ok(bud(json::object(), 4096) == 4096, "budget: silent request -> server budget");
+    ok(bud(json{{"thinking", {{"type", "enabled"}, {"budget_tokens", 512}}}}) == 512,
+       "budget: anthropic thinking.budget_tokens honored");
+    ok(bud(json{{"thinking_token_budget", 256}}) == 256,
+       "budget: openai/qwen thinking_token_budget honored");
+    ok(bud(json{{"chat_template_kwargs", {{"thinking_budget", 128}}}}) == 128,
+       "budget: llama.cpp chat_template_kwargs.thinking_budget honored");
+    ok(bud(json{{"thinking", {{"budget_tokens", 512}}}}, 4096, false) == 4096,
+       "budget: GATED -- request budget IGNORED without --request-think");
+    ok(bud(json{{"thinking", {{"budget_tokens", 0}}}}) == 0,
+       "budget: explicit 0 is honored (not treated as unset)");
+    ok(bud(json{{"thinking", {{"budget_tokens", "512"}}}}, 4096) == 4096,
+       "budget: non-integer budget ignored -> server budget");
+    ok(bud(json{{"thinking", {{"budget_tokens", -1}}}}, 4096) == -1,
+       "budget: negative request budget means unbounded, overriding server");
+    // enabling and bounding are independent: a request may bound a block it
+    // did not itself turn on.
+    ok(q27::resolve_think_cfg(json{{"thinking_token_budget", 64}}, true, true, -1).enabled == true,
+       "budget: bounding alone does not disable thinking");
+    ok(q27::resolve_think_cfg(json{{"enable_thinking", false}, {"thinking_token_budget", 64}},
+                              true, true, -1).enabled == false,
+       "budget: bounding alone does not re-enable a disabled block");
+
+    // --- server default: fraction of max_tokens, absolute, or opt-out ---
+    ok(q27::think_budget_default(-1, 8192) == 4096, "default: <0 flag -> half of max_tokens");
+    ok(q27::think_budget_default(0, 8192) == -1, "default: flag 0 -> unbounded (opt out)");
+    ok(q27::think_budget_default(1234, 8192) == 1234, "default: flag >0 -> absolute");
+    ok(q27::think_budget_default(-1, 0) == -1, "default: no max_tokens -> unbounded");
+
     printf(failures ? "\nTHINK-RESOLVE: %d FAIL\n" : "\nTHINK-RESOLVE: all pass\n", failures);
     return failures ? 1 : 0;
 }

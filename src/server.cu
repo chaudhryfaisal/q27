@@ -117,6 +117,16 @@ int main(int argc, char** argv) {
                 "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
                 "  request enable_thinking; off by default). The CLI keeps reference\n"
                 "  defaults (bitwise canonical).\n"
+                "  Reasoning budget: whenever a <think> block is served, tokens\n"
+                "  inside it are capped and the block is force-closed on trip --\n"
+                "  the answer still gets written. Default = half the request's\n"
+                "  max_tokens; --think-budget N sets an absolute cap, 0 disables.\n"
+                "  Requests may bound it too, symmetric with the enable\n"
+                "  conventions: thinking.budget_tokens (Anthropic),\n"
+                "  thinking_token_budget (OpenAI/Qwen), or\n"
+                "  chat_template_kwargs.thinking_budget -- honored only under\n"
+                "  --request-think. A trip is reported as usage.reasoning_tokens\n"
+                "  and usage.reasoning_budget_exceeded.\n"
                 "  Auth: no API key is required by default (loopback-only is the\n"
                 "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
                 "  one key per line (# comments ignored); Q27_API_KEY adds one more.\n"
@@ -153,6 +163,11 @@ int main(int argc, char** argv) {
     bool kv_fp16 = false;
     bool constrain_tools = false;
     bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
+    // --think-budget: cap on tokens generated inside a <think> block. <0
+    // (default) = THINK_BUDGET_FRAC of the request max_tokens; 0 = unbounded
+    // (opt out); >0 = absolute. Applies whenever a block is served, by boot
+    // flag or by request. api_common.h documents why the default is ON.
+    int think_budget_flag = -1;
     std::vector<std::string> api_keys;
     q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
     double pfx_ram_gb = 0;       // P16c: host-RAM tier budget (0 = off)
@@ -172,6 +187,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
+        else if (!strcmp(argv[i], "--think-budget") && i + 1 < argc)
+            think_budget_flag = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
@@ -1252,8 +1269,10 @@ int main(int argc, char** argv) {
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
         int sys_len = 0;     // P16b: system-block tokens (0 = none/feature off)
         bool thinking = false; // request wants a real <think> block; seeds the splitter below
+        q27::ThinkCfg tcfg;    // .budget resolved against the final n_max at each loop
         if (routed_chat) {
-            thinking = q27::resolve_think(body, !no_think_srv, req_think);
+            tcfg = q27::resolve_think_cfg(body, !no_think_srv, req_think, -1);
+            thinking = tcfg.enabled;
             // thinking and a FORCED tool call are mutually exclusive: FORCED
             // injects <tool_call>\n into the tail (below), leaving no room for a
             // think block, so suppress the opener when a tool is forced.
@@ -1399,6 +1418,8 @@ int main(int argc, char** argv) {
             // routed_chat: think/tool-aware path, an exact mechanical twin of
             // the /v1/messages non-stream handler above, OpenAI-shaped output.
             StreamSplitter sp;
+            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                : q27::think_budget_default(think_budget_flag, n_max)};
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -1436,6 +1457,8 @@ int main(int argc, char** argv) {
                 eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
             auto on_tok = [&](int id) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
+                if (const char* bclose = tb.tick(sp))
+                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
                 return true;
             };
             Engine::DecodeTask bt;
@@ -1493,7 +1516,11 @@ int main(int argc, char** argv) {
                         {"choices", json::array({choice})},
                         {"usage", {{"prompt_tokens", (int)prompt.size()},
                                    {"completion_tokens", n},
-                                   {"total_tokens", (int)prompt.size() + n}}}};
+                                   {"total_tokens", (int)prompt.size() + n},
+                                   // an accepted-and-inert budget field is worse
+                                   // than none: say when it fired.
+                                   {"reasoning_tokens", tb.used},
+                                   {"reasoning_budget_exceeded", tb.tripped}}}};
             res.set_content(jdump(out), "application/json");
             return;
         }
@@ -1593,6 +1620,8 @@ int main(int argc, char** argv) {
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
                 tc.begin(tool_names_v);
                 StreamSplitter sp;
+                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                    : q27::think_budget_default(think_budget_flag, n_max)};
                 if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
@@ -1644,6 +1673,8 @@ int main(int argc, char** argv) {
                     eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
                 auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
+                    if (const char* bclose = tb.tick(sp))
+                        for (auto& [ch, t] : sp.feed(bclose)) emit_seg(ch, t);
                     return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
@@ -1754,7 +1785,8 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
         int sys_len = 0; // P16b: system-block tokens (0 = none/feature off)
-        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
+        q27::ThinkCfg tcfg = q27::resolve_think_cfg(body, !no_think_srv, req_think, -1);
+        bool thinking = tcfg.enabled;
         size_t sys_off = 0;
         std::string rendered = q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking,
                                                   &stable_off, &sys_off);
@@ -1821,6 +1853,8 @@ int main(int argc, char** argv) {
             eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             StreamSplitter sp;
+            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                : q27::think_budget_default(think_budget_flag, n_max)};
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -1844,6 +1878,8 @@ int main(int argc, char** argv) {
                 eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
             auto on_tok = [&](int id) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
+                if (const char* bclose = tb.tick(sp))
+                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
                 return true;
             };
             Engine::DecodeTask bt;
@@ -1917,7 +1953,9 @@ int main(int argc, char** argv) {
                         {"model", served_name}, {"content", content},
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
-                                   {"output_tokens", n}}}};
+                                   {"output_tokens", n},
+                                   {"reasoning_tokens", tb.used},
+                                   {"reasoning_budget_exceeded", tb.tripped}}}};
             res.set_content(jdump(out), "application/json");
             return;
         }
@@ -1963,6 +2001,8 @@ int main(int argc, char** argv) {
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
 
                 StreamSplitter sp;
+                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                    : q27::think_budget_default(think_budget_flag, n_max)};
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 std::string tool_buf, text_accum;
                 q27::Utf8Gate ugate;
@@ -2036,6 +2076,8 @@ int main(int argc, char** argv) {
                     eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
                 auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
+                    if (const char* bclose = tb.tick(sp))
+                        for (auto& [ch, t] : sp.feed(bclose)) emit_seg(ch, t);
                     return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
@@ -2219,7 +2261,8 @@ int main(int argc, char** argv) {
         // previous request's value cannot leak into this one.
         int sys_len = 0; // P16b: set below if this request carries a system block
         auto tk0 = std::chrono::steady_clock::now();
-        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
+        q27::ThinkCfg tcfg = q27::resolve_think_cfg(body, !no_think_srv, req_think, -1);
+        bool thinking = tcfg.enabled;
         size_t sys_off = 0;
         const std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
         std::vector<int> prompt = tok.encode(rendered);
@@ -2325,6 +2368,8 @@ int main(int argc, char** argv) {
             auto [ctx, flush_think, flush_text, flush_tool] =
                 make_item_cbs(items, tool_counter, nullptr);
             StreamSplitter sp;
+            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                : q27::think_budget_default(think_budget_flag, n_max)};
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
@@ -2343,6 +2388,8 @@ int main(int argc, char** argv) {
             q27::Utf8Gate ugate;
             auto on_tok = [&](int id) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
+                if (const char* bclose = tb.tick(sp))
+                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
                 return true;
             };
             Engine::DecodeTask bt;
@@ -2509,10 +2556,14 @@ int main(int argc, char** argv) {
                         {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
+                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
+                                    : q27::think_budget_default(think_budget_flag, n_max)};
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
+                    if (const char* bclose = tb.tick(sp))
+                        for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
                     return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;

@@ -329,30 +329,74 @@ inline std::string tool_response_text(const std::string& out) {
 // server suppresses it). Three client conventions, all honored -- a given
 // client sends exactly one:
 //   OpenAI / Qwen   : top-level  "enable_thinking": <bool>
-//   llama.cpp / GLM : "chat_template_kwargs": {"enable_thinking": <bool>}
-//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (Claude
-//                     Code's own thinking toggle; budget_tokens ignored)
+//                                "thinking_token_budget": <int>
+//   llama.cpp / GLM : "chat_template_kwargs": {"enable_thinking": <bool>,
+//                                              "thinking_budget": <int>}
+//   Anthropic       : "thinking": {"type": "enabled"|"disabled",
+//                                  "budget_tokens": <int>}
 // Malformed/wrong-typed fields are ignored rather than thrown (Security #1).
 // Later checks win over earlier ones; the conventions never co-occur in practice.
-inline bool resolve_think(const json& body, bool server_default, bool allow_request) {
-    if (!allow_request) return server_default;
-    bool think = server_default;
+//
+// BUDGET (2026-07-28). Every convention that can turn thinking ON can also
+// bound it -- an accepted-and-inert field is worse than an absent one, because
+// it reads as working. `budget` is a cap on tokens generated inside the
+// <think> block; on trip the engine injects `</think>` and the answer proceeds.
+// -1 means unbounded. Measured motivation: on an 11-pack / 240-scenario A/B
+// (BUILDLOG 2026-07-28) the unbudgeted block arm truncated 28 times against the
+// inline arm's 0, and every point it lost came from a run that never
+// terminated -- where nothing truncated it was neutral or better.
+struct ThinkCfg {
+    bool enabled = false;
+    int budget = -1;  // -1 = unbounded; >=0 = max tokens inside the block
+};
+
+inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool allow_request,
+                                  int server_budget) {
+    ThinkCfg c{server_default, server_budget};
+    if (!allow_request) return c;
+    auto take_budget = [&](const json& v) {
+        // 0 is a legitimate "no thinking budget at all"; negative means unbounded.
+        if (v.is_number_integer()) c.budget = v.get<int>();
+    };
     if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
-        think = body["enable_thinking"].get<bool>();
+        c.enabled = body["enable_thinking"].get<bool>();
+    if (body.contains("thinking_token_budget")) take_budget(body["thinking_token_budget"]);
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
         const auto& k = body["chat_template_kwargs"];
         if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean())
-            think = k["enable_thinking"].get<bool>();
+            c.enabled = k["enable_thinking"].get<bool>();
+        if (k.contains("thinking_budget")) take_budget(k["thinking_budget"]);
     }
     if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto& t = body["thinking"];
         if (t.contains("type") && t["type"].is_string()) {
             const std::string ty = t["type"].get<std::string>();
-            if (ty == "enabled") think = true;
-            else if (ty == "disabled") think = false;
+            if (ty == "enabled") c.enabled = true;
+            else if (ty == "disabled") c.enabled = false;
         }
+        if (t.contains("budget_tokens")) take_budget(t["budget_tokens"]);
     }
-    return think;
+    return c;
+}
+
+// Thin compat wrapper: the boolean-only question, for call sites that do not
+// run a generation loop (and for test_think_resolve's existing cases).
+inline bool resolve_think(const json& body, bool server_default, bool allow_request) {
+    return resolve_think_cfg(body, server_default, allow_request, -1).enabled;
+}
+
+// Server-side default budget as a FRACTION of the request's max_tokens, so the
+// answer still fits after the close. 0.5 is not arbitrary: club-3090 #765
+// measured clean terminations at thinking_token_budget=8192, and a 16K cap is
+// the shape that produced it, so 0.5 reproduces the known-good value there.
+static constexpr double THINK_BUDGET_FRAC = 0.5;
+
+// Resolve the server's default budget for a request whose cap is `n_max`.
+// `flag` is --think-budget: <0 = use the fraction, 0 = unbounded, >0 = absolute.
+inline int think_budget_default(int flag, int n_max) {
+    if (flag == 0) return -1;
+    if (flag > 0) return flag;
+    return n_max > 0 ? (int)(THINK_BUDGET_FRAC * n_max) : -1;
 }
 
 // Anthropic error envelope, exactly the real API's shape: the SDK inside
