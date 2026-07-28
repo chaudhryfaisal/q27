@@ -29,6 +29,29 @@ int main() {
     }
     if (!rejected) return 1;
 
+    // NaNs must never reach argmax or sorting comparators; -inf remains a
+    // valid mask value.
+    {
+        std::vector<float> nan_logits = {
+            std::numeric_limits<float>::quiet_NaN(), 1.0f,
+            -std::numeric_limits<float>::infinity()
+        };
+        std::vector<uint32_t> ids = {0, 1, 2};
+        int throws = 0;
+        try { (void)q27::sample_logits_cpu(nan_logits, greedy, rng); }
+        catch (const std::runtime_error&) { throws++; }
+        try { (void)q27::sample_candidates_cpu(nan_logits, ids, 3, greedy, rng); }
+        catch (const std::runtime_error&) { throws++; }
+        try { (void)q27::build_served_distribution(nan_logits, greedy); }
+        catch (const std::runtime_error&) { throws++; }
+        try { (void)q27::build_served_from_candidates(
+            nan_logits.data(), ids.data(), 3, greedy); }
+        catch (const std::runtime_error&) { throws++; }
+        if (throws != 4) return 1;
+        std::vector<float> masked = {-std::numeric_limits<float>::infinity(), 1.0f};
+        if (q27::sample_logits_cpu(masked, greedy, rng) != 1) return 1;
+    }
+
     // A shuffled exact top-k over-set must consume RNG and select tokens
     // identically to the full-logits path.
     {

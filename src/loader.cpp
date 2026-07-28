@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace q27 {
@@ -29,12 +30,21 @@ const char* dtype_name(DType t) {
 
 uint64_t Tensor::rows() const {
     if (shape.size() <= 1) return 1;
-    uint64_t r = 1;
-    for (size_t i = 0; i + 1 < shape.size(); i++) r *= shape[i];
-    return r;
+    uint64_t rows = 1;
+    for (size_t i = 0; i + 1 < shape.size(); i++) {
+        if (shape[i] && rows > std::numeric_limits<uint64_t>::max() / shape[i])
+            throw std::runtime_error("q27: tensor row count overflows uint64: " + name);
+        rows *= shape[i];
+    }
+    return rows;
 }
 uint64_t Tensor::cols() const { return shape.empty() ? 0 : shape.back(); }
-uint64_t Tensor::n_elements() const { return rows() * cols(); }
+uint64_t Tensor::n_elements() const {
+    const uint64_t row_count = rows(), column_count = cols();
+    if (column_count && row_count > std::numeric_limits<uint64_t>::max() / column_count)
+        throw std::runtime_error("q27: tensor element count overflows uint64: " + name);
+    return row_count * column_count;
+}
 
 const Tensor* Model::find(const std::string& name) const {
     auto it = index.find(name);
@@ -70,12 +80,12 @@ struct Cursor {
     const uint8_t* p;
     const uint8_t* end;
     template <typename T> T read() {
-        if (p + sizeof(T) > end) throw std::runtime_error("q27: truncated file");
+        if ((size_t)(end - p) < sizeof(T)) throw std::runtime_error("q27: truncated file");
         T v; std::memcpy(&v, p, sizeof(T)); p += sizeof(T);
         return v;
     }
     void bytes(void* dst, size_t n) {
-        if (p + n > end) throw std::runtime_error("q27: truncated file");
+        if (n > (size_t)(end - p)) throw std::runtime_error("q27: truncated file");
         std::memcpy(dst, p, n); p += n;
     }
 };
@@ -114,6 +124,7 @@ Model Model::open(const std::string& path) {
         uint8_t nd = c.read<uint8_t>();
         t.shape.resize(nd);
         for (uint8_t d = 0; d < nd; d++) t.shape[d] = c.read<uint64_t>();
+        (void)t.n_elements(); // reject overflowing shapes before any backend sees them
         uint64_t doff = c.read<uint64_t>();
         t.data_size   = c.read<uint64_t>();
         uint64_t soff = c.read<uint64_t>();
@@ -124,17 +135,24 @@ Model Model::open(const std::string& path) {
         m.tensors.push_back(std::move(t));
     }
     uint64_t table_end = (uint64_t)(c.p - b);
+    if (table_end > std::numeric_limits<uint64_t>::max() - (ALIGN - 1))
+        throw std::runtime_error("q27: tensor table size overflow");
     uint64_t data_base = (table_end + ALIGN - 1) / ALIGN * ALIGN;
+    const uint64_t file_size = (uint64_t)sz;
+    auto in_file = [&](uint64_t offset, uint64_t length) {
+        return data_base <= file_size && offset <= file_size - data_base &&
+               length <= file_size - data_base - offset;
+    };
 
     for (size_t i = 0; i < m.tensors.size(); i++) {
         Tensor& t = m.tensors[i];
         uint64_t doff = (uint64_t)(uintptr_t)t.data;
-        if (data_base + doff + t.data_size > sz)
+        if (!in_file(doff, t.data_size))
             throw std::runtime_error("q27: tensor data out of range: " + t.name);
         t.data = b + data_base + doff;
         if (t.scales) {
             uint64_t soff = (uint64_t)(uintptr_t)t.scales;
-            if (data_base + soff + t.scales_size > sz)
+            if (!in_file(soff, t.scales_size))
                 throw std::runtime_error("q27: tensor scales out of range: " + t.name);
             t.scales = b + data_base + soff;
         }

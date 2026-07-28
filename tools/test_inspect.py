@@ -24,7 +24,9 @@ def align(value):
     return (value + ALIGN - 1) // ALIGN * ALIGN
 
 
-def make_fixture(path, corrupt=False, misaligned=False):
+def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
+                 bad_t3_range=False, bad_t3_padding=False, overflow=False,
+                 bad_offset=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
@@ -32,14 +34,23 @@ def make_fixture(path, corrupt=False, misaligned=False):
     for index, (name, dtype, shape, data_size, scale_size) in enumerate(TENSORS):
         if misaligned and index == 0:
             shape = [1, 129]
+        if overflow and dtype == 5:
+            shape = [(1 << 63) + 1, 128]
         data_off = align(len(blobs))
+        stored_data_off = (1 << 64) - 128 if bad_offset and dtype == 4 else data_off
         blobs.extend(b'\0' * (data_off - len(blobs)))
-        stored_data_size = data_size + (1 if corrupt and index == 1 else 0)
+        stored_data_size = data_size + (1 if corrupt_size and index == 1 else 0)
         data = bytearray(bytes([index + 1]) * stored_data_size)
         if dtype == 5:
             # The final T3 byte carries three real codes followed by two
             # canonical zero padding codes (1*27 + 1*81).
             data[25] = 108
+            if bad_t3_range:
+                data[0] = 243
+            if bad_t3_padding:
+                data[25] = 0
+        if dtype == 4 and bad_t2:
+            data[0] = 3
         blobs.extend(data)
 
         scale_off = 0
@@ -53,7 +64,7 @@ def make_fixture(path, corrupt=False, misaligned=False):
         entry.extend(name_bytes)
         entry.extend(struct.pack('<BB', dtype, len(shape)))
         entry.extend(struct.pack('<' + 'Q' * len(shape), *shape))
-        entry.extend(struct.pack('<QQQQ', data_off, stored_data_size, scale_off, scale_size))
+        entry.extend(struct.pack('<QQQQ', stored_data_off, stored_data_size, scale_off, scale_size))
         entries.append(entry)
 
     header = struct.pack('<IIII', MAGIC, VERSION, len(entries), len(meta)) + meta
@@ -75,10 +86,20 @@ def main():
         valid = root / 'valid.q27'
         corrupt = root / 'corrupt.q27'
         misaligned = root / 'misaligned.q27'
+        bad_t2 = root / 'bad-t2.q27'
+        bad_t3_range = root / 'bad-t3-range.q27'
+        bad_t3_padding = root / 'bad-t3-padding.q27'
+        overflow = root / 'overflow.q27'
+        bad_offset = root / 'bad-offset.q27'
         make_fixture(valid)
-        make_fixture(corrupt, corrupt=True)
+        make_fixture(corrupt, corrupt_size=True)
         make_fixture(misaligned, misaligned=True)
+        make_fixture(bad_t2, bad_t2=True)
+        make_fixture(bad_t3_range, bad_t3_range=True)
+        make_fixture(bad_t3_padding, bad_t3_padding=True)
+        make_fixture(overflow, overflow=True)
 
+        make_fixture(bad_offset, bad_offset=True)
         good = run(inspect, valid)
         if good.returncode != 0 or '\nOK\n' not in good.stdout:
             sys.stderr.write(good.stdout + good.stderr)
@@ -94,6 +115,37 @@ def main():
                 'not divisible by group 128' not in bad_shape.stdout):
             sys.stderr.write(bad_shape.stdout + bad_shape.stderr)
             raise SystemExit('misaligned packed-dtype shape was not detected')
+
+        invalid_t2 = run(inspect, bad_t2)
+        if (invalid_t2.returncode == 0 or
+                'T2 payload contains reserved code 3' not in invalid_t2.stdout):
+            sys.stderr.write(invalid_t2.stdout + invalid_t2.stderr)
+            raise SystemExit('reserved T2 code was not detected')
+
+        invalid_t3_range = run(inspect, bad_t3_range)
+        if (invalid_t3_range.returncode == 0 or
+                'T3 payload byte exceeds 242' not in invalid_t3_range.stdout):
+            sys.stderr.write(invalid_t3_range.stdout + invalid_t3_range.stderr)
+            raise SystemExit('out-of-range T3 byte was not detected')
+
+        invalid_t3_padding = run(inspect, bad_t3_padding)
+        if (invalid_t3_padding.returncode == 0 or
+                'T3 final-byte padding is noncanonical' not in invalid_t3_padding.stdout):
+            sys.stderr.write(invalid_t3_padding.stdout + invalid_t3_padding.stderr)
+            raise SystemExit('noncanonical T3 padding was not detected')
+
+        invalid_overflow = run(inspect, overflow)
+        if (invalid_overflow.returncode == 0 or
+                'tensor element count overflows uint64' not in
+                invalid_overflow.stdout + invalid_overflow.stderr):
+            sys.stderr.write(invalid_overflow.stdout + invalid_overflow.stderr)
+            raise SystemExit('packed payload size overflow was not detected')
+
+        invalid_offset = run(inspect, bad_offset)
+        if (invalid_offset.returncode == 0 or
+                'tensor data out of range' not in invalid_offset.stdout + invalid_offset.stderr):
+            sys.stderr.write(invalid_offset.stdout + invalid_offset.stderr)
+            raise SystemExit('overflowing tensor offset was not detected')
 
     print('inspect packed dtype fixtures: PASS')
 
