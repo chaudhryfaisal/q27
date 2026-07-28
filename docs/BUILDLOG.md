@@ -8931,3 +8931,193 @@ believing a serving-path gate.
 but appears in no Makefile prerequisite list, so a change confined to that
 header produces a silently stale build. Editing the Makefile needs its own
 approval; filed, not built.
+
+## 2026-07-26 -- Qwen3.6-27B-MTP fine-tune screening: the pi-tune's MTP head is the best measured, and it loses anyway
+
+Two DeepReinforce-adjacent candidates screened as q27 checkpoints:
+`bytkim/Qwen3.6-27B-MTP-pi-tune` (4-bit QLoRA SFT for no-thinking agentic
+coding through a PI-style harness) and its `-pi-reasoning` sibling. Also
+answered, from the same survey: **Ornith-1.0-31B cannot run on q27 at all** --
+it is a Gemma 4 31B post-train (60 layers, sliding-window attention, 5376
+hidden, head_dim 512 global), so every `constexpr` in engine.cuh:35-43 is
+wrong and there are no `nextn.*` tensors. The 9B and 35B Ornith variants are
+Qwen3-Next but MTP-less, so they fail `loader.cpp:42` on the first
+`nextn.eh_proj.weight` lookup.
+
+**Screen before download.** Both pi-tune GGUF headers were read via HTTP range
+request (32 MB prefix, `scratchpad/gguf_head.py`) rather than pulling 55 GB to
+find out. Both carry all four required `nextn.*` tensors at correct shapes,
+866 tensors, zero name or shape deltas against the base MTP GGUF, and every
+arch KV matching q27's constants. Only KV difference is
+`padding_token_id` (248055 -> 248044), which the `.tok` format does not carry.
+Repacked at the default tier: worst-Q4 RMSE 0.1071 / 0.1067, both inside the
+documented band.
+
+**The MTP head is not what a QLoRA breaks.** cctx burst rig, 1488 positions,
+fp16 KV, conditional acceptance restricted to each stream's NOVEL prefix (a
+`--burst-stats` run forces N tokens with no EOS, so a model that finishes early
+repeats itself and inflates acceptance -- pitune's novel prefix was 850/1487,
+pireasoning's 40/1487, qwopus's 1487/1487):
+
+    leg           rows   k=1    E[acc/round] C=5   C=7
+    pitune         841   1.00   5.737             7.304
+    qwopus        1477   0.91   4.335             5.020
+    vanilla       1151   0.83   3.493             3.768
+    pireasoning     31   --     not measurable
+
+vanilla < qwopus reproduces the known ~8pp gap, so the rig ranks correctly.
+The QLoRA did NOT drift the head: pitune drafts +32% better than qwopus at
+C=5. Caveat that cannot be removed from this measurement: each model drafts
+against its OWN output, so acceptance conflates head quality with how
+predictable that model's prose is.
+
+**It loses on the actual work.** thunderdome, 3 tasks picked by measured
+signal-to-noise over 3852 non-crash trials in `results/` rather than by
+intuition -- which VETOED the obvious picks (circuit-debugger 2.44,
+beam-splitter 2.16, constraint-scheduler 2.11, analytics-dashboard 1.59 are
+the WORST S/N on the board, the basin lotteries):
+
+    task                    S/N    pitune  qwopus  noise
+    ecommerce-backend (T10) 5.31   0.977   0.979   0.040
+    fts-search (T3)         4.33   0.210   0.910   0.039
+    reactive-spreadsheet    4.73   0.255   0.748   0.053
+    mean                           0.481   0.879
+
+Losses are 18x and 9x their task's measured noise; the ecommerce tie is the
+control. **Root cause is the tool protocol, not capability.** Both failures end
+with the model emitting its PI-harness scaffolding as assistant text instead of
+a tool call: `<task_create>{...}</task_create>` at turn 29 on
+reactive-spreadsheet (Claude Code saw a text-only turn, called it done, exited
+clean at 55 s with 270 LOC vs qwopus's 952), and on fts-search a real `Edit`
+validation error followed by the model writing `<model_response>` and
+fabricating its own `<tool_use_error>` block. Rare but terminal: 1 leak per ~28
+proper `tool_use` calls, and qwopus leaked zero across all three tasks.
+
+Verdict: NO-GO as a serving checkpoint. The +32% acceptance is worthless when
+the model cannot hold the tool protocol for a long-horizon task. Reviving it
+means teaching the tolerant parser these forms as new drift modes (it catalogs
+nine; `<task_create>` / `<model_response>` / `<tool_use_error>` are
+mechanically recognizable) -- parser work in api_common.h, not a checkpoint
+swap. pi-reasoning is worse: 40 novel tokens before it loops.
+
+## 2026-07-27 -- Qwopus tier sweep: the q4-head error-cancellation family INVERTS on the fine-tune
+
+The vanilla ladder's headline result -- that a single Q4 lm_head plus Q4
+residual writers cancel error, so q4s (4.55 bpw) measures BETTER than the
+larger default -- **does not transfer to Qwopus**. Full sweep, recipes lifted
+verbatim from each shipped vanilla tier's own `quant_policy`/`q8_extra`/
+`q4_head` metadata rather than from prose, same corpus and flags as the
+vanilla anchors (`--nll wiki.test.qwopus.i32 --nll-chunk 2048 --ctx 2048`):
+
+    tier      GB      PPL       HE+     LCB     auto-ctx(fp8)
+    q6k      23.25    7.0303    30/30   20/30   122880
+    q6       20.49    7.0528    30/30   21/30   196608
+    q8       28.45    7.0563*   NOBOOT  NOBOOT  --
+    default  17.73    7.1132    30/30   20/30   262144
+    q6f      20.99    7.1283    30/30   19/30   184320
+    q5f      18.22    7.1519    30/30   21/30   258048
+    q4s      15.46    7.1851    30/30   19/30   262144
+
+Size-matched pairs isolate the Q4 head: default (17.73) beats q5f (18.22) by
+0.54%, q6 (20.49) beats q6f (20.99) by 1.06%. Both times the SMALLER,
+non-q4-head tier wins. On vanilla the ordering is reversed. **The recipe family
+is checkpoint-specific; no fine-tune inherits the vanilla ladder.**
+
+\* q8's batched NLL OOMs (28.45 GB weights + the `PT x VOCAB` logits buffer on
+32 GB). Measured on `--nll-serial` instead, which keeps logits host-side --
+validated first by running default through both paths: 7.1154 serial vs 7.1132
+batched, offset +0.0022 (0.031%), so serial numbers slot into the batched
+ladder. q8 also **fails to boot as a server on 32 GB** (tried at `--ctx 8192`),
+so on a 5090 it is a perplexity reference only. Bits stay non-monotonic in PPL:
+q8 (8.10 bpw) loses to q6k (6.80) and ties q6 (6.00), as on vanilla.
+
+**Tiers do not move task scores, and this is now shown rather than asserted.**
+HumanEval+ is 30/30 on every tier that boots. LCB spans 19-21/30, and the
+per-problem breakdown says that spread is lottery, not ranking: of 18 problems
+failing at least once, only **2 fail on all six tiers**; 16 fail on some and
+pass on others. q6k (best PPL) fails problems q4s (worst PPL) passes. Reconfirms
+the 21-task paired-eval finding on a fine-tune. **The real differentiator is
+context**: auto-ctx spans 2.1x, and q6k costs 139264 tokens of window for a
+1.16% PPL gain with no measurable task effect. Default stays the pick.
+
+An earlier read of this sweep recommended q6/q6k as "strictly better" on PPL
+alone; the task and auto-ctx columns retire that.
+
+**Published** to `signalnine/Qwopus3.6-27B-v2-MTP-q27`: default, q4s, q6, q6k,
+q8, with the card carrying the inversion warning so nobody ports vanilla's tier
+guidance here. q5f and q6f were built and measured but deliberately NOT
+published -- each is beaten by a smaller tier already in the repo.
+
+## 2026-07-28 -- think-block vs inline reasoning: the FORMAT causes the runaway, not the reasoning (n=240/arm)
+
+club-3090 #741 (noonghunna) hypothesised that the failure mode behind the
+GPQA-Diamond no-think win is the unbounded `<think>` block as a FORMAT -- a
+dedicated block invites the model to stay in it, while inline reasoning
+self-terminates because the answer is the same stream. q27 tests this better
+than any cross-engine comparison: same weights, same server, same checkpoint,
+one boot flag apart. Qwopus default tier, 5090, fp8 KV, 11 benchlocal packs,
+240 distinct scenarios per arm, 480 trials.
+
+    metric                          inline    block
+    finish_reason=length / 240      0         28
+    pass / 220 (hermesagent excl.)  173       154
+    p95 instructfollow              0.47 s    27.82 s
+    p95 humaneval                   1.31 s    16.85 s
+    p95 lcb-v6                      57.66 s   113.88 s
+
+Losses concentrate exactly on the truncating packs (dataextract 13->6 with 8
+token_limit, lcb-v6 19->11 with 13). **Where nothing truncates the block arm is
+neutral or BETTER** (instructfollow +2, reasonmath +2, bugfind +1, three ties).
+Reasoning is not what hurts; the unbounded block is. Difficulty-gated: an n=45
+pilot on gsm-symbolic + reasonmath alone found ZERO effect because neither pack
+approaches the cap.
+
+**Method note that nearly cost the result.** The pilot's arm-verification probe
+grepped the response for a literal `<think>` tag, which q27 never emits on
+`/v1/messages` -- thinking returns as a separate content block
+(`{"type":"thinking"}`, server.cu:1886). The probe reported INLINE for BOTH
+arms. The n=240 rerun parses the JSON for a thinking block and ABORTS an arm
+whose probe disagrees with its flag; both arms verified clean. Reproducibility
+checked rather than assumed: reasonmath (11/15, 13/15) and gsm-symbolic (30/30
+both) came out identical in pilot and full run on independent boots.
+
+**RESOLVED same day -- HumanEval+'s block-mode loss is a benchlocal extractor
+artifact, not q27 and not the model.** The block arm lost 10 items with ZERO
+truncation, failing as `SyntaxError` from thinking-style prose ("That's it.",
+"We'll output:") compiled as Python. noonghunna's discriminator (fenced-block
+presence rate per arm) turned out not to separate anything -- neither arm uses
+fences much (inline 0/30, block 3/30) -- but re-running the pack with
+`--save-json` and reading `verifier_trace` named it outright:
+
+    arm     extraction_method              extraction_issue        fails
+    inline  code_start_after_think 30      no_fenced_block 30      2
+    block   last_fenced_after_think 22     none 22                 5
+    block   code_start_after_think 8       prose_before_code 8     7
+
+Those 7 are artifacts: **all 7 returned syntactically valid Python in
+`message.content`** (`ast.parse`, 7/7 clean). HumanEval-0 is representative --
+`content` is 17 complete correct lines, while the `code_excerpt` the verifier
+compiled is the model's in-reasoning draft plus trailing prose ending "That's
+it.", a string that appears only in `reasoning_content`. Every record carries
+`response_field_used: message.content`, so the harness resolved the right field
+and then reconstructed code from the reasoning stream anyway. Inline never trips
+it because there is no reasoning stream to reconstruct from.
+
+q27 is clean here: `content` non-empty 30/30 both arms, `reasoning_content` set
+30/30 block and 0/30 inline, no leakage either way. Corrected, block HumanEval+
+is ~25/30 vs inline 28/30, a 3-item gap rather than 10. The 5 clean-extraction
+failures are real and remain unexplained.
+
+This matters beyond one pack: it was the ONLY conditional-accuracy regression in
+the dataset (every truncating pack is flat-or-better once truncated items are
+excluded), so it alone decided whether a reasoning budget looks like a clear win
+or a coin flip. Break-even for a budget moves from 19-of-28 tripped items (68%)
+to 9-of-28 (32%). Reported upstream; the fix is in benchlocal, not here.
+
+**Follow-up filed:** `--think` landed 2026-07-10 (438edc8) and has NO reasoning
+budget -- `budget_tokens` is parsed and ignored (api_common.h:334). This data
+says that is a real trap, currently defused only by the flag being off by
+default. `resolve_think` returns a bare bool and would need to carry a budget;
+the generation loop would force the `</think>` close on trip, and the splitter
+already treats it as a single added token so the close path exists. Reply with
+the full numbers posted to club-3090#741.
