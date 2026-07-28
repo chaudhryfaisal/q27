@@ -24,9 +24,16 @@ inline void validate_sampling(const SamplingParams& p) {
 }
 
 inline void validate_logits(const float* values,size_t count) {
-    for(size_t i=0;i<count;i++)
+    bool any_finite=false;
+    for(size_t i=0;i<count;i++) {
         if(std::isnan(values[i]))
             throw std::runtime_error("q27: logits contain NaN");
+        if(values[i]==std::numeric_limits<float>::infinity())
+            throw std::runtime_error("q27: logits contain positive infinity");
+        any_finite=any_finite || std::isfinite(values[i]);
+    }
+    if(!any_finite)
+        throw std::runtime_error("q27: logits contain no finite values");
 }
 
 inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const SamplingParams& p,

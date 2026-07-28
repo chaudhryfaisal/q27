@@ -29,26 +29,29 @@ int main() {
     }
     if (!rejected) return 1;
 
-    // NaNs must never reach argmax or sorting comparators; -inf remains a
-    // valid mask value.
+    // NaNs, positive infinity, and fully masked rows cannot define a served
+    // distribution. Negative infinity remains a valid mask when at least one
+    // finite logit survives.
     {
-        std::vector<float> nan_logits = {
-            std::numeric_limits<float>::quiet_NaN(), 1.0f,
-            -std::numeric_limits<float>::infinity()
-        };
         std::vector<uint32_t> ids = {0, 1, 2};
-        int throws = 0;
-        try { (void)q27::sample_logits_cpu(nan_logits, greedy, rng); }
-        catch (const std::runtime_error&) { throws++; }
-        try { (void)q27::sample_candidates_cpu(nan_logits, ids, 3, greedy, rng); }
-        catch (const std::runtime_error&) { throws++; }
-        try { (void)q27::build_served_distribution(nan_logits, greedy); }
-        catch (const std::runtime_error&) { throws++; }
-        try { (void)q27::build_served_from_candidates(
-            nan_logits.data(), ids.data(), 3, greedy); }
-        catch (const std::runtime_error&) { throws++; }
-        if (throws != 4) return 1;
-        std::vector<float> masked = {-std::numeric_limits<float>::infinity(), 1.0f};
+        auto rejected_by_all = [&](const std::vector<float>& invalid) {
+            int throws = 0;
+            try { (void)q27::sample_logits_cpu(invalid, greedy, rng); }
+            catch (const std::runtime_error&) { throws++; }
+            try { (void)q27::sample_candidates_cpu(invalid, ids, 3, greedy, rng); }
+            catch (const std::runtime_error&) { throws++; }
+            try { (void)q27::build_served_distribution(invalid, greedy); }
+            catch (const std::runtime_error&) { throws++; }
+            try { (void)q27::build_served_from_candidates(
+                invalid.data(), ids.data(), 3, greedy); }
+            catch (const std::runtime_error&) { throws++; }
+            return throws == 4;
+        };
+        const float inf = std::numeric_limits<float>::infinity();
+        if (!rejected_by_all({std::numeric_limits<float>::quiet_NaN(), 1.0f, -inf})) return 1;
+        if (!rejected_by_all({inf, 1.0f, -inf})) return 1;
+        if (!rejected_by_all({-inf, -inf, -inf})) return 1;
+        std::vector<float> masked = {-inf, 1.0f};
         if (q27::sample_logits_cpu(masked, greedy, rng) != 1) return 1;
     }
 
