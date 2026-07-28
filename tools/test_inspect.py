@@ -10,10 +10,10 @@ VERSION = 1
 ALIGN = 256
 
 TENSORS = [
-    ("token_embd.weight", 4, [1, 128], 32, 2),
+    ("token_embd.weight", 2, [1, 128], 128, 2),
     ("blk.0.ffn_gate.weight", 5, [1, 128], 26, 2),
     ("blk.3.attn_q.weight", 6, [1, 128], 16, 2),
-    ("blk.64.nextn.eh_proj.weight", 2, [1, 128], 128, 2),
+    ("blk.64.nextn.eh_proj.weight", 4, [1, 128], 32, 2),
     ("output_norm.weight", 0, [4], 16, 0),
     ("test.f16", 1, [2], 4, 0),
     ("test.q4", 3, [1, 64], 32, 2),
@@ -26,12 +26,14 @@ def align(value):
 
 def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
                  bad_t3_range=False, bad_t3_padding=False, overflow=False,
-                 bad_offset=False):
+                 bad_offset=False, bad_embedding=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
 
     for index, (name, dtype, shape, data_size, scale_size) in enumerate(TENSORS):
+        if bad_embedding and name == "token_embd.weight":
+            dtype, data_size = 4, 32
         if misaligned and index == 0:
             shape = [1, 129]
         if overflow and dtype == 5:
@@ -91,6 +93,7 @@ def main():
         bad_t3_padding = root / 'bad-t3-padding.q27'
         overflow = root / 'overflow.q27'
         bad_offset = root / 'bad-offset.q27'
+        bad_embedding = root / 'bad-embedding.q27'
         make_fixture(valid)
         make_fixture(corrupt, corrupt_size=True)
         make_fixture(misaligned, misaligned=True)
@@ -98,12 +101,20 @@ def main():
         make_fixture(bad_t3_range, bad_t3_range=True)
         make_fixture(bad_t3_padding, bad_t3_padding=True)
         make_fixture(overflow, overflow=True)
+        make_fixture(bad_embedding, bad_embedding=True)
 
         make_fixture(bad_offset, bad_offset=True)
         good = run(inspect, valid)
         if good.returncode != 0 or '\nOK\n' not in good.stdout:
             sys.stderr.write(good.stdout + good.stderr)
             raise SystemExit('valid packed-dtype fixture failed inspection')
+
+        invalid_embedding = run(inspect, bad_embedding)
+        if (invalid_embedding.returncode == 0 or
+                'token_embd.weight: CUDA row lookup requires Q8_G128' not in
+                invalid_embedding.stdout):
+            sys.stderr.write(invalid_embedding.stdout + invalid_embedding.stderr)
+            raise SystemExit('non-Q8 CUDA embedding was not rejected')
 
         bad = run(inspect, corrupt)
         if bad.returncode == 0 or 'INVARIANT FAIL blk.0.ffn_gate.weight' not in bad.stdout:
