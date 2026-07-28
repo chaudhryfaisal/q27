@@ -9104,15 +9104,37 @@ and then reconstructed code from the reasoning stream anyway. Inline never trips
 it because there is no reasoning stream to reconstruct from.
 
 q27 is clean here: `content` non-empty 30/30 both arms, `reasoning_content` set
-30/30 block and 0/30 inline, no leakage either way. Corrected, block HumanEval+
-is ~25/30 vs inline 28/30, a 3-item gap rather than 10. The 5 clean-extraction
+30/30 block and 0/30 inline, no leakage either way. The 5 clean-extraction
 failures are real and remain unexplained.
 
-This matters beyond one pack: it was the ONLY conditional-accuracy regression in
-the dataset (every truncating pack is flat-or-better once truncated items are
-excluded), so it alone decided whether a reasoning budget looks like a clear win
-or a coin flip. Break-even for a budget moves from 19-of-28 tripped items (68%)
-to 9-of-28 (32%). Reported upstream; the fix is in benchlocal, not here.
+**Bounded, not corrected -- two limits on the above, both from noonghunna and
+both right.** (1) `ast.parse` clean on 7/7 bounds the RECOVERY at 7; it does not
+demonstrate 7 functional passes. Block HumanEval+ is therefore in **[18, 25]**,
+not "~25", and break-even for a reasoning budget is in **[32%, 68%]**, not 32%.
+(2) `lcb-v6-30` runs on the SAME `code-reasoning` sandbox image and the same
+extractor, so **60 of the 220 scored items sit on the defective path, not 30**,
+and the lcb-v6 row above (19->11 raw, +1.4 conditional) is not clean either. The
+honest statement is that HumanEval+'s block-mode loss is at least partly
+measurement, with magnitude pending a rescore, and that the format result has
+TWO open terms rather than one. Do not bank 32%.
+
+He reproduced the defect independently on 183 archived records across four
+checkpoints with no q27 in the loop: **183 of 183 had no `</think>` anywhere in
+the buffer the extractor splits on**, and 48 of 183 (26%) returned text absent
+from `content` entirely. Mechanism at line level: `_response_text` joins
+`("reasoning_content", "reasoning", "content")` reasoning-FIRST, then
+`extract_code_with_info` looks for a literal `</think>` that is never present
+when reasoning arrives out-of-band, so `after_think` becomes the whole buffer.
+Every `*_after_think` method label was asserting a boundary that was never
+found. `response_field_used` comes from a different, content-first function --
+two code paths, opposite orderings, one record.
+
+**What survives untouched:** every truncation count (28 block / 0 inline), 190
+of the 220 items, and cli-40's +13.6 conditional (content-first sandbox, never
+affected). The core finding -- format causes the runaway, reasoning does not --
+rests on those 190 and is unmoved. Rescore of the 60 affected items is blocked
+on benchlocal extending `rescore` to sandboxed packs; it then costs one command
+against the saved JSON, zero GPU.
 
 **Follow-up filed:** `--think` landed 2026-07-10 (438edc8) and has NO reasoning
 budget -- `budget_tokens` is parsed and ignored (api_common.h:334). This data
