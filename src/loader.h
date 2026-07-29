@@ -25,6 +25,10 @@ struct Tensor {
     uint64_t n_elements() const;
 };
 
+// Structural payload invariants shared by inspect and runtime validation.
+// Empty means valid; each string is a tensor-local failure description.
+std::vector<std::string> validate_tensor_payload(const Tensor& tensor);
+
 struct Model {
     std::string meta_json;                        // raw JSON metadata blob
     std::vector<Tensor> tensors;                  // file order

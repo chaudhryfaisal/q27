@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 
@@ -26,6 +27,82 @@ const char* dtype_name(DType t) {
         case DType::B1_G128: return "B1_G128";
     }
     return "?";
+}
+
+std::vector<std::string> validate_tensor_payload(const Tensor& tensor) {
+    std::vector<std::string> errors;
+    const uint64_t rows = tensor.rows(), cols = tensor.cols();
+    uint64_t group = 0;
+    if (tensor.dtype == DType::Q4_G64) group = 64;
+    else if (tensor.dtype == DType::Q8_G128 || tensor.dtype == DType::T2_G128 ||
+             tensor.dtype == DType::T3_G128 || tensor.dtype == DType::B1_G128)
+        group = 128;
+    if (group && cols % group) {
+        errors.push_back("cols " + std::to_string(cols) +
+                         " not divisible by group " + std::to_string(group));
+        return errors;
+    }
+
+    auto checked_product = [](std::initializer_list<uint64_t> factors, uint64_t& out) {
+        out = 1;
+        for (uint64_t factor : factors) {
+            if (factor && out > std::numeric_limits<uint64_t>::max() / factor)
+                return false;
+            out *= factor;
+        }
+        return true;
+    };
+    uint64_t want_data = 0, want_scales = 0;
+    bool sizes_representable = true;
+    switch (tensor.dtype) {
+        case DType::F32:     sizes_representable = checked_product({rows, cols, 4}, want_data); break;
+        case DType::F16:     sizes_representable = checked_product({rows, cols, 2}, want_data); break;
+        case DType::Q8_G128: sizes_representable = checked_product({rows, cols}, want_data) &&
+            checked_product({rows, cols / 128, 2}, want_scales); break;
+        case DType::Q4_G64:  sizes_representable = checked_product({rows, cols / 2}, want_data) &&
+            checked_product({rows, cols / 64, 2}, want_scales); break;
+        case DType::T2_G128: sizes_representable = checked_product({rows, cols / 4}, want_data) &&
+            checked_product({rows, cols / 128, 2}, want_scales); break;
+        case DType::T3_G128: sizes_representable = checked_product({rows, cols / 128, 26}, want_data) &&
+            checked_product({rows, cols / 128, 2}, want_scales); break;
+        case DType::B1_G128: sizes_representable = checked_product({rows, cols / 8}, want_data) &&
+            checked_product({rows, cols / 128, 2}, want_scales); break;
+    }
+    if (!sizes_representable) {
+        errors.push_back("packed payload size overflows uint64");
+        return errors;
+    }
+    if (tensor.data_size != want_data || tensor.scales_size != want_scales) {
+        errors.push_back("data " + std::to_string(tensor.data_size) +
+                         " (want " + std::to_string(want_data) + "), scales " +
+                         std::to_string(tensor.scales_size) + " (want " +
+                         std::to_string(want_scales) + ")");
+        return errors;
+    }
+    if (tensor.dtype == DType::T2_G128) {
+        for (uint64_t i = 0; i < tensor.data_size; i++) {
+            const uint8_t byte = tensor.data[i];
+            for (int shift = 0; shift < 8; shift += 2)
+                if (((byte >> shift) & 3u) == 3u) {
+                    errors.push_back("T2 payload contains reserved code 3");
+                    return errors;
+                }
+        }
+    } else if (tensor.dtype == DType::T3_G128) {
+        bool invalid_byte = false, invalid_padding = false;
+        const uint64_t groups = rows * (cols / 128);
+        for (uint64_t group_index = 0; group_index < groups; group_index++) {
+            const uint8_t* packed = tensor.data + group_index * 26;
+            for (int i = 0; i < 26; i++)
+                if (packed[i] > 242) { invalid_byte = true; break; }
+            const uint8_t tail = packed[25];
+            if ((tail / 27) % 3 != 1 || (tail / 81) % 3 != 1)
+                invalid_padding = true;
+        }
+        if (invalid_byte) errors.push_back("T3 payload byte exceeds 242");
+        if (invalid_padding) errors.push_back("T3 final-byte padding is noncanonical");
+    }
+    return errors;
 }
 
 uint64_t Tensor::rows() const {
