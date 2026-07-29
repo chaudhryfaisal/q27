@@ -26,7 +26,7 @@ def align(value):
 
 def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
                  bad_t3_range=False, bad_t3_padding=False, overflow=False,
-                 bad_offset=False, bad_embedding=False):
+                 bad_offset=False, bad_embedding=False, bad_dtype=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
@@ -34,6 +34,8 @@ def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
     for index, (name, dtype, shape, data_size, scale_size) in enumerate(TENSORS):
         if bad_embedding and name == "token_embd.weight":
             dtype, data_size = 4, 32
+        if bad_dtype and index == 1:
+            dtype, data_size, scale_size = 255, 0, 0
         if misaligned and index == 0:
             shape = [1, 129]
         if overflow and dtype == 5:
@@ -94,6 +96,7 @@ def main():
         overflow = root / 'overflow.q27'
         bad_offset = root / 'bad-offset.q27'
         bad_embedding = root / 'bad-embedding.q27'
+        bad_dtype = root / 'bad-dtype.q27'
         make_fixture(valid)
         make_fixture(corrupt, corrupt_size=True)
         make_fixture(misaligned, misaligned=True)
@@ -102,6 +105,7 @@ def main():
         make_fixture(bad_t3_padding, bad_t3_padding=True)
         make_fixture(overflow, overflow=True)
         make_fixture(bad_embedding, bad_embedding=True)
+        make_fixture(bad_dtype, bad_dtype=True)
 
         make_fixture(bad_offset, bad_offset=True)
         good = run(inspect, valid)
@@ -115,6 +119,12 @@ def main():
                 invalid_embedding.stdout):
             sys.stderr.write(invalid_embedding.stdout + invalid_embedding.stderr)
             raise SystemExit('non-Q8 CUDA embedding was not rejected')
+        invalid_dtype = run(inspect, bad_dtype)
+        if (invalid_dtype.returncode == 0 or
+                'unsupported dtype 255' not in invalid_dtype.stdout):
+            sys.stderr.write(invalid_dtype.stdout + invalid_dtype.stderr)
+            raise SystemExit('undeclared packed dtype was not rejected')
+
 
         bad = run(inspect, corrupt)
         if bad.returncode == 0 or 'INVARIANT FAIL blk.0.ffn_gate.weight' not in bad.stdout:

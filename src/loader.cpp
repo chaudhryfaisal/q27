@@ -67,6 +67,11 @@ std::vector<std::string> validate_tensor_payload(const Tensor& tensor) {
             checked_product({rows, cols / 128, 2}, want_scales); break;
         case DType::B1_G128: sizes_representable = checked_product({rows, cols / 8}, want_data) &&
             checked_product({rows, cols / 128, 2}, want_scales); break;
+        default:
+            errors.push_back("unsupported dtype " +
+                             std::to_string(static_cast<unsigned>(tensor.dtype)));
+            return errors;
+
     }
     if (!sizes_representable) {
         errors.push_back("packed payload size overflows uint64");
