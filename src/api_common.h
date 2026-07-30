@@ -385,10 +385,17 @@ inline bool resolve_think(const json& body, bool server_default, bool allow_requ
     return resolve_think_cfg(body, server_default, allow_request, -1).enabled;
 }
 
-// Server-side default budget as a FRACTION of the request's max_tokens, so the
-// answer still fits after the close. 0.5 is not arbitrary: club-3090 #765
-// measured clean terminations at thinking_token_budget=8192, and a 16K cap is
-// the shape that produced it, so 0.5 reproduces the known-good value there.
+// Server-side default budget as a FRACTION of the request's max_tokens. The
+// fraction is the load-bearing part: whatever the cap, half of it remains for
+// the answer after the block closes. An absolute default would starve small
+// requests and barely bind large ones.
+//
+// 0.5 specifically is a judgement call, not a measurement. It lands on 8192 for
+// a 16K request, which is the value club-3090 #765 reported clean terminations
+// at -- but that thread compared two BUDGETS (8192 vs a 16K rerun), not a
+// budget as a fraction of a cap, so read the agreement as a sanity check on
+// magnitude rather than as their result reproducing here. If a measured
+// fraction ever exists, it should replace this.
 static constexpr double THINK_BUDGET_FRAC = 0.5;
 
 // Resolve the server's default budget for a request whose cap is `n_max`.
