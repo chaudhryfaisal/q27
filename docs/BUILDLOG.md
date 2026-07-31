@@ -9107,16 +9107,22 @@ q27 is clean here: `content` non-empty 30/30 both arms, `reasoning_content` set
 30/30 block and 0/30 inline, no leakage either way. The 5 clean-extraction
 failures are real and remain unexplained.
 
-**Bounded, not corrected -- two limits on the above, both from noonghunna and
-both right.** (1) `ast.parse` clean on 7/7 bounds the RECOVERY at 7; it does not
-demonstrate 7 functional passes. Block HumanEval+ is therefore in **[18, 25]**,
-not "~25", and break-even for a reasoning budget is in **[32%, 68%]**, not 32%.
-(2) `lcb-v6-30` runs on the SAME `code-reasoning` sandbox image and the same
-extractor, so **60 of the 220 scored items sit on the defective path, not 30**,
-and the lcb-v6 row above (19->11 raw, +1.4 conditional) is not clean either. The
-honest statement is that HumanEval+'s block-mode loss is at least partly
-measurement, with magnitude pending a rescore, and that the format result has
-TWO open terms rather than one. Do not bank 32%.
+**Bounded, then MEASURED -- see the 07-30 entry; the bound below was itself
+wrong, in the direction it was meant to guard against.** Two limits raised by
+noonghunna, both right at the time: (1) `ast.parse` clean on 7/7 bounds the
+RECOVERY at 7 and does not demonstrate 7 functional passes, so block HumanEval+
+is in **[18, 25]**, not "~25"; (2) `lcb-v6-30` runs on the SAME
+`code-reasoning` sandbox and extractor, so **60 of the 220 scored items sit on
+the defective path, not 30**, and the lcb-v6 row above (19->11 raw, +1.4
+conditional) is not clean either.
+
+The rescore (07-30) put block HumanEval+ at **30/30** -- above the ceiling of my
+own interval, and above the inline arm's 28. The `ast.parse` ceiling bounded the
+wrong SET: it examined only the 7 `prose_before_code` items, and 12 recovered,
+so some of the 5 "clean extraction" failures were artifacts too. Lesson worth
+more than the number: a bound is only as good as the population it is computed
+over, and I picked the population from the failure label rather than from the
+question being asked.
 
 He reproduced the defect independently on 183 archived records across four
 checkpoints with no q27 in the loop: **183 of 183 had no `</think>` anywhere in
@@ -9143,3 +9149,137 @@ default. `resolve_think` returns a bare bool and would need to carry a budget;
 the generation loop would force the `</think>` close on trip, and the splitter
 already treats it as a single added token so the close path exists. Reply with
 the full numbers posted to club-3090#741.
+
+## 2026-07-30 -- reasoning-token budget shipped; the rescore says the block arm's accuracy deficit was measurement, and the truncation asymmetry is the whole result
+
+Three things landed: the budget (`bdc58d6`), a cli-40 negative, and a rescore of
+our corpora against benchlocal's fixed extractor. The rescore reverses part of
+the 07-28 entry and strengthens the rest.
+
+### The budget
+
+`--think` landed 2026-07-10 with no cap and `budget_tokens` parsed-and-ignored.
+The 07-28 A/B named that the one losing configuration, so it got fixed before
+`--think` has users to regress.
+
+`ThinkBudget` (stream_split.h) counts tokens generated inside the THINK channel
+and, on trip, returns `T_CLOSE` for the caller to feed back through the
+splitter -- the channel then flips exactly as a model-emitted `</think>` would,
+so routing, the tool scan, the Anthropic thinking block and `reasoning_content`
+all see an ordinary close. Deliberately NOT a hard stop: the block closes and
+the model still answers, because truncating the request would reproduce the
+failure the feature exists to prevent.
+
+`resolve_think_cfg` returns `{enabled, budget}`; `resolve_think` survives as a
+bool wrapper. Every convention that can enable thinking can now bound it --
+`thinking.budget_tokens`, `thinking_token_budget`,
+`chat_template_kwargs.thinking_budget` -- all gated behind `--request-think`
+exactly as the enable fields are. Server default is ON at
+`THINK_BUDGET_FRAC = 0.5` of the request's `max_tokens`; `--think-budget N`
+overrides absolute, `0` opts out. The fraction is the load-bearing choice (half
+the cap always remains for the answer); 0.5 itself is a judgement call and
+`afcd7ba` corrects an earlier comment that claimed it reproduced a club-3090
+#765 measurement -- that thread compared two budgets, not a fraction of a cap.
+
+Measured, qwopus default tier, `max_tokens 900`:
+
+    config                  reasoning_tokens  tripped  answer
+    --think-budget 64       64                yes      2641 chars
+    --think (default)       450 (exact half)  yes      written
+    --think --think-budget 0  900             no       NONE -- all output stayed inside the block
+
+The last row is the runaway itself and is the argument for the default.
+
+**Own bug, caught in test:** `tick()` first counted only when a budget was set,
+so opting out reported `reasoning_tokens: 0` beside 2879 characters of
+reasoning. That is the accepted-and-inert pattern this whole thread is about,
+one level down. It counts always now and enforces only when bounded.
+
+GATES: tri-arch sm_86/89/120 x4; 7 CPU suites PASS; test_think_resolve +18
+budget cases all pass; canonical vanilla EXACT `a2982c5197c627551b27d76a0a94b220`;
+sampling gates ALL PASS; fused_smoke PASS; ninv ALL PASS. Pre-existing and
+unrelated: test_tokenizer's `billing-header cch normalize` fails identically on
+HEAD without this change (filed, not fixed here).
+
+### cli-40: NO-GO for the budget, prediction retracted
+
+noonghunna named cli-40 the first candidate for a pack nothing has moved
+(17-26/40 across every engine and quant on that board). Three arms, same
+checkpoint, content-first `cli` sandbox so the extractor bug cannot reach it:
+
+    arm                 pass    finish=length  reasoning_tokens(max)  trips
+    inline              20/40   0              0                      0
+    block, unbudgeted   21/40   7              1024                   0
+    block, budgeted     21/40   7              512                    10
+
+The budget fired -- 10 trips, reasoning capped at exactly half of the pack's
+`max_tokens: 1024` -- and nothing else moved. The **same seven** scenarios
+truncate in both block arms (CLI-07/09/10/11/13/19/20), none rescued, no tripped
+item flipped. cli-40's truncation is not reasoning runaway: at a 1024 cap the
+whole budget is tight, so capping reasoning at 512 relocates the spend and the
+answer meets the same ceiling. A reasoning budget only rescues a request whose
+REASONING overruns. Caveat: 15 of 40 scenarios record no `finish_reason` or
+usage, so trip accounting covers 25 of 40.
+
+### The rescore: the accuracy deficit was measurement
+
+benchlocal pinned at `d08ddcc` (content-first single-channel extractor) and the
+`code-reasoning` sandbox rebuilt. NOT via `pip install git+...`:
+`/mnt/ai/projects/benchlocal-cli` is an existing clean checkout the package
+imports directly from, so `git checkout` is the upgrade and `git checkout
+master` is the undo. Reviewed before running -- declarative pyproject with no
+build hooks, a 62-line cp+docker-build script, a `python:3.12-slim` + numpy
+Dockerfile that drops to non-root.
+
+    corpus       pack                was      now      delta  fail->pass  pass->fail
+    inline arm   humaneval-plus-30   28/30    28/30    0      0           0
+    block arm    humaneval-plus-30   18/30    30/30    +12    12          0
+    block arm    lcb-v6-30           11/30    17/30    +6     6           0
+
+The inline arm moving by exactly zero is the control: no reasoning channel, so
+the defect cannot reach it. ZERO pass->fail here against noonghunna's 3 -- an
+accidental pass needs the reasoning buffer to hold better code than `content`,
+and our content is either good or empty, never a worse-but-plausible
+alternative.
+
+The lcb-v6 corpus was generated fresh for this (block, `--think-budget 0` to
+match pre-budget conditions) and **reproduced the original A/B leg exactly on an
+independent boot** -- 11/30 with 13 truncations, both identical -- which is what
+licenses splicing it into the 220-item total.
+
+Corrected, the 07-28 format result becomes:
+
+    pack                inline   block(was)  block(rescored)
+    humaneval-plus-30   28       18          30
+    lcb-v6-30           19       11          17
+    220-item total      173      154         172
+
+**Block and inline are a dead heat on raw accuracy -- 172 vs 173, not the -19
+originally reported.** 172 is exact, not estimated: by noonghunna's scope table
+the other eight packs run content-first and were never affected. Holding inline
+lcb-v6 at 19 is inference (no inline lcb-v6 corpus was saved) but the inline arm
+carries no `reasoning_content` at all, which is the precondition the defect
+needs.
+
+**What survives is the truncation asymmetry: 28 vs 0, and rescoring provably
+cannot move it** -- `finish_reason` is recorded from the model's response, not
+produced by the verifier (lcb-v6 13 before / 13 after, both humaneval arms 0/0).
+So the finding is now SHARPER than the one the budget shipped on: unbudgeted
+block mode costs 28 non-terminations and buys **nothing** in raw score. A budget
+recovering even part of those should put the block arm AHEAD of inline. That is
+the next experiment and it is not yet run.
+
+**Their fallback question, answered but not settled.** noonghunna asked whether
+our corpus shows his 5.8% band (failed, `content` selected, no usable code out
+of it, reasoning demonstrably contains code). Ours shows **0 of 60**. But the
+reason is not cleaner extraction: all 13 remaining failures are lcb-v6 and every
+one has `len(content) == 0` against 36,971-67,172 characters of reasoning, so
+single-channel selection correctly fell through to reasoning and there was
+nothing for a fallback to do. His 11-of-14 have short-but-populated content, a
+shape neither arm here produces. Reported as "neither supports nor refutes",
+explicitly not as a refutation. Those 13 are runaways, not extraction failures,
+and are the direct evidence for the budget.
+
+**OPS:** benchlocal-cli is left pinned at `d08ddcc` in detached HEAD;
+`git checkout master` in that repo reverts it, and the `code-reasoning` image
+is now the fixed build.

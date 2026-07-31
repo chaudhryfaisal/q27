@@ -160,7 +160,7 @@ errors so Claude Code compacts correctly. Concurrent sessions
 (`--slots N`) batch through one weight sweep by default -- 234-239 t/s
 aggregate at 2 slots, zero config (see Serving).
 
-## State of the engine (2026-07-19)
+## State of the engine (2026-07-30)
 
 One binary serves Claude Code, Codex, and OpenAI clients at 231-246 t/s
 aggregate live decode on a 5090 (90-116 t/s at 262K context on a 3090, turbo3 default),
@@ -191,6 +191,16 @@ GEMM that shares one activation `ldmatrix` load across two row-tiles
 (+3.4% GEMM / ~6% cold-prefill wall, bitwise, sm_120; `Q27_PF_NTX=0`
 opts out). fp4/`tcgen05` is a hardware dead end here -- consumer/
 workstation Blackwell has no fp4 MMA in PTX, so int8 is the ceiling.
+
+Two serving-side additions since: **P16 persistent prefix cache** (opt-in,
+`--prefix-cache DIR`) survives a restart or a fresh conversation by writing the
+P8 stable prefix to disk -- restart TTFT **8.15 s -> 1.20 s** on a 26,700-token
+prompt, bitwise-identical continuations, with an optional pinned host-RAM tier
+above it (`--prefix-cache-ram-gb`). And a **reasoning-token budget**, ON by
+default whenever a `<think>` block is served: the block is force-closed at half
+the request's `max_tokens` and the model still answers, because an A/B over 240
+scenarios found unbudgeted block mode truncating 28 times against inline's 0
+while scoring level on raw accuracy. See Serving for both.
 
 ### Reference numbers (v0.2.0, 2026-07-16, vanilla model, 5090)
 
@@ -483,7 +493,7 @@ pre-batch). Every knob keeps its env/flag override (user env always
 wins), `Q27_PROFILE=ref` restores the conservative reference behavior
 (fp16, ungated, no suffix, fd2, no batching), and the **CLI binary keeps
 reference defaults** so the bitwise canonical gates are untouched.
-Escapes: `--kv-fp16 --no-fast-head --think --request-think`, any individual `Q27_*`.
+Escapes: `--kv-fp16 --no-fast-head --think --request-think --think-budget`, any individual `Q27_*`.
 
 `--slots N` auto-sizes too (since 2026-07-18): with `--ctx` omitted the
 free-VRAM budget is split across the N co-resident engines and every slot
@@ -577,6 +587,25 @@ answer. When a client omits `max_tokens` the server defaults it to 8192
 (unified across all three API shapes, clamped to the context window); a long
 thinking trace wants more, set it explicitly.
 
+**Reasoning budget (2026-07-30, ON by default whenever a block is served).**
+Tokens generated inside the `<think>` block are capped; on trip the block is
+force-closed and the model answers with what it has. It is not a hard stop --
+truncating the request instead would reproduce the failure the cap exists to
+prevent. Default is **half the request's `max_tokens`**, so the answer still
+fits after the close; `--think-budget N` sets an absolute cap and
+`--think-budget 0` opts out. Requests can bound it too, symmetric with the
+enable conventions above and gated behind the same `--request-think`:
+`thinking.budget_tokens` (Anthropic), `thinking_token_budget` (OpenAI/Qwen), or
+`chat_template_kwargs.thinking_budget` (llama.cpp). A trip is reported as
+`usage.reasoning_tokens` and `usage.reasoning_budget_exceeded` -- a budget that
+fired silently would be no better than the inert `budget_tokens` this replaced.
+
+Why it defaults on: an 11-pack / 240-scenario A/B (BUILDLOG 2026-07-28, rescored
+07-30) found unbudgeted block mode truncating **28 times against inline's 0**
+while scoring level with it on raw accuracy -- 172 vs 173 of 220. The
+unbudgeted block is the one configuration in that study that costs and returns
+nothing.
+
 A reasoning model handed zero reasoning budget over-refuses a narrow class of
 borderline requests; mitigated 2026-07-13 by injecting a minimal default system
 prompt when the client sends none (never fires for real Claude Code;
@@ -658,7 +687,7 @@ Full methodology, fairness controls, the payload microbench, and reproduce
 steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,
 and raw per-instance results: [bench/swebench/](bench/swebench/).
 
-## Open items (2026-07-16)
+## Open items (2026-07-30)
 
 - ~~**turbo3-vs-fp8 quality gate**~~ **CLOSED 2026-07-16, verdict PASS**
   (BUILDLOG "TURBO3 AGENTIC QUALITY GATE"): agentic-corpus NLL on a real
@@ -707,6 +736,18 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
 - **Graph-cache cap under churn**: live CC already draws 44+ keys vs
   the bench's 28; cap 64 swallows today's alphabet, revisit
   `Q27_BATCH_GRAPH_CAP` if multi-tenant composition churn widens it.
+- **Does a budgeted think-block beat inline?** OPEN, not yet run. The 07-28
+  A/B rescored (BUILDLOG 07-30) leaves block and inline level on raw accuracy
+  (172 vs 173 of 220) while the block arm eats **28 truncations to inline's 0**.
+  A budget recovering even part of those should put the block arm ahead --
+  which no one on club-3090#741 has tested. The cheap version re-runs lcb-v6
+  block with the budget on: its 13 failures are all `len(content)==0` runaways
+  that reasoned 37-67 KB without answering, which is exactly what the cap
+  converts. cli-40 is already NO-GO for this (07-30): at `max_tokens 1024` the
+  cap relocates the spend and the answer meets the same ceiling.
+- **`billing-header cch normalize`** fails in `test_tokenizer` on HEAD,
+  independent of any 07-28/07-30 work (verified by stashing). Commit `5a81225`
+  last touched that normalizer. Filed, not fixed.
 
 Measured-and-parked levers (chunked-WY delta scan, AWQ-style scales, P11 split path, and friends):
 [docs/notes.md](docs/notes.md).
