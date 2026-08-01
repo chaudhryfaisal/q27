@@ -58,4 +58,8 @@ struct Model {
     size_t map_size_ = 0;
 };
 
+// Reject model-wide dtype combinations the CUDA kernels cannot consume.
+// Call before constructing or populating a DeviceModel.
+void validate_cuda_model(const Model& model);
+
 } // namespace q27

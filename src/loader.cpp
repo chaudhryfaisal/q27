@@ -112,7 +112,17 @@ bool cuda_weight_dtype_supported(DType dtype) {
     }
     return false;
 }
-
+void validate_cuda_model(const Model& model) {
+    const Tensor& embedding=model.get("token_embd.weight");
+    if(embedding.dtype!=DType::Q8_G128)
+        throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128");
+    for(const Tensor& tensor:model.tensors) {
+        if(!cuda_weight_dtype_supported(tensor.dtype))
+            throw std::runtime_error("q27 CUDA: unsupported weight dtype " +
+                                     std::string(dtype_name(tensor.dtype)) +
+                                     " in " + tensor.name);
+    }
+}
 
 uint64_t Tensor::rows() const {
     if (shape.size() <= 1) return 1;
