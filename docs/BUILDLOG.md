@@ -6186,6 +6186,15 @@ with these numbers: README reference/State/Serving lines +
 docs/BENCHMARKING.md 2-slot aggregate table.
 
 **2026-07-16 -- TURBO3 AGENTIC QUALITY GATE (master eccc641 / v0.2.0).**
+> **ANNOTATION 2026-08-01: this gate measured MEANS, and its PASS is a
+> mean-tax verdict only.** The pre-declared rule below is stated in terms of
+> bucket NLL deltas and it answered that question correctly -- nothing here is
+> retracted. What it never claimed, and nobody checked until the 08-01 KV tail
+> study, is the TAIL: on this same corpus the mean turbo3-vs-fp8 delta is
+> +0.0017 while p99.9 is +5.49, and against an fp16 reference turbo3 carries
+> **6x fp8's catastrophic-position count** at a dPPL of only +0.804%. Read
+> "no detectable mean tax", not "no tax".
+
 The open question from the 07-15 turbo3 x batching validation: turbo3 CC
 scores pooled below the fp8-131K-era bands in SHAPE-CONFOUNDED runs (fp8
 ran 131K windows, turbo3 ran 2x96K/2x48K squeezes). Already measured, NOT
@@ -9283,3 +9292,100 @@ and are the direct evidence for the budget.
 **OPS:** benchlocal-cli is left pinned at `d08ddcc` in detached HEAD;
 `git checkout master` in that repo reverts it, and the `code-reasoning` image
 is now the fixed build.
+
+## 2026-08-01 -- KV tail study: turbo3's PPL is harmless and its TAIL is 6x fp8's; the 07-16 gate measured means and said so honestly, but "PASS" was never a tail claim
+
+Prompted by anbeeld's KV-cache long-context benchmarks, whose methodological
+claim is that PPL and mean NLL hide rare catastrophic positions: "one position
+that destroys a JSON key or hallucinates a closing brace gets diluted by
+thousands of unremarkable tokens." Tested against our own gate corpus. **The
+critique is correct and it applies here.**
+
+New: `--nll-dump FILE` on the `--nll-long` path writes `(int32 pos, float nll)`
+per counted position. The values were already computed on device by `nll_rows`
+and discarded into bucket sums. Canonical re-verified EXACT
+(`a2982c5197c627551b27d76a0a94b220`) after the edit.
+
+### Leg 1 -- 154K agentic corpus, turbo3 vs fp8
+
+Same corpus the 07-16 gate passed on (agentic_req0031.i32, 154,160 tokens of
+real CC traffic, sha256 verified against its recorded provenance), same flags.
+
+    statistic          turbo3 - fp8
+    mean                  +0.001718     <- what the gate reported (+0.39% worst bucket)
+    median                +0.000010
+    p99                   +1.876583
+    p99.9                 +5.489213
+    max                  +15.389016
+    positions |d|>1.0      3079 (2.00%)
+    fp8 NLL<0.1 & turbo3 >1.0   124
+
+A 3000x gap between the mean and p99.9. Depth distribution of the worst 0.1%:
+0.696% of the 16k-32k bucket, and **ZERO** in 32k-48k and 48k-64k. The deep
+buckets are the near-verbatim echo regions (NLL ~0.02) where both formats are
+trivially right; damage sits where the model makes a real prediction and is
+averaged into invisibility by the certain tokens around it. That is the
+article's mechanism, reproduced on our data.
+
+**But the tail is SYMMETRIC vs fp8** -- worse at 1425 positions past |d|>2.0,
+better at 1439; at |d|>5.0 better MORE often (228 vs 203); net +265 nats over
+154,159 positions (+0.172% PPL); 86.2% of positions indistinguishable
+(|d|<0.01). Symmetric divergence against a LOSSY reference is ambiguous, and
+fp16 KV cannot run at 154K (11.1 GB of cache beside 17.73 GB of weights OOMs a
+32 GB card -- which is why the 07-16 gate used fp8 as its reference too). So
+leg 1 cannot separate "turbo3 is fine" from "both diverge".
+
+### Leg 2 -- 64K, fp16 REFERENCE (the disambiguation)
+
+    format    KB/tok    dPPL     mean|d|   p99.9   |d|>1   catastrophic
+    fp16        68.0    ref        --       --      --        --
+    fp8         34.0   +0.458%   0.14612  5.4287   2718        19
+    turbo3v     41.0   +0.510%   0.20971  7.0938   4321        52
+    turbo3      14.1   +0.804%   0.27673  8.7321   5816       114
+
+("catastrophic" = fp16 NLL < 0.1 and the format's NLL > 1.0: the reference is
+confident and the format is badly wrong.)
+
+**turbo3 is genuinely worse than fp8, and PPL cannot see it.** 1.89x the mean
+divergence, 1.61x at p99.9, 2.14x the |d|>1 count, and **6.0x the catastrophic
+positions** -- while dPPL reads a harmless +0.804%. Any tier decision made on
+PPL alone on this axis is uninformed.
+
+**The K-precision hypothesis is CONFIRMED in direction.** turbo3v (fp16 K +
+turbo3 V) cuts catastrophic 114 -> 52 and mean |d| by 24%. Spending bits on K
+is where the tail lives, exactly as the article argues.
+
+**But turbo3v is Pareto-DOMINATED by fp8 and stays diagnostic.** At 41.0 KB/tok
+it is BIGGER than fp8's 34.0 and worse on every metric (52 vs 19 catastrophic,
+p99.9 7.09 vs 5.43). On sm_89+ there is no reason to select it. It fails not
+because asymmetry is wrong but because fp16 K is a sledgehammer: K is half the
+cache, so fp16 K nearly triples turbo3's footprint.
+
+### What changes
+
+- **sm_89+ (5090): nothing.** fp8 is already the serving default and is the
+  best format measured here. turbo3 remains what the README calls it -- the
+  CAPACITY lever -- now with a measured tail cost attached rather than an
+  assumed absence of one.
+- **Ampere (3090): a caveat, not a retraction.** turbo3 is the default because
+  fp8 needs sm_89+ and fp16 cannot reach 262K; it is still the only way that
+  config exists. But 262K@turbo3 carries ~6x the catastrophic-position rate of
+  fp8-class, and for code/JSON that is worth stating.
+- **The 07-16 TURBO3 AGENTIC QUALITY GATE is not retracted.** Its pre-declared
+  rule was about mean NLL deltas and it answered that question correctly. What
+  it never claimed, and what nobody checked until now, is the tail. Annotated
+  in place.
+
+**Gap this exposes, filed:** q27 jumps from 3-bit turbo3 straight to fp8/fp16
+with nothing between. The article's best-value configs (q5_0/q4_1, q6_0/q5_0)
+all live in the 5-6 bit band we skip. **A 5-bit K with 3-bit V** would land
+where the value is and does not exist here. Sized against these numbers it
+would sit near ~24 KB/tok -- below fp8, above turbo3 -- and the open question is
+whether it recovers most of the 114 -> 52 catastrophic gain at that size.
+
+Caveats on this study, stated: the reference is fp16 KV, not bf16/fp32 weights,
+so it isolates CACHE error only. "Catastrophic" is a threshold on teacher-forced
+NLL of the observed token, not a measured downstream failure -- it bounds where
+damage COULD occur, it does not demonstrate a broken JSON key. And the 64K legs
+are one corpus; the article's own finding that weight precision masks cache
+artifacts means these ratios are specific to the default 5.25 bpw tier.

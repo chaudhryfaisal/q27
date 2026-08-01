@@ -40,6 +40,12 @@ int main(int argc, char** argv) {
     const char* burst_out = "burst_stats.csv";
     int pfdbg_n = 0;
     std::string nll_path;
+    // --nll-dump FILE: per-position NLL as (int32 pos, float nll) pairs, in
+    // addition to the bucket means. The bucket mean is a MEAN, and a mean over
+    // a high-confidence echo region (CC depths run NLL ~0.02) dilutes a rare
+    // catastrophic position to nothing -- which is exactly the blind spot a
+    // KV-quant tail study needs to see. Written by the --nll-long path.
+    std::string nll_dump;
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
     std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
@@ -63,6 +69,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--nll-long") && i + 1 < argc) nll_long = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-max") && i + 1 < argc) nll_max = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
+        if (!strcmp(argv[i], "--nll-dump") && i + 1 < argc) nll_dump = argv[++i];
         if (!strcmp(argv[i], "--verify-weights")) verify_weights = true;
         if (!strcmp(argv[i], "--kvstats") && i + 1 < argc) kvstats_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
@@ -697,6 +704,11 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)PT * VOCAB * 4));
             CUDA_CHECK(cudaMalloc((void**)&d_nll, PT * 4));
             CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+            FILE* ndump = nll_dump.empty() ? nullptr : fopen(nll_dump.c_str(), "wb");
+            if (!nll_dump.empty() && !ndump) {
+                fprintf(stderr, "cannot open --nll-dump %s\n", nll_dump.c_str());
+                return 1;
+            }
             e.reset();
             const int NB = 14;
             const int bl[NB + 1] = {0,      2048,   8192,   16384,  32768,
@@ -726,9 +738,11 @@ int main(int argc, char** argv) {
                     while (tpos >= bl[b + 1]) b++;
                     bs[b] += h_nll[r];
                     bc[b]++;
+                    if (ndump) { fwrite(&tpos, 4, 1, ndump); fwrite(&h_nll[r], 4, 1, ndump); }
                 }
                 if ((c0 / PT) % 32 == 0) fprintf(stderr, "  pos %d/%d\r", c0, N);
             }
+            if (ndump) { fclose(ndump); fprintf(stderr, "nll-dump -> %s\n", nll_dump.c_str()); }
             printf("\nlong-context NLL by target position (%d tokens, no resets):\n", N);
             for (int b = 0; b < NB; b++)
                 if (bc[b])

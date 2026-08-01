@@ -12,7 +12,9 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
   Claude-Code traffic (its prefix cache gets 0% reuse on this
   hybrid-GDN architecture); sglang 0.5.15 cannot load the model at all
   (BUILDLOG 2026-07-12).
-- **turbo3 3-bit KV cache**, symmetric K+V: 14.1 KB/token (14400 B,
+- **turbo3 3-bit KV cache** (capacity lever, not a quality-parity format --
+  see the 2026-08-01 tail study: 6x fp8's catastrophic-position rate against an
+  fp16 reference, at a dPPL of only +0.804%), symmetric K+V: 14.1 KB/token (14400 B,
   18-pair accounting), ~1% PPL, needle 6/6 at a 361K-token prompt,
   655K context allocatable on a 5090, two full 131K tenants at once,
   and a 24GB card promoted from a 32K box to a **262K box** (turbo3 is
@@ -745,6 +747,14 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   that reasoned 37-67 KB without answering, which is exactly what the cap
   converts. cli-40 is already NO-GO for this (07-30): at `max_tokens 1024` the
   cap relocates the spend and the answer meets the same ceiling.
+- **No intermediate K precision (5-6 bit band)**: q27 jumps from 3-bit turbo3
+  straight to fp8/fp16. The 08-01 tail study (BUILDLOG) shows K precision is
+  where tail damage concentrates -- fp16 K cuts catastrophic positions 114 -> 52
+  -- but `turbo3v` pays 41.0 KB/tok for it, which is BIGGER than fp8's 34.0 and
+  worse on every metric, so it stays diagnostic. **A 5-bit K with 3-bit V**
+  would sit near ~24 KB/tok, below fp8 and above turbo3, and is the untested
+  config where the value plausibly is. Matters most on Ampere, where fp8 is
+  unavailable and turbo3 is the only way to reach 262K.
 - **`billing-header cch normalize`** fails in `test_tokenizer` on HEAD,
   independent of any 07-28/07-30 work (verified by stashing). Commit `5a81225`
   last touched that normalizer. Filed, not fixed.

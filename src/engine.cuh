@@ -486,6 +486,9 @@ struct Engine {
     // (src/turbo3.cuh), row = N_KV*(HEAD_DIM/128) 50-B blocks = 400 B (~13.4
     // vs 68 KB/token); turbo3v = fp16 K + turbo3 V (the GQA=6 K-risk escape,
     // port spec docs/plans/2026-07-11-turbo3-kv-port-spec.md). Phase 1 is
+    // (STALE as of phase 2 -- prefill.cu:2477 implements the turbo3 prefill
+    // legs and test_kernels.cu:1789 covers them e2e, which is why --nll-long
+    // runs turbo3 at all. Kept for the phase-1 history it explains.)
     // DECODE-ONLY: batched prefill has no turbo3 leg yet (guard below), so
     // serving is gated off; quality triage runs over --nll-serial / -n.
     bool kv_fp8 = false;
