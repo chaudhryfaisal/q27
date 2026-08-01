@@ -48,7 +48,7 @@ inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const Samplin
 
     std::vector<uint32_t> order(logits.size());
     for(uint32_t i=0;i<order.size();i++) order[i]=i;
-    // Ties break index-ascending (codex P2 on the boundary-tie fix): the
+    // Ties break index-ascending: the
     // candidates path already orders ties by index, and with boundary ties
     // now inside the nucleus the two paths must map the same draw to the
     // same token — unspecified sort order here would break that.
@@ -70,7 +70,7 @@ inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const Samplin
     if(p.top_p<1.0f) {
         const double cutoff=total*p.top_p; double cumulative=0.0; size_t retained=0;
         do { cumulative+=weights[retained++]; } while(retained<weights.size() && cumulative<cutoff);
-        // Boundary ties stay in the nucleus (parity audit 2026-07-17): the
+        // Boundary ties stay in the nucleus: the
         // CUDA sampler keeps every token at or above its threshold value, so
         // exact ties at the truncation boundary must not be dropped by sort
         // order here. Extends through logits exactly equal to the boundary.
@@ -125,8 +125,8 @@ inline uint32_t sample_candidates_cpu(const std::vector<float>& values,
     if(p.top_p<1.0f) {
         const double cutoff=total*p.top_p; double cumulative=0.0; size_t retained=0;
         do { cumulative+=weights[retained++]; } while(retained<weights.size() && cumulative<cutoff);
-        // Boundary ties stay in the nucleus — same rule as sample_logits_cpu
-        // (parity audit 2026-07-17), keyed on the exact candidate values.
+        // Boundary ties stay in the nucleus, using the same rule as
+        // sample_logits_cpu and keyed on exact candidate values.
         while(retained<weights.size() && values[order[retained]]==values[order[retained-1]])
             cumulative+=weights[retained++];
         order.resize(retained); weights.resize(retained); total=cumulative;
@@ -281,8 +281,8 @@ inline double served_probability(const ServedDistribution& d,uint32_t token) {
 // resample after a rejected draft). Never returns `exclude`. If exclude
 // removes all mass (singleton nucleus on the rejected draft), throws —
 // re-emitting the excluded token would violate the residual distribution
-// (codex P2 on Phase 0). Callers that need a soft fallback must widen the
-// nucleus (e.g. drop top_k) before sampling; the Metal sample round keeps
+// Callers that need a soft fallback must widen the nucleus (e.g. drop top_k)
+// before sampling; the Metal sample round keeps
 // vocab-wide logits and only hits this when p(draft) was already ~1.
 inline uint32_t sample_served(const ServedDistribution& d,std::mt19937_64& random,
                               int32_t exclude=-1) {
