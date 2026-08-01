@@ -693,19 +693,20 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st, int ntok, int kvk) {
-    // turbo3v (diagnostic) and turbo5k have exactly one read path (fd2).
-    // turbo3 gets the fdmma verify leg below (phase 3); Q27_FD=v1 still falls
-    // to fd2.
+    // turbo3v (diagnostic) has exactly one read path (fd2). turbo3 and
+    // turbo5k both have fdmma + H16 legs; Q27_FD=v1 still falls to fd2 for
+    // every turbo kind.
     //
     // THE RETURN IS THE GUARD, not a shortcut. Both branches below select a K
-    // format from a closed list -- the mma leg engages on `fp8 || kvk ==
-    // KV_T3`, its H16 sibling maps anything unrecognized to fmt 0 (fp16 rows),
-    // and the v1 tail templates on __half/__nv_fp8_e4m3. A new turbo kind that
-    // reached any of them would be read at the WRONG format with no error, so
-    // every kind without its own leg in those kernels must return here. If you
-    // add an fdmma or v1 leg for a kind, take it out of this list -- do not
-    // widen the conditions downstream and leave this in place.
-    if (kvk == KV_T3V || kvk == KV_T5K) {
+    // format from a closed list -- the mma leg engages on an explicit kind
+    // list, its H16 sibling maps anything unrecognized to fmt 0 (fp16 rows),
+    // and the v1 tail templates on __half/__nv_fp8_e4m3. A kind that reached
+    // any of them without its own leg would be read at the WRONG format with
+    // no error, so every such kind must return here. turbo5k LEFT this list on
+    // 08-01 (c) when it gained both mma legs -- which is the maintenance rule:
+    // add the leg, then take the kind out, rather than widening a condition
+    // downstream and leaving the guard stale.
+    if (kvk == KV_T3V) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
@@ -731,6 +732,18 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
             arch = mj * 10 + mn;
         }
+        // turbo5k is NOT in this list, deliberately -- a turbo5 e4m3 leg was
+        // built, measured and DELETED on 2026-08-01 (d). The e4m3 tiles carry
+        // 3 mantissa bits (~3.1% max relative error), which against each
+        // format's OWN quantization error is +17.6% for turbo3 (noise on an
+        // 18.6%-RMS format) but +81% for turbo5, whose own error is 5.0% --
+        // inflating it 1.29x in quadrature and throwing away roughly a third
+        // of what the 5th bit was bought for. Trading precision for speed is
+        // exactly backwards in a format that exists to fix a TAIL. turbo5k
+        // falls through to the H16 branch below, which stages fp16 (11
+        // mantissa bits, no meaningful loss) and runs on sm_80+ -- so it gets
+        // an mma leg on BOTH arches without the precision cost. Above H16's
+        // ntok<=8 smem cap it lands on fd2, which is correct, not a gap.
         if (arch >= 89 && (fp8 || kvk == KV_T3)) {
             fdmma::FCP3 mq;
             fdmma::FIP3 mp;
@@ -830,7 +843,10 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             fdmma::FCP3 mq;
             fdmma::FIP3 mp;
             for (int t = 0; t < 16; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
-            const int fmt = kvk == KV_T3 ? 2 : kvk == KV_FP8 ? 1 : 0;
+            const int fmt = kvk == KV_T3    ? 2
+                            : kvk == KV_T5K ? 3
+                            : kvk == KV_FP8 ? 1
+                                            : 0;
             if (fdmma::launch_fdmma_h16(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
                                         n_q_heads / n_kv_heads, head_dim, scale, h16_ns,
                                         ntok, fmt, st)) {
@@ -842,8 +858,8 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             }
         }
     }
-    if (!fd || strcmp(fd, "v1") != 0 || kvk == KV_T3) {
-        // turbo3 never runs the v1 kernel (no block leg there)
+    if (!fd || strcmp(fd, "v1") != 0 || kvk >= KV_T3) {
+        // no turbo kind ever runs the v1 kernel (no block leg there)
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;

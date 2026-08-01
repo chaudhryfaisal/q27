@@ -1540,8 +1540,8 @@ static void test_attn_fd2_turbo3() {
     CUDA_CHECK(cudaFree(d_scr));
 }
 
-// phase 3 (fdmma verify leg): Q27_FD=mma + KV_T3 must ENGAGE k_attn_fdmma
-// <W,1,true> (dequant-to-e4m3 tiles) and agree with fd2-t3 at fdmma's
+// phase 3 (fdmma verify leg): Q27_FD=mma + a turbo kind must ENGAGE
+// k_attn_fdmma<W,1,KVFMT> (dequant-to-e4m3 tiles) and agree with fd2 at fdmma's
 // tolerance class (e4m3 Q/P + e4m3-of-dequant K/V; the fp8 fdmma ships at
 // ~1e-2 output rel vs exact). Control leg first: WITHOUT Q27_FD=mma the
 // dispatch must fall through to fd2 bitwise -- proves the discriminator.
@@ -1563,9 +1563,11 @@ static void test_attn_fdmma_turbo3() {
                        vf = rand_vec((size_t)SEQMAX * ROW, 112);
     std::vector<float> qh = rand_vec((size_t)NT * QROW, 113);
     std::vector<block_turbo3> kb((size_t)SEQMAX * BPR), vb((size_t)SEQMAX * BPR);
+    std::vector<block_turbo5> k5b((size_t)SEQMAX * BPR);
     for (size_t b = 0; b < kb.size(); b++) {
         t3_quant(kf.data() + b * 128, &kb[b]);
         t3_quant(vf.data() + b * 128, &vb[b]);
+        t5_quant(kf.data() + b * 128, &k5b[b]);
     }
     std::vector<uint8_t> k8(kf.size()), v8(vf.size());
     for (size_t i = 0; i < kf.size(); i++) {
@@ -1573,6 +1575,7 @@ static void test_attn_fdmma_turbo3() {
         v8[i] = __nv_fp8_e4m3(vf[i]).__x;
     }
     block_turbo3 *d_kb, *d_vb;
+    block_turbo5* d_k5;
     uint8_t *d_k8, *d_v8;
     float *d_qr[NT], *d_oa[NT], *d_ob[NT], *d_scr;
     int* d_pos[NT];
@@ -1580,8 +1583,11 @@ static void test_attn_fdmma_turbo3() {
     CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMalloc(&d_k8, k8.size()));
     CUDA_CHECK(cudaMalloc(&d_v8, v8.size()));
+    CUDA_CHECK(cudaMalloc(&d_k5, k5b.size() * sizeof(block_turbo5)));
     CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k5, k5b.data(), k5b.size() * sizeof(block_turbo5),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_kb, kb.data(), kb.size() * sizeof(block_turbo3),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vb, vb.data(), vb.size() * sizeof(block_turbo3),
@@ -1596,7 +1602,14 @@ static void test_attn_fdmma_turbo3() {
     const float scale = 1.0f / sqrtf((float)HD);
     std::vector<float> A(OROW), Bv(OROW);
     char label[96];
-    for (int ntok : {5, 12}) {
+    // turbo3 only: there is no turbo5 e4m3 leg (built, measured, deleted --
+    // see attn_decode3). turbo5k's mma path is H16, covered by
+    // test_attn_fdmma_h16; its ntok>8 fallthrough is gated at the end here.
+    for (int tk : {KV_T3}) {
+      const void* kc = (const void*)d_kb;
+      const char* tn = "t3 ";
+      const double floor_mult = 2.5;
+      for (int ntok : {5, 12}) {
         for (int seq : {47, SEQMAX}) {
             q27k::CP3 q{};
             q27k::P3 qw{}, va{}, vb2{};
@@ -1617,12 +1630,12 @@ static void test_attn_fdmma_turbo3() {
             // A: fd2-t3 reference (post-attention inverse-WHT skipped on both
             // legs -- comparing pre-rotation outputs is equivalent and avoids
             // touching the buffers twice)
-            q27k::attn_decode3_fd2(q, 2 * HD, d_kb, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
-                                   HD, scale, 0, ntok, KV_T3);
+            q27k::attn_decode3_fd2(q, 2 * HD, kc, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
+                                   HD, scale, 0, ntok, tk);
             // control: no Q27_FD -> dispatch must fall through to fd2 BITWISE
             unsetenv("Q27_FD");
-            q27k::attn_decode3(q, 2 * HD, d_kb, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
-                               scale, 0, ntok, KV_T3);
+            q27k::attn_decode3(q, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, tk);
             CUDA_CHECK(cudaDeviceSynchronize());
             double ctrl = 0;
             for (int t = 0; t < ntok; t++) {
@@ -1635,13 +1648,13 @@ static void test_attn_fdmma_turbo3() {
                     ctrl = std::max(ctrl, std::isfinite(d) ? d : 1e30);
                 }
             }
-            snprintf(label, sizeof label, "fdmma-t3 control fallthrough ntok=%d seq=%d",
-                     ntok, seq);
+            snprintf(label, sizeof label, "fdmma-%s control fallthrough ntok=%d seq=%d",
+                     tn, ntok, seq);
             check(label, ctrl, 1e-30);
             // B: Q27_FD=mma -> the turbo3 fdmma leg
             setenv("Q27_FD", "mma", 1);
-            q27k::attn_decode3(q, 2 * HD, d_kb, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
-                               scale, 0, ntok, KV_T3);
+            q27k::attn_decode3(q, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, tk);
             CUDA_CHECK(cudaDeviceSynchronize());
             unsetenv("Q27_FD");
             double md = 0, worst = 0;
@@ -1659,8 +1672,8 @@ static void test_attn_fdmma_turbo3() {
                     worst = std::max(worst, std::isfinite(d) ? d / rms : 1e30);
                 }
             }
-            snprintf(label, sizeof label, "fdmma-t3 engaged (!=fd2) ntok=%d seq=%d", ntok,
-                     seq);
+            snprintf(label, sizeof label, "fdmma-%s engaged (!=fd2) ntok=%d seq=%d", tn,
+                     ntok, seq);
             check(label, md > 1e-9 ? 0.0 : 1.0, 0.5);
             // fp8 CONTROL: fdmma-vs-fd2 rel with scalar e4m3 KV and raw Q --
             // the e4m3 Q/P pipeline's own noise floor. fdmma ships
@@ -1693,13 +1706,50 @@ static void test_attn_fdmma_turbo3() {
             snprintf(label, sizeof label, "fdmma fp8 control rel ntok=%d seq=%d", ntok,
                      seq);
             check(label, fp8rel, 1.0); // informational floor (never gates)
-            snprintf(label, sizeof label, "fdmma-t3 rel vs fp8 floor ntok=%d seq=%d",
-                     ntok, seq);
-            check(label, worst / std::max(fp8rel, 1e-6), 2.5);
+            snprintf(label, sizeof label, "fdmma-%s rel vs fp8 floor ntok=%d seq=%d",
+                     tn, ntok, seq);
+            check(label, worst / std::max(fp8rel, 1e-6), floor_mult);
         }
+      }
+    }
+    // turbo5k width-cap routing: H16 caps at ntok<=8, so a wider round MUST
+    // fall through to fd2 BITWISE rather than reach a kernel with no turbo5
+    // leg. This is the guard the dispatch comment promises, made falsifiable.
+    {
+        const int ntok = 12, seq = SEQMAX;
+        q27k::CP3 q{};
+        q27k::P3 qw{}, va{}, vb2{};
+        q27k::IP3 P{};
+        for (int t = 0; t < ntok; t++) {
+            CUDA_CHECK(cudaMemcpy(d_qr[t], qh.data() + (size_t)t * QROW, (size_t)QROW * 4,
+                                  cudaMemcpyHostToDevice));
+            int p = std::max(0, seq - 1 - (ntok - 1 - t));
+            CUDA_CHECK(cudaMemcpy(d_pos[t], &p, 4, cudaMemcpyHostToDevice));
+            q.p[t] = d_qr[t]; qw.p[t] = d_qr[t];
+            va.p[t] = d_oa[t]; vb2.p[t] = d_ob[t]; P.p[t] = d_pos[t];
+        }
+        q27k::wht3(qw, NH, HD, 2 * HD, false, 0, ntok);
+        q27k::attn_decode3_fd2(q, 2 * HD, d_k5, d_vb, va, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, KV_T5K);
+        setenv("Q27_FD", "mma", 1);
+        q27k::attn_decode3(q, 2 * HD, d_k5, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD, scale,
+                           0, ntok, KV_T5K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        unsetenv("Q27_FD");
+        double d = 0;
+        for (int t = 0; t < ntok; t++) {
+            CUDA_CHECK(cudaMemcpy(A.data(), d_oa[t], (size_t)OROW * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(Bv.data(), d_ob[t], (size_t)OROW * 4, cudaMemcpyDeviceToHost));
+            for (int i = 0; i < OROW; i++) {
+                double e = std::fabs((double)A[i] - Bv[i]);
+                d = std::max(d, std::isfinite(e) ? e : 1e30);
+            }
+        }
+        check("t5k ntok=12 > H16 cap falls to fd2 (bitwise)", d, 1e-30);
     }
     CUDA_CHECK(cudaFree(d_kb));
     CUDA_CHECK(cudaFree(d_vb));
+    CUDA_CHECK(cudaFree(d_k5));
     CUDA_CHECK(cudaFree(d_k8));
     CUDA_CHECK(cudaFree(d_v8));
     for (int t = 0; t < NT; t++) {
@@ -1727,11 +1777,13 @@ static void test_attn_fdmma_h16() {
                        vf = rand_vec((size_t)SEQMAX * ROW, 122);
     std::vector<float> qh = rand_vec((size_t)NT * QROW, 123);
     std::vector<block_turbo3> kb((size_t)SEQMAX * BPR), vb((size_t)SEQMAX * BPR);
+    std::vector<block_turbo5> k5b((size_t)SEQMAX * BPR);
     std::vector<__half> khalf(kf.size()), vhalf(vf.size());
     std::vector<uint8_t> k8(kf.size()), v8(vf.size());
     for (size_t b = 0; b < kb.size(); b++) {
         t3_quant(kf.data() + b * 128, &kb[b]);
         t3_quant(vf.data() + b * 128, &vb[b]);
+        t5_quant(kf.data() + b * 128, &k5b[b]);
     }
     for (size_t i = 0; i < kf.size(); i++) {
         khalf[i] = __float2half_rn(kf[i]);
@@ -1740,6 +1792,7 @@ static void test_attn_fdmma_h16() {
         v8[i] = __nv_fp8_e4m3(vf[i]).__x;
     }
     block_turbo3 *d_kb, *d_vb;
+    block_turbo5* d_k5;
     __half *d_kh, *d_vh;
     uint8_t *d_k8, *d_v8;
     float *d_qr[NT], *d_oa[NT], *d_ob[NT], *d_scr;
@@ -1758,6 +1811,9 @@ static void test_attn_fdmma_h16() {
     CUDA_CHECK(cudaMemcpy(d_vh, vhalf.data(), vhalf.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_k5, k5b.size() * sizeof(block_turbo5)));
+    CUDA_CHECK(cudaMemcpy(d_k5, k5b.data(), k5b.size() * sizeof(block_turbo5),
+                          cudaMemcpyHostToDevice));
     for (int t = 0; t < NT; t++) {
         CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
         CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
@@ -1774,12 +1830,15 @@ static void test_attn_fdmma_h16() {
     CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
     const int arch = mj * 10 + mn;
     struct Leg { const char* name; int kvk; const void *kc, *vc; bool rot; };
-    Leg legs[3] = {{"f16", KV_F16, d_kh, d_vh, false},
+    Leg legs[4] = {{"f16", KV_F16, d_kh, d_vh, false},
                    {"fp8", KV_FP8, d_k8, d_v8, false},
-                   {"t3 ", KV_T3, d_kb, d_vb, true}};
+                   {"t3 ", KV_T3, d_kb, d_vb, true},
+                   {"t5k", KV_T5K, d_k5, d_vb, true}};
     for (const Leg& L : legs) {
-        // on sm_89+ fp8/turbo3 route to the e4m3 kernel (already gated
-        // elsewhere) -- only the fp16 leg exercises H16 there
+        // on sm_89+ fp8/turbo3/turbo5k route to the e4m3 kernel (already gated
+        // elsewhere) -- only the fp16 leg exercises H16 there. On sm_80..88 --
+        // AMPERE, the arch turbo5k actually targets -- every leg here IS the
+        // H16 kernel, so this is turbo5k's real serving path.
         const bool h16_leg = arch < 89 || L.kvk == KV_F16;
         for (int ntok : {5, 8}) {
             for (int seq : {47, SEQMAX}) {
@@ -1832,6 +1891,7 @@ static void test_attn_fdmma_h16() {
         }
     }
     CUDA_CHECK(cudaFree(d_kb)); CUDA_CHECK(cudaFree(d_vb));
+    CUDA_CHECK(cudaFree(d_k5));
     CUDA_CHECK(cudaFree(d_kh)); CUDA_CHECK(cudaFree(d_vh));
     CUDA_CHECK(cudaFree(d_k8)); CUDA_CHECK(cudaFree(d_v8));
     for (int t = 0; t < NT; t++) {

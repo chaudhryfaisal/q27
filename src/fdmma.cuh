@@ -25,6 +25,7 @@
 
 #include "cuda_common.h" // kv2h (H16 fp8 tile fill)
 #include "turbo3.cuh" // T3 verify leg: block struct + stage8_e4m3
+#include "turbo5.cuh" // T5K verify leg: 5-bit K blocks (V stays turbo3)
 
 namespace fdmma {
 
@@ -207,6 +208,13 @@ static __device__ __forceinline__ void fdmma_tile_compute(
 // epilogue) is untouched. T3 is only instantiated with STAGES==1 (the
 // default config; the blocking expand leans on the 2nd resident CTA for
 // overlap exactly like the raw single-buffer variant).
+//
+// There is deliberately NO turbo5 leg here. One was built and measured on
+// 2026-08-01 (d): e4m3 tiles (3 mantissa bits) add +17.6% on top of turbo3's
+// own quantization error but +81% on top of turbo5's, inflating turbo5's
+// error 1.29x in quadrature -- a third of what the 5th bit bought, traded
+// away for speed, in a format that exists to fix a TAIL. turbo5k routes to
+// the fp16-tile H16 kernel below instead. See attn_decode3's dispatch.
 template <int W, int STAGES = 2, bool T3 = false>
 __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     k_attn_fdmma(__grid_constant__ const FCP3 qp, int q_stride,
@@ -481,7 +489,11 @@ inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, 
 // V rows (no s_vt transpose). Single-buffered half tiles, blocking fill
 // (v1: no cp.async -- profile before adding it); ~59KB at W8 = 1 CTA/SM on
 // sm_86, so the launcher sizes ns to one 1-CTA wave (SMs/kv_heads).
-// FMT: 0 = fp16 rows, 1 = fp8 rows (kv2h), 2 = turbo3 blocks (stage8_h2).
+// FMT: 0 = fp16 rows, 1 = fp8 rows (kv2h), 2 = turbo3 blocks (stage8_h2),
+// 3 = turbo5 K blocks + turbo3 V blocks (turbo5k -- the ASYMMETRIC one, which
+// is why K and V are staged by separate branches below rather than one flag).
+// This is the Ampere path: on sm_80..88 the e4m3 MMA is a no-op stub, so
+// k_attn_fdmma above never engages and everything routes here.
 constexpr int FDMMA_LDH16 = FDMMA_HD + 8; // halves; 528B rows, frag loads 16B-aligned
 
 __host__ __device__ constexpr size_t fdmma_h16_smem_bytes(int W) {
@@ -594,9 +606,14 @@ __global__ void __launch_bounds__(192, 1)
             __half2* kd = (__half2*)(s_k + (size_t)pp * LDH + d8);
             __half2* vd = (__half2*)(s_v + (size_t)pp * LDH + d8);
             if (gpos < p_end) {
-                if constexpr (FMT == 2) {
+                if constexpr (FMT == 2 || FMT == 3) {
                     const size_t rb = ((size_t)gpos * n_kv_heads + kvh) * 2;
-                    q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)kc + rb, d8, kd);
+                    if constexpr (FMT == 3)
+                        q27turbo::turbo5_stage8_h2((const q27turbo::block_turbo5*)kc + rb, d8,
+                                                   kd);
+                    else
+                        q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)kc + rb, d8,
+                                                   kd);
                     q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)vc + rb, d8, vd);
                 } else if constexpr (FMT == 1) {
                     const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d8;
@@ -762,13 +779,16 @@ inline void launch_fdmma_h16_w(FCP3 qp, int q_stride, const void* kc, const void
                                                  gqa, head_dim, scale);
 }
 
-// H16 dispatch: W 4..8 only (smem); fmt 0=fp16 1=fp8 2=turbo3.
+// H16 dispatch: W 4..8 only (smem); fmt 0=fp16 1=fp8 2=turbo3 3=turbo5k.
 inline bool launch_fdmma_h16(FCP3 qp, int q_stride, const void* kc, const void* vc,
                              float* part, FIP3 pos, int n_kv_heads, int gqa, int head_dim,
                              float scale, int ns, int ntok, int fmt, cudaStream_t st) {
 #define FDMMA_H16_CASE(N)                                                                     \
     case N:                                                                                   \
-        if (fmt == 2)                                                                         \
+        if (fmt == 3)                                                                         \
+            launch_fdmma_h16_w<N, 3>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+                                     head_dim, scale, ns, st);                                \
+        else if (fmt == 2)                                                                    \
             launch_fdmma_h16_w<N, 2>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
                                      head_dim, scale, ns, st);                                \
         else if (fmt == 1)                                                                    \

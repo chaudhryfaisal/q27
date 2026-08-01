@@ -212,6 +212,26 @@ __device__ __forceinline__ void turbo5_stage8_h2(const block_turbo5* row2, int d
     for (int j = 0; j < 4; j++)
         dst[j] = __halves2half2(__float2half_rn(v[2 * j]), __float2half_rn(v[2 * j + 1]));
 }
+
+// Same 8-dim stage as e4m3 bytes (the fdmma verify tiles): the MMA operands
+// become e4m3(centroid*norm) -- one extra rounding on top of the 5-bit quant,
+// same tolerance class as fdmma's own e4m3 Q/P staging and as turbo3's
+// equivalent. Mirrors turbo3_stage8_e4m3 exactly; only the unpack differs.
+__device__ __forceinline__ void turbo5_stage8_e4m3(const block_turbo5* row2, int d8,
+                                                   __nv_fp8_e4m3* dst) {
+    const block_turbo5* b = row2 + (d8 >> 7);
+    int j0 = d8 & 127;
+    float norm = __half2float(b->norm);
+    const uint8_t* q = b->qs + (j0 >> 1);
+    uint8_t h8 = b->hi[j0 >> 3];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int lo = (q[i] & 0xF) | (((h8 >> (2 * i)) & 1) << 4);
+        int hi = ((q[i] >> 4) & 0xF) | (((h8 >> (2 * i + 1)) & 1) << 4);
+        dst[2 * i] = __nv_fp8_e4m3(TURBO_CENTROIDS_5BIT[lo] * norm);
+        dst[2 * i + 1] = __nv_fp8_e4m3(TURBO_CENTROIDS_5BIT[hi] * norm);
+    }
+}
 #endif
 
 } // namespace q27turbo

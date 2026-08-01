@@ -9613,3 +9613,89 @@ had `2>/dev/null` so the reason was thrown away. Re-run with stderr kept.
 Discarding stderr in a bench harness converts a diagnosable failure into a
 silently empty column -- and an empty column next to full ones reads as
 "didn't apply" rather than "broke".
+
+## 2026-08-01 (d) -- turbo5k gets an mma leg: -28% per round at depth, and the e4m3 leg it was "supposed" to get was built, measured and DELETED
+
+The (c) entry filed an fdmma turbo5 leg as the obvious lever against turbo5k's
+decode cost. Built it. **The obvious version is wrong, and measuring why is the
+result.**
+
+### The e4m3 leg: built, measured, deleted
+
+The natural move was to mirror `turbo3_stage8_e4m3` -- expand 5-bit blocks into
+the e4m3 MMA tiles. It works and it engages. It is also **the wrong trade for
+this format**, which the gate caught before the dispatch shipped: `fdmma-t5k rel
+vs fp8 floor` came in at 2.587 against turbo3's 2.245 on the same shape and the
+same 2.5 bar.
+
+Quantified on the centroid tables directly, no GPU needed -- e4m3 carries 3
+mantissa bits (~3.1% max relative error), and against each format's OWN
+quantization error that is:
+
+    format   own RMS err   e4m3 adds   added/own
+    turbo3      0.020536    0.003609       17.6%
+    turbo5      0.005529    0.004479       81.0%
+
+turbo3's own error is 18.6% RMS, so e4m3 staging is noise. turbo5's is 5.0%, so
+e4m3 inflates it **1.29x in quadrature and throws away roughly a third of what
+the 5th bit was bought for.** A format whose entire justification is the tail
+cannot pay for speed in precision. The leg was removed rather than shipped
+behind a flag -- the `k_attn_fdmma` e4m3 kernel is textually back to master's
+`bool T3`, so the shipped fp8/turbo3 legs are untouched.
+
+(An opt-in flag was tried first and does not work here: the dispatch reads its
+knobs through one-shot `static const` locals -- deliberately, they sit on a
+per-attention-layer path -- so a `setenv` inside a test loop is latched to
+whatever the FIRST iteration saw. That is a property of the hot path, not a bug
+to fix; it just means "flag it off by default" is not available in this dispatch
+and the choice is ship-or-delete.)
+
+### H16 is the right leg, and it covers BOTH arches
+
+`k_attn_fdmma_h16` stages **fp16** tiles (11 mantissa bits -- no meaningful loss
+on a 5-bit table) and runs on **sm_80+**. So routing turbo5k there gives it an
+mma leg on Ampere AND Blackwell without the precision cost. FMT gains 3 =
+turbo5 K + turbo3 V; K and V are staged by separate branches because turbo5k is
+the first ASYMMETRIC turbo kind and one format flag no longer describes a cache.
+
+Above H16's `ntok<=8` smem cap turbo5k lands on fd2, which is correct rather
+than a gap, and is now gated explicitly (`t5k ntok=12 > H16 cap falls to fd2
+(bitwise)`) instead of being a comment.
+
+### Measured (5090, accept_kv_ab, ms/rnd -- the acceptance-independent cost)
+
+    payload         BEFORE (fd2)              AFTER (H16)           turbo5k
+    code    (27K)   t3 19.10  t5k 24.50=1.28x  t3 20.04 t5k 20.59=1.03x  -16.0%
+    docs61k (61K)   t3 22.51  t5k 35.88=1.59x  t3 22.55 t5k 25.80=1.14x  -28.1%
+
+**-28% per round at depth, and the gap to turbo3 collapses from 1.59x to
+1.14x.** Note 1.14x is now BELOW turbo5k's 1.32x byte cost: the fp16 tiles
+amortize the unpack across the MMA work exactly the way prefill always did,
+which is why prefill never showed this cost in the first place.
+
+Decomposing the deep leg (both det=OK): tps 116.7/164.5 = 0.709 = kernel 0.874
+x acceptance 0.812. **After H16 the draft lottery (0.812) is a bigger share of
+the remaining wall-clock gap than kernel cost (0.874) is** -- the kernel gap is
+substantially closed and what is left is mostly not a property of the format.
+(The 27K turbo3 leg reported `det=NONDET rounds=[76,76,80]`, the known codegen
+replay nondeterminism; weight the deep leg, which is det=OK on both sides.)
+
+### The product call, revised a second time
+
+(b) said "capacity vs tail". (c) corrected that to "and it costs 1.6x decode at
+depth -- do not flip the Ampere default". **With the H16 leg the cost is 1.14x,
+and that verdict softens accordingly:** ~1.14x per-round decode and +32% cache
+for 43% fewer catastrophic positions is a defensible default, not merely a
+defensible opt-in.
+
+**But it is not yet a decision, for a stated reason: this is measured on sm_120,
+and the target is Ampere.** On sm_86 turbo3 has no e4m3 leg either, so BOTH
+formats run H16 there and the comparison should transfer better than the (c)
+numbers did -- but "should" is not "did". The honest position is that turbo5k's
+decode cost is now small enough that the Ampere default is worth deciding, and
+deciding it wants one accept_kv_ab run on the 3090. Not run here: that card is
+serving a live session and the model is 17.7 GB against its 24.
+
+Gates after the change: canonical `a2982c5197c627551b27d76a0a94b220` EXACT + all
+5 sampling gates; `test_kernels` ALL PASS on BOTH arches (sm_120 351, sm_86
+346, 0 fail); `ninv_test` ALL PASS.
