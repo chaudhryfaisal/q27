@@ -28,6 +28,9 @@ cd "$(dirname "$0")/.."
 MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
 TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
 PORT=${PORT:-8199}
+# BIN: the server binary. 24GB Ampere cards need build/q27-server-w8 (the
+# default W12 build OOMs at graph setup there) -- see README.
+BIN=${BIN:-build/q27-server}
 CTX=${CTX:-32768}
 LEGS=${LEGS:-"fp8 fp8fd2 turbo3 turbo5k"}
 PAYLOADS=${*:-cctx cctx2 repro}
@@ -48,7 +51,7 @@ for pay in $PAYLOADS; do
       turbo5k) kvenv="Q27_KV=turbo5k";;
     esac
     env $kvenv Q27_PMIN=0.5 Q27_MAXD=auto7 \
-      build/q27-server "$MODEL" "$TOK" --port "$PORT" --ctx "$CTX" --no-think \
+      "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx "$CTX" --no-think \
       --fast-head >"$LOG" 2>&1 &
     SRV=$!
     for i in $(seq 1 120); do

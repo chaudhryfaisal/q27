@@ -9721,8 +9721,11 @@ build, bare cc profile:
     q4s            208896             159744
     default         53248              40960
 
-That is 49152 tokens of window on the tier Ampere actually serves, given up for
-the tail. `Q27_KV=turbo3` restores it exactly -- the profile uses
+**CORRECTED by measurement in (f) below: the real q4s picks are 253952 and
+192512.** The RATIO (0.758) was exact; the absolute windows were ~21% low
+because this used a 23.6 GB usable estimate and the card reports 8.75 GB free
+post-weights, not 8.14. The window actually given up is 61440 tokens, not
+49152. `Q27_KV=turbo3` restores it exactly -- the profile uses
 `setenv(overwrite=0)`, so any user Q27_KV wins and `Q27_PROFILE=ref` still
 keeps fp16. The README's Ampere claims were updated to match; its historical
 measurement records (the 07-12 102.2 t/s turbo3+h16 run, the +19%-at-2x-context
@@ -9748,3 +9751,66 @@ change returned `d41d8cd98f00b204e9800998ecf8427e` -- the md5 of EMPTY -- becaus
 the production server had been restored to GPU0 and the co-located CLI OOMed
 without erroring. It reads exactly like a broken canonical. Free the GPU before
 any canonical check; this is now the second time it has bitten in one day.
+
+## 2026-08-01 (f) -- the Ampere run that (e) shipped without: turbo5k costs 1.11-1.17x per round on a real 3090, and the acceptance confound vanishes
+
+Gabe freed the 3090 (speech-to-speech stopped and restored). This is the
+`accept_kv_ab` run (e) named as its one soft spot, plus the auto-ctx and needle
+checks that only that card can answer.
+
+### Decode, measured on sm_86 (q4s tier, w8 build, both formats on H16)
+
+    payload          leg      tps_med  tok/rnd  ms/rnd  rounds
+    code    (27K)    turbo3      84.5    2.943   34.84      87
+                     turbo5k     75.9    2.943   38.77      87
+    docs61k (61K)    turbo3      63.1    2.783   44.09      92
+                     turbo5k     55.2    2.844   51.50      90
+
+**turbo5k costs 1.113x per round at 27K and 1.168x at 61K on real Ampere.**
+Wall-clock decode is -10.2% and -12.5%.
+
+**This is the cleanest of the three throughput measurements, because the
+acceptance confound is simply absent**: tok/rnd is 2.943 vs 2.943 at 27K and
+2.783 vs 2.844 at 61K, and the round counts nearly match (87/87, 92/90). On the
+5090 runs the draft lottery moved tok/rnd by 15-19% and had to be divided out;
+here ms/rnd IS the whole story and needs no decomposition.
+
+### Correcting (d) and (e)
+
+**(d)'s hedge was wrong in the direction it guarded.** It said the sm_120 ratio
+"should transfer at least as well" to Ampere because both formats run H16
+there. Ampere is uniformly slightly WORSE: 1.113x vs 1.03x at 27K, 1.168x vs
+1.14x at 61K. The magnitude was right, the direction of the hedge was not.
+Bandwidth-starved parts pay more for the wider unpack, not less -- the opposite
+of the 07-17 finding that turbo3's 5090 decode tax *inverts* on Ampere.
+
+**(e)'s context table was ~21% low in absolute terms.** Measured on the card,
+bare cc profile, q4s, w8:
+
+    format    --ctx auto     vram free post-weights
+    turbo3       253952            8.75 GB
+    turbo5k      192512            8.75 GB
+
+Ratio 0.758 -- exactly as predicted, because it is fixed by per_tok alone. The
+absolute windows were low because the estimate assumed 23.6 GB usable. **The
+window actually given up is 61440 tokens (253952 -> 192512), not 49152.**
+
+### Retrieval at the new default's depth
+
+`needle_check --depth 440000` under `Q27_KV=turbo5k --ctx 163840` on the 3090:
+**6/6 PASS at ~146727 tokens.** The Ampere default now has a retrieval check on
+its own arch at three quarters of its auto-sized window, which it did not have
+when (e) shipped.
+
+### Verdict: the (e) default STANDS, now measured rather than inferred
+
+On real Ampere the trade is **~10-13% wall-clock decode and 61440 tokens of
+window for 43% fewer catastrophic KV positions**, with retrieval intact at
+146K. Nothing about the sign of the decision changed; the soft spot (e) flagged
+is closed, and it closed slightly against turbo5k rather than for it, which is
+worth stating plainly. `Q27_KV=turbo3` remains the one-env escape for
+deployments that want the deeper window.
+
+Harness: `tools/accept_kv_ab.sh` gains a `BIN` override -- 24 GB cards need
+`build/q27-server-w8` and the harness had the W12 binary hardcoded, so no
+Ampere KV A/B could have been run through it before now.
