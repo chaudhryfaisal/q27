@@ -21,6 +21,11 @@ int main() {
             return 1;
         }
     }
+    q27::Tensor selective;
+    selective.name = "blk.0.ffn_gate.weight";
+    selective.dtype = DType::Q4_G64;
+    q27::validate_cuda_tensor(selective);
+
 
     q27::Model model;
     q27::Tensor embedding;
@@ -46,6 +51,18 @@ int main() {
         std::fputs("Metal-only model was accepted by CUDA\n", stderr);
         return 1;
     }
+    bool selective_packed_rejected = false;
+    try {
+        q27::validate_cuda_tensor(packed);
+    } catch (const std::runtime_error& error) {
+        selective_packed_rejected = std::string(error.what()).find(
+            "unsupported weight dtype T2_G128") != std::string::npos;
+    }
+    if (!selective_packed_rejected) {
+        std::fputs("Metal-only selective tensor was accepted by CUDA\n", stderr);
+        return 1;
+    }
+
 
     model.tensors[0].dtype = DType::T2_G128;
     bool embedding_rejected = false;

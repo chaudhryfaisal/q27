@@ -20,7 +20,7 @@ struct DevTensor {
 
 class DeviceModel {
   public:
-    explicit DeviceModel(const Model& m) : model_(m) { validate_cuda_model(model_); }
+    explicit DeviceModel(const Model& m) : model_(m) {}
     ~DeviceModel();
     // owns raw CUDA pointers in dev_; a copy would double-free on destruction.
     DeviceModel(const DeviceModel&) = delete;

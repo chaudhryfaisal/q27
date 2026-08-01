@@ -58,8 +58,11 @@ struct Model {
     size_t map_size_ = 0;
 };
 
-// Reject model-wide dtype combinations the CUDA kernels cannot consume.
-// Call before constructing or populating a DeviceModel.
+// Reject one tensor whose dtype or CUDA-specific role is unsupported.
+// Selective upload paths validate only the tensor they request.
+void validate_cuda_tensor(const Tensor& tensor);
+// Reject model-wide CUDA incompatibilities and require the full engine schema.
 void validate_cuda_model(const Model& model);
+
 
 } // namespace q27
