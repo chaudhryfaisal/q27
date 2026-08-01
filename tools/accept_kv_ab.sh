@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # accept_kv_ab.sh -- KV-format acceptance A/B at the CC serving point
 # (PMIN=0.5, MAXD=auto7, profile suffix defaults): fp8-as-served (mma),
-# fp8+fd2 (kernel-numerics control), turbo3 (fd2 fallthrough). Derived from
+# fp8+fd2 (kernel-numerics control), turbo3 and turbo5k (both fd2 fallthrough).
+#
+# READ ms/rnd, NOT tps, when comparing KV FORMATS. A format change re-rolls the
+# trajectory (different numerics -> different tokens -> different acceptance),
+# so tps mixes kernel cost with a draft-acceptance lottery. ms/rnd is the
+# acceptance-independent cost; tok/rnd is the acceptance; tps is their ratio.
+# fp8fd2 is the control that separates "fd2 vs mma" from "format vs format" --
+# turbo3/turbo5k have no mma leg by construction (see attn_decode3's guard).
+#
+# Derived from
 # accept_ab.sh; same 1-cold + 3-warm replay protocol and [req] parser.
 #
 # For each payload (repro/code/testgen) x each depth leg (d4/d5/auto):
@@ -20,7 +29,7 @@ MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
 TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
 PORT=${PORT:-8199}
 CTX=${CTX:-32768}
-LEGS=${LEGS:-"fp8 fp8fd2 turbo3"}
+LEGS=${LEGS:-"fp8 fp8fd2 turbo3 turbo5k"}
 PAYLOADS=${*:-cctx cctx2 repro}
 SRV=""
 
@@ -36,6 +45,7 @@ for pay in $PAYLOADS; do
       fp8)    kvenv="Q27_KV=fp8";;
       fp8fd2) kvenv="Q27_KV=fp8 Q27_FD=fd2";;
       turbo3) kvenv="Q27_KV=turbo3";;
+      turbo5k) kvenv="Q27_KV=turbo5k";;
     esac
     env $kvenv Q27_PMIN=0.5 Q27_MAXD=auto7 \
       build/q27-server "$MODEL" "$TOK" --port "$PORT" --ctx "$CTX" --no-think \

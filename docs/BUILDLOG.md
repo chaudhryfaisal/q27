@@ -9516,3 +9516,100 @@ essentially-lossless K it would sit at 3.5e-2 and FAIL.
 - Same caveats as the morning study: fp16-KV reference isolates CACHE error
   only, "catastrophic" bounds where damage could occur rather than
   demonstrating it, one corpus, default 5.25 bpw tier.
+
+## 2026-08-01 (c) -- turbo5k throughput: prefill barely notices, DECODE costs 1.28-1.59x turbo3 and the gap GROWS with depth
+
+The (b) entry shipped turbo5k on quality and left throughput explicitly
+unmeasured. Measured now. **It is expensive, and more expensive than its byte
+count predicts.**
+
+Method, two independent legs because they answer different things. Prefill via
+`--pf` (no server, fully deterministic, no acceptance confound). Decode via
+`tools/accept_kv_ab.sh` (fresh server per leg, 1 cold + 3 warm greedy replays),
+gaining a `turbo5k` case. **Read `ms/rnd`, not `tps`** -- a KV format change
+re-rolls the trajectory, so tps mixes kernel cost with a draft-acceptance
+lottery; that is the confound banked on 07-16. `fp8fd2` is the control that
+separates "fd2 vs mma" from "format vs format", and it is the RIGHT baseline
+here because turbo3 and turbo5k have no mma leg by construction.
+
+### Decode (the expensive axis)
+
+    payload            leg      tps_med  tok/rnd  ms/rnd  rounds
+    code    (27K)      fp8        170.5    3.084   18.08      83
+                       fp8fd2     146.6    2.943   20.08      87
+                       turbo3     165.5    3.160   19.10      81
+                       turbo5k    124.4    3.048   24.50      84
+    docs61k (61K)      fp8        153.5    3.048   19.86      84
+                       fp8fd2     120.1    2.813   23.42      91
+                       turbo3     164.8    3.710   22.51      69
+                       turbo5k     87.0    3.122   35.88      82
+
+**turbo5k costs 1.28x turbo3's per-round time at 27K and 1.59x at 61K.** The
+gap grows with depth, which is what it should do -- fd2 re-reads every cached
+position every round, so the format's per-element unpack cost scales with
+context while everything else in the round does not.
+
+**It is WORSE than byte-proportional.** turbo5k is 1.32x turbo3's cache size
+but 1.59x its per-round cost at 61K. The 5-bit lane load is an unaligned-nibble
+job -- one ushort, four nibble extracts, a variable shift for the 5th bit --
+against turbo3's byte-aligned 2-bit + sign-byte extraction. The extra bits cost
+more than the extra bytes.
+
+Decomposing the end-to-end tps ratio confirms the reading rather than resting
+on it: turbo5k/turbo3 tps = 0.528 at 61K = kernel 0.627 x acceptance 0.842, so
+**70% of the wall-clock gap is real kernel cost and 30% is the acceptance
+re-roll** (turbo3 drew 3.710 tok/rnd against turbo5k's 3.122 -- a lottery, not
+a property; at 27K the split is 86/14 the other way on a smaller gap). Anyone
+quoting the raw 164.8-vs-87.0 tps as "turbo5k is half the speed" is quoting a
+number that is ~30% draft luck.
+
+Side note the control earns: **turbo3 is 4-5% FASTER per round than fp8 on the
+same fd2 kernel** (19.10 vs 20.08, 22.51 vs 23.42). fp8's headline win in this
+table is the mma leg, not the format -- and that leg is exactly what the turbo
+family gives up.
+
+### Prefill (cheap)
+
+    tokens    fp8      turbo3   turbo5k     turbo5k vs turbo3   vs fp8
+    16384    3618 t/s  3271     3123              -4.5%        -13.7%
+    65536    2960 t/s  2287     2046             -10.5%        -30.9%
+
+Prefill barely notices the wider format: the mma path stages a 32-position tile
+into fp16 once and amortizes the dequant across all the MMA work that follows,
+so the unpack is a small share. That is the same structural reason decode is
+expensive -- decode has nothing to amortize against.
+
+### What this does to the product call
+
+The (b) entry called the Ampere question "capacity vs tail". **That was one
+axis short.** The real trade on a 3090 is now three-way:
+
+- **turbo3**: 14.1 KB/tok, 114 catastrophic, baseline speed.
+- **turbo5k**: 18.6 KB/tok (+32%), 65 catastrophic (-43%), **1.28-1.59x the
+  per-round decode cost, worsening with depth**.
+
+Paying ~1.6x decode at depth for a 43% cut in catastrophic positions is a much
+harder sell than (b) implied, and at 262K -- the context where turbo3 is the
+only option and therefore the case turbo5k was built for -- the multiplier is
+at its worst. **Recommendation: do NOT flip the Ampere default on this
+evidence.** turbo5k earns its place as an opt-in for Ampere workloads that are
+tail-sensitive and depth-moderate (code/JSON under ~32K), not as a default.
+
+**The obvious follow-on is a real lever, not a caveat.** turbo5k is fd2-only
+because the dispatch guard deliberately excludes it from fdmma. fp8's mma leg
+is worth ~11% per round in this same table, and an fdmma turbo5 leg
+(`turbo5_stage8_e4m3`, mirroring the turbo3 one that already exists) would
+attack exactly the cost measured here. Filed, not built. A cheaper lane load --
+repacking so the 5th bit does not need a per-element variable shift -- is the
+other half and is a pure format change, so it would need a new microtest and a
+new tier, not an edit to this one.
+
+Artifacts: `scratchpad/t5_throughput.sh`, `tools/accept_kv_ab.sh` (+turbo5k leg
+and a header that says to read ms/rnd).
+
+**METHOD TRAP BANKED:** the prefill legs of the first scripted run emitted
+NOTHING under `systemd-run --user` while working interactively, and the script
+had `2>/dev/null` so the reason was thrown away. Re-run with stderr kept.
+Discarding stderr in a bench harness converts a diagnosable failure into a
+silently empty column -- and an empty column next to full ones reads as
+"didn't apply" rather than "broke".
