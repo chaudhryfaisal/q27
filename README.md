@@ -7,8 +7,9 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 - **Fastest known way to run this model.** +47% decode over tuned
   llama.cpp on a 5090 (same model, GPU, harness, day; protocol filed
   before it could pass). On a 24GB 3090: +19% decode at 2x the
-  context over mainline llama.cpp (262K turbo3 default vs their
-  100-131K class). vLLM measured 4.7x slower wall on real
+  context over mainline llama.cpp (that run used the turbo3 default of
+  the day at 262K; the default is now turbo5k, ~76% of that window for
+  43% fewer catastrophic KV positions -- `Q27_KV=turbo3` restores it). vLLM measured 4.7x slower wall on real
   Claude-Code traffic (its prefix cache gets 0% reuse on this
   hybrid-GDN architecture); sglang 0.5.15 cannot load the model at all
   (BUILDLOG 2026-07-12).
@@ -62,9 +63,12 @@ release binaries include the sm_89 target; v0.3.0 did not.)
 
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
-default width-12 build OOMs at graph setup on 24GB. turbo3 is the
-default on Ampere (no env needed); prefer the q4s tier: its
-2.27GB-smaller weight file goes straight to KV budget (~74K tokens/GB at turbo3 rates).
+default width-12 build OOMs at graph setup on 24GB. turbo5k (5-bit K +
+3-bit V) is the default on Ampere since 2026-08-01 (no env needed) --
+43% fewer catastrophic KV positions than turbo3 at 1.14x its per-round
+decode; `Q27_KV=turbo3` trades that back for ~32% more context. Prefer
+the q4s tier: its 2.27GB-smaller weight file goes straight to KV budget
+(~56K tokens/GB at turbo5k rates, ~74K at turbo3's).
 Cards with less than a true 24 GiB (A10-class cloud parts, ECC
 reserve, decimal-GB VRAM) can also add `Q27_MAXD=4` (trims the graph
 zoo ~280MB) and `Q27_SAMPLED=0` for greedy-only serving (skips the
@@ -482,12 +486,14 @@ make build/q27-server
 **Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV
-itself needs sm_89+; sm_86/Ampere defaults to turbo3 since v0.3.0 --
-a bare w8 boot serves the full 262144 window on a 24GB 3090 -- with
-fp16 via `--kv-fp16`), `Q27_PMIN=0.5`,
+itself needs sm_89+; sm_86/Ampere defaulted to turbo3 from v0.3.0 and
+to turbo5k since 2026-08-01 -- a bare w8 boot serves ~159744 on a 24GB
+3090 at the q4s tier, or ~208896 under `Q27_KV=turbo3` -- with
+fp16 via `--kv-fp16`; sm_86/Ampere moved to turbo5k on 2026-08-01),
+`Q27_PMIN=0.5`,
 `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head, no-think, phase
 stats; `--ctx` auto-sizes the KV budget to free VRAM (capped at the
-262144 native window for fp8/turbo3, 131072 fp16; single-slot).
+262144 native window for fp8/turbo3/turbo5k, 131072 fp16; single-slot).
 Continuous batching is default since 2026-07-16 (`Q27_BATCH=1
 Q27_BATCH_GRAPH=1`, graph-cache cap 64, shrunk to fit VRAM headroom;
 `Q27_BATCH=0` disables; single-slot/solo traffic is byte-identical to

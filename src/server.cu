@@ -288,13 +288,35 @@ int main(int argc, char** argv) {
         } else if (cc_arch >= 80) {
             // H16 (fp16-MMA) verify: Ampere gets the mma path too
             // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md).
-            // KV defaults to turbo3 on Ampere (2026-07-17, Gabe sign-off):
-            // no fp8 HW here, and the 5090's turbo3 decode tax INVERTS on a
-            // bandwidth-starved part -- 3090 q4s decode narr +1.1% / code
-            // +9.8% over fp16 at 4.27x the context (262144 on 24 GB, needle
-            // 6/6 @233K; BUILDLOG 2026-07-17). setenv(overwrite=0): any
-            // user Q27_KV wins; Q27_PROFILE=ref keeps fp16.
-            setenv("Q27_KV", "turbo3", 0);
+            //
+            // KV defaulted to turbo3 here from 2026-07-17 (Gabe sign-off):
+            // no fp8 HW on Ampere, and the 5090's turbo3 decode tax INVERTS
+            // on a bandwidth-starved part -- 3090 q4s decode narr +1.1% /
+            // code +9.8% over fp16 at 4.27x the context (262144 on 24 GB,
+            // needle 6/6 @233K; BUILDLOG 2026-07-17).
+            //
+            // 2026-08-01 (e), Gabe sign-off: turbo5k REPLACES turbo3 as the
+            // Ampere default. It carries 43% fewer catastrophic positions
+            // (65 vs 114 against an fp16 reference on the 64K agentic
+            // corpus, BUILDLOG 2026-08-01 (b)) at 1.14x turbo3's per-round
+            // decode cost once the H16 mma leg lands (BUILDLOG (d)) -- and
+            // Ampere is precisely where the tail mattered most, because fp8
+            // is unavailable and turbo3 was the only route to a deep window.
+            //
+            // THE TRADE IS CONTEXT, and it is real: turbo5k is 19008 B/token
+            // against turbo3's 14400, so auto-ctx shrinks to 75.8% of the
+            // turbo3 window -- on the q4s tier a bare 24 GB boot sizes to
+            // ~159744 instead of ~208896. If a deployment needs the deeper
+            // window more than the tail, Q27_KV=turbo3 restores it exactly
+            // (setenv(overwrite=0): any user Q27_KV wins, and
+            // Q27_PROFILE=ref still keeps fp16).
+            //
+            // UNMEASURED, stated: the 1.14x decode ratio is from sm_120. On
+            // Ampere BOTH formats run the same H16 kernel (no e4m3 leg
+            // exists here), so the comparison should transfer at least as
+            // well -- but it has not been run on a 3090. One accept_kv_ab
+            // run there closes it.
+            setenv("Q27_KV", "turbo5k", 0);
             setenv("Q27_FD", "mma", 0);
         }
         setenv("Q27_PMIN", "0.5", 0);

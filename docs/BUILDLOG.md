@@ -9699,3 +9699,52 @@ serving a live session and the model is 17.7 GB against its 24.
 Gates after the change: canonical `a2982c5197c627551b27d76a0a94b220` EXACT + all
 5 sampling gates; `test_kernels` ALL PASS on BOTH arches (sm_120 351, sm_86
 346, 0 fail); `ninv_test` ALL PASS.
+
+## 2026-08-01 (e) -- turbo5k IS the Ampere default (Gabe sign-off); the trade is 24% of the context window, stated up front
+
+One line: `src/server.cu`'s cc-profile `setenv("Q27_KV", "turbo3", 0)` for
+`cc_arch >= 80 && < 89` becomes `"turbo5k"`. sm_89+ is untouched -- fp8 remains
+the serving default there and is still the best format measured (19
+catastrophic vs turbo5k's 65).
+
+**Why Ampere specifically.** It is where the tail mattered most and where there
+was no answer: fp8 needs sm_89+, so turbo3-or-nothing was the whole menu, and
+turbo3 carries 6.0x fp8's catastrophic-position rate. turbo5k cuts that 43% (114
+-> 65) at 1.14x turbo3's per-round decode once the H16 mma leg lands.
+
+**THE TRADE IS CONTEXT AND IT IS REAL.** turbo5k is 19008 B/token against
+turbo3's 14400, so auto-ctx shrinks to **75.8%** of the turbo3 window.
+Reproducing server.cu's own single-slot formula for a 24 GB sm_86 card, w8
+build, bare cc profile:
+
+    tier      turbo3 auto-ctx    turbo5k auto-ctx
+    q4s            208896             159744
+    default         53248              40960
+
+That is 49152 tokens of window on the tier Ampere actually serves, given up for
+the tail. `Q27_KV=turbo3` restores it exactly -- the profile uses
+`setenv(overwrite=0)`, so any user Q27_KV wins and `Q27_PROFILE=ref` still
+keeps fp16. The README's Ampere claims were updated to match; its historical
+measurement records (the 07-12 102.2 t/s turbo3+h16 run, the +19%-at-2x-context
+comparison) were NOT rewritten -- those are records of what was measured with
+turbo3, and rewriting them would be falsifying a result.
+
+**What is NOT measured, restated at the decision rather than buried.** The 1.14x
+decode ratio is sm_120. On Ampere both formats run the same H16 kernel -- no
+e4m3 leg exists there -- so the comparison should transfer at least as well, but
+it has not been run on a 3090. One `accept_kv_ab` run there closes it, and it
+was not run here because that card is serving a live session and the q4s tier is
+15.46 GB against its 17.8 GB free. **This default is shipped on a cross-arch
+inference, and that is the one soft spot in it.**
+
+Gates: `profile: cc (sm_86) | kv=turbo5k fd=mma` verified on the REAL 3090
+(banner prints before any weight load, so this costs the live session nothing);
+sm_89+ branch diff-verified untouched and the restarted 5090 server reports
+`kv=fp8`; canonical `a2982c5197c627551b27d76a0a94b220` EXACT + all 5 sampling
+gates; `test_kernels` ALL PASS on sm_86.
+
+**TRAP RE-FIRED, worth its third mention:** the first canonical run of this
+change returned `d41d8cd98f00b204e9800998ecf8427e` -- the md5 of EMPTY -- because
+the production server had been restored to GPU0 and the co-located CLI OOMed
+without erroring. It reads exactly like a broken canonical. Free the GPU before
+any canonical check; this is now the second time it has bitten in one day.
