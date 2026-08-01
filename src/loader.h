@@ -25,9 +25,9 @@ struct Tensor {
     uint64_t n_elements() const;
 };
 
-// Structural payload invariants shared by inspect and runtime validation.
-// Empty means valid; each string is a tensor-local failure description.
-std::vector<std::string> validate_tensor_payload(const Tensor& tensor);
+// Structural payload invariants shared by inspection and runtime loading.
+// Empty means valid; otherwise returns the first tensor-local failure.
+std::string validate_tensor_payload(const Tensor& tensor);
 
 struct Model {
     std::string meta_json;                        // raw JSON metadata blob

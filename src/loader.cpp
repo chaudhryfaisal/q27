@@ -29,19 +29,16 @@ const char* dtype_name(DType t) {
     return "?";
 }
 
-std::vector<std::string> validate_tensor_payload(const Tensor& tensor) {
-    std::vector<std::string> errors;
+std::string validate_tensor_payload(const Tensor& tensor) {
     const uint64_t rows = tensor.rows(), cols = tensor.cols();
     uint64_t group = 0;
     if (tensor.dtype == DType::Q4_G64) group = 64;
     else if (tensor.dtype == DType::Q8_G128 || tensor.dtype == DType::T2_G128 ||
              tensor.dtype == DType::T3_G128 || tensor.dtype == DType::B1_G128)
         group = 128;
-    if (group && cols % group) {
-        errors.push_back("cols " + std::to_string(cols) +
-                         " not divisible by group " + std::to_string(group));
-        return errors;
-    }
+    if (group && cols % group)
+        return "cols " + std::to_string(cols) +
+               " not divisible by group " + std::to_string(group);
 
     auto checked_product = [](std::initializer_list<uint64_t> factors, uint64_t& out) {
         out = 1;
@@ -68,46 +65,35 @@ std::vector<std::string> validate_tensor_payload(const Tensor& tensor) {
         case DType::B1_G128: sizes_representable = checked_product({rows, cols / 8}, want_data) &&
             checked_product({rows, cols / 128, 2}, want_scales); break;
         default:
-            errors.push_back("unsupported dtype " +
-                             std::to_string(static_cast<unsigned>(tensor.dtype)));
-            return errors;
+            return "unsupported dtype " +
+                   std::to_string(static_cast<unsigned>(tensor.dtype));
+    }
+    if (!sizes_representable) return "packed payload size overflows uint64";
+    if (tensor.data_size != want_data || tensor.scales_size != want_scales)
+        return "data " + std::to_string(tensor.data_size) +
+               " (want " + std::to_string(want_data) + "), scales " +
+               std::to_string(tensor.scales_size) + " (want " +
+               std::to_string(want_scales) + ")";
 
-    }
-    if (!sizes_representable) {
-        errors.push_back("packed payload size overflows uint64");
-        return errors;
-    }
-    if (tensor.data_size != want_data || tensor.scales_size != want_scales) {
-        errors.push_back("data " + std::to_string(tensor.data_size) +
-                         " (want " + std::to_string(want_data) + "), scales " +
-                         std::to_string(tensor.scales_size) + " (want " +
-                         std::to_string(want_scales) + ")");
-        return errors;
-    }
     if (tensor.dtype == DType::T2_G128) {
         for (uint64_t i = 0; i < tensor.data_size; i++) {
             const uint8_t byte = tensor.data[i];
             for (int shift = 0; shift < 8; shift += 2)
-                if (((byte >> shift) & 3u) == 3u) {
-                    errors.push_back("T2 payload contains reserved code 3");
-                    return errors;
-                }
+                if (((byte >> shift) & 3u) == 3u)
+                    return "T2 payload contains reserved code 3";
         }
     } else if (tensor.dtype == DType::T3_G128) {
-        bool invalid_byte = false, invalid_padding = false;
         const uint64_t groups = rows * (cols / 128);
         for (uint64_t group_index = 0; group_index < groups; group_index++) {
             const uint8_t* packed = tensor.data + group_index * 26;
             for (int i = 0; i < 26; i++)
-                if (packed[i] > 242) { invalid_byte = true; break; }
+                if (packed[i] > 242) return "T3 payload byte exceeds 242";
             const uint8_t tail = packed[25];
             if ((tail / 27) % 3 != 1 || (tail / 81) % 3 != 1)
-                invalid_padding = true;
+                return "T3 final-byte padding is noncanonical";
         }
-        if (invalid_byte) errors.push_back("T3 payload byte exceeds 242");
-        if (invalid_padding) errors.push_back("T3 final-byte padding is noncanonical");
     }
-    return errors;
+    return {};
 }
 
 uint64_t Tensor::rows() const {
@@ -238,6 +224,10 @@ Model Model::open(const std::string& path) {
                 throw std::runtime_error("q27: tensor scales out of range: " + t.name);
             t.scales = b + data_base + soff;
         }
+        const std::string payload_error = validate_tensor_payload(t);
+        if (!payload_error.empty())
+            throw std::runtime_error("q27: invalid tensor payload " + t.name + ": " +
+                                     payload_error);
         m.index.emplace(t.name, i);
     }
     return m;

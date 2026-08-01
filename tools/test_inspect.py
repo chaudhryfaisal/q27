@@ -81,6 +81,10 @@ def run(inspect, fixture):
     return subprocess.run([inspect, str(fixture)], text=True, capture_output=True)
 
 
+def output(result):
+    return result.stdout + result.stderr
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(f'usage: {sys.argv[0]} build/inspect')
@@ -116,43 +120,44 @@ def main():
         invalid_embedding = run(inspect, bad_embedding)
         if (invalid_embedding.returncode == 0 or
                 'token_embd.weight: CUDA row lookup requires Q8_G128' not in
-                invalid_embedding.stdout):
-            sys.stderr.write(invalid_embedding.stdout + invalid_embedding.stderr)
+                output(invalid_embedding)):
+            sys.stderr.write(output(invalid_embedding))
             raise SystemExit('non-Q8 CUDA embedding was not rejected')
         invalid_dtype = run(inspect, bad_dtype)
         if (invalid_dtype.returncode == 0 or
-                'unsupported dtype 255' not in invalid_dtype.stdout):
-            sys.stderr.write(invalid_dtype.stdout + invalid_dtype.stderr)
+                'unsupported dtype 255' not in output(invalid_dtype)):
+            sys.stderr.write(output(invalid_dtype))
             raise SystemExit('undeclared packed dtype was not rejected')
 
 
         bad = run(inspect, corrupt)
-        if bad.returncode == 0 or 'INVARIANT FAIL blk.0.ffn_gate.weight' not in bad.stdout:
-            sys.stderr.write(bad.stdout + bad.stderr)
+        if (bad.returncode == 0 or
+                'invalid tensor payload blk.0.ffn_gate.weight' not in output(bad)):
+            sys.stderr.write(output(bad))
             raise SystemExit('one-byte packed-dtype corruption was not detected')
 
         bad_shape = run(inspect, misaligned)
         if (bad_shape.returncode == 0 or
-                'not divisible by group 128' not in bad_shape.stdout):
-            sys.stderr.write(bad_shape.stdout + bad_shape.stderr)
+                'not divisible by group 128' not in output(bad_shape)):
+            sys.stderr.write(output(bad_shape))
             raise SystemExit('misaligned packed-dtype shape was not detected')
 
         invalid_t2 = run(inspect, bad_t2)
         if (invalid_t2.returncode == 0 or
-                'T2 payload contains reserved code 3' not in invalid_t2.stdout):
-            sys.stderr.write(invalid_t2.stdout + invalid_t2.stderr)
+                'T2 payload contains reserved code 3' not in output(invalid_t2)):
+            sys.stderr.write(output(invalid_t2))
             raise SystemExit('reserved T2 code was not detected')
 
         invalid_t3_range = run(inspect, bad_t3_range)
         if (invalid_t3_range.returncode == 0 or
-                'T3 payload byte exceeds 242' not in invalid_t3_range.stdout):
-            sys.stderr.write(invalid_t3_range.stdout + invalid_t3_range.stderr)
+                'T3 payload byte exceeds 242' not in output(invalid_t3_range)):
+            sys.stderr.write(output(invalid_t3_range))
             raise SystemExit('out-of-range T3 byte was not detected')
 
         invalid_t3_padding = run(inspect, bad_t3_padding)
         if (invalid_t3_padding.returncode == 0 or
-                'T3 final-byte padding is noncanonical' not in invalid_t3_padding.stdout):
-            sys.stderr.write(invalid_t3_padding.stdout + invalid_t3_padding.stderr)
+                'T3 final-byte padding is noncanonical' not in output(invalid_t3_padding)):
+            sys.stderr.write(output(invalid_t3_padding))
             raise SystemExit('noncanonical T3 padding was not detected')
 
         invalid_overflow = run(inspect, overflow)

@@ -35,10 +35,6 @@ int main(int argc, char** argv) {
             bad++;
         }
 
-        for (const std::string& error : q27::validate_tensor_payload(t)) {
-            printf("INVARIANT FAIL %s: %s\n", t.name.c_str(), error.c_str());
-            bad++;
-        }
     }
 
     printf("%zu tensors, %.2f GB payload\n", m.tensors.size(), total / 1e9);
