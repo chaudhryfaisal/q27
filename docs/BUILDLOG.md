@@ -9389,3 +9389,130 @@ NLL of the observed token, not a measured downstream failure -- it bounds where
 damage COULD occur, it does not demonstrate a broken JSON key. And the 64K legs
 are one corpus; the article's own finding that weight precision masks cache
 artifacts means these ratios are specific to the default 5.25 bpw tier.
+
+## 2026-08-01 (b) -- turbo5k SHIPPED: the 5-bit K rung clears its pre-declared bar, and PPL ranks it BACKWARDS
+
+Built the plan filed hours earlier the same day
+(`docs/plans/2026-08-01-5bit-k.md`), which the tail study above ended by
+filing: q27 jumped 3-bit straight to fp8 with nothing between, and every
+best-value config in anbeeld's benchmarks lives in the 5-6 bit band we skipped.
+
+**turbo5k = turbo5 5-bit K + turbo3 3-bit V, `Q27_KV=turbo5k`, 18.6 KB/tok.**
+
+### The format (P0)
+
+`src/turbo5.cuh`: 32 Lloyd-Max centroids, 5 bits/element, an 82-byte block over
+128 dims. Only the centroid table and the packing are new -- the WHT rotation,
+the per-block L2 norm, the recon-norm correction and the fp16 norm field are
+reused from `turbo3.cuh` **by inclusion**, so the two formats cannot drift on
+the shared half and a turbo5 K shares one rotation with a turbo3 V.
+
+The centroid table is DERIVED, not transcribed. `scratchpad/lloydmax.py` solves
+Lloyd-Max for N(0,1) and scales by 1/sqrt(128); its 8-level output reproduces
+turbo3's SHIPPED table to 4.7e-7, and that agreement is the derivation's own
+gate. Predicted distortion 0.00250467 -> round-trip cosine 0.998747; measured
+0.998780.
+
+Packing is chosen so the fd2 lane layout still maps on with zero reshuffle:
+lane `l` owns dims 4l..4l+3, which at 5 bits is one aligned ushort of `qs`
+(2 nibbles/byte) plus nibble (l&1)*4 of `hi[l>>1]` -- the same hi-byte
+addressing turbo3's signs use. That lane load lives in the HEADER, shared by
+the kernel and the microtest, precisely because it is the one place the wider
+packing could silently misalign.
+
+`tools/turbo5_test.cu` is a tighter gate than `turbo3_test` was: it drives the
+REAL cooperative `turbo5_quant_group` the stores call (and folds in
+`turbo3_quant_group`, which nothing covered), and its primary oracle reproduces
+the device's TREE-order reductions so it demands BITWISE equality rather than a
+tie tolerance. 0/8192 blocks differ on qs/hi AND on norm.
+
+### Wiring (P1 decode, P2 prefill)
+
+`KV_T5K` joins `KvKind`. V is turbo3 in every turbo kind and only K varies,
+which is what `Engine::kv_bytes(is_v)` was always shaped to express, so the
+sizing hook already existed. The enum ordering is now documented as
+load-bearing: every `kv_kind >= KV_T3` test picks up new turbo kinds
+automatically, so non-turbo kinds must stay below `KV_T3`.
+
+**The dispatch guard is the real content of P1.** `attn_decode3`'s mma leg
+engages on `fp8 || kvk == KV_T3`, its H16 sibling maps anything unrecognized to
+fmt 0 (fp16 rows), and the v1 tail templates on `__half`/`__nv_fp8_e4m3`. A new
+turbo kind reaching any of them would be read at the WRONG FORMAT with no
+error. turbo5k therefore returns to fd2 at the top alongside turbo3v, and the
+comment says the return IS the guard, not a shortcut.
+
+### P3 -- the measurement that decides it
+
+Same method as leg 2 above: 64K slice of `agentic_req0031.i32`, **fp16 KV as
+the reference**. Analysis in `scratchpad/t5_tail_analyze.py`, which self-gates
+by reproducing the published fp8/turbo3v/turbo3 rows before reporting.
+
+    format    KB/tok    dPPL     mean|d|   p99.9   |d|>1   catastrophic
+    fp16        72.0    ref        --       --      --        --
+    fp8         36.0   +0.458%   0.14612  5.4287   2718        19
+    turbo3v     43.0   +0.510%   0.20971  7.0938   4321        52
+    turbo5k     18.6   +0.983%   0.21837  7.8075   4492        65
+    turbo3      14.1   +0.804%   0.27673  8.7321   5816       114
+
+**PASS against the pre-declared bar** (recover >= half the 114 -> 52
+catastrophic gain, so <= 83, at under 24 KB/tok): **65 at 18.6 KB/tok**. It
+recovers 79% of the turbo3 -> turbo3v gain at **43% of turbo3v's size**, and
+turbo3v is the thing it replaces -- fp16 K cost 43.0 KB/tok to reach 52, five
+bits reach 65 for 18.6. Kill condition not tripped.
+
+**AND PPL RANKS IT BACKWARDS.** turbo5k beats turbo3 on every tail metric --
+21% lower mean|d|, 11% lower p99.9, 23% fewer |d|>1, 43% fewer catastrophic,
+and closer to the fp16 reference at 57.5% of all positions -- while its dPPL
+reads **+0.983% vs turbo3's +0.804%**, i.e. worse. Mechanism, measured:
+**97.1% of turbo3's absolute error cancels in the signed mean, and 95.5% of
+turbo5k's does.** PPL sees only the ~3-5% residual, so on this axis it is not
+merely insensitive, it is comparing two near-cancellations and reporting their
+ratio. The 08-01 morning entry said PPL is blind here on the strength of a
+format it could not see was worse; this is the same claim confirmed from the
+other side, on a format it says is worse and isn't. **Anything gated on PPL
+alone would have rejected turbo5k.**
+
+**Honest caveat on "recovers 79%":** the catastrophic sets are not nested. Of
+turbo5k's 65, only 25 are also turbo3's -- it fixes 89 of turbo3's 114 and
+introduces 40 new ones. Net is a 43% reduction, but the two quantizers make
+different errors rather than one being a strict refinement of the other.
+
+**Correction to the morning table's size column.** It counted 17 K/V pairs for
+fp16/fp8/turbo3v (68.0/34.0/41.0) but 18 for turbo3 (14.1). The engine
+allocates **18** -- 17 attention layers (`attn_layers` ends 59,63,64) plus the
+MTP cache -- so the consistent figures are fp16 72.0, fp8 36.0, turbo3v 43.0,
+turbo3 14.1, turbo5k 18.6. Ratios and every conclusion are unaffected; turbo5k
+clears the 24 KB/tok ceiling on either count (17-pair would be 17.5).
+
+### Gates
+
+Canonical `a2982c5197c627551b27d76a0a94b220` EXACT (the CLI defaults to fp16,
+so the feature is inert there) + all 5 sampling gates; `test_kernels` 334 PASS
+/ 0 FAIL including new turbo5k store / store_T / fd2-read / both prefill legs;
+`ninv_test` ALL PASS; `fused_smoke` solo/fused/conductor/A2/graph ALL PASS;
+`turbo5_test` ALL PASS; **needle 6/6 at ~120K tokens** under
+`Q27_KV=turbo5k --ctx 131072`.
+
+Kernel-level mechanism, independently visible in `test_kernels`: output cosine
+vs an fp16 cache at seq=1024 goes turbo3 3.54e-2 -> turbo5k 1.91e-2 ->
+turbo3v (fp16 K) 1.75e-2, so 5-bit K recovers ~91% of the fp16-K gap there.
+turbo5k is held to turbo3v's bar, not turbo3's: had the 5th bit not bought
+essentially-lossless K it would sit at 3.5e-2 and FAIL.
+
+### What this changes, and what it does not
+
+- **sm_89+ (5090): still nothing.** fp8 remains the serving default at 19
+  catastrophic. turbo5k is not competitive with it on quality and does not try
+  to be -- it is half fp8's size.
+- **Ampere (3090): this is the real target.** fp8 needs sm_89+, so the choice
+  there was turbo3-or-nothing at 262K. turbo5k offers 43% fewer catastrophic
+  positions for 32% more cache, and 262K still fits comfortably. Whether it
+  should DISPLACE turbo3 as the Ampere default is a serving call, not a
+  measurement gap -- both fit, and the trade is capacity vs tail.
+- **Not measured:** decode/prefill throughput. turbo5k is fd2-only (no fdmma
+  leg) and the 5-bit unpack is more work per element than turbo3's. The
+  quality question is answered; the speed question is untouched, and an fdmma
+  turbo5 leg is the obvious follow-on if Ampere adopts it.
+- Same caveats as the morning study: fp16-KV reference isolates CACHE error
+  only, "catastrophic" bounds where damage could occur rather than
+  demonstrating it, one corpus, default 5.25 bpw tier.
