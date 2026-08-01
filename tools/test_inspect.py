@@ -26,7 +26,8 @@ def align(value):
 
 def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
                  bad_t3_range=False, bad_t3_padding=False, overflow=False,
-                 bad_offset=False, bad_embedding=False, bad_dtype=False):
+                 bad_offset=False, zero_scale_offset=False,
+                 bad_embedding=False, bad_dtype=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
@@ -62,6 +63,8 @@ def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
             scale_off = align(len(blobs))
             blobs.extend(b'\0' * (scale_off - len(blobs)))
             blobs.extend(b'\0<' * (scale_size // 2))
+            if zero_scale_offset and index == 1:
+                scale_off = 0
 
         name_bytes = name.encode()
         entry = bytearray(struct.pack('<H', len(name_bytes)))
@@ -101,6 +104,7 @@ def main():
         bad_offset = root / 'bad-offset.q27'
         bad_embedding = root / 'bad-embedding.q27'
         bad_dtype = root / 'bad-dtype.q27'
+        zero_scale_offset = root / 'zero-scale-offset.q27'
         make_fixture(valid)
         make_fixture(corrupt, corrupt_size=True)
         make_fixture(misaligned, misaligned=True)
@@ -112,6 +116,7 @@ def main():
         make_fixture(bad_dtype, bad_dtype=True)
 
         make_fixture(bad_offset, bad_offset=True)
+        make_fixture(zero_scale_offset, zero_scale_offset=True)
         good = run(inspect, valid)
         if good.returncode != 0 or '\nOK\n' not in good.stdout:
             sys.stderr.write(good.stdout + good.stderr)
@@ -172,6 +177,11 @@ def main():
                 'tensor data out of range' not in invalid_offset.stdout + invalid_offset.stderr):
             sys.stderr.write(invalid_offset.stdout + invalid_offset.stderr)
             raise SystemExit('overflowing tensor offset was not detected')
+        invalid_scale_offset = run(inspect, zero_scale_offset)
+        if (invalid_scale_offset.returncode == 0 or
+                'tensor scale offset is zero' not in output(invalid_scale_offset)):
+            sys.stderr.write(output(invalid_scale_offset))
+            raise SystemExit('zero scale offset was not detected')
 
     print('inspect packed dtype fixtures: PASS')
 

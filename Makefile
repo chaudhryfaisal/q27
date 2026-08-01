@@ -19,9 +19,13 @@ build:
 
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
+build/test_loader_contracts: src/test_loader_contracts.cpp src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) src/test_loader_contracts.cpp src/loader.cpp -o $@
 
-test-inspect: build/inspect
+
+test-inspect: build/inspect build/test_loader_contracts
 	python3 tools/test_inspect.py ./build/inspect
+	./build/test_loader_contracts
 
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@

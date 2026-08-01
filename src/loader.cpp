@@ -74,6 +74,9 @@ std::string validate_tensor_payload(const Tensor& tensor) {
                " (want " + std::to_string(want_data) + "), scales " +
                std::to_string(tensor.scales_size) + " (want " +
                std::to_string(want_scales) + ")";
+    if (want_data && !tensor.data) return "data payload is missing";
+    if (want_scales && !tensor.scales) return "scale payload is missing";
+
 
     if (tensor.dtype == DType::T2_G128) {
         for (uint64_t i = 0; i < tensor.data_size; i++) {
@@ -95,6 +98,21 @@ std::string validate_tensor_payload(const Tensor& tensor) {
     }
     return {};
 }
+bool cuda_weight_dtype_supported(DType dtype) {
+    switch (dtype) {
+        case DType::F32:
+        case DType::F16:
+        case DType::Q8_G128:
+        case DType::Q4_G64:
+            return true;
+        case DType::T2_G128:
+        case DType::T3_G128:
+        case DType::B1_G128:
+            return false;
+    }
+    return false;
+}
+
 
 uint64_t Tensor::rows() const {
     if (shape.size() <= 1) return 1;
@@ -218,8 +236,10 @@ Model Model::open(const std::string& path) {
         if (!in_file(doff, t.data_size))
             throw std::runtime_error("q27: tensor data out of range: " + t.name);
         t.data = b + data_base + doff;
-        if (t.scales) {
+        if (t.scales_size) {
             uint64_t soff = (uint64_t)(uintptr_t)t.scales;
+            if (!soff)
+                throw std::runtime_error("q27: tensor scale offset is zero: " + t.name);
             if (!in_file(soff, t.scales_size))
                 throw std::runtime_error("q27: tensor scales out of range: " + t.name);
             t.scales = b + data_base + soff;

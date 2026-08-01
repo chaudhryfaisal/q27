@@ -28,6 +28,8 @@ struct Tensor {
 // Structural payload invariants shared by inspection and runtime loading.
 // Empty means valid; otherwise returns the first tensor-local failure.
 std::string validate_tensor_payload(const Tensor& tensor);
+bool cuda_weight_dtype_supported(DType dtype);
+
 
 struct Model {
     std::string meta_json;                        // raw JSON metadata blob
