@@ -27,6 +27,7 @@
 #include "prefix_cache.h"
 #include "prefix_ram.h"
 #include "turbo3.cuh"
+#include "turbo5.cuh"
 #include "vgemm.cuh"
 
 using q27::DevTensor;
@@ -495,10 +496,14 @@ struct Engine {
     int kv_kind = KV_F16;
     size_t kv_esz() const { return kv_fp8 ? 1 : 2; }
     // bytes per K/V cache buffer (one attn layer, one stream). K and V sized
-    // separately: turbo3v keeps K fp16 while V goes turbo3.
+    // separately: every turbo kind stores V as turbo3 blocks and differs only
+    // in K -- turbo3v keeps K fp16, turbo5k stores it as turbo5 5-bit blocks.
     size_t kv_bytes(bool is_v) const {
-        size_t t3 = (size_t)max_ctx * N_KV * (HEAD_DIM / 128) * sizeof(q27turbo::block_turbo3);
-        if (kv_kind == KV_T3 || (kv_kind == KV_T3V && is_v)) return t3;
+        const size_t rows = (size_t)max_ctx * N_KV * (HEAD_DIM / 128);
+        size_t t3 = rows * sizeof(q27turbo::block_turbo3);
+        if (kv_kind >= KV_T3 && is_v) return t3;      // V is turbo3 in all turbo kinds
+        if (kv_kind == KV_T3) return t3;
+        if (kv_kind == KV_T5K) return rows * sizeof(q27turbo::block_turbo5);
         return (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz();
     }
     std::vector<void*> kcache, vcache;
@@ -533,15 +538,18 @@ struct Engine {
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");
         kv_fp8 = kve && !strcmp(kve, "fp8");
-        kv_kind = kv_fp8                          ? KV_FP8
-                  : kve && !strcmp(kve, "turbo3") ? KV_T3
+        kv_kind = kv_fp8                           ? KV_FP8
+                  : kve && !strcmp(kve, "turbo3")  ? KV_T3
                   : kve && !strcmp(kve, "turbo3v") ? KV_T3V
+                  : kve && !strcmp(kve, "turbo5k") ? KV_T5K
                                                    : KV_F16;
         if (kv_fp8) fprintf(stderr, "KV cache: fp8 E4M3 (opt-in, 34 KB/token)\n");
         else if (kv_kind == KV_T3)
             fprintf(stderr, "KV cache: turbo3 3-bit K+V (opt-in, ~13.4 KB/token)\n");
         else if (kv_kind == KV_T3V)
             fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in, diagnostic)\n");
+        else if (kv_kind == KV_T5K)
+            fprintf(stderr, "KV cache: turbo5 5-bit K + turbo3 V (opt-in, ~18.6 KB/token)\n");
         const std::string& mj = model.meta_json;
         size_t p = mj.find("\"attn_layers\": [");
         if (p == std::string::npos) { fprintf(stderr, "no attn_layers in meta\n"); exit(1); }
@@ -937,10 +945,10 @@ struct Engine {
         mm(T(il, "attn_v.weight"), xin, vbuf, st);
         q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos_src, FREQ_BASE, st);
         q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos_src, FREQ_BASE, st);
-        // turbo3: Q forward-WHT after rope (K's rotation is folded into the
-        // store; <WHT q, WHT K> == <q,K>); turbo3v keeps K fp16 => Q raw.
+        // turbo3/turbo5k: Q forward-WHT after rope (K's rotation is folded into
+        // the store; <WHT q, WHT K> == <q,K>); turbo3v keeps K fp16 => Q raw.
         // Host branches on kv_kind only -- fixed at init, graph-capture-safe.
-        if (kv_kind == KV_T3) {
+        if (kv_k_rotated(kv_kind)) {
             q27k::P3 qw{{qg}};
             q27k::wht3(qw, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, st, 1);
         }
@@ -948,8 +956,7 @@ struct Engine {
             q27k::CP3 kw{{kbuf}};
             q27k::CP3 vw3{{vbuf}};
             q27k::IP3 pw{{pos_src}};
-            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, st, 1,
-                              /*k_plain=*/kv_kind == KV_T3V);
+            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, st, 1, kv_kind);
         } else {
             q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, st, kv_fp8);
         }
@@ -1550,16 +1557,16 @@ struct Engine {
         int ci = attn_cache_idx[il];
         q27k::IP3 P LANESW(d_pos);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
-        // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
-        // branch on kv_kind only (init-fixed, graph-capture-safe)
-        if (kv_kind == KV_T3)
+        // turbo3/turbo5k: rotate all vw Q lanes post-rope (see attn_block);
+        // host branch on kv_kind only (init-fixed, graph-capture-safe)
+        if (kv_k_rotated(kv_kind))
             q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, st, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
             q27k::kv_store_t3(LANESW(kbuf),
                               LANESW(vbuf), kcache[ci], vcache[ci],
-                              P, N_KV, HEAD_DIM, st, vw, /*k_plain=*/kv_kind == KV_T3V);
+                              P, N_KV, HEAD_DIM, st, vw, kv_kind);
         else
             q27k::kv_store3(LANESW(kbuf),
                             LANESW(vbuf), kcache[ci], vcache[ci],
@@ -2809,15 +2816,14 @@ struct Engine {
         q27k::rope_neox_T(qgT, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, QROW, base, T, FREQ_BASE,
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
-        // turbo3 (phase 2): same rotation contract as decode -- forward-WHT
-        // on Q post-rope (K's rotation folds into the store), inverse-WHT on
-        // the pooled output BEFORE the sigmoid gate. turbo3v: K plain fp16,
-        // Q unrotated.
-        if (kv_kind == KV_T3)
+        // turbo3/turbo5k (phase 2): same rotation contract as decode --
+        // forward-WHT on Q post-rope (K's rotation folds into the store),
+        // inverse-WHT on the pooled output BEFORE the sigmoid gate. turbo3v:
+        // K plain fp16, Q unrotated.
+        if (kv_k_rotated(kv_kind))
             q27k::wht_T(qgT, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, QROW, T, false, stm);
         if (kv_kind >= KV_T3)
-            q27k::kv_store_T_t3(kT, vT, kc, vc, base, N_KV, HEAD_DIM, T, stm,
-                                /*k_plain=*/kv_kind == KV_T3V);
+            q27k::kv_store_T_t3(kT, vT, kc, vc, base, N_KV, HEAD_DIM, T, stm, kv_kind);
         else
             q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
         q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, pf_part,
@@ -2890,7 +2896,7 @@ struct Engine {
                           stm);
         if (kv_kind >= KV_T3)
             q27k::kv_store_T_t3(kT, vT, mtp_k, mtp_v, base + 1, N_KV, HEAD_DIM, T, stm,
-                                /*k_plain=*/kv_kind == KV_T3V);
+                                kv_kind);
         else
             q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
     }

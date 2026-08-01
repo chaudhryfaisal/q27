@@ -405,8 +405,8 @@ int main(int argc, char** argv) {
     // from in-process free deltas on both cards; see BUILDLOG).
     // per-token KV bytes are EXACT: 18 K/V pairs (17 attn + 1 MTP),
     // per-buffer/token = N_KV*HEAD_DIM*esz (fp16 2048 B, fp8 1024 B) or
-    // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3. MIRROR WARNING: matches
-    // Engine::kv_bytes -- update together.
+    // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3 / *82 B = 656 B turbo5 K.
+    // MIRROR WARNING: matches Engine::kv_bytes -- update together.
     {
         // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
         // 8 = the conductor's hard MAX_K/2 fusion limit (W_PLUMB=16 lane
@@ -423,7 +423,11 @@ int main(int argc, char** argv) {
             const bool fp8 = kvv && !strcmp(kvv, "fp8");
             const bool t3 = kvv && !strcmp(kvv, "turbo3");
             const bool t3v = kvv && !strcmp(kvv, "turbo3v");
-            const double pair = t3 ? 800.0 : t3v ? 2448.0 : fp8 ? 2048.0 : 4096.0;
+            const bool t5k = kvv && !strcmp(kvv, "turbo5k");
+            // K+V bytes per token per layer-pair. turbo3 400+400, turbo3v
+            // 2048(fp16 K)+400, turbo5k 656(82 B x 8 blocks)+400.
+            const double pair =
+                t3 ? 800.0 : t3v ? 2448.0 : t5k ? 1056.0 : fp8 ? 2048.0 : 4096.0;
             const double per_tok = 18.0 * pair;
             // calibrated 2026-07-17 (in-process free deltas, q4s tier):
             // sm_120 W12 fp8@131072: non-KV stack 4.49GB => base 0.89;
@@ -482,21 +486,21 @@ int main(int argc, char** argv) {
             // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
             // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
             // historical 131072 (it barely clears it anyway).
-            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
+            const long cap = (fp8 || t3 || t3v || t5k) ? 262144 : 131072;
             if (c > cap) c = cap;
             ctx = (int)(c / 4096 * 4096);
             if (ctx < 4096) {
                 fprintf(stderr,
                         "--ctx auto: only %d fits (free %.1fGB post-weights, %s KV, W_MAX=%d) -- "
                         "likely to OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
-                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16",
+                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : t5k ? "turbo5k" : fp8 ? "fp8" : "fp16",
                         Q27_W_MAX);
                 if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
             } else {
                 fprintf(stderr,
                         "--ctx auto: %d%s (free %.1fGB post-weights, %s KV, W_MAX=%d)\n", ctx,
                         n_slots > 1 ? " per slot" : "", free_b / 1e9,
-                        t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                        t3 ? "turbo3" : t3v ? "turbo3v" : t5k ? "turbo5k" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
                 if (ctx < 16384)
                     fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
             }
@@ -527,9 +531,13 @@ int main(int argc, char** argv) {
     q27::PrefixRam pfx_ram;
     if (!pfx_cfg.root.empty()) {
         const char* kve = getenv("Q27_KV");
+        // MIRROR WARNING: this must agree with Engine::init's Q27_KV parse --
+        // it only feeds the prefix-cache compat hash, so a kind missing here
+        // would alias two formats onto one cache key.
         const int kvk = kve && !strcmp(kve, "fp8")       ? KV_FP8
                         : kve && !strcmp(kve, "turbo3")  ? KV_T3
                         : kve && !strcmp(kve, "turbo3v") ? KV_T3V
+                        : kve && !strcmp(kve, "turbo5k") ? KV_T5K
                                                          : KV_F16;
         size_t model_bytes = 0;
         { struct stat st; if (::stat(model.c_str(), &st) == 0) model_bytes = (size_t)st.st_size; }

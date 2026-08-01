@@ -57,12 +57,19 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
                     int T, cudaStream_t st);
 void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st, bool fp8 = false);
-// turbo3 prefill store: cooperative per-128-group quantize of T tokens'
-// rope'd K + raw V into block caches at rows base_pos..base_pos+T-1
-// (same pipeline as the decode store -- shared turbo3_quant_group).
-// k_plain: K side stays plain fp16 rows (turbo3v).
+// turbo prefill store: cooperative per-128-group quantize of T tokens' rope'd
+// K + raw V into block caches at rows base_pos..base_pos+T-1 (same pipeline as
+// the decode store -- shared turbo3_quant_group / turbo5_quant_group). V is
+// turbo3 for every kind; kvk picks the K leg (KV_T3 turbo3, KV_T3V plain fp16
+// rows, KV_T5K turbo5).
 void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                   int n_kv_heads, int head_dim, int T, cudaStream_t st, bool k_plain = false);
+                   int n_kv_heads, int head_dim, int T, cudaStream_t st, int kvk = KV_T3);
+
+// K tile source for the prefill attention kernels. PF_K_CT reads scalar CT
+// rows -- fp16, fp8, and turbo3v's plain-fp16 K all take that leg -- while
+// PF_K_T3/PF_K_T5 dequant turbo blocks into the tiles. Only the staging
+// differs; every MMA past the tiles is format-agnostic.
+enum PfKFmt : int { PF_K_CT = 0, PF_K_T3 = 1, PF_K_T5 = 2 };
 // Per-128-group WHT rotate over a flat [T][row_stride] buffer (prefill Q
 // forward after rope; attention output inverse before the sigmoid gate).
 // head_stride = floats between heads within a row (2*head_dim for qgT,
@@ -76,9 +83,12 @@ void wht_T(float* x, int n_heads, int head_dim, int head_stride, int row_stride,
 // n_q_heads * SB_rounded_to_16 * PF_SPLIT_MAX * 258 floats. part == nullptr
 // disables splitting (exact pre-split path).
 constexpr int PF_SPLIT_MAX = 8;
-// kvk (KvKind): widened from `bool fp8` (0/1 keep the old meaning). KV_T3
-// runs the f16-MMA path with turbo3 tile dequant (lite via Q27_ATTN_PF=lite);
-// KV_T3V (fp16 K + turbo3 V, diagnostic) always uses the lite path.
+// kvk (KvKind): widened from `bool fp8` (0/1 keep the old meaning). Every
+// turbo kind runs the f16-MMA path with turbo tile dequant (Q27_ATTN_PF=lite
+// selects the scalar path instead, as for fp16/fp8): KV_T3 dequants both
+// sides, KV_T3V reads plain fp16 K rows with a turbo3 V, KV_T5K dequants a
+// 5-bit K with a turbo3 V. The fp8 cp.async prefetch is CT-rows-only and
+// stays off for all of them.
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
                     float* outT, int out_row, float* part, int base_pos, int t0, int SB,
                     int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,

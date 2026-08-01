@@ -6,6 +6,7 @@
 #include "fdmma.cuh"
 #include "spec3.cuh"
 #include "turbo3.cuh"
+#include "turbo5.cuh"
 
 namespace q27k {
 
@@ -171,33 +172,41 @@ void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream
 // The CPU oracle sums norms serially, so tree-order skew can flip elements
 // sitting exactly on a centroid midpoint (rare; the block stays
 // self-consistent because idx and corrected norm derive from the same pass).
-// k_plain (turbo3v): the K side bypasses quantization and stores plain fp16
-// rows -- the GQA=6 escape if turbo3-K craters (port-spec risk section).
+// V is turbo3 in every turbo kind; only K varies, so the kernel takes the
+// kv_kind itself rather than a widening pile of bools:
+//   KV_T3   -- K turbo3 (3-bit blocks)
+//   KV_T3V  -- K bypasses quantization entirely and stores plain fp16 rows,
+//              the GQA=6 escape if turbo3-K craters (port-spec risk section)
+//   KV_T5K  -- K turbo5 (5-bit blocks, src/turbo5.cuh)
 // Assumes head_dim == 256 (two groups/head), like the whole fd2 family.
 __global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ const CP3 vp,
                               void* __restrict__ kc, void* __restrict__ vc,
                               __grid_constant__ const IP3 pos, int n_kv_heads, int head_dim,
-                              int k_plain) {
+                              int kvk) {
     const int t = blockIdx.z, j = threadIdx.x;
     const bool is_v = blockIdx.y == 1;
     const int h = blockIdx.x >> 1, g = blockIdx.x & 1;
     const int p = *pos.p[t];
     const float* src = (is_v ? vp.p[t] : kp.p[t]) + (size_t)h * head_dim + g * 128;
-    if (!is_v && k_plain) {
+    const size_t blk = (size_t)p * n_kv_heads * 2 + h * 2 + g;
+    __shared__ float xs[128], red[128];
+    if (!is_v && kvk == KV_T3V) {
         ((__half*)kc)[(size_t)p * n_kv_heads * head_dim + (size_t)h * head_dim + g * 128 + j] =
             __float2half_rn(src[j]);
         return;
     }
-    q27turbo::block_turbo3* dst = (q27turbo::block_turbo3*)(is_v ? vc : kc) +
-                                  (size_t)p * n_kv_heads * 2 + h * 2 + g;
-    __shared__ float xs[128], red[128];
-    q27turbo::turbo3_quant_group(src[j], dst, j, xs, red);
+    if (!is_v && kvk == KV_T5K) {
+        q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
+        return;
+    }
+    q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
+                                 xs, red);
 }
 
 void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,
-                 cudaStream_t st, int ntok, bool k_plain) {
+                 cudaStream_t st, int ntok, int kvk) {
     dim3 g(n_kv_heads * (head_dim >> 7), 2, ntok); // x: (head, group); y: K,V
-    k_kv_store_t3<<<g, 128, 0, st>>>(k, v, kc, vc, pos, n_kv_heads, head_dim, k_plain);
+    k_kv_store_t3<<<g, 128, 0, st>>>(k, v, kc, vc, pos, n_kv_heads, head_dim, kvk);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -517,16 +526,19 @@ __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
     }
 }
 
-// k_attn_fd2 with turbo3 K/V loads (KT3=false: plain fp16 K rows, the
-// turbo3v split). Row addressing is in 50-byte blocks (pos*n_kv_heads*2 +
+// k_attn_fd2 for the turbo (block-cache) family. V is always turbo3; KVK
+// selects the K leg -- KV_T3 turbo3 blocks, KV_T3V plain fp16 rows, KV_T5K
+// turbo5 5-bit blocks. Row addressing is in blocks (pos*n_kv_heads*2 +
 // kvh*2), so this is a separate kernel rather than a CT overload (port spec
 // item 3); the softmax / online-max / serialized warp merge / partial layout
 // are copied byte-identical from k_attn_fd2 -- only the loads differ. The
-// fp8/fp16 k_attn_fd2 instantiations are textually untouched (bitwise gate).
-// Q arrives already WHT-rotated when KT3 (engine rotates after rope);
+// fp8/fp16 k_attn_fd2 instantiations are textually untouched (bitwise gate),
+// and widening the old `bool KT3` to KVK leaves the turbo3/turbo3v legs
+// compiling to the same branch they always took.
+// Q arrives already WHT-rotated whenever K is (engine rotates after rope);
 // VKQ accumulates in the rotated V basis -- the engine's single post-combine
 // inverse-WHT un-rotates the pooled output (linearity).
-template <bool KT3, int NW>
+template <int KVK, int NW>
 __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
                               const void* __restrict__ kc, const void* __restrict__ vc,
                               float* __restrict__ part, IP3 pos, int n_kv_heads, int gqa,
@@ -560,9 +572,13 @@ __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
 
     for (int p = p_lo + warp; p < p_hi; p += NW) {
         float kv[8], vv[8];
-        if constexpr (KT3)
+        if constexpr (KVK == KV_T3)
             fd2_ld8_t3((const q27turbo::block_turbo3*)kc + ((size_t)p * n_kv_heads + kvh) * 2,
                        lane, kv);
+        else if constexpr (KVK == KV_T5K)
+            q27turbo::turbo5_ld8_lane(
+                (const q27turbo::block_turbo5*)kc + ((size_t)p * n_kv_heads + kvh) * 2, lane,
+                kv);
         else
             fd2_ld8((const __half*)kc + ((size_t)p * n_kv_heads + kvh) * head_dim, lane, kv);
         fd2_ld8_t3((const q27turbo::block_turbo3*)vc + ((size_t)p * n_kv_heads + kvh) * 2,
@@ -653,11 +669,14 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
     size_t sm = (size_t)(2 * 6) * 256 * sizeof(float);
     dim3 g1(ntok, FD2_NS, n_kv_heads);  // P14: lane (x) fastest -> cross-lane KV L2 reuse
     if (kvk == KV_T3)
-        k_attn_fd2_t3<true, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
-                                                           n_kv_heads, gqa, head_dim, scale);
-    else if (kvk == KV_T3V)
-        k_attn_fd2_t3<false, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+        k_attn_fd2_t3<KV_T3, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
                                                             n_kv_heads, gqa, head_dim, scale);
+    else if (kvk == KV_T3V)
+        k_attn_fd2_t3<KV_T3V, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+                                                             n_kv_heads, gqa, head_dim, scale);
+    else if (kvk == KV_T5K)
+        k_attn_fd2_t3<KV_T5K, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+                                                             n_kv_heads, gqa, head_dim, scale);
     else if (kvk == KV_FP8)
         k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
             q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,
@@ -674,9 +693,19 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st, int ntok, int kvk) {
-    // turbo3v (diagnostic) has exactly one read path (fd2). turbo3 gets the
-    // fdmma verify leg below (phase 3); Q27_FD=v1 still falls to fd2.
-    if (kvk == KV_T3V) {
+    // turbo3v (diagnostic) and turbo5k have exactly one read path (fd2).
+    // turbo3 gets the fdmma verify leg below (phase 3); Q27_FD=v1 still falls
+    // to fd2.
+    //
+    // THE RETURN IS THE GUARD, not a shortcut. Both branches below select a K
+    // format from a closed list -- the mma leg engages on `fp8 || kvk ==
+    // KV_T3`, its H16 sibling maps anything unrecognized to fmt 0 (fp16 rows),
+    // and the v1 tail templates on __half/__nv_fp8_e4m3. A new turbo kind that
+    // reached any of them would be read at the WRONG format with no error, so
+    // every kind without its own leg in those kernels must return here. If you
+    // add an fdmma or v1 leg for a kind, take it out of this list -- do not
+    // widen the conditions downstream and leave this in place.
+    if (kvk == KV_T3V || kvk == KV_T5K) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;

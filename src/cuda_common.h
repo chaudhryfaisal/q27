@@ -39,9 +39,22 @@ static constexpr int OUTCOME_INTS = W_PLUMB + 2;
 // KV-cache format kind (Q27_KV): scalar fp16 (default) / fp8 E4M3 ("fp8") /
 // turbo3 3-bit blocks ("turbo3", src/turbo3.cuh) / turbo3 V with plain fp16 K
 // ("turbo3v" -- the GQA=6 escape hatch if turbo3-K craters, port spec risk
-// section). Values 0/1 keep the old `bool fp8` call sites meaning-compatible
+// section) / turbo5 5-bit K with turbo3 V ("turbo5k", src/turbo5.cuh -- the
+// missing 5-6 bit rung, plan docs/plans/2026-08-01-5bit-k.md).
+// Values 0/1 keep the old `bool fp8` call sites meaning-compatible
 // (false->KV_F16, true->KV_FP8) where the parameter widened to int.
-enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3 };
+//
+// ORDERING IS LOAD-BEARING: everything from KV_T3 up stores V as turbo3
+// blocks, so the engine's `kv_kind >= KV_T3` tests (turbo store, inverse-WHT
+// on the pooled output) pick up new turbo kinds automatically. Only K varies
+// across them, which is exactly what Engine::kv_bytes(is_v) is shaped to
+// express. Append new turbo kinds at the END; anything that is NOT a turbo
+// kind must go below KV_T3.
+enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3, KV_T5K = 4 };
+
+// Does K carry the WHT rotation (so Q must be forward-rotated to match)?
+// True for every turbo kind except turbo3v, whose K stays plain fp16.
+static inline bool kv_k_rotated(int kvk) { return kvk == KV_T3 || kvk == KV_T5K; }
 
 #ifdef __CUDACC__
 #include <cuda_fp8.h>

@@ -16,6 +16,7 @@
 #include "prefill.cuh"
 #include "spec3.cuh"
 #include "turbo3.cuh"
+#include "turbo5.cuh"
 
 using q27::DType;
 
@@ -1066,6 +1067,42 @@ static void t3_dequant(const block_turbo3* x, float* y) {
     }
 }
 
+// turbo5 (5-bit K, src/turbo5.cuh) host oracle. Same shape as t3_quant --
+// same rotation, same L2 + recon-norm correction -- so only the centroid
+// table and the packing differ. tools/turbo5_test.cu already proved the
+// device kernel BITWISE against a tree-order oracle; this serial restatement
+// exists so the engine-level store gate covers turbo5k the same way it covers
+// the turbo3 legs, from the same call site.
+using q27turbo::block_turbo5;
+
+static void t5_quant(const float* x, block_turbo5* y) {
+    float buf[128], nsq = 0.f;
+    for (int j = 0; j < 128; j++) { buf[j] = x[j]; nsq += buf[j] * buf[j]; }
+    float gn = sqrtf(nsq), inv = gn > 1e-10f ? 1.f / gn : 0.f;
+    for (int j = 0; j < 128; j++) buf[j] *= inv;
+    t3_fwht(buf);
+    memset(y->qs, 0, 64);
+    memset(y->hi, 0, 16);
+    float rsq = 0.f;
+    for (int j = 0; j < 128; j++) {
+        int idx = q27turbo::turbo5_nearest(buf[j]);
+        y->qs[j / 2] |= (uint8_t)((idx & 15) << ((j % 2) * 4));
+        if (idx & 16) y->hi[j / 8] |= (uint8_t)(1 << (j % 8));
+        rsq += q27turbo::TURBO_CENTROIDS_5BIT_HOST[idx] *
+               q27turbo::TURBO_CENTROIDS_5BIT_HOST[idx];
+    }
+    float rn = sqrtf(rsq), corr = rn > 1e-10f ? gn / rn : gn;
+    y->norm = __float2half(corr);
+}
+static void t5_dequant(const block_turbo5* x, float* y) {
+    float norm = __half2float(x->norm);
+    for (int j = 0; j < 128; j++) {
+        uint8_t l = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+        uint8_t h = (x->hi[j / 8] >> (j % 8)) & 1;
+        y[j] = q27turbo::TURBO_CENTROIDS_5BIT_HOST[l | (h << 4)] * norm;
+    }
+}
+
 // C2: cooperative store kernel vs the serial CPU quantizer. The kernel's
 // L2/recon-norm reductions are fixed-order trees (run-to-run deterministic)
 // but not the CPU's serial sum order, so ULP-level norm skew can flip
@@ -1099,7 +1136,7 @@ static void test_kv_turbo3_store() {
     CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
-    q27k::kv_store_t3(kp, vp, d_kc, d_vc, pp, NKV, HD, 0, T, false);
+    q27k::kv_store_t3(kp, vp, d_kc, d_vc, pp, NKV, HD, 0, T, KV_T3);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
@@ -1145,7 +1182,7 @@ static void test_kv_turbo3_store() {
     __half* d_kh;
     CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
     CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
-    q27k::kv_store_t3(kp, vp, d_kh, d_vc, pp, NKV, HD, 0, T, true);
+    q27k::kv_store_t3(kp, vp, d_kh, d_vc, pp, NKV, HD, 0, T, KV_T3V);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<__half> kh((size_t)CAP * ROW);
     CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
@@ -1162,6 +1199,69 @@ static void test_kv_turbo3_store() {
         if (memcmp(&vc[b], &vc2[b], sizeof(block_turbo3))) vdrift++;
     check("turbo3v k_plain fp16 K rows (bitwise)", (double)kbad, 1);
     check("turbo3v V blocks unchanged vs turbo3 leg", (double)vdrift, 1);
+    // turbo5k: 5-bit K blocks, V still turbo3. Same three gates as the turbo3
+    // leg (index ties, bit-match majority, norm ULP) plus the V-unchanged
+    // check that proves the new K leg did not disturb the shared V writer.
+    block_turbo5* d_k5;
+    CUDA_CHECK(cudaMalloc(&d_k5, (size_t)CAP * BPR * sizeof(block_turbo5)));
+    CUDA_CHECK(cudaMemset(d_k5, 0, (size_t)CAP * BPR * sizeof(block_turbo5)));
+    q27k::kv_store_t3(kp, vp, d_k5, d_vc, pp, NKV, HD, 0, T, KV_T5K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<block_turbo5> k5((size_t)CAP * BPR);
+    std::vector<block_turbo3> vc3(CAP * BPR);
+    CUDA_CHECK(cudaMemcpy(k5.data(), d_k5, k5.size() * sizeof(block_turbo5),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(vc3.data(), d_vc, vc3.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    long e5 = 0, t5tot = 0, n5bad = 0, b5n = 0, b5match = 0, v5drift = 0;
+    for (int t = 0; t < T; t++)
+        for (int b = 0; b < BPR; b++) {
+            const block_turbo5& dev = k5[(size_t)(3 + t) * BPR + b];
+            block_turbo5 ref;
+            t5_quant(kf.data() + (size_t)t * ROW + (size_t)b * 128, &ref);
+            b5n++;
+            if (!memcmp(ref.qs, dev.qs, 64) && !memcmp(ref.hi, dev.hi, 16)) {
+                b5match++;
+                uint16_t a, c;
+                memcpy(&a, &ref.norm, 2);
+                memcpy(&c, &dev.norm, 2);
+                if (abs((int)a - (int)c) > 1) n5bad++;
+            } else {
+                for (int j = 0; j < 128; j++) {
+                    uint8_t rl = (ref.qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+                    uint8_t dl = (dev.qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+                    uint8_t rh = (ref.hi[j / 8] >> (j % 8)) & 1;
+                    uint8_t dh = (dev.hi[j / 8] >> (j % 8)) & 1;
+                    if (rl != dl || rh != dh) e5++;
+                }
+            }
+            t5tot += 128;
+        }
+    for (size_t b = 0; b < vc.size(); b++)
+        if (memcmp(&vc[b], &vc3[b], sizeof(block_turbo3))) v5drift++;
+    check("turbo5k store idx vs CPU ref (<=0.2% ties)", (double)e5 / t5tot, 2e-3);
+    check("turbo5k store blocks bit-matching CPU (>=95%)",
+          1.0 - (double)b5match / b5n, 0.05);
+    check("turbo5k store norm ULP (idx-matching blocks)", (double)n5bad, 1);
+    check("turbo5k V blocks unchanged vs turbo3 leg", (double)v5drift, 1);
+    // the 5-bit K must actually reconstruct better than the 3-bit one it
+    // replaces -- otherwise the extra 32 bytes/block buy nothing
+    double se5 = 0, se3 = 0;
+    for (int t = 0; t < T; t++)
+        for (int b = 0; b < BPR; b++) {
+            float r5[128], r3[128];
+            t5_dequant(&k5[(size_t)(3 + t) * BPR + b], r5);
+            t3_dequant(&kc[(size_t)(3 + t) * BPR + b], r3);
+            t3_fwht_inv(r5);
+            t3_fwht_inv(r3);
+            const float* ox = kf.data() + (size_t)t * ROW + (size_t)b * 128;
+            for (int j = 0; j < 128; j++) {
+                se5 += (r5[j] - ox[j]) * (r5[j] - ox[j]);
+                se3 += (r3[j] - ox[j]) * (r3[j] - ox[j]);
+            }
+        }
+    check("turbo5k K round-trip MSE below turbo3's (ratio)", se5 / se3, 0.2);
+    CUDA_CHECK(cudaFree(d_k5));
     for (int t = 0; t < T; t++) {
         CUDA_CHECK(cudaFree(d_kt[t]));
         CUDA_CHECK(cudaFree(d_vt[t]));
@@ -1213,11 +1313,13 @@ static void test_wht3() {
     CUDA_CHECK(cudaFree(d_o));
 }
 
-// C5: end-to-end turbo3 attention (rotated Q + block cache + fd2-t3 + combine
+// C5: end-to-end turbo attention (rotated Q + block cache + fd2-t3 + combine
 // + inverse-WHT out) vs a double-precision host reference over the SAME
 // CPU-built blocks in the rotated basis -- isolates kernel indexing/algebra
-// from the 3-bit quality floor. The floor itself is checked against the
-// fp16-cache output (cosine). Both cache modes: KV_T3 and KV_T3V (fp16 K).
+// from the quantizer's quality floor. The floor itself is checked against the
+// fp16-cache output (cosine). All three cache modes: KV_T3, KV_T3V (fp16 K)
+// and KV_T5K (5-bit K). V is turbo3 in every one of them, so the cosine bars
+// below are dominated by the 3-bit V and only MOVE with the K format.
 static void test_attn_fd2_turbo3() {
     const int NKV = 4, GQA = 6, HD = 256, NH = NKV * GQA;
     const int SEQMAX = 8192, ROW = NKV * HD, BPR = NKV * (HD / 128);
@@ -1227,21 +1329,27 @@ static void test_attn_fd2_turbo3() {
     std::vector<float> qh = rand_vec((size_t)5 * QROW, 93);
     // CPU-quantize the caches; [pos][kvh][g] blocks cover elements [b*128,..)
     std::vector<block_turbo3> kb((size_t)SEQMAX * BPR), vb((size_t)SEQMAX * BPR);
+    std::vector<block_turbo5> k5b((size_t)SEQMAX * BPR);
     std::vector<__half> khalf(kf.size()), vhalf(vf.size());
     for (size_t b = 0; b < kb.size(); b++) {
         t3_quant(kf.data() + b * 128, &kb[b]);
         t3_quant(vf.data() + b * 128, &vb[b]);
+        t5_quant(kf.data() + b * 128, &k5b[b]);
     }
     for (size_t i = 0; i < kf.size(); i++) {
         khalf[i] = __float2half_rn(kf[i]);
         vhalf[i] = __float2half_rn(vf[i]);
     }
     block_turbo3 *d_kb, *d_vb;
+    block_turbo5* d_k5;
     __half *d_kh, *d_vh;
     float *d_q[5], *d_qr[5], *d_oa[5], *d_ob[5], *d_scr;
     int* d_pos[5];
     CUDA_CHECK(cudaMalloc(&d_kb, kb.size() * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_k5, k5b.size() * sizeof(block_turbo5)));
+    CUDA_CHECK(cudaMemcpy(d_k5, k5b.data(), k5b.size() * sizeof(block_turbo5),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&d_kh, khalf.size() * 2));
     CUDA_CHECK(cudaMalloc(&d_vh, vhalf.size() * 2));
     CUDA_CHECK(cudaMemcpy(d_kb, kb.data(), kb.size() * sizeof(block_turbo3),
@@ -1260,17 +1368,18 @@ static void test_attn_fd2_turbo3() {
                               cudaMemcpyHostToDevice));
     }
     CUDA_CHECK(cudaMalloc(&d_scr, (size_t)5 * NH * q27k::FD_MAXNS * q27k::FD_ST * 4));
-    // host double reference in the rotated basis (k_t3: q rotated, K from
-    // dequantized blocks; else fp16 K with raw q); V always dequantized
-    // blocks, pooled output inverse-rotated per 128-group.
-    auto host_ref_t3 = [&](int t, int p_t, bool k_t3, std::vector<float>& out) {
+    // host double reference in the rotated basis (rotated K kinds: q rotated,
+    // K from dequantized blocks; turbo3v: fp16 K with raw q); V always
+    // dequantized turbo3 blocks, pooled output inverse-rotated per 128-group.
+    auto host_ref_t3 = [&](int t, int p_t, int rk, std::vector<float>& out) {
+        const bool krot = kv_k_rotated(rk);
         out.assign(OROW, 0.f);
         float qw[256], dq[256];
         for (int hh = 0; hh < NH; hh++) {
             int kvh = hh / GQA;
             const float* qv = qh.data() + (size_t)t * QROW + (size_t)hh * 2 * HD;
             for (int i = 0; i < HD; i++) qw[i] = qv[i];
-            if (k_t3) {
+            if (krot) {
                 t3_fwht(qw);
                 t3_fwht(qw + 128);
             }
@@ -1278,9 +1387,14 @@ static void test_attn_fd2_turbo3() {
             double mx = -1e300;
             for (int p = 0; p <= p_t; p++) {
                 double d = 0;
-                if (k_t3) {
-                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
-                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                if (krot) {
+                    if (rk == KV_T5K) {
+                        t5_dequant(&k5b[((size_t)p * NKV + kvh) * 2], dq);
+                        t5_dequant(&k5b[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    } else {
+                        t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
+                        t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    }
                     for (int i = 0; i < HD; i++) d += (double)qw[i] * dq[i];
                 } else {
                     for (int i = 0; i < HD; i++)
@@ -1312,8 +1426,11 @@ static void test_attn_fd2_turbo3() {
     const float scale = 1.0f / sqrtf((float)HD);
     std::vector<float> ref(OROW), got(OROW), gfp(OROW);
     char label[96];
-    for (int kvk : {KV_T3, KV_T3V}) {
-        const void* kc = kvk == KV_T3 ? (const void*)d_kb : (const void*)d_kh;
+    for (int kvk : {KV_T3, KV_T3V, KV_T5K}) {
+        const void* kc = kvk == KV_T3    ? (const void*)d_kb
+                         : kvk == KV_T5K ? (const void*)d_k5
+                                         : (const void*)d_kh;
+        const char* kvn = kvk == KV_T3 ? "t3 " : kvk == KV_T5K ? "t5k" : "t3v";
         for (int seq : {1, 47, 1024, SEQMAX}) {
             for (int ntok : {1, 5}) {
                 q27k::CP3 qr{{d_qr[0], d_qr[1], d_qr[2], d_qr[3], d_qr[4]}};
@@ -1327,7 +1444,7 @@ static void test_attn_fd2_turbo3() {
                     CUDA_CHECK(cudaMemcpy(d_qr[t], d_q[t], (size_t)QROW * 4,
                                           cudaMemcpyDeviceToDevice));
                 }
-                if (kvk == KV_T3) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
+                if (kv_k_rotated(kvk)) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
                 q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
                                        HD, scale, 0, ntok, kvk);
                 q27k::wht3(va, NH, HD, HD, true, 0, ntok);
@@ -1337,7 +1454,7 @@ static void test_attn_fd2_turbo3() {
                 for (int t = 0; t < ntok && seq <= 1024; t++) {
                     int p_t;
                     CUDA_CHECK(cudaMemcpy(&p_t, d_pos[t], 4, cudaMemcpyDeviceToHost));
-                    host_ref_t3(t, p_t, kvk == KV_T3, ref);
+                    host_ref_t3(t, p_t, kvk, ref);
                     CUDA_CHECK(cudaMemcpy(got.data(), d_oa[t], (size_t)OROW * 4,
                                           cudaMemcpyDeviceToHost));
                     double ss = 0;
@@ -1352,7 +1469,7 @@ static void test_attn_fd2_turbo3() {
                 }
                 if (seq <= 1024) {
                     snprintf(label, sizeof label, "fd2-t3 vs host-ref %s seq=%d ntok=%d",
-                             kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                             kvn, seq, ntok);
                     check(label, worst, 2e-4);
                 }
                 // quality floor vs fp16-cache attention on the same raw K/V
@@ -1376,13 +1493,17 @@ static void test_attn_fd2_turbo3() {
                     cmin = std::min(cmin, std::isfinite(cs) ? cs : -1.0);
                 }
                 snprintf(label, sizeof label, "fd2-t3 vs fp16 cosine %s seq=%d ntok=%d",
-                         kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                         kvn, seq, ntok);
+                // K format sets the bar; V is 3-bit in all three. turbo5k is
+                // held to turbo3v's (fp16-K) bar, not turbo3's -- if the 5th
+                // bit did not buy essentially-lossless K, it lands at
+                // turbo3's 0.08 and FAILS here.
                 check(label, 1.0 - cmin, kvk == KV_T3 ? 0.08 : 0.05);
                 // run-to-run bitwise determinism
                 for (int t = 0; t < ntok; t++)
                     CUDA_CHECK(cudaMemcpy(d_qr[t], d_q[t], (size_t)QROW * 4,
                                           cudaMemcpyDeviceToDevice));
-                if (kvk == KV_T3) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
+                if (kv_k_rotated(kvk)) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
                 q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV,
                                        HD, scale, 0, ntok, kvk);
                 q27k::wht3(vb2, NH, HD, HD, true, 0, ntok);
@@ -1399,13 +1520,14 @@ static void test_attn_fd2_turbo3() {
                     }
                 }
                 snprintf(label, sizeof label, "fd2-t3 deterministic %s seq=%d ntok=%d",
-                         kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                         kvn, seq, ntok);
                 check(label, dd, 1e-30);
             }
         }
     }
     CUDA_CHECK(cudaFree(d_kb));
     CUDA_CHECK(cudaFree(d_vb));
+    CUDA_CHECK(cudaFree(d_k5));
     CUDA_CHECK(cudaFree(d_kh));
     CUDA_CHECK(cudaFree(d_vh));
     for (int t = 0; t < 5; t++) {
@@ -1736,7 +1858,7 @@ static void test_kv_turbo3_store_T() {
     CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
-    q27k::kv_store_T_t3(d_kT, d_vT, d_kc, d_vc, BASE, NKV, HD, T, 0, false);
+    q27k::kv_store_T_t3(d_kT, d_vT, d_kc, d_vc, BASE, NKV, HD, T, 0, KV_T3);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
@@ -1771,7 +1893,7 @@ static void test_kv_turbo3_store_T() {
     __half* d_kh;
     CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
     CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
-    q27k::kv_store_T_t3(d_kT, d_vT, d_kh, d_vc, BASE, NKV, HD, T, 0, true);
+    q27k::kv_store_T_t3(d_kT, d_vT, d_kh, d_vc, BASE, NKV, HD, T, 0, KV_T3V);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<__half> kh((size_t)CAP * ROW);
     CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
@@ -1782,6 +1904,38 @@ static void test_kv_turbo3_store_T() {
             if (memcmp(&kh[(size_t)(BASE + t) * ROW + i], &w, 2)) kbad++;
         }
     check("turbo3v store_T k_plain fp16 rows (bitwise)", (double)kbad, 1);
+    // turbo5k store_T: same gates as the turbo3 leg. The prefill and decode
+    // stores share turbo5_quant_group, so this proves the T-major addressing
+    // and base_pos offset, not the quantizer (tools/turbo5_test.cu owns that).
+    block_turbo5* d_k5T;
+    CUDA_CHECK(cudaMalloc(&d_k5T, (size_t)CAP * BPR * sizeof(block_turbo5)));
+    CUDA_CHECK(cudaMemset(d_k5T, 0, (size_t)CAP * BPR * sizeof(block_turbo5)));
+    q27k::kv_store_T_t3(d_kT, d_vT, d_k5T, d_vc, BASE, NKV, HD, T, 0, KV_T5K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<block_turbo5> k5T((size_t)CAP * BPR);
+    CUDA_CHECK(cudaMemcpy(k5T.data(), d_k5T, k5T.size() * sizeof(block_turbo5),
+                          cudaMemcpyDeviceToHost));
+    long e5T = 0, tot5T = 0, m5T = 0, n5T = 0;
+    for (int t = 0; t < T; t++)
+        for (int b = 0; b < BPR; b++) {
+            const block_turbo5& dev = k5T[(size_t)(BASE + t) * BPR + b];
+            block_turbo5 rf;
+            t5_quant(kf.data() + (size_t)t * ROW + (size_t)b * 128, &rf);
+            n5T++;
+            if (!memcmp(rf.qs, dev.qs, 64) && !memcmp(rf.hi, dev.hi, 16)) m5T++;
+            else
+                for (int j = 0; j < 128; j++) {
+                    uint8_t rl = (rf.qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+                    uint8_t dl = (dev.qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+                    uint8_t rh = (rf.hi[j / 8] >> (j % 8)) & 1;
+                    uint8_t dh = (dev.hi[j / 8] >> (j % 8)) & 1;
+                    if (rl != dl || rh != dh) e5T++;
+                }
+            tot5T += 128;
+        }
+    check("turbo5k store_T idx vs CPU ref (<=0.2% ties)", (double)e5T / tot5T, 2e-3);
+    check("turbo5k store_T blocks bit-matching (>=95%)", 1.0 - (double)m5T / n5T, 0.05);
+    CUDA_CHECK(cudaFree(d_k5T));
     CUDA_CHECK(cudaFree(d_kT)); CUDA_CHECK(cudaFree(d_vT));
     CUDA_CHECK(cudaFree(d_kc)); CUDA_CHECK(cudaFree(d_vc)); CUDA_CHECK(cudaFree(d_kh));
 }
@@ -1799,17 +1953,23 @@ static void test_attn_prefill_turbo3() {
     std::vector<float> kf = rand_vec((size_t)CAP * ROW, 95), vf = rand_vec((size_t)CAP * ROW, 96);
     std::vector<float> qh = rand_vec((size_t)T * QROW, 97);
     std::vector<block_turbo3> kb((size_t)CAP * BPR), vb((size_t)CAP * BPR);
+    std::vector<block_turbo5> k5b((size_t)CAP * BPR);
     std::vector<__half> khalf(kf.size());
     for (size_t b = 0; b < kb.size(); b++) {
         t3_quant(kf.data() + b * 128, &kb[b]);
         t3_quant(vf.data() + b * 128, &vb[b]);
+        t5_quant(kf.data() + b * 128, &k5b[b]);
     }
     for (size_t i = 0; i < kf.size(); i++) khalf[i] = __float2half_rn(kf[i]);
     block_turbo3 *d_kb, *d_vb;
+    block_turbo5* d_k5;
     __half* d_kh;
     float *d_q, *d_qr, *d_out;
     CUDA_CHECK(cudaMalloc(&d_kb, kb.size() * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_k5, k5b.size() * sizeof(block_turbo5)));
+    CUDA_CHECK(cudaMemcpy(d_k5, k5b.data(), k5b.size() * sizeof(block_turbo5),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&d_kh, khalf.size() * 2));
     CUDA_CHECK(cudaMalloc(&d_q, (size_t)T * QROW * 4));
     CUDA_CHECK(cudaMalloc(&d_qr, (size_t)T * QROW * 4));
@@ -1822,7 +1982,8 @@ static void test_attn_prefill_turbo3() {
     CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
     const float scale = 1.0f / sqrtf((float)HD);
     std::vector<float> ref(OROW), got((size_t)T * OROW);
-    auto href = [&](int t, bool k_t3, std::vector<float>& out) {
+    auto href = [&](int t, int rk, std::vector<float>& out) {
+        const bool krot = kv_k_rotated(rk);
         out.assign(OROW, 0.f);
         float qw[256], dq[256];
         const int bound = BASE + t + 1;
@@ -1830,7 +1991,7 @@ static void test_attn_prefill_turbo3() {
             int kvh = hh / GQA;
             const float* qv = qh.data() + (size_t)t * QROW + (size_t)hh * 2 * HD;
             for (int i = 0; i < HD; i++) qw[i] = qv[i];
-            if (k_t3) {
+            if (krot) {
                 t3_fwht(qw);
                 t3_fwht(qw + 128);
             }
@@ -1838,9 +1999,14 @@ static void test_attn_prefill_turbo3() {
             double mx = -1e300;
             for (int p = 0; p < bound; p++) {
                 double d = 0;
-                if (k_t3) {
-                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
-                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                if (krot) {
+                    if (rk == KV_T5K) {
+                        t5_dequant(&k5b[((size_t)p * NKV + kvh) * 2], dq);
+                        t5_dequant(&k5b[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    } else {
+                        t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
+                        t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    }
                     for (int i = 0; i < HD; i++) d += (double)qw[i] * dq[i];
                 } else {
                     for (int i = 0; i < HD; i++)
@@ -1871,11 +2037,14 @@ static void test_attn_prefill_turbo3() {
     };
     struct Leg { const char* name; int kvk; bool lite; double tol; };
     for (Leg L : { Leg{"mma  t3 ", KV_T3, false, 1e-2}, Leg{"lite t3 ", KV_T3, true, 2e-4},
-                   Leg{"lite t3v", KV_T3V, true, 2e-4} }) {
+                   Leg{"lite t3v", KV_T3V, true, 2e-4},
+                   Leg{"mma  t5k", KV_T5K, false, 1e-2}, Leg{"lite t5k", KV_T5K, true, 2e-4} }) {
         if (L.lite) setenv("Q27_ATTN_PF", "lite", 1);
         CUDA_CHECK(cudaMemcpy(d_qr, d_q, (size_t)T * QROW * 4, cudaMemcpyDeviceToDevice));
-        if (L.kvk == KV_T3) q27k::wht_T(d_qr, NH, HD, 2 * HD, QROW, T, false, 0);
-        const void* kc = L.kvk == KV_T3 ? (const void*)d_kb : (const void*)d_kh;
+        if (kv_k_rotated(L.kvk)) q27k::wht_T(d_qr, NH, HD, 2 * HD, QROW, T, false, 0);
+        const void* kc = L.kvk == KV_T3    ? (const void*)d_kb
+                         : L.kvk == KV_T5K ? (const void*)d_k5
+                                           : (const void*)d_kh;
         q27k::attn_prefill_T(d_qr, 2 * HD, QROW, kc, d_vb, d_out, OROW, nullptr, BASE, 0, T,
                              NH, NKV, HD, scale, 0, L.kvk);
         q27k::wht_T(d_out, NH, HD, HD, OROW, T, true, 0);
@@ -1885,7 +2054,7 @@ static void test_attn_prefill_turbo3() {
                               cudaMemcpyDeviceToHost));
         double worst = 0;
         for (int t : {0, 7, T - 1}) {
-            href(t, L.kvk == KV_T3, ref);
+            href(t, L.kvk, ref);
             double ss = 0;
             for (int i = 0; i < OROW; i++) ss += (double)ref[i] * ref[i];
             double rms = std::sqrt(ss / OROW) + 1e-12;
@@ -1899,6 +2068,7 @@ static void test_attn_prefill_turbo3() {
         check(label, worst, L.tol);
     }
     CUDA_CHECK(cudaFree(d_kb)); CUDA_CHECK(cudaFree(d_vb)); CUDA_CHECK(cudaFree(d_kh));
+    CUDA_CHECK(cudaFree(d_k5));
     CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_qr)); CUDA_CHECK(cudaFree(d_out));
 }
 

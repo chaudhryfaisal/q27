@@ -7,6 +7,7 @@
 #include "cuda_common.h"
 #include "prefill.cuh"
 #include "turbo3.cuh"
+#include "turbo5.cuh"
 
 namespace q27k {
 
@@ -1304,11 +1305,11 @@ static __device__ __forceinline__ void ldm_x2_trans(uint32_t& r0, uint32_t& r1, 
 // long context the attention wall is SM starvation, not bandwidth.
 constexpr int PF_PART_STRIDE = 258; // m, l, O[256]
 
-// KT3/VT3 (phase 2): the K/V side reads turbo3 blocks instead of scalar
-// rows -- ONLY the smem staging below changes (dequant via turbo3_stage8_h2);
-// every MMA past the tiles is format-agnostic. CT is __half for the turbo3
+// KFMT/VT3 (phase 2): the K/V side reads turbo blocks instead of scalar rows
+// -- ONLY the smem staging below changes (dequant via turbo{3,5}_stage8_h2);
+// every MMA past the tiles is format-agnostic. CT is __half for the turbo
 // instantiations (the typed pointers are reinterpreted in the staging).
-template <typename CT, bool KT3 = false, bool VT3 = false>
+template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
                    const CT* __restrict__ kc, const CT* __restrict__ vc,
@@ -1350,7 +1351,7 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
     // cp.async raw prefetch buffers: one PP-tile of K and V, contiguous (no LDH
     // pad, 16B-aligned). fp8 only -- the fp16 path lacks smem room under the
     // 99 KB sm_120 cap, so it stays on the blocking staging (CPA=false).
-    constexpr bool CPA = (sizeof(CT) == 1) && !KT3 && !VT3;
+    constexpr bool CPA = (sizeof(CT) == 1) && KFMT == PF_K_CT && !VT3;
     CT* s_kraw = (CT*)(s_v + PP * LDH);   // [PP*HD] (valid only when CPA)
     CT* s_vraw = s_kraw + PP * HD;        // [PP*HD]
     const bool cpa = CPA && cp_async;
@@ -1431,11 +1432,14 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
                 __half2* kd = (__half2*)(s_k + pp * LDH + d8);
                 __half2* vd = (__half2*)(s_v + pp * LDH + d8);
                 if (ok) {
-                    if constexpr (KT3 || VT3) {
+                    if constexpr (KFMT != PF_K_CT || VT3) {
                         size_t rb = ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2;
-                        if constexpr (KT3)
+                        if constexpr (KFMT == PF_K_T3)
                             q27turbo::turbo3_stage8_h2(
                                 (const q27turbo::block_turbo3*)kc + rb, d8, kd);
+                        else if constexpr (KFMT == PF_K_T5)
+                            q27turbo::turbo5_stage8_h2(
+                                (const q27turbo::block_turbo5*)kc + rb, d8, kd);
                         else {
                             const __half* kr = (const __half*)kc + off;
                             #pragma unroll
@@ -2227,7 +2231,7 @@ __global__ void k_attn_pf_combine(const float* __restrict__ part, float* __restr
 // (head, token) pairs. Online softmax (no position scratch). Note: fp
 // summation order differs from the serial decode kernel; gated empirically
 // on identical continuations.
-template <typename CT, bool KT3 = false, bool VT3 = false>
+template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
 __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int q_row,
                                  const CT* __restrict__ kc, const CT* __restrict__ vc,
                                  float* __restrict__ outT, int out_row, int base_pos,
@@ -2263,9 +2267,13 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
         for (int idx = threadIdx.x; idx < np * HD; idx += blockDim.x) {
             int pp = idx / HD, d = idx % HD;
             size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
-            if constexpr (KT3)
+            if constexpr (KFMT == PF_K_T3)
                 s_kv[(pp * 2) * HD + d] = q27turbo::turbo3_deq_elem(
                     (const q27turbo::block_turbo3*)kc +
+                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+            else if constexpr (KFMT == PF_K_T5)
+                s_kv[(pp * 2) * HD + d] = q27turbo::turbo5_deq_elem(
+                    (const q27turbo::block_turbo5*)kc +
                         ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
             else
                 s_kv[(pp * 2) * HD + d] = kv2f(((const CT*)kc)[off]);
@@ -2311,7 +2319,7 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
     }
 }
 
-template <typename CT, bool KT3 = false, bool VT3 = false>
+template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
 static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const void* kc,
                                 const void* vc, float* outT, int out_row, float* part,
                                 int base_pos, int t0, int SB, int n_q_heads, int n_kv_heads,
@@ -2428,7 +2436,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         }
         static bool attr2 = false;
         if (!attr2) {
-            CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma<CT, KT3, VT3>,
+            CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma<CT, KFMT, VT3>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
             attr2 = true;
         }
@@ -2446,7 +2454,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         }
         const int tiles = (SB + TT - 1) / TT;
         dim3 grid(n_kv_heads, tiles, nsplit);
-        k_attn_prefill_mma<CT, KT3, VT3><<<grid, 192, SM, st>>>(
+        k_attn_prefill_mma<CT, KFMT, VT3><<<grid, 192, SM, st>>>(
             qT, q_stride, q_row, (const CT*)kc, (const CT*)vc, outT, out_row, part,
             base_pos, t0, t0 + SB, n_kv_heads, head_dim, scale, cpa_env);
         CUDA_CHECK(cudaGetLastError());
@@ -2462,46 +2470,50 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
     const size_t SM = (size_t)PP * 2 * 256 * sizeof(float);
     static bool attr = false;
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_T<CT, KT3, VT3>,
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_T<CT, KFMT, VT3>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
     int gqa = n_q_heads / n_kv_heads;
     dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
-    k_attn_prefill_T<CT, KT3, VT3><<<grid, 256, SM, st>>>(
+    k_attn_prefill_T<CT, KFMT, VT3><<<grid, 256, SM, st>>>(
         qT, q_stride, q_row, (const CT*)kc, (const CT*)vc, outT, out_row, base_pos, t0,
         t0 + SB, n_kv_heads, gqa, head_dim, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ---- turbo3 prefill legs (phase 2). Store shares turbo3_quant_group with
-// the decode store (spec3.cu) so the two writers cannot drift; rotate shares
-// turbo3_butterfly128 with k_wht3.
+// ---- turbo prefill legs (phase 2; turbo5 K added 2026-08-01). Store shares
+// turbo3_quant_group / turbo5_quant_group with the decode store (spec3.cu) so
+// the two writers cannot drift; rotate shares turbo3_butterfly128 with k_wht3.
+// kvk picks the K leg exactly as in the decode store -- see kv_store_t3.
 __global__ void k_kv_store_T_t3(const float* __restrict__ kT, const float* __restrict__ vT,
                                 void* __restrict__ kc, void* __restrict__ vc, int base_pos,
-                                int n_kv_heads, int head_dim, int k_plain) {
+                                int n_kv_heads, int head_dim, int kvk) {
     const int t = blockIdx.z, j = threadIdx.x;
     const bool is_v = blockIdx.y == 1;
     const int h = blockIdx.x >> 1, g = blockIdx.x & 1; // head_dim==256: 2 groups/head
     const int rowlen = n_kv_heads * head_dim;
     const float* src = (is_v ? vT : kT) + (size_t)t * rowlen + (size_t)h * head_dim + g * 128;
     const int p = base_pos + t;
-    if (!is_v && k_plain) {
+    const size_t blk = (size_t)p * n_kv_heads * 2 + h * 2 + g;
+    __shared__ float xs[128], red[128];
+    if (!is_v && kvk == KV_T3V) {
         ((__half*)kc)[(size_t)p * rowlen + (size_t)h * head_dim + g * 128 + j] =
             __float2half_rn(src[j]);
         return;
     }
-    q27turbo::block_turbo3* dst = (q27turbo::block_turbo3*)(is_v ? vc : kc) +
-                                  (size_t)p * n_kv_heads * 2 + h * 2 + g;
-    __shared__ float xs[128], red[128];
-    q27turbo::turbo3_quant_group(src[j], dst, j, xs, red);
+    if (!is_v && kvk == KV_T5K) {
+        q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
+        return;
+    }
+    q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
+                                 xs, red);
 }
 
 void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                   int n_kv_heads, int head_dim, int T, cudaStream_t st, bool k_plain) {
+                   int n_kv_heads, int head_dim, int T, cudaStream_t st, int kvk) {
     dim3 g(n_kv_heads * (head_dim >> 7), 2, T);
-    k_kv_store_T_t3<<<g, 128, 0, st>>>(kT, vT, kc, vc, base_pos, n_kv_heads, head_dim,
-                                       k_plain);
+    k_kv_store_T_t3<<<g, 128, 0, st>>>(kT, vT, kc, vc, base_pos, n_kv_heads, head_dim, kvk);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2532,15 +2544,21 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, co
                     int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
                     int kvk) {
     if (kvk == KV_T3) {
-        attn_prefill_launch<__half, true, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
-                                                part, base_pos, t0, SB, n_q_heads, n_kv_heads,
-                                                head_dim, scale, st);
+        attn_prefill_launch<__half, PF_K_T3, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                                   part, base_pos, t0, SB, n_q_heads,
+                                                   n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_T3V) {
-        attn_prefill_launch<__half, false, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
-                                                 part, base_pos, t0, SB, n_q_heads,
-                                                 n_kv_heads, head_dim, scale, st);
+        attn_prefill_launch<__half, PF_K_CT, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                                   part, base_pos, t0, SB, n_q_heads,
+                                                   n_kv_heads, head_dim, scale, st);
+        return;
+    }
+    if (kvk == KV_T5K) {
+        attn_prefill_launch<__half, PF_K_T5, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                                   part, base_pos, t0, SB, n_q_heads,
+                                                   n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_FP8)
