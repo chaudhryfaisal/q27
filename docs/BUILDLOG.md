@@ -9930,6 +9930,24 @@ establish that the genuine shape is absent. The fence bug is reported here
 against the pinned `d08ddcc` extractor and has not been re-tested against any
 later benchlocal.
 
+**FILED UPSTREAM 08-02** (noonghunna confirmed the diagnosis against source and
+asked for it out of the closed thread): benchlocal-cli **#120** the fence bug,
+**#121** the pack drift + extend-don't-regenerate convention. Reply on the
+closed club-3090#741 is comment `5159069832`.
+
+Two things landed after that BUILDLOG entry was written. noonghunna's read of
+the cause is sharper than the one filed above: `OPENING_FENCE_ANYWHERE_RE`'s
+language group is optional, so a bare closer satisfies an "opening" pattern --
+and because that branch sits ABOVE the `CODE_START_RE` fallbacks, the stray
+closer does not merely fail, it SHORT-CIRCUITS the heuristics that would have
+recovered the record. And the cost is bigger than "code dropped": re-POSTing
+each of the three to an unmodified `code-reasoning` container with only the
+stray closer removed takes all three from FAIL `wrong_answer` to **PASS**. The
+harness under-reports this corpus by 3/234 (1.28%) -- 194/234 as run,
+**197/234** fixed. The proposed fix (claim the anywhere-match only if its
+remainder is non-empty, else strip and continue down the chain) rescues all
+three and is **zero-regression: 231/234 extractions byte-identical**.
+
 **OPS:** `/mnt/ai/projects/benchlocal-cli` is still detached at `d08ddcc` and
 now carries LOCAL modifications -- `benchlocal_cli/sandbox.py` (two
 `SandboxConfig` entries, ports 9007/9008, same code-reasoning image) plus the
