@@ -452,6 +452,18 @@ soft-error incident that set this policy is in the BUILDLOG appendix.
   measured amax sits 3.8x under the 448 E4M3 max, so per-row scales buy
   nothing. 36 KB/token, +11% decode @28.5K, PPL -0.05%, KL 3.4e-5. The
   CLI stays fp16 so the bitwise canonicals hold.
+- **turbo5k 5-bit K + 3-bit V** (`Q27_KV=turbo5k`, src/turbo5.cuh) --
+  **the Ampere default since 2026-08-01**. 32 Lloyd-Max centroids over the
+  same WHT rotation turbo3 uses, 82-byte K blocks per 128 dims, 18.6
+  KB/token. Exists because the 08-01 KV tail study found turbo3 carries
+  6.0x fp8's catastrophic-position rate at a dPPL of only +0.804%: turbo5k
+  cuts that 43% (114 -> 65 against an fp16 reference on a 64K agentic
+  corpus). Measured on a 3090: 1.11-1.17x turbo3's per-round decode
+  (~10-13% wall), 192512 auto-ctx vs turbo3's 253952 on the q4s tier,
+  needle 6/6 @146K. Reads via fd2 and the fp16-tile H16 mma leg; it is
+  deliberately NOT routed to the e4m3 fdmma leg, which would inflate its
+  error 1.29x and give back a third of what the 5th bit bought.
+  `Q27_KV=turbo3` trades the tail back for the deeper window.
 - **turbo3 3-bit KV** (`Q27_KV=turbo3`; `turbo3v` = fp16-K diagnostic):
   WHT-rotated 50-byte blocks per 128 dims (ported from
   [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant),
@@ -462,8 +474,8 @@ soft-error incident that set this policy is in the BUILDLOG appendix.
   replay.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline tools are Python: tools/repack.py (runs once; docs/FORMAT.md) and tools/gguf_to_hf.py (certified GGUF -> HF inversion, 866/866 tensors byte-exact, for cross-engine reference runs).
-- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV on sm_89+ (and to
-turbo3 on sm_86 since v0.3.0) (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
+- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV on sm_89+ (and on sm_86 to
+turbo3 from v0.3.0, turbo5k since 2026-08-01) (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
 - **Numerics contracts (batching)**: every fused lane family carries
   the ninv N-invariance gate -- **bitwise-when-untrimmed** -- plus its
   seam and twin legs; fused rounds run a UNION GEMM-family policy so
@@ -487,8 +499,9 @@ make build/q27-server
 serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV
 itself needs sm_89+; sm_86/Ampere defaulted to turbo3 from v0.3.0 and
-to turbo5k since 2026-08-01 -- a bare w8 boot serves ~159744 on a 24GB
-3090 at the q4s tier, or ~208896 under `Q27_KV=turbo3` -- with
+to turbo5k since 2026-08-01 -- a bare w8 boot serves 192512 on a 24GB
+3090 at the q4s tier, or 253952 under `Q27_KV=turbo3` (both measured on
+the card 08-01) -- with
 fp16 via `--kv-fp16`; sm_86/Ampere moved to turbo5k on 2026-08-01),
 `Q27_PMIN=0.5`,
 `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head, no-think, phase
@@ -753,14 +766,23 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   that reasoned 37-67 KB without answering, which is exactly what the cap
   converts. cli-40 is already NO-GO for this (07-30): at `max_tokens 1024` the
   cap relocates the spend and the answer meets the same ceiling.
-- **No intermediate K precision (5-6 bit band)**: q27 jumps from 3-bit turbo3
-  straight to fp8/fp16. The 08-01 tail study (BUILDLOG) shows K precision is
-  where tail damage concentrates -- fp16 K cuts catastrophic positions 114 -> 52
-  -- but `turbo3v` pays 41.0 KB/tok for it, which is BIGGER than fp8's 34.0 and
-  worse on every metric, so it stays diagnostic. **A 5-bit K with 3-bit V**
-  would sit near ~24 KB/tok, below fp8 and above turbo3, and is the untested
-  config where the value plausibly is. Matters most on Ampere, where fp8 is
-  unavailable and turbo3 is the only way to reach 262K.
+- ~~**No intermediate K precision (5-6 bit band)**~~ **CLOSED 2026-08-01 by
+  turbo5k** (`Q27_KV=turbo5k`, 18.6 KB/tok, now the Ampere default; see the KV
+  bullet above and BUILDLOG 08-01 (b)-(f)). It landed at 65 catastrophic
+  positions against turbo3's 114 and fp8's 19, recovering 79% of the
+  turbo3 -> fp16-K gain at 43% of fp16-K's size. Two findings worth carrying
+  forward: **PPL ranks turbo5k BACKWARDS** (+0.983% dPPL against turbo3's
+  +0.804% while beating it on every tail metric, because 95-97% of both
+  formats' absolute error cancels in the signed mean -- do not gate a KV
+  format on PPL), and **e4m3 MMA staging is free for coarse quantizers and
+  corrosive for fine ones** (+17.6% on turbo3's own error, +81% on turbo5's),
+  which is why turbo5k reads through the fp16-tile H16 leg instead.
+- **turbo5k's remaining tail is not a subset of turbo3's**: only 25 of its 65
+  catastrophic positions are also turbo3's -- it fixes 89 of turbo3's 114 and
+  introduces 40 new ones. Net -43%, but the two quantizers make different
+  errors, so a workload that is fine on turbo3 is not guaranteed fine on
+  turbo5k. Untested: whether TCQ (a different algorithm, not a bit-width
+  change) would dominate both; filed as its own plan, not started.
 - **`billing-header cch normalize`** fails in `test_tokenizer` on HEAD,
   independent of any 07-28/07-30 work (verified by stashing). Commit `5a81225`
   last touched that normalizer. Filed, not fixed.

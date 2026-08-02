@@ -534,6 +534,20 @@ class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
 tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
 sm_86 (bare boot = turbo3 @ 262144 on a 3090).
 
+**SUPERSEDED 2026-08-01 as a statement about the DEFAULT (the measurements
+above stand as measured).** The sm_86 serving default is now `turbo5k`
+(5-bit K + 3-bit V), so a bare 3090 boot is turbo5k @ 192512 on q4s, not
+turbo3 @ 262144. The 07-17 numbers in this section were taken on turbo3 and
+are unchanged -- `Q27_KV=turbo3` reproduces that exact config, and the row
+above is still what it delivers. What moved is which one you get without an
+env var. Measured on the same card 08-01: turbo5k costs 1.113x turbo3's
+per-round decode at 27K and 1.168x at 61K (~10-13% wall) and 61440 tokens of
+auto-ctx (253952 -> 192512), and buys 43% fewer catastrophic KV positions
+(114 -> 65 against an fp16 reference); needle 6/6 at ~146K. Note the
+"inversion" claimed just above is turbo3-vs-fp16-specific and does NOT
+generalize: turbo5k's wider unpack costs MORE on Ampere than on the 5090,
+not less. Full rationale in BUILDLOG 2026-08-01 (b)-(f).
+
 ### Independent tool: llama-benchy (2026-07-19, RTX 5090, q4s fp8)
 
 [llama-benchy](https://github.com/eugr/llama-benchy) is a community
