@@ -9814,3 +9814,127 @@ deployments that want the deeper window.
 Harness: `tools/accept_kv_ab.sh` gains a `BIN` override -- 24 GB cards need
 `build/q27-server-w8` and the harness had the W12 binary hardcoded, so no
 Ampere KV A/B could have been run through it before now.
+
+## 2026-08-02 -- club-3090#741 power request: n=234 says our 0/60 was underpowered, and 3 of the 4 hits are a SECOND extractor bug rather than the pattern being argued about
+
+noonghunna's 08-02 comment closes the accuracy half of the thread (+18/60
+confirms direction, both corpora agree) and declines to build the
+content->reasoning fallback branch, flagging it as an open decision rather than
+a closed one. The one ask, explicitly optional: another block-arm run at n>=180
+with `--save-json`, because at n=60 against a 5.8% base rate the expected count
+is ~3.5 and observing 0 cannot rule the pattern out. That read is correct and
+we ran it.
+
+### Why n>=180 was not "run it three more times"
+
+Only `humaneval-plus-30` and `lcb-v6-30` route through the code-reasoning
+sandbox -- the other nine packs are content-first and carry no out-of-band
+reasoning at all. **That universe IS 60.** Both packs also run `temperature: 0`,
+so re-running is deterministic and three runs give the same 60 records three
+times. More n means more SCENARIOS, and the packs' own metadata records how
+they were drawn:
+
+    humaneval-plus-30 : "first 30 canonical test rows"                 pool 164
+    lcb-v6-30         : "first 30 release_v6 leetcode functional rows
+                         with contest_date >= 2025-01-01"              pool  50
+
+**CORRECTION to the pre-run estimate: the LCB pool is 70, not 50.** The 50 is
+against the snapshot that pack pinned; the same filter on current `main` yields
+70, so 20 of the extension are problems added upstream since. LCB grows 30->70,
+double the +20 predicted, which matters because LCB is where the phenomenon
+lives on their side.
+
+### What was built
+
+The humaneval/lcb generator was never vendored (`tools/build-packs.js` only
+builds the `stevibe/*` packs), so the projection was DERIVED from the 30 shipped
+rows and gated on re-deriving them. benchlocal rewrites evalplus's assertion
+helper -- `np.testing.assert_allclose(out, exp` -> `assert np.allclose(out, exp,
+rtol=1e-07` -- which reproduces 28/30 byte-identically; the 2 misses are
+upstream snapshot drift (evalplus has ADDED test data to HumanEval/1 and /28
+since the pin), not a projection error. LCB reproduced 30/30 exactly, which
+independently validates the filter.
+
+Emitted as EXTENSION packs (`humaneval-plus-ext134`, `lcb-v6-ext40`) holding
+only the rows the originals lack, so the originals stay byte-identical and the
+60 records already reported on remain exactly that corpus. Total 234.
+
+**No outage was needed, contrary to the estimate.** `--request-think` leaves
+thinking OFF by default and enables it per-request, so the packs (which set
+`enable_thinking: true`) get the block arm while every other client sees
+unchanged behaviour -- verified with a plain request returning no
+`reasoning_content`. The production server served throughout.
+
+### Result
+
+Scoring reuses benchlocal's OWN extractor by import
+(`sandboxes/code-reasoning/server.py::extract_code_with_info`) rather than a
+reimplementation, so the classification cannot drift from what the verifier did.
+
+    class                       all  humaneval    lcb
+    A_content_absent             28          2     26   <- the runaway shape
+    B_fallback-shape candidate    4          3      1
+    C_code_ok_wrong_answer        8          7      1
+    TOTAL FAILURES               40         12     28   (194/234 passed)
+
+    fallback-shape candidates     4 / 234 = 1.71%
+    GENUINE (see below)           1 / 234 = 0.43%   95% UB ~1.24%
+    their corpus                 14 / 240 = 5.83%
+
+**Our 0/60 was underpowered and the shape claim attached to it was wrong.** The
+count was accurate for that corpus, and "neither supports nor refutes" was the
+right read -- but the mechanism we offered alongside it, that our failures
+"bifurcate into good content or none", is falsified. HumanEval-76 is 284 chars
+of content truncated mid-docstring: neither good nor absent.
+
+### The more useful finding: a SECOND extractor bug, and it explains 3 of the 4
+
+Three of the four candidates are not fallback cases. The model emitted a single
+unpaired trailing ` ``` ` with no opening fence; `OPENING_FENCE_ANYWHERE_RE`
+then matches that CLOSER and returns everything after it, which is nothing. The
+code is complete and sitting right there.
+
+    31 records end with a trailing fence
+      28 EVEN fence count (paired)   -> last_fenced           -> code kept   -> all 28 PASSED
+       3 ODD  fence count (unpaired) -> opening_fence_anywhere -> code DROPPED -> all  3 FAILED
+
+Odd/even separates them 31/31. Strip the stray fence and all three parse;
+HumanEval-75's stripped content is BYTE-IDENTICAL to the code in its reasoning
+channel. Same family as #116/#117 -- a channel/extraction defect, not model
+behaviour.
+
+Removing it leaves exactly one genuine fallback record (HumanEval-76,
+content truncated mid-docstring, reasoning holds the complete function) =
+**0.43%**, which rules out 5.83% at our end.
+
+**This strengthens their decision rather than undermining it.** Their stated
+reasoning was that the extraction fix already removed the defect and a fallback
+would paper over residual model behaviour. Our data says there is MORE defect
+left to remove, and after removing it the residual is one record in 234 -- so
+fixing extraction is strictly the better lever, since it recovers the record
+without changing what counts as a pass.
+
+### Reproductions, free
+
+`humaneval-plus-30` returned 30/30 and `lcb-v6-30` returned 13 failures ALL of
+the `content_absent` shape -- the corpus described in the 07-30 comment,
+reproduced on an independent boot. The LCB extension also earned its place:
+LCB went 0/30 -> 1/70, and that record is a fence-bug case, so extending it was
+worth doing but not for the reason either side expected.
+
+### Caveats
+
+One checkpoint (Qwopus default tier), one engine, greedy. 0.43% is one record;
+the Wilson upper bound is ~1.24%, which separates from 5.83% but does not
+establish that the genuine shape is absent. The fence bug is reported here
+against the pinned `d08ddcc` extractor and has not been re-tested against any
+later benchlocal.
+
+**OPS:** `/mnt/ai/projects/benchlocal-cli` is still detached at `d08ddcc` and
+now carries LOCAL modifications -- `benchlocal_cli/sandbox.py` (two
+`SandboxConfig` entries, ports 9007/9008, same code-reasoning image) plus the
+two untracked `*-ext*.jsonl` packs. Nothing was upstreamed. `git checkout
+master` still reverts the pin but would NOT remove the untracked packs.
+Artifacts in `q27/scratchpad/`: `gen_ext_packs.py` (generator + reproduction
+gate), `score_fallback.py` (classifier, imports the sandbox extractor),
+`run_blockarm.sh`.
