@@ -103,6 +103,61 @@ struct HookGuard {
     }
 };
 
+// In batch mode the conductor must observe bounded-thinking transitions before
+// it starts the next round. The request thread drains TokenQueue asynchronously;
+// observing there races the next draft and can either miss the forced close or
+// enqueue it after a natural close, leaking a literal </think> into content.
+// Keep an independent parser on the conductor thread. The request parser still
+// owns output routing; this twin owns only ThinkBudgetState / DecodeTask control.
+struct BatchThinkBudgetObserver {
+    q27::Tokenizer& tok;
+    q27::ThinkBudgetState& state;
+    Engine::DecodeTask& task;
+    const std::vector<int>& close_ids;
+    StreamSplitter split;
+    q27::Utf8Gate gate;
+    StreamSplitter round_split;
+    q27::Utf8Gate round_gate;
+
+    BatchThinkBudgetObserver(q27::Tokenizer& tok_, q27::ThinkBudgetState& state_,
+                             Engine::DecodeTask& task_,
+                             const std::vector<int>& close_ids_,
+                             StreamSplitter::Chan initial)
+        : tok(tok_), state(state_), task(task_), close_ids(close_ids_) {
+        split.chan = initial;
+        round_split.chan = initial;
+        task.preview_round = [this](const int* ids, int n) { return preview_round(ids, n); };
+        task.commit_round = [this](const int* ids, int n) { commit_round(ids, n); };
+    }
+
+    int preview_round(const int* ids, int n) const {
+        if (state.limit < 0) return -1;
+        StreamSplitter preview_split = round_split;
+        q27::Utf8Gate preview_gate = round_gate;
+        for (int i = 0; i < n; i++) {
+            const auto before = preview_split.chan;
+            (void)preview_split.feed(preview_gate.feed(tok.decode_one(ids[i])));
+            if (before != StreamSplitter::THINK &&
+                preview_split.chan == StreamSplitter::THINK)
+                return i + 1;
+        }
+        return -1;
+    }
+
+    void commit_round(const int* ids, int n) {
+        if (state.limit < 0) return;
+        for (int i = 0; i < n; i++)
+            (void)round_split.feed(round_gate.feed(tok.decode_one(ids[i])));
+    }
+
+
+    void observe(int id) {
+        const auto before = split.chan;
+        (void)split.feed(gate.feed(tok.decode_one(id)));
+        state.observe(before, split.chan, task, close_ids);
+    }
+};
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -404,6 +459,7 @@ int main(int argc, char** argv) {
     // the post-upload block below; no legacy 8192 fallback.
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
+    const std::vector<int> think_close_ids = tok.encode("</think>\n\n");
     fprintf(stderr, "loading model...\n");
     // P10-A1: weights owned here and shared into the Engine(s) by reference.
     // Upload once; borrowing engines skip the 17.7 GB weight copy. (Multi-slot
@@ -850,14 +906,26 @@ int main(int argc, char** argv) {
     // bounded by <=4 slots and self-limiting clients -- the GPU gate is the
     // fair one.
     long slot_use_counter = 0;
-    auto claim_slot = [&](const std::vector<int>& prompt) -> Slot& {
+    auto claim_slot = [&](const std::vector<int>& prompt, int requested,
+                          bool thinking, const q27::ThinkCfg& cfg,
+                          bool budget_aware) -> Slot& {
         std::unique_lock<std::mutex> lk(route_m);
-        // eligibility requires a POSITIVE decode budget on the slot, not
-        // just prompt-fits (review follow-up 2026-07-09 #3): a slot whose
-        // clamp would floor n_max to 0 must not take the request. The route
-        // preflights guarantee at least the largest slot qualifies, so this
-        // never deadlocks.
-        const bool fits_any = (int)prompt.size() <= max_prompt;
+        const q27::ThinkCfg raw_cfg{false, -1, true};
+        const q27::ThinkCfg& limit_cfg = budget_aware ? cfg : raw_cfg;
+        const int limit_close = budget_aware ? (int)think_close_ids.size() : 0;
+        const int limit_flag = budget_aware ? think_budget_flag : 0;
+        // Eligibility includes the request's forced-close reserve. This keeps
+        // prefix reuse from routing a boundary request to a smaller slot that
+        // cannot honor the bounded-thinking transition.
+        auto can_fit = [&](Slot& s) {
+            return q27::resolve_think_decode_limits(
+                       requested, s.eng->max_ctx, (int)prompt.size(),
+                       s.eng->ctx_round_reserve(), limit_close, thinking,
+                       limit_cfg, limit_flag)
+                .context_ok;
+        };
+        bool fits_any = false;
+        for (auto& s : slots) fits_any = fits_any || can_fit(s);
         for (;;) {
             Slot* best = nullptr;
             int best_tier = -1, best_key = 0;
@@ -867,7 +935,7 @@ int main(int argc, char** argv) {
                     if (!best || s.eng->max_ctx > best->eng->max_ctx) best = &s;
                     continue;
                 }
-                if ((int)prompt.size() + s.eng->ctx_round_reserve() > s.eng->max_ctx) continue;
+                if (!can_fit(s)) continue;
                 int rl = s.eng->reuse_len(prompt);
                 int tier = rl > 0 ? 2 : s.eng->cache_empty() ? 1 : 0;
                 bool better;
@@ -1077,7 +1145,7 @@ int main(int argc, char** argv) {
     // stamped either way so the [req] line never reports a failed
     // generation as a normal finish.
     auto batch_generate = [&](Engine& eng, const std::vector<int>& prompt, int nm,
-                              std::function<bool(int)> on_token,
+                              std::function<bool(int, bool)> on_token,
                               std::function<void(int)> on_emit, int stable_len, double& qw,
                               const ReqTrace& rt, Engine::DecodeTask& t,
                               std::string* err_out) -> int {
@@ -1091,19 +1159,21 @@ int main(int argc, char** argv) {
                 return 0; // refused; gs.end already stamped for req_log
             }
             eng.on_round_gap = nullptr; // Task 9 invariant (contract above)
-            // sink is replaced by register_member; the queue carries tokens
-            eng.make_decode_task(t, nm, EOS, on_token, P);
+            // register_member replaces this placeholder with the queue sink.
+            auto placeholder = [](int) { return true; };
+            eng.make_decode_task(t, nm, EOS, placeholder, P);
         } // lease released: decode arbitration belongs to the conductor
         conductor->register_member(&eng, &t, &q, std::move(on_emit));
         bool client_gone = false;
-        std::vector<int> ids;
+        std::vector<q27::TokenQueue::Token> ids;
         try {
             while (q.pop(ids)) {
-                for (int id : ids)
-                    if (!client_gone && !on_token(id)) {
+                for (const auto& token : ids) {
+                    if (!client_gone && !on_token(token.id, token.forced)) {
                         client_gone = true;
                         t.cancel.store(true); // A3: takes effect at a round boundary
                     }
+                }
                 ids.clear();
             }
         } catch (...) {
@@ -1345,14 +1415,28 @@ int main(int argc, char** argv) {
                             "application/json");
             return;
         }
+        const bool think_aware=routed_chat && tchoice.mode!=q27::ToolChoice::FORCED;
         // context-limit preflight BEFORE slot claim / SSE commit (review
         // follow-up 2026-07-09 #3): past this bound the routed slot's
         // n_max clamp floors at 0 -> empty 200
-        if ((int)prompt.size() > max_prompt) {
+        const auto admission = think_aware
+            ? q27::resolve_think_decode_limits(
+                  n_max, max_slot_ctx, (int)prompt.size(), slots[0].eng->ctx_round_reserve(),
+                  (int)think_close_ids.size(), thinking, tcfg, think_budget_flag)
+            : q27::resolve_think_decode_limits(
+                  n_max, max_slot_ctx, (int)prompt.size(), slots[0].eng->ctx_round_reserve(),
+                  0, false, q27::ThinkCfg{false, -1, true}, 0);
+        const int request_max_prompt = !think_aware || admission.context_ok
+            ? max_prompt
+            : q27::max_prompt_for_think_decode(
+                  n_max, max_slot_ctx, slots[0].eng->ctx_round_reserve(), max_prompt,
+                  (int)prompt.size(), (int)think_close_ids.size(), thinking, tcfg,
+                  think_budget_flag);
+        if ((int)prompt.size() > max_prompt || !admission.context_ok) {
             res.status = 400;
             res.set_content(json{{"error",
                                   {{"message", q27::ctx_limit_error_message(
-                                                   (int)prompt.size(), max_prompt)},
+                                                   (int)prompt.size(), request_max_prompt)},
                                    {"type", "invalid_request_error"},
                                    {"code", "context_length_exceeded"}}}}
                                 .dump(),
@@ -1383,7 +1467,7 @@ int main(int argc, char** argv) {
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt); // may wait for a free engine
+            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
@@ -1399,7 +1483,15 @@ int main(int argc, char** argv) {
             eng.on_round_gap = make_yield(eng);
             // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
             // in ctx; reserve derived from the engine's active max depth)
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+            auto limits = think_aware
+                ? q27::resolve_think_decode_limits(
+                      n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                      (int)think_close_ids.size(), thinking, tcfg, think_budget_flag)
+                : q27::resolve_think_decode_limits(
+                      n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                      0, false, q27::ThinkCfg{false, -1, true}, 0);
+            n_max = limits.n_max;
+            const int think_budget = limits.budget;
 
             if (!routed_chat) {
                 // ORIGINAL text-only behavior, byte-for-byte unchanged.
@@ -1411,9 +1503,11 @@ int main(int argc, char** argv) {
                 };
                 Engine::DecodeTask bt;
                 std::string berr;
-                int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
-                                                   qw, rt, bt, &berr)
-                                  : eng.generate(prompt, n_max, EOS, on_tok);
+                int n = conductor
+                            ? batch_generate(eng, prompt, n_max,
+                                             [&](int id, bool) { return on_tok(id); },
+                                             nullptr, -1, qw, rt, bt, &berr)
+                            : eng.generate(prompt, n_max, EOS, on_tok);
                 eng.on_round_gap = nullptr;
                 text += ugate.flush();
                 req_log(rt, qw, eng, sl.id, bat_stats(bt));
@@ -1448,8 +1542,8 @@ int main(int argc, char** argv) {
             // routed_chat: think/tool-aware path, an exact mechanical twin of
             // the /v1/messages non-stream handler above, OpenAI-shaped output.
             StreamSplitter sp;
-            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                : q27::think_budget_default(think_budget_flag, n_max)};
+            q27::ThinkBudgetState tb{think_budget};
+            Engine::DecodeTask bt;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -1481,26 +1575,32 @@ int main(int argc, char** argv) {
             // generated token is already inside the block, and its </think> flips
             // back to text (same mechanism as the FORCED TOOL pre-seed above).
             else if (thinking) sp.chan = StreamSplitter::THINK;
+            tb.start(bt, think_close_ids, sp.chan);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
                 eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-            auto on_tok = [&](int id) {
-                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                if (const char* bclose = tb.tick(sp))
-                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
+            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+            auto on_tok = [&](int id, bool forced) {
+                const auto before = sp.chan;
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
+                    if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
+                        continue;
+                    route(ch, t);
+                }
+                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                 return true;
             };
-            Engine::DecodeTask bt;
             std::string berr;
             int n = conductor
-                        ? batch_generate(eng, prompt, n_max, on_tok,
-                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
+                        ? batch_generate(eng, prompt, n_max,
+                                         [&](int id, bool forced) { return on_tok(id, forced); },
+                                         [&](int id) { tc.on_id(id); batch_tb.observe(id); }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
-                              return on_tok(id);
-                          }, stable_len);
+                              return on_tok(id, bt.callback_forced);
+                          }, stable_len, &bt);
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
@@ -1539,7 +1639,8 @@ int main(int argc, char** argv) {
                 if (c.ok) any_call = true;
             json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
             json choice = {{"index", 0},
-                          {"finish_reason", any_call ? "tool_calls" : (n >= n_max ? "length" : "stop")},
+                          {"finish_reason", any_call ? "tool_calls" :
+                              ((n >= n_max || bt.budget_truncated) ? "length" : "stop")},
                           {"message", msg}};
             json out = {{"id", "chatcmpl-q27-" + std::to_string(rid)}, {"object", obj},
                         {"created", created}, {"model", served_name},
@@ -1568,8 +1669,8 @@ int main(int argc, char** argv) {
             // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, tchoice, stable_len, has_tools, rid,
-             thinking, sys_len](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt);
+             thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
+                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
@@ -1579,8 +1680,15 @@ int main(int argc, char** argv) {
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
-                const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+                auto limits = think_aware
+                    ? q27::resolve_think_decode_limits(
+                          n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                          (int)think_close_ids.size(), thinking, tcfg, think_budget_flag)
+                    : q27::resolve_think_decode_limits(
+                          n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                          0, false, q27::ThinkCfg{false, -1, true}, 0);
+                const int nm = limits.n_max;
+                const int think_budget = limits.budget;
                 auto send = [&](const json& j) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -1608,9 +1716,11 @@ int main(int argc, char** argv) {
                     // SSE shape has no standard mid-stream error event, so none
                     // is invented; end=error lands in the [req] line and
                     // [req-error] carries the what().
-                    int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                              -1, qw, rt, bt, nullptr)
-                                             : eng.generate(prompt, nm, EOS, on_tok);
+                    int produced = conductor
+                                       ? batch_generate(eng, prompt, nm,
+                                                        [&](int id, bool) { return on_tok(id); },
+                                                        nullptr, -1, qw, rt, bt, nullptr)
+                                       : eng.generate(prompt, nm, EOS, on_tok);
                     eng.on_round_gap = nullptr;
                     std::string tailp = ugate.flush();
                     if (!tailp.empty()) send(piece_chunk(tailp));
@@ -1650,15 +1760,17 @@ int main(int argc, char** argv) {
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
                 tc.begin(tool_names_v);
                 StreamSplitter sp;
-                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                    : q27::think_budget_default(think_budget_flag, n_max)};
+                q27::ThinkBudgetState tb{think_budget};
+                Engine::DecodeTask bt;
                 if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
+                tb.start(bt, think_close_ids, sp.chan);
                 q27::Utf8Gate ugate;
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
                 bool any_call = false;
                 std::string tool_buf, text_accum;
+                bool forced_control_token = false;
                 auto emit_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
@@ -1692,6 +1804,10 @@ int main(int argc, char** argv) {
                             alive = false;
                         return;
                     }
+                    // Only decoder-injected close whitespace is parser control.
+                    // Preserve ordinary leading whitespace, including when
+                    // thinking is disabled or the model closes naturally.
+                    if (forced_control_token && q27::strip_ws2(t).empty()) return;
                     text_accum += t;
                     if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                        json{{"content", t}})))
@@ -1701,21 +1817,22 @@ int main(int argc, char** argv) {
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
                 if (tc.enabled)
                     eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-                auto on_tok = [&](int id) {
+                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                auto on_tok = [&](int id, bool forced) {
+                    forced_control_token = forced;
+                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (const char* bclose = tb.tick(sp))
-                        for (auto& [ch, t] : sp.feed(bclose)) emit_seg(ch, t);
+                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                     return alive; // stop generating once the client has disconnected
                 };
-                Engine::DecodeTask bt;
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) { tc.on_id(id); },
+                                                    [&](int id) { tc.on_id(id); batch_tb.observe(id); },
                                                     stable_len, qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
-                                         return on_tok(id);
-                                     }, stable_len);
+                                         return on_tok(id, bt.callback_forced);
+                                     }, stable_len, &bt);
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
@@ -1752,7 +1869,9 @@ int main(int argc, char** argv) {
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
                 {
-                    const char* fr = any_call ? "tool_calls" : (produced >= nm ? "length" : "stop");
+                    const char* fr = any_call ? "tool_calls"
+                                              : ((produced >= nm || bt.budget_truncated)
+                                                     ? "length" : "stop");
                     send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                   json::object(), fr));
                 }
@@ -1761,7 +1880,9 @@ int main(int argc, char** argv) {
                               {"model", served_name}, {"choices", json::array()},
                               {"usage", {{"prompt_tokens", (int)prompt.size()},
                                          {"completion_tokens", produced},
-                                         {"total_tokens", (int)prompt.size() + produced}}}});
+                                         {"total_tokens", (int)prompt.size() + produced},
+                                         {"reasoning_tokens", tb.used},
+                                         {"reasoning_budget_exceeded", tb.tripped}}}});
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
@@ -1850,10 +1971,20 @@ int main(int argc, char** argv) {
         // instead of compacting. "prompt is too long" is CC's compact-now
         // signal. Ceiling is the shared max_prompt (largest slot minus the
         // depth-derived spec-round reserve, keeping n_max >= 1).
-        if ((int)prompt.size() > max_prompt) {
+        const auto admission = q27::resolve_think_decode_limits(
+            n_max, max_slot_ctx, (int)prompt.size(), slots[0].eng->ctx_round_reserve(),
+            (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+        const int request_max_prompt = admission.context_ok
+            ? max_prompt
+            : q27::max_prompt_for_think_decode(
+                  n_max, max_slot_ctx, slots[0].eng->ctx_round_reserve(), max_prompt,
+                  (int)prompt.size(), (int)think_close_ids.size(), thinking, tcfg,
+                  think_budget_flag);
+        if ((int)prompt.size() > max_prompt || !admission.context_ok) {
             fprintf(stderr, "[ctx-limit] prompt=%zu max=%d -> 400\n", prompt.size(),
-                    max_prompt);
-            anthropic_400(res, q27::ctx_limit_error_message((int)prompt.size(), max_prompt));
+                    request_max_prompt);
+            anthropic_400(
+                res, q27::ctx_limit_error_message((int)prompt.size(), request_max_prompt));
             return;
         }
         // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
@@ -1871,7 +2002,7 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double, std::milli>(tk2 - tk0).count()};
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
@@ -1881,11 +2012,16 @@ int main(int argc, char** argv) {
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+            auto limits = q27::resolve_think_decode_limits(
+                n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+            n_max = limits.n_max;
+            const int think_budget = limits.budget;
             StreamSplitter sp;
-            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                : q27::think_budget_default(think_budget_flag, n_max)};
+            q27::ThinkBudgetState tb{think_budget};
+            Engine::DecodeTask bt;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
+            tb.start(bt, think_close_ids, sp.chan);
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -1906,24 +2042,29 @@ int main(int argc, char** argv) {
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
                 eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-            auto on_tok = [&](int id) {
-                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                if (const char* bclose = tb.tick(sp))
-                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
+            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+            auto on_tok = [&](int id, bool forced) {
+                const auto before = sp.chan;
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
+                    if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
+                        continue;
+                    route(ch, t);
+                }
+                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                 return true;
             };
-            Engine::DecodeTask bt;
             std::string berr;
             // batch: tc.on_id rides on_emit -- the CONDUCTOR thread, between
             // scan_round and on_pending, its exact solo slot (driver contract)
             int n = conductor
-                        ? batch_generate(eng, prompt, n_max, on_tok,
-                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
+                        ? batch_generate(eng, prompt, n_max,
+                                         [&](int id, bool forced) { return on_tok(id, forced); },
+                                         [&](int id) { tc.on_id(id); batch_tb.observe(id); }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
-                              return on_tok(id);
-                          }, stable_len);
+                              return on_tok(id, bt.callback_forced);
+                          }, stable_len, &bt);
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
@@ -1978,7 +2119,9 @@ int main(int argc, char** argv) {
                                        {"id", "toolu_q27_" + std::to_string(rid) + "_" +
                                                   std::to_string(ci++)},
                                        {"name", c.name}, {"input", c.arguments}});
-            const char* sr = any_call ? "tool_use" : (n >= n_max ? "max_tokens" : "end_turn");
+            const char* sr = any_call ? "tool_use"
+                                      : ((n >= n_max || bt.budget_truncated)
+                                             ? "max_tokens" : "end_turn");
             json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
                         {"model", served_name}, {"content", content},
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
@@ -1997,8 +2140,8 @@ int main(int argc, char** argv) {
             "text/event-stream",
             // by-value or dangling: see the /v1/chat/completions twin
             [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt,
-             thinking, sys_len](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt);
+             thinking, tcfg, sys_len](size_t, httplib::DataSink& sink) {
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
@@ -2008,8 +2151,11 @@ int main(int argc, char** argv) {
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
-                const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+                auto limits = q27::resolve_think_decode_limits(
+                    n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                    (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+                const int nm = limits.n_max;
+                const int think_budget = limits.budget;
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
@@ -2031,9 +2177,10 @@ int main(int argc, char** argv) {
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
 
                 StreamSplitter sp;
-                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                    : q27::think_budget_default(think_budget_flag, n_max)};
+                q27::ThinkBudgetState tb{think_budget};
+                Engine::DecodeTask bt;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
+                tb.start(bt, think_close_ids, sp.chan);
                 std::string tool_buf, text_accum;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
@@ -2084,13 +2231,15 @@ int main(int argc, char** argv) {
                                    {"partial_json", jdump(c.arguments)}}}});
                     ev("content_block_stop", {{"type", "content_block_stop"}, {"index", ti}});
                 };
+                bool forced_control_token = false;
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
                     if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
                     if (!tool_buf.empty()) emit_tool();
                     if (t.empty()) return;
                     int chan = ch == StreamSplitter::THINK ? 1 : 0;
-                    // suppress pure-whitespace text before the first block or between blocks
-                    if (chan == 0 && idx < 0 && q27::strip_ws2(t).empty()) return;
+                    // Injected template whitespace is parser control; model
+                    // whitespace, including after a natural close, is content.
+                    if (chan == 0 && forced_control_token && q27::strip_ws2(t).empty()) return;
                     open_block(chan);
                     if (chan == 0) text_accum += t;
                     if (chan == 1)
@@ -2104,24 +2253,25 @@ int main(int argc, char** argv) {
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
                 if (tc.enabled)
                     eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-                auto on_tok = [&](int id) {
+                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                auto on_tok = [&](int id, bool forced) {
+                    forced_control_token = forced;
+                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (const char* bclose = tb.tick(sp))
-                        for (auto& [ch, t] : sp.feed(bclose)) emit_seg(ch, t);
+                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                     return alive; // stop generating once the client has disconnected
                 };
-                Engine::DecodeTask bt;
                 std::string berr;
                 // batch: tc.on_id rides on_emit (conductor thread, solo slot);
                 // a dead client flips `alive` -> the drain cancels (A3)
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) { tc.on_id(id); },
+                                                    [&](int id) { tc.on_id(id); batch_tb.observe(id); },
                                                     stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
-                                         return on_tok(id);
-                                     }, stable_len);
+                                         return on_tok(id, bt.callback_forced);
+                                     }, stable_len, &bt);
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
@@ -2178,10 +2328,13 @@ int main(int argc, char** argv) {
                     ev("error", {{"type", "error"},
                                  {"error", {{"type", "api_error"}, {"message", berr}}}});
                 const char* sr = any_call ? "tool_use"
-                                          : (produced >= nm ? "max_tokens" : "end_turn");
+                                          : ((produced >= nm || bt.budget_truncated)
+                                                 ? "max_tokens" : "end_turn");
                 ev("message_delta", {{"type", "message_delta"},
                                      {"delta", {{"stop_reason", sr}, {"stop_sequence", nullptr}}},
-                                     {"usage", {{"output_tokens", produced}}}});
+                                     {"usage", {{"output_tokens", produced},
+                                                {"reasoning_tokens", tb.used},
+                                                {"reasoning_budget_exceeded", tb.tripped}}}});
                 ev("message_stop", {{"type", "message_stop"}});
                 sink.done();
                 return true;
@@ -2191,9 +2344,10 @@ int main(int argc, char** argv) {
     // ---------------- OpenAI Responses API (Codex CLI) ----------------
     // Wire facts from codex-rs (v0.143): client keys off the JSON `type` field
     // in SSE data (event: lines ignored); the agent loop consumes only
-    // response.output_item.done items; response.completed{response:{id}} is the
-    // required terminator; function_call.arguments is a JSON-encoded STRING;
-    // tool results arrive as function_call_output with a bare-string output.
+    // response.output_item.done items; response.completed / response.incomplete
+    // terminate their matching lifecycle states; function_call.arguments is a
+    // JSON-encoded STRING; tool results arrive as function_call_output with a
+    // bare-string output.
     // 400 is fatal to Codex, 500 retries -- so tolerate quirks, 500 on bugs.
 
     srv.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
@@ -2306,7 +2460,10 @@ int main(int argc, char** argv) {
         // review follow-up 2026-07-09 #3: the bound includes the spec-round
         // reserve (max_prompt), so a prompt that passes can never have its
         // n_max floored to 0 by the routed slot's clamp (empty 200/stream)
-        if ((int)prompt.size() > max_prompt) {
+        const auto admission = q27::resolve_think_decode_limits(
+            n_max, max_slot_ctx, (int)prompt.size(), slots[0].eng->ctx_round_reserve(),
+            (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+        if ((int)prompt.size() > max_prompt || !admission.context_ok) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
             res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}",
                             "application/json");
@@ -2343,26 +2500,27 @@ int main(int argc, char** argv) {
                 items.push_back(r);
                 return r;
             };
-            auto flush_text = [&items, ctx, rid]() {
+            auto flush_text = [&items, ctx, rid](bool incomplete=false) {
                 std::string tx = q27::strip_ws2(ctx->text);
                 ctx->text.clear();
                 if (tx.empty()) return json();
                 json m = {{"type", "message"}, {"id", "msg_q27_" + std::to_string(rid)},
-                          {"role", "assistant"}, {"status", "completed"},
+                          {"role", "assistant"}, {"status", incomplete ? "incomplete" : "completed"},
                           {"content",
                            json::array({{{"type", "output_text"}, {"text", tx},
                                          {"annotations", json::array()}}})}};
                 items.push_back(m);
                 return m;
             };
-            auto flush_tool = [&items, ctx, rid, &tool_counter, &custom_names]() {
+            auto flush_tool = [&items, ctx, rid, &tool_counter, &custom_names](bool incomplete=false) {
                 auto c = q27::parse_tool_call(q27::strip_ws2(ctx->tool_buf));
                 ctx->tool_buf.clear();
                 std::string cid = "call_q27_" + std::to_string(rid) + "_" +
                                   std::to_string(tool_counter++);
                 json it;
                 if (!c.ok) { // malformed call: surface as text so codex shows it
-                    it = {{"type", "message"}, {"role", "assistant"}, {"status", "completed"},
+                    it = {{"type", "message"}, {"role", "assistant"},
+                          {"status", incomplete ? "incomplete" : "completed"},
                           {"content", json::array({{{"type", "output_text"}, {"text", c.raw},
                                                     {"annotations", json::array()}}})}};
                 } else if (custom_names.count(c.name)) {
@@ -2383,7 +2541,7 @@ int main(int argc, char** argv) {
         };
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             eng.samp = parse_sample(body);
@@ -2392,15 +2550,20 @@ int main(int argc, char** argv) {
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+            auto limits = q27::resolve_think_decode_limits(
+                n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+            n_max = limits.n_max;
+            const int think_budget = limits.budget;
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
                 make_item_cbs(items, tool_counter, nullptr);
             StreamSplitter sp;
-            q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                : q27::think_budget_default(think_budget_flag, n_max)};
+            q27::ThinkBudgetState tb{think_budget};
+            Engine::DecodeTask bt;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
+            tb.start(bt, think_close_ids, sp.chan);
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
                     if (!ctx->think.empty()) flush_think();
@@ -2416,17 +2579,26 @@ int main(int argc, char** argv) {
                 }
             };
             q27::Utf8Gate ugate;
-            auto on_tok = [&](int id) {
-                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                if (const char* bclose = tb.tick(sp))
-                    for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
+            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+            auto on_tok = [&](int id, bool forced) {
+                const auto before = sp.chan;
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
+                    if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
+                        continue;
+                    route(ch, t);
+                }
+                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                 return true;
             };
-            Engine::DecodeTask bt;
             std::string berr;
-            int produced = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr,
-                                                      -1, qw, rt, bt, &berr)
-                                     : eng.generate(prompt, n_max, EOS, on_tok);
+            int produced = conductor
+                               ? batch_generate(eng, prompt, n_max,
+                                                [&](int id, bool forced) { return on_tok(id, forced); },
+                                                [&](int id) { batch_tb.observe(id); }, -1,
+                                                qw, rt, bt, &berr)
+                               : eng.generate(prompt, n_max, EOS,
+                                              [&](int id) { return on_tok(id, bt.callback_forced); },
+                                              -1, &bt);
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, bat_stats(bt));
             // batch error surfacing (review pass 2): nothing emitted = 500
@@ -2440,16 +2612,24 @@ int main(int argc, char** argv) {
                                 "application/json");
                 return;
             }
+            const auto terminal = q27::responses_terminal_state(
+                produced, n_max, bt.budget_truncated);
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
-            if (!ctx->tool_buf.empty()) flush_tool();
+            if (!ctx->tool_buf.empty()) flush_tool(terminal.incomplete);
             flush_think();
-            flush_text();
-            json out = {{"id", resp_id}, {"object", "response"}, {"status", "completed"},
+            flush_text(terminal.incomplete);
+            const bool incomplete = terminal.incomplete;
+            json out = {{"id", resp_id}, {"object", "response"},
+                        {"status", incomplete ? "incomplete" : "completed"},
                         {"model", served_name}, {"output", items},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", produced},
+                                   {"output_tokens_details", {{"reasoning_tokens", tb.used},
+                                                               {"reasoning_budget_exceeded", tb.tripped}}},
                                    {"total_tokens", (int)prompt.size() + produced}}}};
+            if (incomplete)
+                out["incomplete_details"] = {{"reason", "max_output_tokens"}};
             res.set_content(jdump(out), "application/json");
             return;
         }
@@ -2460,8 +2640,8 @@ int main(int argc, char** argv) {
             "text/event-stream",
             // by-value or dangling: see the /v1/chat/completions twin
             [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
-             thinking, sys_len](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt);
+             thinking, tcfg, sys_len](size_t, httplib::DataSink& sink) {
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 eng.samp = samp;
@@ -2470,8 +2650,11 @@ int main(int argc, char** argv) {
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
-                const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+                auto limits = q27::resolve_think_decode_limits(
+                    n_max, eng.max_ctx, (int)prompt.size(), eng.ctx_round_reserve(),
+                    (int)think_close_ids.size(), thinking, tcfg, think_budget_flag);
+                const int nm = limits.n_max;
+                const int think_budget = limits.budget;
                 bool alive = true; // cleared when a write fails (client disconnected)
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
@@ -2524,7 +2707,7 @@ int main(int argc, char** argv) {
                         {"part", {{"type", "output_text"}, {"text", ""},
                                   {"annotations", json::array()}}}});
                 };
-                auto flush_text = [&]() {
+                auto flush_text = [&](bool incomplete=false) {
                     if (msg_index < 0) { text.clear(); return; }
                     std::string tx = q27::strip_ws2(text);
                     text.clear();
@@ -2535,7 +2718,7 @@ int main(int argc, char** argv) {
                         {"part", {{"type", "output_text"}, {"text", tx},
                                   {"annotations", json::array()}}}});
                     json it = {{"type", "message"}, {"id", msg_id}, {"role", "assistant"},
-                               {"status", "completed"},
+                               {"status", incomplete ? "incomplete" : "completed"},
                                {"content", json::array({{{"type", "output_text"}, {"text", tx},
                                                          {"annotations", json::array()}}})}};
                     ev({{"type", "response.output_item.done"}, {"output_index", msg_index},
@@ -2544,14 +2727,14 @@ int main(int argc, char** argv) {
                     out_index = msg_index + 1;
                     msg_index = -1;
                 };
-                auto flush_tool = [&]() {
+                auto flush_tool = [&](bool incomplete=false) {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     std::string cid = "call_q27_" + std::to_string(rid) + "_" +
                                       std::to_string(tool_counter++);
                     if (!c.ok) {
                         item_done({{"type", "message"}, {"role", "assistant"},
-                                   {"status", "completed"},
+                                   {"status", incomplete ? "incomplete" : "completed"},
                                    {"content",
                                     json::array({{{"type", "output_text"}, {"text", c.raw},
                                                   {"annotations", json::array()}}})}});
@@ -2568,6 +2751,7 @@ int main(int argc, char** argv) {
                                    {"arguments", jdump(c.arguments)}});
                     }
                 };
+                bool forced_control_token = false;
                 auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                     if (ch == StreamSplitter::TOOL) {
                         if (!think.empty()) flush_think();
@@ -2576,9 +2760,10 @@ int main(int argc, char** argv) {
                         return;
                     }
                     if (!tool_buf.empty()) flush_tool();
+                    if (t.empty()) return;
                     if (ch == StreamSplitter::THINK) { think += t; return; }
                     if (!think.empty()) flush_think();
-                    if (text.empty() && q27::strip_ws2(t).empty()) return;
+                    if (forced_control_token && q27::strip_ws2(t).empty()) return;
                     open_text();
                     text += t;
                     text_accum += t; // survives flush_text for bare-call recovery
@@ -2586,33 +2771,41 @@ int main(int argc, char** argv) {
                         {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
-                q27::ThinkBudget tb{tcfg.budget >= 0 ? tcfg.budget
-                                    : q27::think_budget_default(think_budget_flag, n_max)};
+                q27::ThinkBudgetState tb{think_budget};
+                Engine::DecodeTask bt;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
+                tb.start(bt, think_close_ids, sp.chan);
                 q27::Utf8Gate ugate;
-                auto on_tok = [&](int id) {
+                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                auto on_tok = [&](int id, bool forced) {
+                    forced_control_token = forced;
+                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                    if (const char* bclose = tb.tick(sp))
-                        for (auto& [ch, t] : sp.feed(bclose)) route(ch, t);
+                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
                     return alive; // stop generating once the client has disconnected
                 };
-                Engine::DecodeTask bt;
                 // TODO(batch error surfacing): no mid-stream error event is
                 // emitted here -- codex-rs (v0.143) keys only off the item /
                 // completed types this handler already sends and defines no
                 // error shape we could mirror without inventing protocol;
                 // end=error lands in the [req] line and [req-error] carries
                 // the what().
-                int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                          -1, qw, rt, bt, nullptr)
-                                         : eng.generate(prompt, nm, EOS, on_tok);
+                int produced = conductor
+                                   ? batch_generate(eng, prompt, nm, on_tok,
+                                                    [&](int id) { batch_tb.observe(id); }, -1,
+                                                    qw, rt, bt, nullptr)
+                                   : eng.generate(prompt, nm, EOS, [&](int id) {
+                                         return on_tok(id, bt.callback_forced);
+                                     }, -1, &bt);
                 eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                const auto terminal = q27::responses_terminal_state(
+                    produced, nm, bt.budget_truncated);
                 for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
-                if (!tool_buf.empty()) flush_tool();
+                if (!tool_buf.empty()) flush_tool(terminal.incomplete);
                 flush_think();
-                flush_text();
+                flush_text(terminal.incomplete);
                 // wrapper-less call recovery (parity with the Anthropic path):
                 // the model sometimes emits a bare {"name":...,"arguments":...}
                 // as text, no <tool_call> wrapper -- it already streamed as an
@@ -2649,14 +2842,19 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                ev({{"type", "response.completed"},
-                    {"response", {{"id", resp_id}, {"object", "response"},
-                                  {"status", "completed"}, {"output", items},
-                                  {"usage", {{"input_tokens", (int)prompt.size()},
-                                             {"input_tokens_details", {{"cached_tokens", 0}}},
-                                             {"output_tokens", produced},
-                                             {"output_tokens_details", {{"reasoning_tokens", 0}}},
-                                             {"total_tokens", (int)prompt.size() + produced}}}}}});
+
+                json final_response = {{"id", resp_id}, {"object", "response"},
+                                       {"status", terminal.status},
+                                       {"output", items},
+                                       {"usage", {{"input_tokens", (int)prompt.size()},
+                                                  {"input_tokens_details", {{"cached_tokens", 0}}},
+                                                  {"output_tokens", produced},
+                                                  {"output_tokens_details", {{"reasoning_tokens", tb.used},
+                                                                               {"reasoning_budget_exceeded", tb.tripped}}},
+                                                  {"total_tokens", (int)prompt.size() + produced}}}};
+                if (terminal.incomplete)
+                    final_response["incomplete_details"] = {{"reason", "max_output_tokens"}};
+                ev({{"type", terminal.event}, {"response", final_response}});
                 sink.done();
                 return true;
             });
