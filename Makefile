@@ -21,7 +21,7 @@ build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
 
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
-	$(CXX) $(CXXFLAGS) src/test_tokenizer.cpp src/tokenizer.cpp -o $@
+	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
