@@ -9956,3 +9956,52 @@ master` still reverts the pin but would NOT remove the untracked packs.
 Artifacts in `q27/scratchpad/`: `gen_ext_packs.py` (generator + reproduction
 gate), `score_fallback.py` (classifier, imports the sandbox extractor),
 `run_blockarm.sh`.
+## 2026-08-02 -- reasoning pre-merge corrections: seeded defaults and byte-stable responses
+
+The pre-merge review found two reasoning-branch behaviors that were internally
+consistent but too expensive or too surprising to publish unchanged.
+
+**Default-budget scope.** The fractional `--think-budget` default now applies
+only when the rendered prompt actually starts inside the `<think>` channel. An
+ordinary sampled request therefore keeps its negotiated speculative width.
+Explicit request budgets and an explicit positive CLI budget still arm the
+later-block guard, so clients that intentionally permit spontaneous thinking
+retain decoder-visible force-close enforcement. `--think-budget 0` remains the
+unbounded opt-out.
+
+**Response byte parity.** Natural model whitespace is now preserved in every
+non-stream response instead of passing completed text through `strip_ws2()`.
+Only the exact whitespace belonging to a decoder-injected `</think>` control
+transition is suppressed. The OpenAI chat, Anthropic Messages, and Responses
+production paths apply that rule. The OpenAI integration harness pins
+concatenated stream deltas to non-stream text, including leading whitespace
+after a natural close and malformed-tool text interleaved between ordinary text;
+the Anthropic malformed-tool path uses the same flush-at-generation-position rule.
+
+Host gates on the corrected tree:
+
+- `tools/test_think_resolve.cpp`: all resolver/admission/enforcement assertions
+  pass, including default no-think speculative width and explicit spontaneous
+  budget coverage.
+- `tools/test_chat_completions_integration.cpp`: all integration tests pass,
+  including OpenAI stream/non-stream byte parity and malformed-tool fallback.
+- `tools/test_stream_split.cpp`, `tools/test_openai_bridge.cpp`, and
+  `tools/test_conductor.cpp`: all assertions pass.
+- `build/test_tokenizer` compiles; its file-independent UTF-8, GPU-gate, and
+  Anthropic-shape self-tests pass. The corpus leg was not run because this tree
+  contains neither `q27.tok` nor a tokenizer cases file.
+- `git diff --check`: clean.
+
+Structured closeout used
+`skill://autoreview/scripts/autoreview --mode local --stream-engine-output`.
+The first passes identified synthetic-newline and generation-order defects in
+malformed-tool fallback; both were fixed and regression-pinned. The final Codex
+run returned no accepted/actionable findings (`patch is correct`, confidence
+0.91).
+
+CUDA gate: CUDA 12.8.93 on Yukon successfully rebuilt the corrected source with
+`make -B NVCC=/home/ddbb/.local/cuda-12.8/bin/nvcc build/q27-server-w8`.
+The compile emits only warnings in unchanged `prefill.cu` and `tokenizer.cpp`.
+No live-model result is claimed for this correction: the 3090 remained occupied
+by PID 2062415 (`evidence-wt/.venv/bin/python`, 21884 MiB), so taking the card
+would have disrupted another workload.

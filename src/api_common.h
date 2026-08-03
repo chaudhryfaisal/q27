@@ -418,18 +418,25 @@ inline bool resolve_think(const json& body, bool server_default, bool allow_requ
 // fraction ever exists, it should replace this.
 static constexpr double THINK_BUDGET_FRAC = 0.5;
 
-// Resolve the server's default budget for a request whose cap is `n_max`.
-// `flag` is --think-budget: <0 = use the fraction, 0 = unbounded, >0 = absolute.
+// Resolve the server budget for a request whose public cap is `n_max`.
+// `flag` is --think-budget: <0 = use the fractional default, 0 = unbounded,
+// >0 = an explicit absolute cap. The fractional default applies only when the
+// prompt already opened THINK. Otherwise every sampled no-think response would
+// be forced to one token per round merely to watch for a spontaneous opener.
+// An explicit request budget, or an explicit positive server flag, still arms
+// that later-block guard.
 inline int think_budget_default(int flag, int n_max) {
     if (flag == 0) return -1;
     if (flag > 0) return flag;
     return n_max > 0 ? (int)(THINK_BUDGET_FRAC * n_max) : -1;
 }
 
-inline int think_budget_for_request(bool /*prompt_starts_in_think*/, const ThinkCfg& cfg,
+inline int think_budget_for_request(bool prompt_starts_in_think, const ThinkCfg& cfg,
                                     int flag, int n_max) {
     if (cfg.enabled_set && !cfg.enabled) return -1;
-    return cfg.budget_set ? cfg.budget : think_budget_default(flag, n_max);
+    if (cfg.budget_set) return cfg.budget;
+    if (!prompt_starts_in_think && flag < 0) return -1;
+    return think_budget_default(flag, n_max);
 }
 
 struct ThinkDecodeLimits {

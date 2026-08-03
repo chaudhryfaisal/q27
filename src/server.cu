@@ -172,16 +172,15 @@ int main(int argc, char** argv) {
                 "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
                 "  request enable_thinking; off by default). The CLI keeps reference\n"
                 "  defaults (bitwise canonical).\n"
-                "  Reasoning budget: whenever a <think> block is served, tokens\n"
-                "  inside it are capped and the block is force-closed on trip --\n"
-                "  the answer still gets written. Default = half the request's\n"
-                "  max_tokens; --think-budget N sets an absolute cap, 0 disables.\n"
-                "  Requests may bound it too, symmetric with the enable\n"
-                "  conventions: thinking.budget_tokens (Anthropic),\n"
-                "  thinking_token_budget (OpenAI/Qwen), or\n"
-                "  chat_template_kwargs.thinking_budget -- honored only under\n"
-                "  --request-think. A trip is reported as usage.reasoning_tokens\n"
-                "  and usage.reasoning_budget_exceeded.\n"
+                "  Reasoning budget: prompt-seeded <think> blocks default to half\n"
+                "  the request's max_tokens and are force-closed on trip so the\n"
+                "  answer still gets written. A no-think request keeps ordinary\n"
+                "  speculative decode; --think-budget N (N>0) or an explicit\n"
+                "  request budget also arms a later model-generated block.\n"
+                "  --think-budget 0 disables. Request conventions: thinking.\n"
+                "  budget_tokens (Anthropic), thinking_token_budget (OpenAI/Qwen),\n"
+                "  or chat_template_kwargs.thinking_budget -- honored only under\n"
+                "  --request-think. A trip is reported in reasoning usage.\n"
                 "  Auth: no API key is required by default (loopback-only is the\n"
                 "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
                 "  one key per line (# comments ignored); Q27_API_KEY adds one more.\n"
@@ -219,9 +218,9 @@ int main(int argc, char** argv) {
     bool constrain_tools = false;
     bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
     // --think-budget: cap on tokens generated inside a <think> block. <0
-    // (default) = THINK_BUDGET_FRAC of the request max_tokens; 0 = unbounded
-    // (opt out); >0 = absolute. Applies whenever a block is served, by boot
-    // flag or by request. api_common.h documents why the default is ON.
+    // (default) = THINK_BUDGET_FRAC for prompt-seeded thinking only, preserving
+    // speculative width on ordinary no-think requests; 0 = unbounded; >0 = an
+    // explicit absolute cap that also arms a later model-generated block.
     int think_budget_flag = -1;
     std::vector<std::string> api_keys;
     q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
@@ -1547,12 +1546,15 @@ int main(int argc, char** argv) {
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
+            auto flush_tool = [&]() {
+                auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                tool_buf.clear();
+                if (c.ok) calls.push_back(std::move(c));
+                else text += c.raw; // stream parity: preserve generation order
+            };
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
-                if (!tool_buf.empty()) { // tool segment closed
-                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
-                    tool_buf.clear();
-                }
+                if (!tool_buf.empty()) flush_tool();
                 (ch == StreamSplitter::THINK ? think : text) += t;
             };
             ToolConstrainer tc;
@@ -1616,12 +1618,9 @@ int main(int argc, char** argv) {
             }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
-            if (!tool_buf.empty())
-                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+            if (!tool_buf.empty()) flush_tool();
 
-            std::string tx = q27::strip_ws2(text);
-            for (auto& c : calls)
-                if (!c.ok) tx += (tx.empty() ? "" : "\n") + c.raw;
+            std::string tx = text;
             if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
@@ -1637,7 +1636,7 @@ int main(int argc, char** argv) {
             bool any_call = false;
             for (auto& c : calls)
                 if (c.ok) any_call = true;
-            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            json msg = q27::openai_chat_message_json(tx, calls, rid, think);
             json choice = {{"index", 0},
                           {"finish_reason", any_call ? "tool_calls" :
                               ((n >= n_max || bt.budget_truncated) ? "length" : "stop")},
@@ -2025,12 +2024,15 @@ int main(int argc, char** argv) {
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
+            auto flush_tool = [&]() {
+                auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                tool_buf.clear();
+                if (c.ok) calls.push_back(std::move(c));
+                else text += c.raw; // stream parity: preserve generation order
+            };
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
-                if (!tool_buf.empty()) { // tool segment closed
-                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
-                    tool_buf.clear();
-                }
+                if (!tool_buf.empty()) flush_tool();
                 (ch == StreamSplitter::THINK ? think : text) += t;
             };
             ToolConstrainer tc;
@@ -2084,18 +2086,16 @@ int main(int argc, char** argv) {
             }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
-            if (!tool_buf.empty())
-                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+            if (!tool_buf.empty()) flush_tool();
 
             json content = json::array();
-            std::string th = q27::strip_ws2(think), tx = q27::strip_ws2(text);
+            std::string th = think, tx = text;
             if (!th.empty())
                 content.push_back({{"type", "thinking"}, {"thinking", th},
                                    {"signature", "q27-local"}});
             bool any_call = false;
             int ci = 0;
             for (auto& c : calls) {
-                if (!c.ok) { tx += (tx.empty() ? "" : "\n") + c.raw; continue; }
                 any_call = true;
                 (void)ci;
             }
@@ -2491,7 +2491,7 @@ int main(int argc, char** argv) {
             };
             auto ctx = std::make_shared<Ctx>();
             auto flush_think = [&items, ctx, rid]() {
-                std::string th = q27::strip_ws2(ctx->think);
+                std::string th = ctx->think;
                 ctx->think.clear();
                 if (th.empty()) return json();
                 json r = {{"type", "reasoning"}, {"id", "rs_q27_" + std::to_string(rid)},
@@ -2501,7 +2501,7 @@ int main(int argc, char** argv) {
                 return r;
             };
             auto flush_text = [&items, ctx, rid](bool incomplete=false) {
-                std::string tx = q27::strip_ws2(ctx->text);
+                std::string tx = ctx->text;
                 ctx->text.clear();
                 if (tx.empty()) return json();
                 json m = {{"type", "message"}, {"id", "msg_q27_" + std::to_string(rid)},
@@ -2557,8 +2557,11 @@ int main(int argc, char** argv) {
             const int think_budget = limits.budget;
             json items = json::array();
             int tool_counter = 0;
-            auto [ctx, flush_think, flush_text, flush_tool] =
-                make_item_cbs(items, tool_counter, nullptr);
+            auto item_cbs = make_item_cbs(items, tool_counter, nullptr);
+            auto& ctx = std::get<0>(item_cbs);
+            auto& flush_think = std::get<1>(item_cbs);
+            auto& flush_text = std::get<2>(item_cbs);
+            auto& flush_tool = std::get<3>(item_cbs);
             StreamSplitter sp;
             q27::ThinkBudgetState tb{think_budget};
             Engine::DecodeTask bt;
@@ -2679,7 +2682,7 @@ int main(int argc, char** argv) {
                     items.push_back(it);
                 };
                 auto flush_think = [&]() {
-                    std::string th = q27::strip_ws2(think);
+                    std::string th = think;
                     think.clear();
                     if (th.empty()) return;
                     item_done({{"type", "reasoning"}, {"id", "rs_q27_" + std::to_string(rid)},
@@ -2709,7 +2712,7 @@ int main(int argc, char** argv) {
                 };
                 auto flush_text = [&](bool incomplete=false) {
                     if (msg_index < 0) { text.clear(); return; }
-                    std::string tx = q27::strip_ws2(text);
+                    std::string tx = text;
                     text.clear();
                     ev({{"type", "response.output_text.done"}, {"item_id", msg_id},
                         {"output_index", msg_index}, {"content_index", 0}, {"text", tx}});

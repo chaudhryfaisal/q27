@@ -560,12 +560,15 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
+            auto flush_tool = [&]() {
+                auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                tool_buf.clear();
+                if (c.ok) calls.push_back(std::move(c));
+                else text += c.raw;
+            };
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
-                if (!tool_buf.empty()) { // tool segment closed
-                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
-                    tool_buf.clear();
-                }
+                if (!tool_buf.empty()) flush_tool();
                 (ch == StreamSplitter::THINK ? think : text) += t;
             };
             ToolConstrainer tc;
@@ -629,12 +632,9 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
-            if (!tool_buf.empty())
-                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+            if (!tool_buf.empty()) flush_tool();
 
-            std::string tx = q27::strip_ws2(text);
-            for (auto& c : calls)
-                if (!c.ok) tx += (tx.empty() ? "" : "\n") + c.raw;
+            std::string tx = text;
             if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
@@ -650,7 +650,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             bool any_call = false;
             for (auto& c : calls)
                 if (c.ok) any_call = true;
-            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            json msg = q27::openai_chat_message_json(tx, calls, rid, think);
             json choice = {{"index", 0},
                           {"finish_reason", any_call ? "tool_calls" :
                               ((n >= n_max || bt.budget_truncated) ? "length" : "stop")},
@@ -1503,9 +1503,9 @@ int main() {
                   "1 maximum") != std::string::npos);
     }
 
-    // ---- Test 17: a non-thinking stream preserves model-generated leading
+    // ---- Test 17: stream and non-stream both preserve model-generated leading
     // whitespace; only exact injected close-token whitespace is suppressed. ----
-    {
+    for (bool stream : {false, true}) {
         FakeTok tok;
         tok.pieces = {/*0*/ "<eos>", /*1*/ "\n", /*2*/ "answer"};
         std::vector<std::string> vb = tok.pieces;
@@ -1514,22 +1514,26 @@ int main() {
         slots[0].eng->script = {1, 2};
         std::atomic<long> rc{0};
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "answer"}}})},
-                     {"enable_thinking", false}, {"max_tokens", 2}, {"stream", true}};
+                     {"enable_thinking", false}, {"max_tokens", 2}, {"stream", stream}};
         run_request(tok, "q27-test", false, false, true, 100000, 100000, rc, cache, slots,
                     body, true);
         std::string content;
-        for (const auto& ev : g_sse_events) {
-            if (!ev.contains("choices") || ev["choices"].empty()) continue;
-            const auto& delta = ev["choices"][0]["delta"];
-            if (delta.contains("content") && delta["content"].is_string())
-                content += delta["content"].get<std::string>();
+        if (stream) {
+            for (const auto& ev : g_sse_events) {
+                if (!ev.contains("choices") || ev["choices"].empty()) continue;
+                const auto& delta = ev["choices"][0]["delta"];
+                if (delta.contains("content") && delta["content"].is_string())
+                    content += delta["content"].get<std::string>();
+            }
+        } else {
+            content = g_last_response["choices"][0]["message"]["content"].get<std::string>();
         }
         CHECK(content == "\nanswer");
     }
 
-    // ---- Test 18: a model-generated natural close is not mislabeled as an
-    // injected close even when its token bytes match the template exactly. ----
-    {
+    // ---- Test 18: a model-generated natural close keeps the same answer bytes
+    // in stream and non-stream, even when it matches the template close. ----
+    for (bool stream : {false, true}) {
         FakeTok tok;
         tok.pieces = {/*0*/ "<eos>", /*1*/ "</think>\n\n", /*2*/ "answer"};
         std::vector<std::string> vb = tok.pieces;
@@ -1539,15 +1543,19 @@ int main() {
         std::atomic<long> rc{0};
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "answer"}}})},
                      {"enable_thinking", true}, {"thinking_token_budget", -1},
-                     {"max_tokens", 2}, {"stream", true}};
+                     {"max_tokens", 2}, {"stream", stream}};
         run_request(tok, "q27-test", false, false, true, 100000, 100000, rc, cache, slots,
                     body, true);
         std::string content;
-        for (const auto& ev : g_sse_events) {
-            if (!ev.contains("choices") || ev["choices"].empty()) continue;
-            const auto& delta = ev["choices"][0]["delta"];
-            if (delta.contains("content") && delta["content"].is_string())
-                content += delta["content"].get<std::string>();
+        if (stream) {
+            for (const auto& ev : g_sse_events) {
+                if (!ev.contains("choices") || ev["choices"].empty()) continue;
+                const auto& delta = ev["choices"][0]["delta"];
+                if (delta.contains("content") && delta["content"].is_string())
+                    content += delta["content"].get<std::string>();
+            }
+        } else {
+            content = g_last_response["choices"][0]["message"]["content"].get<std::string>();
         }
         CHECK(content == "\n\nanswer");
     }
@@ -1590,6 +1598,42 @@ int main() {
                 CHECK(finish == (cap == 4 ? "length" : "stop"));
             }
         }
+    }
+
+    // ---- Test 20: malformed tool text stays adjacent to preceding model
+    // whitespace in both stream and non-stream responses. ----
+    for (bool stream : {false, true}) {
+        FakeTok tok;
+        tok.pieces = {/*0*/ "<eos>", /*1*/ " before", /*2*/ "<tool_call>",
+                      /*3*/ "not valid json", /*4*/ "</tool_call>", /*5*/ " after"};
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1, 2, 3, 4, 5};
+        std::atomic<long> rc{0};
+        json body = {
+            {"tools", json::array({
+                {{"type", "function"}, {"function", {{"name", "get_weather"},
+                    {"description", "w"}, {"parameters", json::object()}}}}
+            })},
+            {"messages", json::array({{{"role", "user"}, {"content", "weather?"}}})},
+            {"enable_thinking", false}, {"max_tokens", 5}, {"stream", stream},
+        };
+        run_request(tok, "q27-test", true, false, true, 100000, 100000, rc, cache,
+                    slots, body, true);
+        std::string content;
+        if (stream) {
+            for (const auto& ev : g_sse_events) {
+                if (!ev.contains("choices") || ev["choices"].empty()) continue;
+                const auto& delta = ev["choices"][0]["delta"];
+                if (delta.contains("content") && delta["content"].is_string())
+                    content += delta["content"].get<std::string>();
+            }
+        } else {
+            content = g_last_response["choices"][0]["message"]["content"]
+                          .get<std::string>();
+        }
+        CHECK(content == " beforenot valid json after");
     }
 
     fprintf(stderr, failures ? "%d FAILURE(S)\n" : "all integration tests passed\n", failures);

@@ -187,10 +187,12 @@ int main() {
     ok(disabled_limits.context_ok && disabled_limits.n_max == 8 &&
            disabled_limits.budget == -1,
        "budget: explicit thinking disable reserves no close tokens and enforces no cap");
-    ok(q27::think_budget_for_request(false, q27::ThinkCfg{}, -1, 8) == 4,
-       "default: spontaneous think blocks retain the server budget");
+    ok(q27::think_budget_for_request(false, q27::ThinkCfg{}, -1, 8) == -1,
+       "default: no-think request preserves sampled speculation");
     ok(q27::think_budget_for_request(false, q27::ThinkCfg{false, 3, true}, 0, 8) == 3,
-       "default: explicit budget applies without prompt-seeded thinking");
+       "default: explicit request budget applies without prompt-seeded thinking");
+    ok(q27::think_budget_for_request(false, q27::ThinkCfg{}, 3, 8) == 3,
+       "default: explicit server budget applies without prompt-seeded thinking");
 
     const auto active_two_token_limits = q27::resolve_think_decode_limits(
         2, 20, 8, 5, 2, true, q27::ThinkCfg{}, -1);
@@ -213,14 +215,14 @@ int main() {
         3, 20, 8, 5, 2, false, q27::ThinkCfg{}, -1);
     ok(spontaneous_three_token_limits.context_ok &&
            spontaneous_three_token_limits.n_max == 3 &&
-           spontaneous_three_token_limits.budget == 1,
-       "budget: spontaneous think keeps opener reasoning and answer capacity");
+           spontaneous_three_token_limits.budget == -1,
+       "budget: default no-think request keeps ordinary decode width");
     const auto spontaneous_zero_budget_limits = q27::resolve_think_decode_limits(
         2, 20, 8, 5, 2, false, q27::ThinkCfg{true, 0, true}, -1);
     ok(spontaneous_zero_budget_limits.context_ok &&
            spontaneous_zero_budget_limits.n_max == 2 &&
            spontaneous_zero_budget_limits.budget == 0,
-       "budget: zero spontaneous budget keeps opener and answer capacity");
+       "budget: explicit zero spontaneous budget keeps opener and answer capacity");
 
     // --- server default: fraction of max_tokens, absolute, or opt-out ---
     ok(q27::think_budget_default(-1, 8192) == 4096, "default: <0 flag -> half of max_tokens");

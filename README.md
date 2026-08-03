@@ -608,18 +608,18 @@ answer. When a client omits `max_tokens` the server defaults it to 8192
 (unified across all three API shapes, clamped to the context window); a long
 thinking trace wants more, set it explicitly.
 
-**Reasoning budget (2026-07-30, ON by default whenever a block is served).**
-Tokens generated inside the `<think>` block are capped; on trip the block is
-force-closed and the model answers with what it has. It is not a hard stop --
-truncating the request instead would reproduce the failure the cap exists to
-prevent. Default is **half the request's `max_tokens`**, so the answer still
-fits after the close; `--think-budget N` sets an absolute cap and
-`--think-budget 0` opts out. Requests can bound it too, symmetric with the
-enable conventions above and gated behind the same `--request-think`:
+**Reasoning budget (2026-07-30).** Tokens generated inside a prompt-seeded
+`<think>` block are capped; on trip the block is force-closed and the model
+answers with what it has. It is not a hard stop -- truncating the request
+instead would reproduce the failure the cap exists to prevent. The default is
+**half the request's `max_tokens`**, so the answer still fits after the close.
+Ordinary no-think requests remain unbounded and retain full sampled speculative
+decode width. `--think-budget N` with `N>0` explicitly arms that cap even for a
+later model-generated block; `--think-budget 0` opts out. Requests can likewise
+arm or override the budget, gated behind `--request-think`:
 `thinking.budget_tokens` (Anthropic), `thinking_token_budget` (OpenAI/Qwen), or
 `chat_template_kwargs.thinking_budget` (llama.cpp). A trip is reported as
-`usage.reasoning_tokens` and `usage.reasoning_budget_exceeded` -- a budget that
-fired silently would be no better than the inert `budget_tokens` this replaced.
+`usage.reasoning_tokens` and `usage.reasoning_budget_exceeded`.
 
 Why it defaults on: an 11-pack / 240-scenario A/B (BUILDLOG 2026-07-28, rescored
 07-30) found unbudgeted block mode truncating **28 times against inline's 0**
