@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
@@ -348,6 +349,8 @@ inline std::string tool_response_text(const std::string& out) {
 struct ThinkCfg {
     bool enabled = false;
     int budget = -1;  // -1 = unbounded; >=0 = max tokens inside the block
+    bool budget_set = false; // request supplied a budget, including negative opt-out
+    bool enabled_set = false; // request explicitly enabled/disabled thinking
 };
 
 inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool allow_request,
@@ -355,24 +358,41 @@ inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool al
     ThinkCfg c{server_default, server_budget};
     if (!allow_request) return c;
     auto take_budget = [&](const json& v) {
-        // 0 is a legitimate "no thinking budget at all"; negative means unbounded.
-        if (v.is_number_integer()) c.budget = v.get<int>();
+        // 0 is a legitimate "no thinking budget at all"; negative means
+        // unbounded. nlohmann classifies unsigned values as integer too, so
+        // validate the stored representation before narrowing to int.
+        if (!v.is_number_integer()) return;
+        if (v.is_number_unsigned()) {
+            const uint64_t value = v.get<uint64_t>();
+            if (value > (uint64_t)std::numeric_limits<int>::max()) return;
+            c.budget = (int)value;
+        } else {
+            const int64_t value = v.get<int64_t>();
+            if (value < (int64_t)std::numeric_limits<int>::min() ||
+                value > (int64_t)std::numeric_limits<int>::max()) return;
+            c.budget = (int)value;
+        }
+        c.budget_set = true;
     };
-    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
+    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean()) {
         c.enabled = body["enable_thinking"].get<bool>();
+        c.enabled_set = true;
+    }
     if (body.contains("thinking_token_budget")) take_budget(body["thinking_token_budget"]);
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
         const auto& k = body["chat_template_kwargs"];
-        if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean())
+        if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean()) {
             c.enabled = k["enable_thinking"].get<bool>();
+            c.enabled_set = true;
+        }
         if (k.contains("thinking_budget")) take_budget(k["thinking_budget"]);
     }
     if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto& t = body["thinking"];
         if (t.contains("type") && t["type"].is_string()) {
             const std::string ty = t["type"].get<std::string>();
-            if (ty == "enabled") c.enabled = true;
-            else if (ty == "disabled") c.enabled = false;
+            if (ty == "enabled") { c.enabled = true; c.enabled_set = true; }
+            else if (ty == "disabled") { c.enabled = false; c.enabled_set = true; }
         }
         if (t.contains("budget_tokens")) take_budget(t["budget_tokens"]);
     }
@@ -405,6 +425,123 @@ inline int think_budget_default(int flag, int n_max) {
     if (flag > 0) return flag;
     return n_max > 0 ? (int)(THINK_BUDGET_FRAC * n_max) : -1;
 }
+
+inline int think_budget_for_request(bool /*prompt_starts_in_think*/, const ThinkCfg& cfg,
+                                    int flag, int n_max) {
+    if (cfg.enabled_set && !cfg.enabled) return -1;
+    return cfg.budget_set ? cfg.budget : think_budget_default(flag, n_max);
+}
+
+struct ThinkDecodeLimits {
+    int n_max = 0;
+    int budget = -1;
+    bool context_ok = true;
+};
+
+inline ThinkDecodeLimits resolve_think_decode_limits(
+    int requested, int max_ctx, int prompt_tokens, int round_reserve,
+    int close_tokens, bool active, const ThinkCfg& cfg, int flag) {
+    const int raw_capacity = std::max(0, max_ctx - prompt_tokens - (round_reserve - 1));
+    const int raw_n_max = std::max(0, std::min(requested, raw_capacity));
+    const int raw_budget = think_budget_for_request(active, cfg, flag, raw_n_max);
+    if (raw_capacity == 0) return {0, raw_budget, false};
+
+    // Solve against the cap after reserving the close: fractional defaults
+    // shrink with n_max, and an absolute cap at/above n_max is inert. The
+    // candidate is valid only when the cap can fire before the public limit.
+    // A prompt already in THINK needs one remaining answer token; a prompt in
+    // TEXT also needs one public token for a model-generated <think> opener,
+    // which is a delimiter rather than budgeted reasoning content.
+    const int bounded_n_max = std::max(
+        0, std::min(requested, std::max(0, raw_capacity - close_tokens)));
+    const int bounded_budget =
+        think_budget_for_request(active, cfg, flag, bounded_n_max);
+    const int public_reserve = active ? 1 : 2;
+    if (bounded_budget >= 0 && bounded_budget <= bounded_n_max - public_reserve)
+        return {bounded_n_max, bounded_budget, true};
+
+    // If a prompt already in THINK would fire under the unreserved cap, the
+    // request cannot honor the close and still expose an answer token. A TEXT
+    // prompt is different: thinking is only a future model choice. When its
+    // public cap is too short for opener + budget + answer, preserve the
+    // ordinary request and disable enforcement instead of reporting a false
+    // context overflow; a spontaneous think then ends by the normal length cap.
+    if (raw_budget >= 0 && raw_budget < raw_n_max) {
+        if (!active) return {raw_n_max, -1, true};
+        return {0, raw_budget, false};
+    }
+
+    // Unbounded or unattainable caps require neither one-token acceptance nor
+    // close-token context. Report -1 to disable enforcement for this request.
+    return {raw_n_max, -1, true};
+}
+
+// Nearest admissible prompt below a rejected request. Admission can be
+// nonmonotonic near the boundary (an absolute cap can become inert), so a
+// larger admissible prompt is not a truthful compaction target for the current
+// rejection. Scan downward from the smaller of the ordinary ceiling and the
+// token count immediately below the rejected prompt.
+inline int max_prompt_for_think_decode(
+    int requested, int max_ctx, int round_reserve, int prompt_ceiling,
+    int rejected_prompt, int close_tokens, bool active, const ThinkCfg& cfg,
+    int flag) {
+    const int ceiling = std::max(0, std::min(prompt_ceiling, rejected_prompt - 1));
+    for (int prompt = ceiling; prompt >= 0; prompt--)
+        if (resolve_think_decode_limits(requested, max_ctx, prompt, round_reserve,
+                                        close_tokens, active, cfg, flag).context_ok)
+            return prompt;
+    return 0;
+}
+
+// Request-local controller for bounded <think> spans. The decoder task is the
+// owner of enforcement: parsing alone can hide </think> from the client but
+// cannot advance model state. The first forced close uses the context reserve
+// admitted above. A later exhausted span pays for its close by reducing the
+// remaining public token allowance, so repeated transitions cannot exceed the
+// admitted context.
+struct ThinkBudgetState {
+    int limit = -1;
+    int used = 0;
+    bool tripped = false;
+
+    explicit ThinkBudgetState(int cap = -1) : limit(cap) {}
+
+    template <typename Task>
+    void start(Task& task, const std::vector<int>& close_ids,
+               StreamSplitter::Chan initial = StreamSplitter::THINK) {
+        if (limit < 0) return;
+        task.accept_one = true;
+        if (limit == 0 && initial == StreamSplitter::THINK) trip(task, close_ids);
+    }
+
+    template <typename Task>
+    void observe(StreamSplitter::Chan before, StreamSplitter::Chan after, Task& task,
+                 const std::vector<int>& close_ids) {
+        if (!tripped && before == StreamSplitter::THINK) used++;
+        if (limit < 0) return;
+        if (after != StreamSplitter::THINK) {
+            if (task.sampling) task.accept_one = true;
+            else task.release_accept_one();
+            return;
+        }
+        if (before != StreamSplitter::THINK) {
+            task.accept_one = true;
+            if (used >= limit) {
+                if (tripped) task.force_from_public_budget(close_ids);
+                else trip(task, close_ids);
+            }
+            return;
+        }
+        if (!tripped && used >= limit) trip(task, close_ids);
+    }
+
+  private:
+    template <typename Task>
+    void trip(Task& task, const std::vector<int>& close_ids) {
+        tripped = true;
+        task.force(close_ids);
+    }
+};
 
 // Anthropic error envelope, exactly the real API's shape: the SDK inside
 // Claude Code reads error.message from it, and CC's compact-vs-retry
@@ -1512,6 +1649,21 @@ inline json openai_stream_chunk(const std::string& id, const std::string& obj, l
                    {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
     return {{"id", id}, {"object", obj}, {"created", created}, {"model", model},
             {"choices", json::array({choice})}};
+}
+
+// Responses streaming has distinct terminal lifecycle events. One object owns
+// every terminal field so the SSE event and nested response status cannot
+// diverge when output reaches its public limit.
+struct ResponsesTerminalState {
+    bool incomplete;
+    const char* status;
+    const char* event;
+};
+inline ResponsesTerminalState responses_terminal_state(
+    int produced, int limit, bool budget_truncated) {
+    const bool incomplete = produced >= limit || budget_truncated;
+    return {incomplete, incomplete ? "incomplete" : "completed",
+            incomplete ? "response.incomplete" : "response.completed"};
 }
 
 // One streamed tool_calls[] delta entry. Whole-shot (id+name+full arguments
