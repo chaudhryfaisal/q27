@@ -18,6 +18,7 @@
 #include "../src/conductor.h"
 
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 static int fails = 0;
@@ -149,6 +150,7 @@ int main() {
         int id = 0;
         int budget = 0;
         bool cancel = false;
+        bool forced = false;
         int want = 4;
         bool suffix = false;
         int granted = -1;
@@ -262,6 +264,40 @@ int main() {
             {1}, {1, 2, 3}, {1, 2, 3, 4}, {1, 4}, {1}, {1}};
         CHECK(round_ids == expect, "core: full round-membership trace matches");
     }
+    { // staged control ids must run through the solo decoder path: fused
+      // drafting would overwrite the forced pending token before commit.
+        q27::ConductorCore<FakeMember> core(12);
+        FakeMember A{}, B{};
+        A.id = 1; A.budget = 3;
+        B.id = 2; B.budget = 3; B.forced = true;
+        int solo_calls = 0, fused_calls = 0;
+        core.needs_solo_round = [](FakeMember& mm) { return mm.forced; };
+        core.solo_round = [&](FakeMember& mm) {
+            solo_calls++;
+            mm.rounds++;
+            mm.forced = false;
+            return false;
+        };
+        core.fused_round = [&](FakeMember** ms, const int*, const bool*, int k,
+                               bool* done) {
+            fused_calls++;
+            for (int i = 0; i < k; i++) {
+                ms[i]->rounds++;
+                done[i] = false;
+            }
+        };
+        core.on_leave = [](FakeMember&) {};
+        core.join(&A);
+        core.join(&B);
+        int live = core.round();
+        CHECK(live == 2 && solo_calls == 1 && fused_calls == 0 &&
+                  A.rounds == 0 && B.rounds == 1,
+              "core: forced member runs solo before any fused draft");
+        live = core.round();
+        CHECK(live == 2 && solo_calls == 1 && fused_calls == 1 &&
+                  A.rounds == 1 && B.rounds == 2,
+              "core: member rejoins fused rounds after forced transition");
+    }
     { // solo member cancelled at the boundary: no solo hook, done-path only
         q27::ConductorCore<FakeMember> core(12);
         FakeMember A{};
@@ -275,6 +311,27 @@ int main() {
         int live = core.round();
         CHECK(live == 0 && solo_calls == 0 && A.finished && left,
               "core: pre-check cancel beats the solo hook");
+    }
+    { // Producer-side provenance must remain attached to its token while the
+      // request thread drains concurrently; no shared DecodeTask flag is read.
+        q27::TokenQueue q;
+        std::thread producer([&]() {
+            for (int i = 0; i < 512; i++) q.push(i, (i % 7) == 0);
+            q.close("test complete");
+        });
+        std::vector<q27::TokenQueue::Token> chunk;
+        int next = 0;
+        bool ordered = true;
+        while (q.pop(chunk)) {
+            for (const auto& token : chunk) {
+                ordered = ordered && token.id == next && token.forced == ((next % 7) == 0);
+                next++;
+            }
+            chunk.clear();
+        }
+        producer.join();
+        CHECK(ordered && next == 512,
+              "queue: forced provenance stays ordered across threads");
     }
     printf(fails ? "test_conductor: %d FAILED\n" : "test_conductor: ALL PASS\n", fails);
     return fails ? 1 : 0;

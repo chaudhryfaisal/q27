@@ -181,7 +181,8 @@ struct Engine {
     int* d_mask_ids = nullptr;
     int* d_accept_cap = nullptr;
     int mask_words = 0, mask_pool_used = 0;
-    int h_mask_id0 = -1, h_cap0 = 0; // async-copy sources (must outlive copy)
+    int h_mask_id0 = -1, h_cap0 = 0; // tool-grammar cap (0 = none, 1 = one token)
+    int h_reason_cap = 0, h_accept_cap = 0; // reasoning cap + persistent async-copy source
     static constexpr int MASK_POOL_CAP = 512;
     // GDN state as W_MAX=12 physical buffers with a cyclic role permutation
     // (history: 6 at P12b, 8 at maxd7, 12 at width-12). role r (0=primary,
@@ -2680,6 +2681,20 @@ struct Engine {
     // (mask_id -1 = deactivate). Takes effect from the next spec round.
     // With on_drafts wired (P11) the round runs split and per-lane masks are
     // staged mid-round, so activate the split path instead of capping.
+    void upload_accept_cap() {
+        h_accept_cap = (h_cap0 > 0 || h_reason_cap > 0) ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_accept_cap, 4,
+                                   cudaMemcpyHostToDevice, stm));
+    }
+
+    void set_reasoning_accept_cap(bool active) {
+        const int next = active ? 1 : 0;
+        if (h_reason_cap == next) return;
+        h_reason_cap = next;
+        upload_accept_cap();
+    }
+
+
     void set_tool_constraint(int mask_id) {
         h_mask_id0 = mask_id;
         // P11 split path is OPT-IN (Q27_TOOL_SPLIT=1): it 4.2x's in-call decode
@@ -2701,7 +2716,7 @@ struct Engine {
         // cap only when constraining WITHOUT the split path (P7 v1 fallback)
         h_cap0 = (mask_id >= 0 && !tool_split_active) ? 1 : 0;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, &h_mask_id0, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+        upload_accept_cap();
     }
     // P11: stage all 5 lane mask ids at once (split path). cap stays 0.
     // W16: was a 12-entry {-1,...} brace list -- slots 12..15 would value-init
@@ -2714,7 +2729,7 @@ struct Engine {
         for (int i = 0; i < 5; i++) h_mask_ids5[i] = ids[i];
         h_cap0 = 0;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, 5 * 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+        upload_accept_cap();
     }
     // Full constraint reset: every lane mask id back to -1 + cap 0 (covers
     // stale split-path lanes that set_tool_constraint(-1) alone would miss).
@@ -2725,7 +2740,7 @@ struct Engine {
         for (int i = 0; i < W_PLUMB; i++) h_mask_ids5[i] = -1;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, W_MAX * 4, cudaMemcpyHostToDevice,
                                    stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+        upload_accept_cap();
     }
     // P15 engage-lag fix: rewind the JUST-FINISHED greedy spec round from n
     // accepted tokens to m (1 <= m <= n) and re-decide the pending token under
@@ -3335,6 +3350,10 @@ struct Engine {
         // copies would alias anyway); conductor mode (Task 10) installs an
         // owning sink instead.
         std::function<bool(int)> on_token;
+        // Request-local semantic boundary limiter. Preview is side-effect free;
+        // commit advances only through the prefix retained after Engine::on_round.
+        std::function<int(const int*, int)> preview_round;
+        std::function<void(const int*, int)> commit_round;
         int emitted = 0; // tokens delivered to on_token so far (return value)
         int rounds = 0;  // decode rounds run -> gs.rounds at finish
         int Ph = 0;      // host mirror of the last written position (ctx guard)
@@ -3362,7 +3381,70 @@ struct Engine {
         // writes them, and the request thread reads them after the queue
         // closes (the close is the synchronization edge).
         long bat_members = 0, bat_r2 = 0;
+        // A bounded reasoning span must be observed one token at a time so the
+        // host can stop exactly at its cap. The same cap also makes injected
+        // close ids one committed token per round; unlike parser-only text,
+        // forced ids are written to d_token and therefore advance model state.
+        bool accept_one = false;
+        bool public_budget_reduced = false;
+        bool budget_cancelled = false;
+        bool budget_truncated = false; // final stop actually came from either condition
+        bool round_forced = false;
+        bool callback_forced = false; // true only while on_token receives an injected id
+        int forced_id = -1;
+        std::vector<int> forced_tokens;
+        size_t forced_pos = 0;
+        void force(const std::vector<int>& ids) {
+            forced_tokens.insert(forced_tokens.end(), ids.begin(), ids.end());
+            accept_one = true;
+        }
+        // The first injected close is covered by admission's dedicated context
+        // reserve. Later closes borrow from the still-unemitted public budget;
+        // the current model token has not incremented `emitted` yet, hence the
+        // strict `>` requirement. If it cannot fit, stop before adding control
+        // tokens that would exceed the admitted context.
+        bool force_from_public_budget(const std::vector<int>& ids) {
+            const int cost = (int)ids.size();
+            public_budget_reduced = true;
+            if (n_max - emitted <= cost) {
+                budget_cancelled = true;
+                cancel.store(true);
+                return false;
+            }
+            n_max -= cost;
+            force(ids);
+            return true;
+        }
+        bool has_forced() const { return forced_pos < forced_tokens.size(); }
+        void release_accept_one() {
+            if (!has_forced()) accept_one = false;
+        }
     };
+
+    // Install a forced id as the pending token the next decoder round consumes.
+    // DecodeTask owns the host source, and the sync is intentional: forced
+    // transitions are rare, while letting the next boundary overwrite
+    // forced_id before a deferred pageable H2D read would corrupt d_token.
+    void install_forced_pending(DecodeTask& t) {
+        CUDA_CHECK(cudaMemcpyAsync(d_token, &t.forced_id, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_gen + t.Ph, &t.forced_id, 4,
+                                   cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        last_pending = t.forced_id;
+    }
+
+    // Replace the model-predicted pending token at a coherent round boundary.
+    // Plain sampling is different: d_token is the previously emitted token
+    // that still must be forwarded, so its forced id is installed only after
+    // sample_round commits that token below.
+    void stage_forced_pending(DecodeTask& t) {
+        t.forced_id = t.forced_tokens[t.forced_pos++];
+        if (!(t.sampling && t.force_plain_sample)) {
+            install_forced_pending(t);
+            if (t.sampling) samp_first = false; // zero-budget sampled spec starts from close
+        }
+        t.round_forced = true;
+    }
 
     // R1b preemption point (no-op when the hook is unset or nobody waits).
     // Shared by the prefill chunk loops and decode_step; park time goes to
@@ -3442,6 +3524,8 @@ struct Engine {
     // pre_round/post_round/decode_step is followed by a non-throwing
     // return, so a throwing round cannot have already finished).
     void finish_decode(DecodeTask& t, const char* why) {
+        t.budget_truncated = t.budget_cancelled ||
+                             (t.public_budget_reduced && !strcmp(why, "n_max"));
         if (t.prof_decode) {
             CUDA_CHECK(cudaStreamSynchronize(stm));
             (void)cudaProfilerStop();
@@ -3450,6 +3534,7 @@ struct Engine {
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t.g0).count();
         gs.dec = t.emitted;
         gs.dec_ms = dt * 1000.0;
+        set_reasoning_accept_cap(false);
         gs.rounds = t.rounds;
         gs.end = why;
         // wall-inclusive of yield parks; the suffix keeps a contended
@@ -3487,7 +3572,10 @@ struct Engine {
             finish_decode(t, "cancelled");
             return false;
         }
-        if (t.emitted >= t.n_max) {
+        // Forced control ids are internal decoder transitions, not generated
+        // output. Let an already-queued close finish even when the last model
+        // token consumed n_max; the following round then takes this exit.
+        if (!t.round_forced && !t.has_forced() && t.emitted >= t.n_max) {
             finish_decode(t, "n_max");
             return false;
         }
@@ -3500,11 +3588,14 @@ struct Engine {
             finish_decode(t, "ctx-guard");
             return false;
         }
+        set_reasoning_accept_cap(t.accept_one);
+        // ConductorCore pre-checks every member, then its solo fallback calls
+        // decode_step(), which pre-checks again. Preserve an id staged by the
+        // first call; resetting round_forced here silently discards the
+        // decoder-state transition before the solo round can consume it.
+        if (!t.round_forced && t.has_forced()) stage_forced_pending(t);
         return true;
     }
-
-    // Post-round host bookkeeping (the tail of generate()'s old loop body):
-    // P15 grammar scan/truncate, suffix-index append, Ph advance, per-token
     // emission (EOS / client-stop / budget), on_pending, round_gap. Returns
     // false when generation is done, after running finish_decode(). Factored
     // out of decode_step (P1 Task 9): the conductor's fused round loop runs
@@ -3512,28 +3603,45 @@ struct Engine {
     // stop reasons and GenStats land exactly as the solo loop produces them.
     bool post_round(DecodeTask& t, const int* em, int n) {
         t.rounds++;
-        // P15 engage-lag fix: let the host grammar scan the whole round
-        // pre-emission; on a mid-round <tool_call> completion, truncate to
-        // the marker token and re-decide the pending under the staged mask.
-        if (!t.sampling && on_round) {
-            int m = on_round(em, n);
-            if (m >= 1 && m <= n) {
-                last_pending = refinish_round(m, n, t.Ph + m);
-                n = m;
+        // Compute the semantic prefix first without mutating its parser. The
+        // tool scanner then sees only that prefix, so markers discarded by a
+        // reasoning boundary cannot engage grammar state. Refinish once at the
+        // earliest retained boundary, then commit the semantic parser through
+        // exactly the tokens that survived both scanners.
+        int committed = n;
+        bool refinish = false;
+        if (!t.sampling && t.preview_round) {
+            int m = t.preview_round(em, committed);
+            if (m >= 1 && m <= committed) {
+                committed = m;
+                refinish = true;
             }
         }
+        if (!t.sampling && on_round) {
+            int m = on_round(em, committed);
+            if (m >= 1 && m <= committed) {
+                committed = m;
+                refinish = true;
+            }
+        }
+        if (refinish)
+            last_pending = refinish_round(committed, n, t.Ph + committed);
+        if (!t.sampling && t.commit_round) t.commit_round(em, committed);
+        n = committed;
         // suffix index tracks the committed stream (post-truncation n);
         // the pending token rides along virtually in propose_with.
         if (suffix_on)
             for (int k = 0; k < n; k++) sfx.append(em[k]);
         t.Ph += n;
-        for (int k = 0; k < n && t.emitted < t.n_max; k++) {
+        for (int k = 0; k < n && (t.round_forced || t.emitted < t.n_max); k++) {
             if (em[k] == t.eos) {
                 finish_decode(t, "eos");
                 return false;
             }
             auto c0 = std::chrono::steady_clock::now();
+            t.callback_forced = t.round_forced;
             bool cont = t.on_token(em[k]);
+            t.callback_forced = false;
             gs.cb_ms += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - c0)
                             .count();
@@ -3541,8 +3649,9 @@ struct Engine {
                 finish_decode(t, "client-stop");
                 return false;
             }
-            t.emitted++;
+            if (!t.round_forced) t.emitted++;
         }
+        t.round_forced = false;
         if (!t.sampling && on_pending) on_pending(last_pending);
         round_gap();
         return true;
@@ -3560,9 +3669,19 @@ struct Engine {
     bool decode_step(DecodeTask& t) {
         if (!pre_round(t)) return false;
         int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
-        int n = t.sampling
-                    ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
-                    : spec_round(em);
+        int n;
+        if (t.round_forced && t.sampling && t.force_plain_sample) {
+            // First forward the last emitted reasoning token and sample its
+            // successor. The successor is deliberately discarded: install
+            // the forced close as the new pending token, so the following
+            // round forwards the close and samples the first answer token.
+            n = sample_round(em);
+            install_forced_pending(t);
+            em[0] = t.forced_id;
+        } else {
+            n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
+                           : spec_round(em);
+        }
         return post_round(t, em, n);
     }
 
@@ -3837,14 +3956,15 @@ struct Engine {
     // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
     template <typename F>
     int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
-                 int stable_len = -1) {
+                 int stable_len = -1, DecodeTask* external_task = nullptr) {
         int P = 0;
         if (!generate_prefill(prompt, stable_len, &P)) return 0;
         // Decode: pre-loop state lives in DecodeTask, one round per
         // decode_step (P1: the conductor drives the same step function for
         // several engines). finish_decode() runs inside the step that
         // returns false, so every exit path lands its GenStats/[gen-done].
-        DecodeTask t;
+        DecodeTask local_task;
+        DecodeTask& t = external_task ? *external_task : local_task;
         make_decode_task(t, n_max, eos, on_token, P);
         while (decode_step(t)) {}
         return t.emitted;
