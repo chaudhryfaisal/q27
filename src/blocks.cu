@@ -401,8 +401,18 @@ void add_inplace(float* x, const float* y, int n, cudaStream_t st) {
 // Multi-block argmax: pack (orderable float bits, index) into u64, atomicMax.
 __device__ __forceinline__ unsigned long long am_pack(float v, int idx) {
     unsigned u = __float_as_uint(v);
+    // IEEE equality treats both zero signs as one value. Canonicalize their
+    // bit patterns before the order transform so the index tie-break decides.
+    if ((u & 0x7fffffffu) == 0) u = 0;
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u); // monotonic float->uint map
-    return ((unsigned long long)u << 32) | (unsigned)idx;
+    // Invert the index bits so max reductions resolve exact value ties to the
+    // lowest index, matching the CPU and Metal implementations. Per-thread
+    // strided scans already preserve their lowest index by using strict >.
+    return ((unsigned long long)u << 32) | (unsigned)~idx;
+}
+
+__device__ __forceinline__ int am_unpack_idx(unsigned long long p) {
+    return (int)~(unsigned)(p & 0xffffffffull);
 }
 
 // Exact inverse of am_pack's monotonic map (recovers the packed float value).
@@ -434,7 +444,7 @@ __global__ void k_argmax(const float* __restrict__ x, int n,
 }
 
 __global__ void k_argmax_extract(const unsigned long long* best, int* out) {
-    *out = (int)(unsigned)(*best & 0xffffffffull);
+    *out = am_unpack_idx(*best);
 }
 
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
@@ -506,7 +516,7 @@ __global__ void k_top2_finalize(const unsigned long long* __restrict__ blk1,
         __syncthreads();
     }
     if (t == 0) {
-        tok[0] = (int)(unsigned)(s1[0] & 0xffffffffull);
+        tok[0] = am_unpack_idx(s1[0]);
         margin_out[0] = am_unpack_val(s1[0]) - s2[0];
     }
 }
