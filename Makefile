@@ -183,7 +183,7 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
                  src/metal/metal_backend.mm src/metal/metal_engine.h \
                  src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp \
-                 src/tokenizer.h src/sampling.h src/suffixdraft.h | build
+                 src/tokenizer.h src/sampling.h src/suffixdraft.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
 	       src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	       $(METALLIBS) -o $@
