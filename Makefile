@@ -7,7 +7,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts
+.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -179,6 +179,27 @@ test-metal-contracts: build/test_metal_engine_contracts
 
 metal-engine: build/metal-engine.o
 
+build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
+                 src/metal/metal_backend.mm src/metal/metal_engine.h \
+                 src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                 src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp \
+                 src/tokenizer.h src/sampling.h src/suffixdraft.h | build
+	$(CXX) $(METALFLAGS) src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
+	       src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
+	       $(METALLIBS) -o $@
+
+test-metal: test-metal-backend build/q27-metal
+	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
+	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
+	./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --validate-only
+	./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --tokens 760,6511,314,9338,369 \
+	       -n 2 --ctx 16 --mtp 4 --dump-token-ids build/metal-smoke.ids
+
+test-metal-canonical: build/q27-metal
+	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
+	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
+	tools/metal_canonical_gate.sh "$(MODEL)" "$(TOKENIZER)"
+
 test-metal-backend: build/test-metal-backend build/test-metal-ops
 	./build/test-metal-backend
 	./build/test-metal-ops
@@ -189,4 +210,10 @@ metal-engine:
 	@echo "metal-engine requires macOS" >&2; exit 1
 test-metal-contracts:
 	@echo "test-metal-contracts requires macOS" >&2; exit 1
+
+test-metal:
+	@echo "test-metal requires macOS" >&2; exit 1
+
+test-metal-canonical:
+	@echo "test-metal-canonical requires macOS" >&2; exit 1
 endif
