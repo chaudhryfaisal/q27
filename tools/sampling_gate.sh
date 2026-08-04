@@ -14,9 +14,34 @@ BIN="$(dirname "$0")/../build/q27"
 #   q5f: 683f7f4450ca4c60837abdb603ee3237  (Q4-head + ffn_down, 5.30bpw)
 #   q6f: 2a4d22eafcde63e962bf2408605fe502  (Q4-head + ffn_down + ffn_gate, 6.11bpw)
 #   Qwopus: 4c4120c7...
-CANON_MD5="${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}"
+#
+# THE CANONICAL IS PER-ARCHITECTURE. sm_86 codegen/ULP differences fork the
+# tie-heavy trajectory exactly like a cross-build lottery, so the bitwise
+# contract holds WITHIN an arch, not across them (BUILDLOG 2026-07-09):
+#   sm_120 (5090):  a2982c5197c627551b27d76a0a94b220   <- the default below
+#   sm_86  (3090, A40, and other GA10x): 6894254e3b1a184ee3802771ddd59c2b
+#     ^ PREFIX is ours (BUILDLOG 07-09); the FULL value is as REPORTED by an
+#       A40 run in issue #7 and has not been re-derived on our own 3090. The
+#       32-bit prefix agreement is strong but is not a local verification --
+#       re-run here with CANON_ARCH=sm86 on GPU 1 to make it authoritative.
+# A non-Blackwell run that reports 6894254e has REPRODUCED its own canonical,
+# it has not failed to reproduce this one. tools/shortbench_suite.sh learned
+# this in 07-09 and grew BENCH_GPU=; this gate did not, and in 2026-08-04 that
+# omission cost an outside contributor on an A40 a full gate run (q27 issue #7)
+# because the comment above listed tier overrides and said nothing about arch.
+# CANON_ARCH=sm86 selects the Ampere value; CANON_MD5= still overrides outright.
+#
+# CONTRIBUTORS ON OTHER SILICON: if no canonical is published for your arch, the
+# correct gate is the SAME-DEVICE differential -- build unmodified upstream and
+# your candidate on the one box and require byte-identical `generated:` lines.
+# That is what per-arch means; it is not a weaker substitute.
+case "${CANON_ARCH:-}" in
+  sm86|ampere|3090|a40) CANON_DEFAULT=6894254e3b1a184ee3802771ddd59c2b ;;
+  *)                    CANON_DEFAULT=a2982c5197c627551b27d76a0a94b220 ;;
+esac
+CANON_MD5="${CANON_MD5:-$CANON_DEFAULT}"
 CANON_IDS="760,6511,314,9338,369"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 fail=0
 
