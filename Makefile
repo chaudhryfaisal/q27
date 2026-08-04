@@ -7,7 +7,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend
+.PHONY: all clean test-inspect test-metal-backend metal-engine
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -158,10 +158,19 @@ build/test-metal-ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
 	$(CXX) $(METALFLAGS) src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
 	       src/loader.cpp $(METALLIBS) -o $@
 
+build/metal-engine.o: src/metal/metal_engine.cpp src/metal/metal_engine.h \
+                      src/metal/metal_backend.h src/backend.h src/loader.h \
+                      src/sampling.h src/suffixdraft.h | build
+	$(CXX) $(METALFLAGS) -c src/metal/metal_engine.cpp -o $@
+
+metal-engine: build/metal-engine.o
+
 test-metal-backend: build/test-metal-backend build/test-metal-ops
 	./build/test-metal-backend
 	./build/test-metal-ops
 else
 test-metal-backend:
 	@echo "test-metal-backend requires macOS" >&2; exit 1
+metal-engine:
+	@echo "metal-engine requires macOS" >&2; exit 1
 endif

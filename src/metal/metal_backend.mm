@@ -666,7 +666,7 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
         return offset;
     };
 
-    if (mapped_size <= (uint64_t)impl_->device.maxBufferLength) {
+    if (!uses_per_tensor_upload(model)) {
         BackendTensor result;
         result.dtype = tensor.dtype;
         result.rows = tensor.rows();
@@ -1835,6 +1835,17 @@ uint64_t MetalBackend::recommended_working_set_size() const {
 
 uint64_t MetalBackend::max_buffer_length() const {
     return (uint64_t)impl_->device.maxBufferLength;
+}
+
+bool MetalBackend::uses_per_tensor_upload(const Model& model) const {
+    if (!model.mapping_base() || !model.mapping_size())
+        throw std::runtime_error("q27 Metal: invalid model view");
+    const uint64_t page_size = (uint64_t)getpagesize();
+    const uint64_t logical_size = model.mapping_size();
+    if (logical_size > UINT64_MAX - (page_size - 1))
+        throw std::runtime_error("q27 Metal: model mapping size overflow");
+    const uint64_t mapped_size = (logical_size + page_size - 1) / page_size * page_size;
+    return mapped_size > max_buffer_length();
 }
 
 bool MetalBackend::supports_quantized_matmul() const {
