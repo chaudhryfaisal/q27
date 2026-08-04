@@ -97,6 +97,7 @@ class MetalEngine {
     uint32_t max_context_;
     bool turbo3_kv_;
     uint32_t position_ = 0;
+    bool logits_resident_ = false;
     SpecStats last_spec_stats_;
     std::unordered_map<std::string, BackendTensor> weights_;
     std::vector<LayerState> layers_;

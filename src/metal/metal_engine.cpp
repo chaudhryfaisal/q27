@@ -13,9 +13,6 @@
 namespace q27 {
 namespace {
 
-bool is_matrix_dtype(DType dtype) {
-    return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
-}
 
 class CommandBatch {
   public:
@@ -44,6 +41,7 @@ struct MetalEngine::Snapshot {
     };
     const MetalEngine* owner = nullptr;
     uint32_t position = 0;
+    bool logits_resident = false;
     std::vector<StoredLayer> layers;
     std::shared_ptr<BackendBuffer> mtp_k_cache, mtp_v_cache, hidden, logits;
 };
@@ -116,9 +114,9 @@ void MetalEngine::validate_architecture() const {
         if (!tensor || tensor->dtype != dtype || tensor->shape != std::vector<uint64_t>(shape))
             throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
     };
-    auto matrix = [&](const std::string& name, uint64_t rows, uint64_t cols) {
+    auto matrix = [&](const std::string& name, DType dtype, uint64_t rows, uint64_t cols) {
         const Tensor* tensor = model_.find(name);
-        if (!tensor || !is_matrix_dtype(tensor->dtype) || tensor->shape != std::vector<uint64_t>{rows, cols})
+        if (!tensor || tensor->dtype != dtype || tensor->shape != std::vector<uint64_t>{rows, cols})
             throw std::runtime_error("q27 Metal: required matrix mismatch: " + name);
     };
 
@@ -131,44 +129,44 @@ void MetalEngine::validate_architecture() const {
         const std::string p = "blk." + std::to_string(layer) + ".";
         require(p + "attn_norm.weight", DType::F32, {N_EMBD});
         require(p + "post_attention_norm.weight", DType::F32, {N_EMBD});
-        matrix(p + "ffn_gate.weight", N_FFN, N_EMBD);
-        matrix(p + "ffn_up.weight", N_FFN, N_EMBD);
-        matrix(p + "ffn_down.weight", N_EMBD, N_FFN);
+        matrix(p + "ffn_gate.weight", DType::Q4_G64, N_FFN, N_EMBD);
+        matrix(p + "ffn_up.weight", DType::Q4_G64, N_FFN, N_EMBD);
+        matrix(p + "ffn_down.weight", DType::Q4_G64, N_EMBD, N_FFN);
         if (attention_layer(layer)) {
-            matrix(p + "attn_q.weight", 2 * N_HEAD * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_k.weight", N_KV * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_v.weight", N_KV * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_output.weight", N_EMBD, N_HEAD * HEAD_DIM);
+            matrix(p + "attn_q.weight", DType::Q4_G64, 2 * N_HEAD * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_k.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_v.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_output.weight", DType::Q4_G64, N_EMBD, N_HEAD * HEAD_DIM);
             require(p + "attn_q_norm.weight", DType::F32, {HEAD_DIM});
             require(p + "attn_k_norm.weight", DType::F32, {HEAD_DIM});
         } else {
-            matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
-            matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
+            matrix(p + "attn_qkv.weight", DType::Q4_G64, GDN_CH, N_EMBD);
+            matrix(p + "attn_gate.weight", DType::Q4_G64, GDN_V, N_EMBD);
             require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
             require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
             require(p + "ssm_a", DType::F32, {GDN_HEADS});
             require(p + "ssm_dt.bias", DType::F32, {GDN_HEADS});
             require(p + "ssm_conv1d.weight", DType::F32, {GDN_CH, 4});
             require(p + "ssm_norm.weight", DType::F32, {GDN_DIM});
-            matrix(p + "ssm_out.weight", N_EMBD, GDN_V);
+            matrix(p + "ssm_out.weight", DType::Q4_G64, N_EMBD, GDN_V);
         }
     }
     const std::string p = "blk.64.";
     require(p + "nextn.enorm.weight", DType::F32, {N_EMBD});
     require(p + "nextn.hnorm.weight", DType::F32, {N_EMBD});
     require(p + "nextn.shared_head_norm.weight", DType::F32, {N_EMBD});
-    matrix(p + "nextn.eh_proj.weight", N_EMBD, 2 * N_EMBD);
+    matrix(p + "nextn.eh_proj.weight", DType::Q8_G128, N_EMBD, 2 * N_EMBD);
     require(p + "attn_norm.weight", DType::F32, {N_EMBD});
     require(p + "post_attention_norm.weight", DType::F32, {N_EMBD});
     require(p + "attn_q_norm.weight", DType::F32, {HEAD_DIM});
     require(p + "attn_k_norm.weight", DType::F32, {HEAD_DIM});
-    matrix(p + "attn_q.weight", 2 * N_HEAD * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_k.weight", N_KV * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_v.weight", N_KV * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_output.weight", N_EMBD, N_HEAD * HEAD_DIM);
-    matrix(p + "ffn_gate.weight", N_FFN, N_EMBD);
-    matrix(p + "ffn_up.weight", N_FFN, N_EMBD);
-    matrix(p + "ffn_down.weight", N_EMBD, N_FFN);
+    matrix(p + "attn_q.weight", DType::Q8_G128, 2 * N_HEAD * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_k.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_v.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_output.weight", DType::Q8_G128, N_EMBD, N_HEAD * HEAD_DIM);
+    matrix(p + "ffn_gate.weight", DType::Q8_G128, N_FFN, N_EMBD);
+    matrix(p + "ffn_up.weight", DType::Q8_G128, N_FFN, N_EMBD);
+    matrix(p + "ffn_down.weight", DType::Q8_G128, N_EMBD, N_FFN);
 }
 
 MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool turbo3_kv)
@@ -284,6 +282,7 @@ void MetalEngine::set_chunked_prefill(bool enabled) {
 
 void MetalEngine::reset() {
     position_ = 0;
+    logits_resident_ = false;
     for (LayerState& layer : layers_) {
         if (layer.recurrent) backend_.zero(*layer.recurrent);
         if (layer.ring) backend_.zero(*layer.ring);
@@ -296,6 +295,7 @@ std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
     backend_.synchronize();
     auto snapshot = std::make_shared<Snapshot>();
     snapshot->owner = this; snapshot->position = position_; snapshot->layers.resize(N_LAYER);
+    snapshot->logits_resident = logits_resident_;
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
@@ -336,6 +336,7 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     if(snapshot.logits) backend_.copy(*snapshot.logits,0,*logits_,0,logits_->size());
     batch.finish();
     position_=snapshot.position;
+    logits_resident_=snapshot.logits_resident;
 }
 
 // Serial-decode projection dispatch: T2 weights route to the float-activation
@@ -569,9 +570,11 @@ void MetalEngine::gdn_replay(uint32_t count) {
 uint32_t MetalEngine::step(uint32_t token) {
     if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
     if (position_ >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
+    logits_resident_ = false;
     CommandBatch batch(backend_);
     encode_token(token, true);
     batch.finish();
+    logits_resident_ = true;
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -604,6 +607,7 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         throw std::runtime_error("q27 Metal: prompt exceeds context");
     for (uint32_t token : prompt)
         if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    logits_resident_ = false;
     // Layer-major chunked ingestion. MTP warming needs each token's final
     // normalized hidden state, which the chunked path does not produce, so
     // MTP prompts stay on the token-serial path. The final prompt token is
@@ -634,6 +638,7 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         }
         batch.finish();
     }
+    logits_resident_ = true;
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -644,6 +649,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     if (!has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (position >= max_context_) throw std::runtime_error("q27 Metal: MTP context exhausted");
+    if (!logits_resident_)
+        throw std::runtime_error("q27 Metal: MTP pending token is stale for the current state");
     if (token >= VOCAB) throw std::runtime_error("q27 Metal: MTP token out of range");
     constexpr uint32_t layer = 64;
     CommandBatch batch(backend_);
@@ -788,6 +795,10 @@ uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint3
         if (encoded) {
             CommandBatch batch(backend_);
             gdn_replay(encoded);
+            // A fully accepted draft window advances beyond the final row
+            // written by mtp_forward; warm that consumed lane before the next round.
+            if (encoded == live)
+                mtp_warm(*hidden, lanes[encoded - 1], position_ + encoded - 1);
             backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
                           *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
             backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
@@ -817,6 +828,8 @@ uint32_t MetalEngine::ingest_prompt(const std::vector<uint32_t>& tokens, bool wa
 }
 
 std::vector<float> MetalEngine::read_logits() {
+    if (!logits_resident_)
+        throw std::runtime_error("q27 Metal: logits are not resident for the current state");
     std::vector<float> result(VOCAB);
     backend_.synchronize();
     backend_.read(*logits_,0,result.data(),result.size()*sizeof(float));
@@ -887,6 +900,7 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
             CommandBatch batch(backend_);
             encode_token(tokens[done], true);
             batch.finish();
+            logits_resident_ = true;
         }
         std::vector<float> logits = read_logits();
         result.push_back(nll_cpu(logits.data(), tokens[done + 1], VOCAB));
@@ -944,6 +958,8 @@ uint32_t MetalEngine::stream_from_pending(uint32_t pending, uint32_t count, uint
                                           StopCause& cause) {
     last_spec_stats_={};
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (count && !logits_resident_)
+        throw std::runtime_error("q27 Metal: pending token is stale for the current state");
     if (mtp_width && !has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
@@ -971,6 +987,8 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
                                                           uint32_t mtp_width) {
     last_spec_stats_={};
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (count && !logits_resident_)
+        throw std::runtime_error("q27 Metal: pending token is stale for the current state");
     if (mtp_width && !has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
