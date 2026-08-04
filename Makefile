@@ -7,7 +7,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect
+.PHONY: all clean test-inspect test-metal-backend
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -138,3 +138,30 @@ build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+
+# Native Metal backend primitives. Kept separate from the engine/CLI targets so
+# this dependency cut stays buildable and testable on its own.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+METALFLAGS := $(CXXFLAGS) -Werror -fobjc-arc -pthread -I src/metal
+METALLIBS := -framework Foundation -framework Metal
+
+build/test-metal-backend: src/metal/test_metal.cpp src/metal/metal_backend.mm \
+                          src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                          src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(METALFLAGS) src/metal/test_metal.cpp src/metal/metal_backend.mm \
+	       src/loader.cpp $(METALLIBS) -o $@
+
+build/test-metal-ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
+                      src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                      src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(METALFLAGS) src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
+	       src/loader.cpp $(METALLIBS) -o $@
+
+test-metal-backend: build/test-metal-backend build/test-metal-ops
+	./build/test-metal-backend
+	./build/test-metal-ops
+else
+test-metal-backend:
+	@echo "test-metal-backend requires macOS" >&2; exit 1
+endif
