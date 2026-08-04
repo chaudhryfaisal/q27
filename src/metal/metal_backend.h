@@ -24,6 +24,7 @@ class MetalBackend final : public ComputeBackend {
     void copy(const BackendBuffer& src, uint64_t src_offset,
               BackendBuffer& dst, uint64_t dst_offset, uint64_t bytes) override;
     BackendTensor upload(const Tensor& tensor) override;
+    // Aliases model's mapped bytes; model must outlive the returned tensor.
     BackendTensor upload(const Model& model, const Tensor& tensor) override;
     void begin_commands() override;
     void end_commands() override;

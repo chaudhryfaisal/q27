@@ -1,6 +1,7 @@
 #include "metal_backend.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -73,6 +74,14 @@ int test_mmap_upload(q27::MetalBackend& backend) {
                 backend.copy(*device_x, 0, *weight.data, weight.data_offset, sizeof(replacement));
             }))
             return 1;
+        // The shared mmap buffer extends beyond this tensor. Inflating the
+        // matrix shape must still fail at the tensor's logical boundary.
+        weight.rows = 4;
+        auto oversized_y = backend.allocate(4 * sizeof(float));
+        bool rejected = false;
+        try { backend.matvec(weight, *device_x, *oversized_y); }
+        catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected) { fprintf(stderr, "mmap tensor overread was not rejected\n"); return 1; }
         return 0;
     } catch (...) {
         unlink(path);
@@ -106,6 +115,45 @@ int test_dispatch_validation(q27::MetalBackend& backend) {
     auto bad_weight=backend.upload(bad_group); auto bad_x=backend.allocate(32*4),bad_y=backend.allocate(4);
     rejected=false; try { backend.matvec(bad_weight,*bad_x,*bad_y); } catch(const std::runtime_error&) { rejected=true; }
     if(!rejected) { fprintf(stderr,"invalid quantization group was not rejected\n"); return 1; }
+
+    auto concat_a=backend.allocate(4),concat_b=backend.allocate(4),concat_out=backend.allocate(4);
+    rejected=false;
+    try { backend.concat(*concat_a,UINT32_MAX,*concat_b,1,*concat_out); }
+    catch(const std::runtime_error&) { rejected=true; }
+    if(!rejected) { fprintf(stderr,"concat element overflow was not rejected\n"); return 1; }
+
+    auto tiny=backend.allocate(4);
+    q27::BackendTensor huge;
+    huge.dtype=q27::DType::F16; huge.data=tiny;
+    huge.rows=UINT32_MAX; huge.cols=UINT32_MAX;
+    rejected=false;
+    try { backend.matvec(huge,*tiny,*tiny); }
+    catch(const std::runtime_error& error) {
+        rejected=std::string(error.what()).find("size overflow")!=std::string::npos;
+    }
+    if(!rejected) { fprintf(stderr,"matvec size overflow was not rejected\n"); return 1; }
+    rejected=false;
+    try { backend.matvec_pair(huge,*tiny,huge,*tiny,*tiny); }
+    catch(const std::runtime_error& error) {
+        rejected=std::string(error.what()).find("size overflow")!=std::string::npos;
+    }
+    if(!rejected) { fprintf(stderr,"fused matvec size overflow was not rejected\n"); return 1; }
+    rejected=false;
+    try { backend.matvec_f16_pair_rows(huge,*tiny,huge,*tiny,*tiny,1); }
+    catch(const std::runtime_error& error) {
+        rejected=std::string(error.what()).find("size overflow")!=std::string::npos;
+    }
+    if(!rejected) { fprintf(stderr,"chunked matvec size overflow was not rejected\n"); return 1; }
+
+    const uint32_t batch_write=0x12345678;
+    rejected=false;
+    backend.begin_commands();
+    try { backend.write(*tiny,0,&batch_write,sizeof(batch_write)); }
+    catch(const std::runtime_error& error) {
+        rejected=std::string(error.what()).find("cannot CPU-write during command batch")!=std::string::npos;
+    }
+    backend.abort_commands();
+    if(!rejected) { fprintf(stderr,"CPU write during command batch was not rejected\n"); return 1; }
 
     // Aborting a failed explicit batch must leave the backend reusable.
     std::vector<float> x={1,2,3,4}; auto xb=backend.allocate(16),yb=backend.allocate(16);
@@ -647,6 +695,46 @@ int test_mixed_pair(q27::MetalBackend& backend) {
     return 0;
 }
 
+int test_profiled_batch_atomicity() {
+    if(setenv("Q27_METAL_PROFILE","1",1)!=0) return 1;
+    int failure=0;
+    try {
+        q27::MetalBackend backend;
+        auto src=backend.allocate(4),dst=backend.allocate(4);
+        bool nested_rejected=false;
+        backend.begin_commands();
+        try { backend.begin_commands(); }
+        catch(const std::runtime_error& error) {
+            nested_rejected=std::string(error.what()).find("command batch already active")!=std::string::npos;
+        }
+        backend.abort_commands();
+        if(!nested_rejected) { fprintf(stderr,"profiled nested batch was not rejected\n"); failure=1; }
+        const uint32_t value=0x12345678; uint32_t got=0;
+        backend.write(*src,0,&value,sizeof(value)); backend.write(*dst,0,&got,sizeof(got));
+        bool rejected=false;
+        backend.begin_commands();
+        try {
+            for(uint32_t i=0;i<4096;i++) backend.copy(*src,0,*dst,0,sizeof(value));
+        } catch(const std::runtime_error& error) {
+            rejected=std::string(error.what()).find("profiled command batch exceeds operation limit")!=std::string::npos;
+        }
+        backend.abort_commands();
+        if(!rejected) {
+            fprintf(stderr,"profiled oversized batch was not rejected\n"); failure=1;
+        } else {
+            backend.read(*dst,0,&got,sizeof(got));
+            if(got!=0) { fprintf(stderr,"rejected profiled batch committed partial work\n"); failure=1; }
+            backend.copy(*src,0,*dst,0,sizeof(value)); backend.read(*dst,0,&got,sizeof(got));
+            if(got!=value) { fprintf(stderr,"backend was not reusable after profiled batch rejection\n"); failure=1; }
+        }
+    } catch(...) {
+        unsetenv("Q27_METAL_PROFILE");
+        throw;
+    }
+    unsetenv("Q27_METAL_PROFILE");
+    return failure;
+}
+
 } // namespace
 
 int main() {
@@ -670,6 +758,7 @@ int main() {
              (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128) ||
               test_matmul_tiles(backend,q27::DType::T2_G128))))
             return 1;
+        if (test_profiled_batch_atomicity()) return 1;
         puts("Metal matvec: OK");
         return 0;
     } catch (const std::exception& error) {
