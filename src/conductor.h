@@ -85,11 +85,14 @@ inline void trim_widths(int* want, const bool* is_suffix, int k, int cap) {
 // (gs.end="error" in the [req] line, 500 when nothing was emitted, an SSE
 // `error` event on the Anthropic stream). It rides the same close() wakeup.
 struct TokenQueue {
-    void push(const int* ids, int n) {
-        if (n <= 0) return;
+    struct Token {
+        int id = -1;
+        bool forced = false;
+    };
+    void push(int id, bool forced) {
         {
             std::lock_guard<std::mutex> lk(m);
-            buf.insert(buf.end(), ids, ids + n);
+            buf.push_back({id, forced});
         }
         cv.notify_one();
     }
@@ -126,13 +129,19 @@ struct TokenQueue {
     // token arrives or the queue closes. Returns false only when the queue is
     // closed AND nothing was delivered -- `while (q.pop(out)) {}` drains a
     // stream to completion.
-    bool pop(std::vector<int>& out) {
+    bool pop(std::vector<Token>& out) {
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [&] { return !buf.empty() || closed; });
         bool got = !buf.empty();
         out.insert(out.end(), buf.begin(), buf.end());
         buf.clear();
         return got || !closed;
+    }
+    bool pop(std::vector<int>& out) {
+        std::vector<Token> tokens;
+        const bool more = pop(tokens);
+        for (const auto& token : tokens) out.push_back(token.id);
+        return more;
     }
     const char* finish_reason() {
         std::lock_guard<std::mutex> lk(m);
@@ -146,7 +155,7 @@ struct TokenQueue {
 private:
     std::mutex m;
     std::condition_variable cv;
-    std::vector<int> buf;
+    std::vector<Token> buf;
     bool closed = false;
     const char* reason = "";
     const char* error = nullptr;
@@ -198,6 +207,13 @@ struct ConductorCore {
     std::vector<MemberT*> members; // live set; mutated at round boundaries only
     std::vector<MemberT*> joins;   // staged joins; drained at boundaries
     std::function<bool(MemberT&)> solo_round;
+    // Some rounds are intentionally ineligible for fusion (currently the
+    // host-forced token queue used for reasoning/tool close transitions).
+    // Run one such member through the exact solo decode_step path before
+    // drafting any other member; otherwise fused drafting overwrites the
+    // staged forced id and the transition never reaches decoder state.
+    std::function<bool(MemberT&)> needs_solo_round;
+
     std::function<void(MemberT**, const int*, const bool*, int, bool*)> fused_round;
     std::function<void(MemberT&)> on_leave;
     // P2a (optional): batch draft hook -- fills want[] and sfx[] for all k
@@ -225,6 +241,17 @@ struct ConductorCore {
                 on_leave(*gone);
             } else {
                 i++;
+            }
+        }
+        if (needs_solo_round) {
+            for (size_t i = 0; i < members.size(); i++) {
+                MemberT* mm = members[i];
+                if (!needs_solo_round(*mm)) continue;
+                if (solo_round(*mm)) {
+                    members.erase(members.begin() + i);
+                    on_leave(*mm);
+                }
+                return (int)members.size();
             }
         }
         const int k = (int)members.size();
@@ -890,6 +917,7 @@ public:
         // whose ctor throws never runs. Tear down + rethrow.
         try {
             core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
+            core.needs_solo_round = [](Member& mm) { return mm.t->round_forced; };
             core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                       int k, bool* done) {
                 this->fused_round(ms, granted, sfx, k, done);
@@ -943,14 +971,14 @@ public:
         // dangling over the dead queue.
         std::function<bool(int)> sink;
         if (on_emit)
-            sink = [q, oe = std::move(on_emit)](int id) {
+            sink = [q, t, oe = std::move(on_emit)](int id) {
                 oe(id);
-                q->push(&id, 1);
+                q->push(id, t->callback_forced);
                 return true;
             };
         else
-            sink = [q](int id) {
-                q->push(&id, 1);
+            sink = [q, t](int id) {
+                q->push(id, t->callback_forced);
                 return true;
             };
         CUDA_CHECK(cudaEventCreateWithFlags(&mm->draft_done, cudaEventDisableTiming));

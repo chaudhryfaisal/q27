@@ -96,37 +96,5 @@ struct StreamSplitter {
     }
 };
 
-// Reasoning-token budget (2026-07-28). Counts tokens generated INSIDE the THINK
-// channel and, on trip, hands back T_CLOSE for the caller to feed through the
-// splitter -- which flips the channel to TEXT exactly as a model-emitted
-// </think> would, so every downstream consumer (routing, tool scan, the
-// Anthropic thinking block, reasoning_content) sees an ordinary close.
-//
-// Call tick() once per generated token, AFTER feeding that token to the
-// splitter. It counts only while the splitter is actually in THINK, so a
-// prompt-injected opener, a natural close, and tool segments are all handled
-// without special cases. Trips at most once per request.
-//
-// Deliberately NOT a hard stop: closing the block lets the model answer with
-// what it has. Truncating the request instead would reproduce the failure this
-// exists to prevent.
-struct ThinkBudget {
-    int limit = -1;  // -1 = unbounded
-    int used = 0;
-    bool tripped = false;
-
-    const char* tick(const StreamSplitter& sp) {
-        if (sp.chan != StreamSplitter::THINK) return nullptr;
-        // Count ALWAYS, enforce only when bounded. `used` is reported as
-        // usage.reasoning_tokens, and a counter that reads 0 while the model
-        // reasoned for 2879 characters is the same accepted-and-inert failure
-        // this class exists to prevent -- just one level down.
-        ++used;
-        if (limit < 0 || tripped) return nullptr;
-        if (used < limit) return nullptr;
-        tripped = true;
-        return StreamSplitter::T_CLOSE;
-    }
-};
 
 } // namespace q27

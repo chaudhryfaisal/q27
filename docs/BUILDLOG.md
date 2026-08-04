@@ -9956,3 +9956,91 @@ master` still reverts the pin but would NOT remove the untracked packs.
 Artifacts in `q27/scratchpad/`: `gen_ext_packs.py` (generator + reproduction
 gate), `score_fallback.py` (classifier, imports the sandbox extractor),
 `run_blockarm.sh`.
+## 2026-08-02 -- reasoning pre-merge corrections: seeded defaults and byte-stable responses
+
+The pre-merge review found two reasoning-branch behaviors that were internally
+consistent but too expensive or too surprising to publish unchanged.
+
+**Default-budget scope.** The fractional `--think-budget` default now applies
+only when the rendered prompt actually starts inside the `<think>` channel. An
+ordinary sampled request therefore keeps its negotiated speculative width.
+Explicit request budgets and an explicit positive CLI budget still arm the
+later-block guard, so clients that intentionally permit spontaneous thinking
+retain decoder-visible force-close enforcement. `--think-budget 0` remains the
+unbounded opt-out.
+
+**Response byte parity.** Natural model whitespace is now preserved in every
+non-stream response instead of passing completed text through `strip_ws2()`.
+Only the exact whitespace belonging to a decoder-injected `</think>` control
+transition is suppressed. The OpenAI chat, Anthropic Messages, and Responses
+production paths apply that rule. The OpenAI integration harness pins
+concatenated stream deltas to non-stream text, including leading whitespace
+after a natural close and malformed-tool text interleaved between ordinary text;
+the Anthropic malformed-tool path uses the same flush-at-generation-position rule.
+
+Host gates on the corrected tree:
+
+- `tools/test_think_resolve.cpp`: all resolver/admission/enforcement assertions
+  pass, including default no-think speculative width and explicit spontaneous
+  budget coverage.
+- `tools/test_chat_completions_integration.cpp`: all integration tests pass,
+  including OpenAI stream/non-stream byte parity and malformed-tool fallback.
+- `tools/test_stream_split.cpp`, `tools/test_openai_bridge.cpp`, and
+  `tools/test_conductor.cpp`: all assertions pass.
+- `build/test_tokenizer` compiles; its file-independent UTF-8, GPU-gate, and
+  Anthropic-shape self-tests pass. The corpus leg was not run because this tree
+  contains neither `q27.tok` nor a tokenizer cases file.
+- `git diff --check`: clean.
+
+Structured closeout used
+`skill://autoreview/scripts/autoreview --mode local --stream-engine-output`.
+The first passes identified synthetic-newline and generation-order defects in
+malformed-tool fallback; both were fixed and regression-pinned. The final Codex
+run returned no accepted/actionable findings (`patch is correct`, confidence
+0.91).
+
+CUDA gate: CUDA 12.8.93 on our local RTX 3090 successfully rebuilt the corrected
+source with
+`make -B NVCC=/home/ddbb/.local/cuda-12.8/bin/nvcc build/q27-server-w8`.
+The compile emitted only warnings in unchanged `prefill.cu` and `tokenizer.cpp`.
+No live-model result was claimed for this correction at the time because that
+GPU was occupied by another workload.
+
+## 2026-08-03 -- reasoning PR current-upstream stabilization and sampled pricing
+
+The five-commit reasoning candidate was rebased from `e2f150ca` onto current
+upstream `5ce983d0`. The `src/` tree is byte-identical to reviewed tip
+`1de550a7bf81`; the upstream change adds the corrected per-architecture sampling
+gate and BUILDLOG records. The PR documentation now states the intended default
+scope and sampled-budget price explicitly.
+
+Exact host gates on the rebased tree pass: conductor, think resolution and
+enforcement, stream splitting, OpenAI bridge, and chat integration. An
+independent concurrency pass found the changed queue-sink paths safe:
+`callback_forced` is written and read synchronously on the conductor thread,
+client disconnect drains to queue closure, cancellation is atomic, and every
+accepted-member normal/error path finishes decode before the final queue
+close/fail edge. It also noted a pre-existing, server-unreachable registration-
+refusal path that skips `finish_decode`; the sink is never installed there, so
+the new `DecodeTask` capture is not exposed. That bookkeeping cleanup remains
+outside this bug fix.
+
+CUDA 12.8.93 / `sm_86` on our local RTX 3090 rebuilt `q27`, `q27-server-w8`,
+`test_kernels`, and `fused_smoke`. `CANON_ARCH=sm86 tools/sampling_gate.sh`
+reports `6894254e3b1a184ee3802771ddd59c2b` EXACT and all five sampling gates
+pass. The full model-backed kernel battery ends `ALL PASS`. A live width-8,
+`Q27_BATCH=1` sampled Responses request with budget 4 reports exactly four
+reasoning tokens, `reasoning_budget_exceeded: true`, and continues into answer
+text. The two-engine fused binary cannot instantiate two full-model engines on
+the 24 GiB card, including its width-8/greedy-only profile; that is the expected
+24 GiB capacity boundary, not a candidate failure. Because the rebased `src/`
+tree is unchanged, the published A40 and maintainer-run RTX 5090 fused-smoke
+passes remain exact source evidence.
+
+Product decision: bounded sampled requests keep one-token acceptance for their
+full lifetime so every accepted token is a coherent budget boundary. The
+maintainer measured 56.9 t/s bounded versus 143.1 t/s unbounded on the reviewed
+RTX 5090 tip, a 2.51x reduction. Prompt-seeded reasoning remains covered by
+default; later model-generated reasoning is capped only when explicitly armed.
+Recovering sampled speculative width without weakening those semantics is a
+separate follow-up.
