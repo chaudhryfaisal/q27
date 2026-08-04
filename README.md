@@ -625,16 +625,20 @@ Messages report a trip as `usage.reasoning_tokens` and
 `usage.reasoning_budget_exceeded`; Responses reports the same fields under
 `usage.output_tokens_details`.
 
-Greedy checks land after the accepted speculative round, so the reasoning count
-may exceed the configured limit by that round's accepted width. A natural close
-later in the same round ends normally rather than reporting a budget trip.
+Positive budget checks land after the accepted speculative round, so the
+reasoning count may exceed the configured limit by that round's accepted width.
+A natural close later in the same round ends normally rather than reporting a
+budget trip.
 
-Bounded sampled requests intentionally use one-token acceptance rounds so every
-accepted token is a coherent budget-observation point. This disables
-speculative acceptance for the bounded request: on the reviewed RTX 5090 run,
-the exact tip measured 56.9 t/s bounded versus 143.1 t/s unbounded, a 2.51x
-reduction. Unbounded sampled requests retain normal speculative width. Restoring
-speculative width without weakening transition semantics is follow-up work.
+Bounded sampled requests now retain normal speculative acceptance. The accepted
+round is observed before host emission; if committing it would consume reserved
+close/answer capacity, the engine retains only the prefix through the budget
+trip, re-finishes that sampled state, and installs the forced close before the
+next model decision. On one local RTX 3090 / width-8 / `Q27_BATCH=1` gate, the
+same 256-token bounded request improved from 32.4 t/s and 0.985 tokens/round to
+89.7 t/s and 2.639 tokens/round (2.77x); the unbounded control was 100.2 t/s and
+2.943 tokens/round. This is a single-prompt regression gate, not a universal
+throughput claim.
 
 
 Why it defaults on: an 11-pack / 240-scenario A/B (BUILDLOG 2026-07-28, rescored

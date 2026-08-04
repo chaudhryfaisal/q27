@@ -76,7 +76,6 @@ struct FakeEngine {
         int Ph = 0;
         std::atomic<bool> cancel{false};
         bool sampling = false;
-        bool sampled_budget_watch = false;
         bool public_budget_reduced = false;
         bool budget_cancelled = false;
         bool budget_truncated = false;
@@ -145,6 +144,7 @@ struct FakeEngine {
     int conditioned_token = -1;
     int stale_token = -1;
     bool forced_committed = false;
+    int max_sampled_round = 0;
 
     int resolve_token(int id) const {
         return id == conditioned_token && !forced_committed ? stale_token : id;
@@ -162,12 +162,13 @@ struct FakeEngine {
         task.sampling = samp.inv_temp > 0.f;
         forced_committed = false;
         forced_commit_count = 0;
+        max_sampled_round = 0;
         int n = 0;
         auto emit_forced = [&]() {
             while (task.has_forced()) {
                 int id = task.pop_forced();
                 task.round_forced = true;
-                if (!task.sampling && on_round) (void)on_round(&id, 1);
+                if (on_round) (void)on_round(&id, 1);
                 task.callback_forced = true;
                 const bool keep_going = on_token(id);
                 task.callback_forced = false;
@@ -181,17 +182,18 @@ struct FakeEngine {
         };
         if (!emit_forced()) return 0;
         for (size_t pos = 0; pos < script.size() && n < task.n_max;) {
-            const int width = task.sampling && task.sampled_budget_watch ? 1 : round_width;
+            const int width = round_width;
             const int available = (int)script.size() - (int)pos;
             const int proposed = std::min(width, available);
             std::vector<int> ids;
             ids.reserve((size_t)proposed);
             for (int i = 0; i < proposed; i++) ids.push_back(resolve_token(script[pos + i]));
             int committed = proposed;
-            if (!task.sampling && on_round) {
+            if (on_round) {
                 int m = on_round(ids.data(), proposed);
                 if (m >= 1 && m <= proposed) committed = m;
             }
+            if (task.sampling) max_sampled_round = std::max(max_sampled_round, committed);
             task.Ph += committed;
             bool stopped = false;
             for (int i = 0; i < committed && n < task.n_max; i++) {
@@ -207,7 +209,7 @@ struct FakeEngine {
                 n++;
                 task.emitted = n;
             }
-            pos += (size_t)proposed;
+            pos += (size_t)(task.sampling ? committed : proposed);
             if (stopped) break;
             if (!emit_forced() || task.cancel.load()) break;
         }
@@ -249,7 +251,6 @@ struct ReasoningBudgetObserver {
                             StreamSplitter::Chan initial)
         : tok(tok_), state(state_), eng(eng_), task(task_), close_ids(close_ids_) {
         split.chan = initial;
-        task.sampled_budget_watch = state.limit >= 0;
     }
 
     void apply(q27::ThinkBudgetAction action, int current_public_tokens = 0,
@@ -264,15 +265,21 @@ struct ReasoningBudgetObserver {
 
     void start() { apply(state.start(split.chan)); }
 
-    void observe_token(q27::ThinkBudgetState& target_state, StreamSplitter& target_split,
-                       q27::Utf8Gate& target_gate, int id, bool forced) {
+    bool observe_token(q27::ThinkBudgetState& target_state,
+                       StreamSplitter& target_split, q27::Utf8Gate& target_gate,
+                       int id, bool forced) {
         const auto before = target_split.chan;
-        (void)target_split.feed(target_gate.feed(tok.decode_one(id)));
+        const auto segments = target_split.feed(target_gate.feed(tok.decode_one(id)));
         target_state.observe(before, target_split.chan, forced);
+        for (const auto& [ch, text] : segments)
+            if (ch != StreamSplitter::THINK &&
+                text.find_first_not_of(" \t\r\n") != std::string::npos)
+                return true;
+        return false;
     }
 
-    void observe_token(int id, bool forced) {
-        observe_token(state, split, gate, id, forced);
+    bool observe_token(int id, bool forced) {
+        return observe_token(state, split, gate, id, forced);
     }
 
     int visible_prefix(const int* ids, int n, bool forced, bool* hits_eos) const {
@@ -297,8 +304,11 @@ struct ReasoningBudgetObserver {
         StreamSplitter trial_split = split;
         q27::Utf8Gate trial_gate = gate;
         int trip_prefix = -1;
+        bool public_answer_after_trip = false;
         for (int i = 0; i < visible; i++) {
-            observe_token(trial_state, trial_split, trial_gate, ids[i], forced);
+            const bool emitted_public =
+                observe_token(trial_state, trial_split, trial_gate, ids[i], forced);
+            if (trip_prefix > 0 && emitted_public) public_answer_after_trip = true;
             if (!forced && trip_prefix < 0 && trial_state.limit >= 0 &&
                 !trial_state.transition_pending &&
                 trial_split.chan == StreamSplitter::THINK &&
@@ -311,8 +321,12 @@ struct ReasoningBudgetObserver {
         const bool natural_close_after_trip =
             trip_prefix > 0 && action == q27::ThinkBudgetAction::NONE &&
             trial_split.chan != StreamSplitter::THINK;
-        const bool natural_close_keeps_answer =
-            task.n_max - task.emitted - visible >= 1;
+        const bool buffered_public_answer =
+            trial_split.chan != StreamSplitter::THINK &&
+            (!trial_gate.pend.empty() ||
+             trial_split.hold.find_first_not_of(" \t\r\n") != std::string::npos);
+        const bool natural_close_keeps_answer = public_answer_after_trip ||
+            buffered_public_answer || task.n_max - task.emitted - visible >= 1;
         const bool force_full_round_fits =
             action != q27::ThinkBudgetAction::NONE &&
             eng.reasoning_close_fits(
@@ -343,13 +357,6 @@ struct ReasoningBudgetObserver {
         return m;
     }
 
-    void observe_sampled(int id, bool forced) {
-        if (!task.sampling) return;
-        observe_token(id, forced);
-        // post_round advanced Ph before invoking the callback, but emitted is
-        // incremented afterwards: account one public token and zero context rows.
-        apply(state.finish_round(split.chan), forced ? 0 : 1, 0);
-    }
 };
 
 // ---- fake httplib -------------------------------------------------------
@@ -429,27 +436,31 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                               std::string*) -> int {
         int n = 0;
         t.n_max = nm;
+        t.eos = tok.eos();
         t.emitted = 0;
         t.sampling = eng.samp.inv_temp > 0.f;
         eng.forced_committed = false;
+        eng.forced_commit_count = 0;
+        eng.max_sampled_round = 0;
         auto emit_forced = [&]() {
             while (t.has_forced()) {
                 int id = t.pop_forced();
                 t.round_forced = true;
-                if (!t.sampling && eng.on_round) (void)eng.on_round(&id, 1);
+                if (eng.on_round) (void)eng.on_round(&id, 1);
                 t.callback_forced = true;
                 if (on_emit) on_emit(id);
                 const bool keep_going = on_token(id, true);
                 t.callback_forced = false;
                 t.round_forced = false;
                 eng.forced_committed = true;
+                eng.forced_commit_count++;
                 if (!keep_going) return false;
             }
             return true;
         };
         if (!emit_forced()) return 0;
         for (size_t pos = 0; pos < eng.script.size() && n < t.n_max;) {
-            const int width = t.sampling && t.sampled_budget_watch ? 1 : eng.round_width;
+            const int width = eng.round_width;
             const int available = (int)eng.script.size() - (int)pos;
             const int proposed = std::min(width, available);
             std::vector<int> ids;
@@ -457,11 +468,17 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             for (int i = 0; i < proposed; i++)
                 ids.push_back(eng.resolve_token(eng.script[pos + (size_t)i]));
             int committed = proposed;
-            if (!t.sampling && eng.on_round) {
+            if (eng.on_round) {
                 int m = eng.on_round(ids.data(), proposed);
                 if (m >= 1 && m <= proposed) committed = m;
             }
+            if (t.sampling)
+                eng.max_sampled_round = std::max(eng.max_sampled_round, committed);
             for (int i = 0; i < committed && n < t.n_max; i++) {
+                if (ids[(size_t)i] == t.eos) {
+                    pos = eng.script.size();
+                    break;
+                }
                 t.callback_forced = false;
                 if (on_emit) on_emit(ids[(size_t)i]);
                 if (!on_token(ids[(size_t)i], false)) {
@@ -471,8 +488,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 n++;
                 t.emitted = n;
             }
-            pos += (size_t)proposed;
-            if (!emit_forced()) break;
+            pos += (size_t)(t.sampling ? committed : proposed);
+            if (!emit_forced() || t.cancel.load()) break;
         }
         t.emitted = n;
         t.budget_truncated = t.budget_cancelled ||
@@ -794,17 +811,13 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
             int n = conductor
                         ? batch_generate(eng, prompt, n_max,
                                          [&](int id, bool forced) { return on_tok(id, forced); },
-                                         [&](int id) {
-                                             tc.on_id(id);
-                                             budget.observe_sampled(id, bt.callback_forced);
-                                         }, stable_len, qw,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
@@ -1034,15 +1047,11 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) {
-                                                        tc.on_id(id);
-                                                        budget.observe_sampled(id, bt.callback_forced);
-                                                    },
+                                                    [&](int id) { tc.on_id(id); },
                                                     stable_len, qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
@@ -1620,6 +1629,41 @@ int main() {
         CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == false);
     }
 
+    // ---- Test 12s: a sampled natural close plus answer may fill the accepted
+    // round and public cap exactly. Preserve ordinary output and tails buffered
+    // by the marker/UTF-8 gates instead of replacing them with a forced close. ----
+    const std::vector<std::pair<std::string, std::string>> sampled_answers = {
+        {"Natural sampled answer.", "Natural sampled answer."},
+        {"<", "<"},
+        {std::string("\xE2"), std::string("\xEF\xBF\xBD")},
+    };
+    for (bool batch : {false, true}) {
+        for (const auto& [answer_piece, expected_answer] : sampled_answers) {
+            FakeTok tok;
+            tok.pieces = {/*0*/ "<eos>", /*1*/ "short thought",
+                          /*2*/ "</think>\n\n", /*3*/ answer_piece};
+            std::vector<std::string> vb = tok.pieces;
+            auto cache = fresh_cache(vb);
+            auto slots = fresh_slots();
+            slots[0].eng->script = {1, 2, 3};
+            slots[0].eng->round_width = 3;
+            std::atomic<long> rc{0};
+            json body = {{"messages", json::array({{{"role", "user"}, {"content", "answer"}}})},
+                         {"enable_thinking", true}, {"thinking_token_budget", 1},
+                         {"temperature", 0.7}, {"max_tokens", 3}};
+            run_request(tok, "q27-test", false, false, true, 100000, 100000, rc,
+                        cache, slots, body, true, batch);
+            const auto& msg = g_last_response["choices"][0]["message"];
+            CHECK(msg["reasoning_content"] == "short thought");
+            CHECK(msg["content"] == "\n\n" + expected_answer);
+            CHECK(slots[0].eng->forced_commit_count == 0);
+            CHECK(slots[0].eng->max_sampled_round == 3);
+            CHECK(g_last_response["usage"]["completion_tokens"] == 3);
+            CHECK(g_last_response["usage"]["reasoning_tokens"] == 2);
+            CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == false);
+        }
+    }
+
     // ---- Test 13: greedy fused decode may overshoot by the retained round,
     // then the conductor commits the forced close before the next proposal. ----
     {
@@ -1672,8 +1716,9 @@ int main() {
     }
 
     // ---- Test 13b: EOS wins over a same-round cap crossing. Tokens at and
-    // after EOS are neither observed as reasoning nor allowed to queue a close. ----
-    {
+    // after EOS are neither emitted nor observed as reasoning, in solo or the
+    // widened sampled conductor fake, and no close is queued. ----
+    for (bool batch : {false, true}) {
         FakeTok tok;
         tok.pieces = {/*0*/ "<eos>", /*1*/ "final thought", /*2*/ "unreachable"};
         std::vector<std::string> vb = tok.pieces;
@@ -1684,9 +1729,10 @@ int main() {
         std::atomic<long> rc{0};
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "finish"}}})},
                      {"enable_thinking", true}, {"thinking_token_budget", 1},
-                     {"max_tokens", 3}};
+                     {"temperature", 0.7}, {"max_tokens", 3}};
         run_request(tok, "q27-test", false, false, true, 100000, 100000, rc, cache, slots,
-                    body, true);
+                    body, true, batch);
+        CHECK(slots[0].eng->forced_commit_count == 0);
         CHECK(g_last_response["usage"]["completion_tokens"] == 1);
         CHECK(g_last_response["usage"]["reasoning_tokens"] == 1);
         CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == false);
@@ -1742,27 +1788,31 @@ int main() {
         CHECK(slots[0].eng->constraint_sets == 0);
     }
 
-    // ---- Test 13e: sampled observation runs after Ph advances but before
-    // emitted increments; the current token is charged only to public capacity. ----
-    {
+    // ---- Test 13e: sampled zero-budget close commits before any public
+    // reasoning token. A later two-token re-entry round has no public capacity
+    // for another close plus answer, so it retains only the opener and cancels
+    // without exposing or consuming the discarded sampled pending. ----
+    for (bool batch : {false, true}) {
         FakeTok tok;
         tok.pieces = {/*0*/ "<eos>", /*1*/ "<think>", /*2*/ "unreachable answer"};
         std::vector<std::string> vb = tok.pieces;
         auto cache = fresh_cache(vb);
         auto slots = fresh_slots();
         slots[0].eng->script = {1, 2};
+        slots[0].eng->round_width = 2;
         std::atomic<long> rc{0};
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "finish"}}})},
                      {"enable_thinking", true}, {"thinking_token_budget", 0},
                      {"temperature", 0.7}, {"max_tokens", 2}};
         run_request(tok, "q27-test", false, false, true, 100000, 100000, rc, cache, slots,
-                    body, true);
+                    body, true, batch);
         CHECK(slots[0].eng->forced_commit_count == 1);
+        CHECK(slots[0].eng->max_sampled_round == 1);
         CHECK(g_last_response["usage"]["completion_tokens"] == 1);
         CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == true);
     }
-    // ---- Test 13b: sampled bounded decode keeps one-token rounds so the
-    // forced close conditions the next draw in both solo and conductor modes. ----
+    // ---- Test 13b: a sampled boundary-crossing round retains only the budget
+    // prefix, then the forced close conditions the next draw in solo and batch. ----
     for (bool batch : {false, true}) {
         FakeTok tok;
         tok.pieces = {/*0*/ "<eos>", /*1*/ "sampled reasoning",
@@ -1785,6 +1835,35 @@ int main() {
         CHECK(msg["content"] == "Sampled answer.");
         CHECK(msg["content"].get<std::string>().find("STALE") == std::string::npos);
         CHECK(g_last_response["usage"]["reasoning_tokens"] == 1);
+    }
+
+    // ---- Test 13c: bounded sampling keeps speculative width until the round
+    // that crosses the budget, then truncates only that round's stale suffix. ----
+    for (bool batch : {false, true}) {
+        FakeTok tok;
+        tok.pieces = {/*0*/ "<eos>", /*1*/ "r1 ", /*2*/ "r2 ", /*3*/ "r3 ",
+                      /*4*/ "r4 ", /*5*/ "Sampled answer.",
+                      /*6*/ "STALE sampled successor"};
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1, 2, 3, 4, 5};
+        slots[0].eng->round_width = 3;
+        slots[0].eng->conditioned_token = 5;
+        slots[0].eng->stale_token = 6;
+        std::atomic<long> rc{0};
+        json body = {{"messages", json::array({{{"role", "user"}, {"content", "finish"}}})},
+                     {"enable_thinking", true}, {"thinking_token_budget", 4},
+                     {"temperature", 0.7}, {"max_tokens", 5}};
+        run_request(tok, "q27-test", false, false, true, 100000, 100000, rc, cache, slots,
+                    body, true, batch);
+        const auto& msg = g_last_response["choices"][0]["message"];
+        CHECK(msg["reasoning_content"] == "r1 r2 r3 r4 ");
+        CHECK(msg["content"] == "Sampled answer.");
+        CHECK(msg["content"].get<std::string>().find("STALE") == std::string::npos);
+        CHECK(g_last_response["usage"]["reasoning_tokens"] == 4);
+        CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == true);
+        CHECK(slots[0].eng->max_sampled_round == 3);
     }
 
     // ---- Test 14: injected template newlines never surface as an OpenAI

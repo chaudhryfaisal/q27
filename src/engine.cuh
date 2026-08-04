@@ -2653,12 +2653,13 @@ struct Engine {
     // host grammar can stage next round's slot-0 mask (state must include
     // the pending token -- masks lag one token otherwise).
     std::function<void(int)> on_pending;
-    // P15: called after each greedy spec round with the round's emitted
-    // tokens BEFORE anything is emitted or committed host-side. Returns -1
-    // for no action, or m in [1..n] when the <tool_call> marker completed at
-    // em[m-1]: generate() truncates the round to m tokens and refinishes so
-    // the first post-marker decision onward is grammar-masked (the engage-lag
-    // fix). Server-only, greedy-only; CLI never sets it.
+    // P15: called after each speculative round with the round's emitted tokens
+    // BEFORE anything is emitted or committed host-side. Returns -1 for no
+    // action, or m in [1..n] to retain only that prefix. Greedy tool constraints
+    // use it to re-decide the pending token under a newly engaged mask. A sampled
+    // callback may truncate only when it queues a forced pending token or marks
+    // the task cancelled; either way the provisional refinish argmax is never
+    // consumed by another model decision. Server-only; CLI never sets it.
     std::function<int(const int*, int)> on_round;
     // R1b: optional preemption hook, called between decode rounds and
     // between prefill chunks -- the two boundaries where this engine's
@@ -2742,16 +2743,17 @@ struct Engine {
                                    stm));
         upload_accept_cap();
     }
-    // P15 engage-lag fix: rewind the JUST-FINISHED greedy spec round from n
-    // accepted tokens to m (1 <= m <= n) and re-decide the pending token under
-    // the freshly staged slot-0 mask. Everything needed is still resident:
-    // per-lane GDN states / conv rings sit in the rotating role buffers (the
-    // round "commits" by advancing perm, never by copying -- state-after-lane-
-    // (m-1) is old role m-1), lane hiddens in x1..x1_L[5], lane logits in
-    // logits2. KV/MTP rows past the kept position are rewritten by the next
-    // round. Must be called BETWEEN rounds (server on_round hook), with the
-    // engage mask already staged on this stream so the re-argmax orders after
-    // it. Returns the new pending token. The CLI/canonical path never sets
+    // Rewind the JUST-FINISHED speculative round from n accepted tokens to m
+    // (1 <= m <= n). Everything needed is still resident: per-lane GDN states /
+    // conv rings sit in the rotating role buffers (the round "commits" by
+    // advancing perm, never by copying -- state-after-lane-(m-1) is old role
+    // m-1), lane hiddens in x1_L, and lane logits in logits2. KV/MTP rows past
+    // the kept position are rewritten by the next round. Greedy tool engagement
+    // uses the freshly staged slot-0 mask for the replacement pending token.
+    // Sampled budget truncation immediately overwrites that provisional argmax
+    // with the queued forced close, preserving the accepted sampled prefix
+    // without needing a second random draw. Must be called BETWEEN rounds.
+    // Returns the provisional pending token. The CLI/canonical path never sets
     // on_round, so this code is unreachable there.
     int refinish_round(int m, int n, int P_target) {
         perm = (perm + (m - n) + W_MAX) % W_MAX;
@@ -3380,10 +3382,6 @@ struct Engine {
         // Forced control ids are engine-owned decoder transitions. DecodeTask
         // stores only request-local queue/accounting state so solo generate()
         // and the conductor drive the identical round-boundary operation.
-        // Sampled rounds have no on_round hook; an explicitly bounded sampled
-        // request therefore keeps width one so its per-token observer still
-        // runs at a coherent round boundary. Greedy bounded requests do not.
-        bool sampled_budget_watch = false;
         bool public_budget_reduced = false;
         bool budget_cancelled = false;
         bool budget_truncated = false; // final stop actually came from either condition
@@ -3609,8 +3607,7 @@ struct Engine {
             finish_decode(t, "ctx-guard");
             return false;
         }
-        set_reasoning_accept_cap(reasoning_transition_active(t) ||
-                                 (t.sampling && t.sampled_budget_watch));
+        set_reasoning_accept_cap(reasoning_transition_active(t));
         // ConductorCore pre-checks every member, then its solo fallback calls
         // decode_step(), which pre-checks again. Preserve an id staged by the
         // first call; resetting round_forced here silently discards the
@@ -3627,12 +3624,24 @@ struct Engine {
     // stop reasons and GenStats land exactly as the solo loop produces them.
     bool post_round(DecodeTask& t, const int* em, int n) {
         t.rounds++;
-        // on_round is still the sole greedy refinish contract. The server
-        // previews budget retention before its stateful tool scan, commits both
-        // observers to the same kept prefix, and returns that prefix here.
-        if (!t.sampling && on_round) {
+        // on_round previews the accepted speculative round before host emission.
+        // Greedy callbacks may truncate for grammar or budget transitions.
+        // Sampled callbacks normally queue a forced decoder transition, whose
+        // pending token replaces refinish_round's provisional argmax at the next
+        // boundary. If the close cannot fit, force_reasoning_close cancels the
+        // task instead; the retained hidden/KV prefix is still coherent and the
+        // cancel pre-check guarantees that provisional pending is never consumed.
+        if (on_round) {
             int m = on_round(em, n);
             if (m >= 1 && m <= n) {
+                if (t.sampling && m < n && !reasoning_transition_active(t) &&
+                    !t.cancel.load()) {
+                    // Defensive containment for future sampled observers that
+                    // violate the callback contract: retain their prefix, but
+                    // never make a model decision from the provisional argmax.
+                    t.budget_cancelled = true;
+                    t.cancel.store(true);
+                }
                 last_pending = refinish_round(m, n, t.Ph + m);
                 n = m;
             }

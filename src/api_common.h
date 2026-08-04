@@ -421,10 +421,9 @@ static constexpr double THINK_BUDGET_FRAC = 0.5;
 // Resolve the server budget for a request whose public cap is `n_max`.
 // `flag` is --think-budget: <0 = use the fractional default, 0 = unbounded,
 // >0 = an explicit absolute cap. The fractional default applies only when the
-// prompt already opened THINK. Otherwise every sampled no-think response would
-// be forced to one token per round merely to watch for a spontaneous opener.
-// An explicit request budget, or an explicit positive server flag, still arms
-// that later-block guard.
+// prompt already opened THINK: standard thinking-enabled serving starts there,
+// while a later model-generated block is intentionally unbounded unless the
+// client or an explicit positive server flag arms that guard.
 inline int think_budget_default(int flag, int n_max) {
     if (flag == 0) return -1;
     if (flag > 0) return flag;
