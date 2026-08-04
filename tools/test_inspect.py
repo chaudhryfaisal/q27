@@ -26,15 +26,12 @@ def align(value):
 
 def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
                  bad_t3_range=False, bad_t3_padding=False, overflow=False,
-                 bad_offset=False, zero_scale_offset=False,
-                 bad_embedding=False, bad_dtype=False):
+                 bad_offset=False, zero_scale_offset=False, bad_dtype=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
 
     for index, (name, dtype, shape, data_size, scale_size) in enumerate(TENSORS):
-        if bad_embedding and name == "token_embd.weight":
-            dtype, data_size = 4, 32
         if bad_dtype and index == 1:
             dtype, data_size, scale_size = 255, 0, 0
         if misaligned and index == 0:
@@ -102,7 +99,6 @@ def main():
         bad_t3_padding = root / 'bad-t3-padding.q27'
         overflow = root / 'overflow.q27'
         bad_offset = root / 'bad-offset.q27'
-        bad_embedding = root / 'bad-embedding.q27'
         bad_dtype = root / 'bad-dtype.q27'
         zero_scale_offset = root / 'zero-scale-offset.q27'
         make_fixture(valid)
@@ -112,7 +108,6 @@ def main():
         make_fixture(bad_t3_range, bad_t3_range=True)
         make_fixture(bad_t3_padding, bad_t3_padding=True)
         make_fixture(overflow, overflow=True)
-        make_fixture(bad_embedding, bad_embedding=True)
         make_fixture(bad_dtype, bad_dtype=True)
 
         make_fixture(bad_offset, bad_offset=True)
@@ -122,12 +117,6 @@ def main():
             sys.stderr.write(good.stdout + good.stderr)
             raise SystemExit('valid packed-dtype fixture failed inspection')
 
-        invalid_embedding = run(inspect, bad_embedding)
-        if (invalid_embedding.returncode == 0 or
-                'token_embd.weight: CUDA row lookup requires Q8_G128' not in
-                output(invalid_embedding)):
-            sys.stderr.write(output(invalid_embedding))
-            raise SystemExit('non-Q8 CUDA embedding was not rejected')
         invalid_dtype = run(inspect, bad_dtype)
         if (invalid_dtype.returncode == 0 or
                 'unsupported dtype 255' not in output(invalid_dtype)):

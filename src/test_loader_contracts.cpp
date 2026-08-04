@@ -16,7 +16,7 @@ int main() {
     }
     for (DType dtype : {DType::T2_G128, DType::T3_G128, DType::B1_G128}) {
         if (q27::cuda_weight_dtype_supported(dtype)) {
-            std::fprintf(stderr, "Metal-only packed dtype accepted by CUDA: %s\n",
+            std::fprintf(stderr, "CUDA-unsupported packed dtype accepted: %s\n",
                          q27::dtype_name(dtype));
             return 1;
         }
@@ -48,7 +48,7 @@ int main() {
             "unsupported weight dtype T2_G128") != std::string::npos;
     }
     if (!packed_rejected) {
-        std::fputs("Metal-only model was accepted by CUDA\n", stderr);
+        std::fputs("CUDA-unsupported packed model was accepted\n", stderr);
         return 1;
     }
     bool selective_packed_rejected = false;
@@ -59,7 +59,7 @@ int main() {
             "unsupported weight dtype T2_G128") != std::string::npos;
     }
     if (!selective_packed_rejected) {
-        std::fputs("Metal-only selective tensor was accepted by CUDA\n", stderr);
+        std::fputs("CUDA-unsupported packed tensor was accepted\n", stderr);
         return 1;
     }
 

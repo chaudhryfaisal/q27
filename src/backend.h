@@ -248,27 +248,9 @@ class ComputeBackend {
         (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
-    // KV-codec attribution store (kl-kv instrument): fp16 cache write with
-    // one side (mode 1 = K, mode 2 = V) round-tripped through the turbo3
-    // quantizer, so the side's quantization error can be measured alone.
-    // head = UINT32_MAX round-trips every head of the selected side; a
-    // specific head narrows attribution to one (layer is the caller's cut).
-    // flags/scale_off/aux: step-2 scaling arms and the per-feature stats
-    // pass (docs/metal/plans/2026-07-16-kv-codec-step2.md). aux may be null when
-    // flags need no buffer.
-    virtual void kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
-                                          BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                          uint32_t position, uint32_t kv_heads, uint32_t tokens,
-                                          uint32_t mode, uint32_t head, uint32_t flags,
-                                          uint32_t scale_off, BackendBuffer* aux) {
-        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)kv_heads;
-        (void)tokens; (void)mode; (void)head; (void)flags; (void)scale_off; (void)aux;
-        throw std::runtime_error("q27: backend has no KV attribution store");
-    }
-    // partials: caller-owned scratch for the blocked-GQA softmax partials
-    // (engines allocate it once at construction, sized for their own
-    // max context — docs/metal/plans/2026-07-17-metal-review-triage.md E2). May
-    // be null only when the call cannot route to the blocked kernels.
+    // partials: caller-owned scratch for blocked-GQA softmax partials, sized
+    // once by the engine for its maximum context. May be null only when the
+    // call cannot route to the blocked kernels.
     virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                                       uint32_t q_row_stride, const BackendBuffer& k_cache,
                                       const BackendBuffer& v_cache,

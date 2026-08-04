@@ -137,11 +137,11 @@ inline uint32_t sample_candidates_cpu(const std::vector<float>& values,
     return indices[order.back()];
 }
 
-// ---- Spec rejection sampling (Metal sampled-MTP Phase 0) --------------------
+// ---- Backend rejection sampling -------------------------------------------
 // Host-side Leviathan/Chen accept walk with greedy drafts (q = delta at draft).
 // Served p matches sample_logits_cpu (temp / top_p / top_k, boundary ties).
-// Used by Metal mtp_sample_round; CUDA already has device kernels for this.
-// See docs/metal/plans/2026-07-21-metal-sampled-mtp.md.
+// Backends may use this implementation directly or provide an equivalent
+// device-side path.
 
 // Unnormalized nucleus weights for one lane's logits under SamplingParams.
 // tokens[i] is a vocab id; weights[i] > 0; total = sum(weights). Empty when
@@ -215,10 +215,10 @@ inline ServedDistribution build_served_distribution(const std::vector<float>& lo
     return build_served_distribution(logits.data(),(uint32_t)logits.size(),p);
 }
 
-// Served nucleus from a GPU top-k over-set (value, index pairs containing the
-// true top-k). Arithmetic mirrors sample_candidates_cpu so accept probs match
-// plain sampling under the same top_k. Used by Metal mtp_sample_round to avoid
-// full-vocab readback when top_k is in 1..256.
+// Served nucleus from a top-k over-set (value, index pairs containing the true
+// top-k). Arithmetic mirrors sample_candidates_cpu so accept probabilities
+// match plain sampling under the same top_k without a full-vocabulary transfer
+// when top_k is in 1..256.
 inline ServedDistribution build_served_from_candidates(const float* values,
                                                        const uint32_t* indices,
                                                        uint32_t count,
@@ -278,12 +278,10 @@ inline double served_probability(const ServedDistribution& d,uint32_t token) {
 }
 
 // Sample from the served nucleus, optionally excluding one token (residual
-// resample after a rejected draft). Never returns `exclude`. If exclude
-// removes all mass (singleton nucleus on the rejected draft), throws —
-// re-emitting the excluded token would violate the residual distribution
-// Callers that need a soft fallback must widen the nucleus (e.g. drop top_k)
-// before sampling; the Metal sample round keeps
-// vocab-wide logits and only hits this when p(draft) was already ~1.
+// resample after a rejected draft). Never returns `exclude`. If exclude removes
+// all mass (singleton nucleus on the rejected draft), throws: re-emitting the
+// excluded token would violate the residual distribution. Callers needing a
+// soft fallback must widen the nucleus before sampling.
 inline uint32_t sample_served(const ServedDistribution& d,std::mt19937_64& random,
                               int32_t exclude=-1) {
     if(d.tokens.empty()) throw std::runtime_error("q27: empty served distribution");

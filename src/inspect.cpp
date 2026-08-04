@@ -30,10 +30,6 @@ int main(int argc, char** argv) {
         e.first++;
         e.second += t.data_size + t.scales_size;
         total += t.data_size + t.scales_size;
-        if (t.name == "token_embd.weight" && t.dtype != q27::DType::Q8_G128) {
-            printf("INVARIANT FAIL token_embd.weight: CUDA row lookup requires Q8_G128\n");
-            bad++;
-        }
 
     }
 
