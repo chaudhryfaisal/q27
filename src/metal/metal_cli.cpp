@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] "
-                "[-n count] [--ctx count] [--mtp width] [--prefill chunk|serial] "
+                "[-n count] [--ctx count] [--mtp width] [--kv fp16|turbo3] [--prefill chunk|serial] "
                 "[--temperature T --top-p P --top-k K --seed S] [--dump-token-ids file]\n",
                 argv[0]);
         return 1;
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         std::string token_list, prompt_text, dump_token_ids;
         uint32_t count = 1, context = 128, mtp_width = 0;
         q27::SamplingParams sampling;
-        bool validate_only = false, serial_prefill = false;
+        bool validate_only = false, serial_prefill = false, turbo3_kv = false;
 
         for (int i = 3; i < argc; i++) {
             const std::string arg = argv[i];
@@ -97,6 +97,11 @@ int main(int argc, char** argv) {
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
+            else if (arg == "--kv" && i + 1 < argc) {
+                const std::string mode = argv[++i];
+                if (mode == "turbo3") turbo3_kv = true;
+                else if (mode != "fp16") throw std::runtime_error("--kv must be fp16 or turbo3");
+            }
             else if (arg == "--prefill" && i + 1 < argc) {
                 const std::string mode = argv[++i];
                 if (mode == "serial") serial_prefill = true;
@@ -147,7 +152,7 @@ int main(int argc, char** argv) {
             if (token >= q27::MetalEngine::vocabulary_size())
                 throw std::runtime_error("prompt token id is outside the model vocabulary");
 
-        q27::MetalEngine engine(model_path, context);
+        q27::MetalEngine engine(model_path, context, turbo3_kv);
         if (serial_prefill) engine.set_chunked_prefill(false);
         const auto loaded = std::chrono::steady_clock::now();
         fprintf(stderr, "Metal q4s model ready on %s in %.2f s\n", engine.backend().name().c_str(),
