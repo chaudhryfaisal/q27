@@ -160,14 +160,15 @@ build/test-metal-ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
 
 build/metal-engine.o: src/metal/metal_engine.cpp src/metal/metal_engine.h \
                       src/metal/metal_backend.h src/backend.h src/loader.h \
-                      src/sampling.h src/suffixdraft.h | build
+                      src/sampling.h src/suffixdraft.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) -c src/metal/metal_engine.cpp -o $@
 
 build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
                                    src/metal/metal_engine.cpp src/metal/metal_engine.h \
                                    src/metal/metal_backend.mm src/metal/metal_backend.h \
                                    src/metal/q27_kernels.metal src/backend.h \
-                                   src/loader.cpp src/loader.h src/sampling.h src/suffixdraft.h | build
+                                   src/loader.cpp src/loader.h src/sampling.h src/suffixdraft.h \
+                                   third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) src/metal/test_metal_engine_contracts.cpp \
 	       src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
 	       $(METALLIBS) -o $@

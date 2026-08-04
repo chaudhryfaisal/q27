@@ -61,11 +61,23 @@ int main(int argc, char** argv) {
         }
 
         q27::MetalEngine::StopCause cause = q27::MetalEngine::StopCause::MaxTokens;
-        const uint32_t emitted = engine.stream_from_pending(
+        bool sink_called = false;
+        uint32_t emitted = engine.stream_from_pending(
+            pending, 2, pending, 2,
+            [&](uint32_t) { sink_called = true; return true; }, cause);
+        if (emitted != 0 || cause != q27::MetalEngine::StopCause::Eos ||
+            sink_called || engine.position() != 1) {
+            std::fprintf(stderr, "MTP EOS changed unconsumed engine state\n");
+            return 1;
+        }
+
+        cause = q27::MetalEngine::StopCause::MaxTokens;
+        emitted = engine.stream_from_pending(
             pending, 2, UINT32_MAX, 2,
             [](uint32_t) { return false; }, cause);
-        if (emitted != 0 || cause != q27::MetalEngine::StopCause::Cancelled) {
-            std::fprintf(stderr, "cancelled MTP stream did not report cancellation\n");
+        if (emitted != 0 || cause != q27::MetalEngine::StopCause::Cancelled ||
+            engine.position() != 1) {
+            std::fprintf(stderr, "cancelled MTP stream changed unconsumed engine state\n");
             return 1;
         }
 

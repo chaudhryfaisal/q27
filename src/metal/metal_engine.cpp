@@ -786,11 +786,21 @@ uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint3
         backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
         uint32_t accepted = 0;
         while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
-        uint32_t committed = std::min(accepted + 1, remaining);
-        // The final output token is pushed but never encoded, exactly like
-        // the serial walk, so snapshots and continuations stay compatible.
-        const uint32_t encoded = committed == remaining ? committed - 1 : committed;
-        last_spec_stats_.accepted += committed - 1;
+        const uint32_t offered = std::min(accepted + 1, remaining);
+        // Determine the externally committed prefix before mutating recurrent,
+        // KV, hidden, or logits state. EOS and a rejecting sink do not consume
+        // their token; prior delivered tokens still need encoding so state
+        // predicts the stopped token exactly as the serial walk does.
+        uint32_t delivered = 0;
+        int stop = 0;
+        while (delivered < offered) {
+            stop = commit(lanes[delivered]);
+            if (stop) break;
+            delivered++;
+        }
+        last_spec_stats_.accepted += delivered ? delivered - 1 : 0;
+        const bool exhausted = emitted == count;
+        const uint32_t encoded = exhausted ? delivered - 1 : delivered;
         auto commit_start = clock();
         if (encoded) {
             CommandBatch batch(backend_);
@@ -810,9 +820,8 @@ uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint3
             fprintf(stderr, "mtp round: live %u accepted %u | draft %.2fs verify %.2fs commit %.2fs\n",
                     live, accepted, std::chrono::duration<double>(verify_start - draft_start).count(),
                     std::chrono::duration<double>(commit_start - verify_start).count(), since(commit_start));
-        for (uint32_t i = 0; i < committed; i++)
-            if (commit(lanes[i])) return emitted;
-        pending = predictions[committed - 1];
+        if (stop || exhausted) return emitted;
+        pending = predictions[delivered - 1];
         // Width adaptation is a pure performance control: committed tokens
         // are width-invariant, matching the recorded 2/4/8/12 gate.
         live_width = accepted + 1 == live ? std::min(width, live_width + 2)
