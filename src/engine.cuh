@@ -536,7 +536,6 @@ struct Engine {
 
   private:
     void init(int ctx, bool own_weights) {
-        q27::validate_cuda_model(model);
 
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");

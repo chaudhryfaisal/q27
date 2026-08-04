@@ -112,6 +112,86 @@ int main() {
             if (q27::sample_served(distribution, residual_rng, 2) == 2) return 1;
     }
 
+    // The rejection walk commits the pending token plus accepted drafts,
+    // stops on the first p=0 draft, and samples the next pending from that
+    // lane's residual distribution.
+    auto point_mass = [](uint32_t token) {
+        q27::ServedDistribution d;
+        d.argmax_token = token;
+        d.tokens = {token};
+        d.weights = {1.0};
+        d.total = 1.0;
+        return d;
+    };
+    {
+        std::vector<q27::ServedDistribution> lanes = {point_mass(7), point_mass(8)};
+        const uint32_t drafts[] = {99};
+        std::mt19937_64 reject_rng(1);
+        const auto result = q27::spec_rejection_accept(
+            lanes.data(), (uint32_t)lanes.size(), drafts, reject_rng);
+        if (result.n != 1 || result.stop_lane != 0 || result.exclude != 99 ||
+            result.pending != 7)
+            return 1;
+    }
+    {
+        std::vector<q27::ServedDistribution> lanes = {
+            point_mass(1), point_mass(7), point_mass(9)};
+        const uint32_t drafts[] = {1, 99};
+        std::mt19937_64 reject_rng(2);
+        const auto result = q27::spec_rejection_accept(
+            lanes.data(), (uint32_t)lanes.size(), drafts, reject_rng);
+        if (result.n != 2 || result.stop_lane != 1 || result.exclude != 99 ||
+            result.pending != 7)
+            return 1;
+    }
+
+    // p=1 drafts all commit and the last verify lane supplies the free bonus.
+    {
+        const float masked = -std::numeric_limits<float>::infinity();
+        const std::vector<float> lanes = {
+            0.0f, masked, masked,
+            masked, 0.0f, masked,
+            masked, masked, 0.0f,
+        };
+        const std::vector<uint32_t> drafts = {0, 1};
+        std::mt19937_64 accept_rng(3);
+        const auto result = q27::spec_rejection_accept(
+            lanes, 3, 3, drafts, {1.0f, 1.0f, 0, 0}, accept_rng);
+        if (result.n != 3 || result.stop_lane != 2 || result.exclude != -1 ||
+            result.pending != 2)
+            return 1;
+    }
+
+    // Nucleus probabilities are renormalized over retained mass, and a
+    // shuffled candidate-built distribution drives the same rejection walk.
+    {
+        const std::vector<float> full = {
+            std::log(4.0f), std::log(3.0f), std::log(2.0f), 0.0f};
+        const std::vector<uint32_t> ids = {2, 0, 3, 1};
+        const std::vector<float> values = {full[2], full[0], full[3], full[1]};
+        const q27::SamplingParams nucleus{1.0f, 0.5f, 0, 0};
+        const auto full_dist = q27::build_served_distribution(full, nucleus);
+        const auto candidate_dist = q27::build_served_from_candidates(
+            values.data(), ids.data(), (uint32_t)ids.size(), nucleus);
+        const double p0 = q27::served_probability(candidate_dist, 0);
+        const double p1 = q27::served_probability(candidate_dist, 1);
+        if (candidate_dist.tokens != full_dist.tokens ||
+            candidate_dist.weights != full_dist.weights ||
+            candidate_dist.total != full_dist.total ||
+            std::fabs(p0 - 4.0 / 7.0) > 1e-6 ||
+            std::fabs(p0 + p1 - 1.0) > 1e-12)
+            return 1;
+        std::vector<q27::ServedDistribution> lanes = {
+            candidate_dist, point_mass(9)};
+        const uint32_t drafts[] = {99};
+        std::mt19937_64 candidate_rng(4);
+        const auto result = q27::spec_rejection_accept(
+            lanes.data(), (uint32_t)lanes.size(), drafts, candidate_rng);
+        if (result.n != 1 || result.stop_lane != 0 || result.exclude != 99 ||
+            (result.pending != 0 && result.pending != 1))
+            return 1;
+    }
+
     std::puts("CPU sampling: PASS");
     return 0;
 }

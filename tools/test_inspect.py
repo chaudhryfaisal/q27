@@ -26,7 +26,9 @@ def align(value):
 
 def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
                  bad_t3_range=False, bad_t3_padding=False, overflow=False,
-                 bad_offset=False, zero_scale_offset=False, bad_dtype=False):
+                 bad_offset=False, zero_scale_offset=False, bad_dtype=False,
+                 bad_data_alignment=False, bad_scale_alignment=False,
+                 nonzero_absent_scale_offset=False):
     meta = b'{}'
     entries = []
     blobs = bytearray()
@@ -39,7 +41,9 @@ def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
         if overflow and dtype == 5:
             shape = [(1 << 63) + 1, 128]
         data_off = align(len(blobs))
-        stored_data_off = (1 << 64) - 128 if bad_offset and dtype == 4 else data_off
+        stored_data_off = (1 << 64) - 256 if bad_offset and dtype == 4 else data_off
+        if bad_data_alignment and index == 0:
+            stored_data_off += 1
         blobs.extend(b'\0' * (data_off - len(blobs)))
         stored_data_size = data_size + (1 if corrupt_size and index == 1 else 0)
         data = bytearray(bytes([index + 1]) * stored_data_size)
@@ -62,13 +66,19 @@ def make_fixture(path, corrupt_size=False, misaligned=False, bad_t2=False,
             blobs.extend(b'\0<' * (scale_size // 2))
             if zero_scale_offset and index == 1:
                 scale_off = 0
+        stored_scale_off = scale_off
+        if bad_scale_alignment and index == 0:
+            stored_scale_off += 1
+        if nonzero_absent_scale_offset and index == 4:
+            stored_scale_off = ALIGN
 
         name_bytes = name.encode()
         entry = bytearray(struct.pack('<H', len(name_bytes)))
         entry.extend(name_bytes)
         entry.extend(struct.pack('<BB', dtype, len(shape)))
         entry.extend(struct.pack('<' + 'Q' * len(shape), *shape))
-        entry.extend(struct.pack('<QQQQ', stored_data_off, stored_data_size, scale_off, scale_size))
+        entry.extend(struct.pack('<QQQQ', stored_data_off, stored_data_size,
+                                 stored_scale_off, scale_size))
         entries.append(entry)
 
     header = struct.pack('<IIII', MAGIC, VERSION, len(entries), len(meta)) + meta
@@ -101,6 +111,9 @@ def main():
         bad_offset = root / 'bad-offset.q27'
         bad_dtype = root / 'bad-dtype.q27'
         zero_scale_offset = root / 'zero-scale-offset.q27'
+        bad_data_alignment = root / 'bad-data-alignment.q27'
+        bad_scale_alignment = root / 'bad-scale-alignment.q27'
+        nonzero_absent_scale_offset = root / 'nonzero-absent-scale-offset.q27'
         make_fixture(valid)
         make_fixture(corrupt, corrupt_size=True)
         make_fixture(misaligned, misaligned=True)
@@ -112,6 +125,10 @@ def main():
 
         make_fixture(bad_offset, bad_offset=True)
         make_fixture(zero_scale_offset, zero_scale_offset=True)
+        make_fixture(bad_data_alignment, bad_data_alignment=True)
+        make_fixture(bad_scale_alignment, bad_scale_alignment=True)
+        make_fixture(nonzero_absent_scale_offset,
+                     nonzero_absent_scale_offset=True)
         good = run(inspect, valid)
         if good.returncode != 0 or '\nOK\n' not in good.stdout:
             sys.stderr.write(good.stdout + good.stderr)
@@ -171,6 +188,24 @@ def main():
                 'tensor scale offset is zero' not in output(invalid_scale_offset)):
             sys.stderr.write(output(invalid_scale_offset))
             raise SystemExit('zero scale offset was not detected')
+        invalid_data_alignment = run(inspect, bad_data_alignment)
+        if (invalid_data_alignment.returncode == 0 or
+                'tensor data offset is not 256-byte aligned' not in
+                output(invalid_data_alignment)):
+            sys.stderr.write(output(invalid_data_alignment))
+            raise SystemExit('unaligned tensor data offset was not detected')
+        invalid_scale_alignment = run(inspect, bad_scale_alignment)
+        if (invalid_scale_alignment.returncode == 0 or
+                'tensor scale offset is not 256-byte aligned' not in
+                output(invalid_scale_alignment)):
+            sys.stderr.write(output(invalid_scale_alignment))
+            raise SystemExit('unaligned tensor scale offset was not detected')
+        invalid_absent_scale = run(inspect, nonzero_absent_scale_offset)
+        if (invalid_absent_scale.returncode == 0 or
+                'tensor scale offset must be zero without scales' not in
+                output(invalid_absent_scale)):
+            sys.stderr.write(output(invalid_absent_scale))
+            raise SystemExit('nonzero absent-scale offset was not detected')
 
     print('inspect packed dtype fixtures: PASS')
 

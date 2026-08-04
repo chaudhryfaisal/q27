@@ -228,7 +228,7 @@ Model Model::open(const std::string& path) {
         t.scales_size = c.read<uint64_t>();
         // stash offsets in pointers temporarily; fixed up after base is known
         t.data   = (const uint8_t*)(uintptr_t)doff;
-        t.scales = t.scales_size ? (const uint8_t*)(uintptr_t)soff : nullptr;
+        t.scales = (const uint8_t*)(uintptr_t)soff;
         m.tensors.push_back(std::move(t));
     }
     uint64_t table_end = (uint64_t)(c.p - b);
@@ -244,16 +244,28 @@ Model Model::open(const std::string& path) {
     for (size_t i = 0; i < m.tensors.size(); i++) {
         Tensor& t = m.tensors[i];
         uint64_t doff = (uint64_t)(uintptr_t)t.data;
+        if (doff % ALIGN)
+            throw std::runtime_error("q27: tensor data offset is not 256-byte aligned: " +
+                                     t.name);
         if (!in_file(doff, t.data_size))
             throw std::runtime_error("q27: tensor data out of range: " + t.name);
         t.data = b + data_base + doff;
+
+        uint64_t soff = (uint64_t)(uintptr_t)t.scales;
         if (t.scales_size) {
-            uint64_t soff = (uint64_t)(uintptr_t)t.scales;
             if (!soff)
                 throw std::runtime_error("q27: tensor scale offset is zero: " + t.name);
+            if (soff % ALIGN)
+                throw std::runtime_error("q27: tensor scale offset is not 256-byte aligned: " +
+                                         t.name);
             if (!in_file(soff, t.scales_size))
                 throw std::runtime_error("q27: tensor scales out of range: " + t.name);
             t.scales = b + data_base + soff;
+        } else {
+            if (soff)
+                throw std::runtime_error("q27: tensor scale offset must be zero without scales: " +
+                                         t.name);
+            t.scales = nullptr;
         }
         const std::string payload_error = validate_tensor_payload(t);
         if (!payload_error.empty())
