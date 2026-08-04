@@ -7,7 +7,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend metal-engine
+.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -163,6 +163,19 @@ build/metal-engine.o: src/metal/metal_engine.cpp src/metal/metal_engine.h \
                       src/sampling.h src/suffixdraft.h | build
 	$(CXX) $(METALFLAGS) -c src/metal/metal_engine.cpp -o $@
 
+build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
+                                   src/metal/metal_engine.cpp src/metal/metal_engine.h \
+                                   src/metal/metal_backend.mm src/metal/metal_backend.h \
+                                   src/metal/q27_kernels.metal src/backend.h \
+                                   src/loader.cpp src/loader.h src/sampling.h src/suffixdraft.h | build
+	$(CXX) $(METALFLAGS) src/metal/test_metal_engine_contracts.cpp \
+	       src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
+	       $(METALLIBS) -o $@
+
+test-metal-contracts: build/test_metal_engine_contracts
+	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
+	./build/test_metal_engine_contracts "$(MODEL)"
+
 metal-engine: build/metal-engine.o
 
 test-metal-backend: build/test-metal-backend build/test-metal-ops
@@ -173,4 +186,6 @@ test-metal-backend:
 	@echo "test-metal-backend requires macOS" >&2; exit 1
 metal-engine:
 	@echo "metal-engine requires macOS" >&2; exit 1
+test-metal-contracts:
+	@echo "test-metal-contracts requires macOS" >&2; exit 1
 endif
