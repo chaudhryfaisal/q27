@@ -103,58 +103,127 @@ struct HookGuard {
     }
 };
 
-// In batch mode the conductor must observe bounded-thinking transitions before
-// it starts the next round. The request thread drains TokenQueue asynchronously;
-// observing there races the next draft and can either miss the forced close or
-// enqueue it after a natural close, leaking a literal </think> into content.
-// Keep an independent parser on the conductor thread. The request parser still
-// owns output routing; this twin owns only ThinkBudgetState / DecodeTask control.
-struct BatchThinkBudgetObserver {
+// Greedy budgets are observed through Engine::on_round before host emission.
+// The whole retained round is parsed first, so a natural close later in that
+// round wins. When an overshooting round would consume reserved close/answer
+// capacity, only the prefix through the trip is retained and re-finished.
+// Sampled rounds intentionally keep on_round unset; bounded sampled requests
+// use the engine's one-token observation fallback instead.
+struct ReasoningBudgetObserver {
     q27::Tokenizer& tok;
     q27::ThinkBudgetState& state;
+    Engine& eng;
     Engine::DecodeTask& task;
     const std::vector<int>& close_ids;
     StreamSplitter split;
     q27::Utf8Gate gate;
-    StreamSplitter round_split;
-    q27::Utf8Gate round_gate;
 
-    BatchThinkBudgetObserver(q27::Tokenizer& tok_, q27::ThinkBudgetState& state_,
-                             Engine::DecodeTask& task_,
-                             const std::vector<int>& close_ids_,
-                             StreamSplitter::Chan initial)
-        : tok(tok_), state(state_), task(task_), close_ids(close_ids_) {
+    ReasoningBudgetObserver(q27::Tokenizer& tok_, q27::ThinkBudgetState& state_,
+                            Engine& eng_, Engine::DecodeTask& task_,
+                            const std::vector<int>& close_ids_,
+                            StreamSplitter::Chan initial)
+        : tok(tok_), state(state_), eng(eng_), task(task_), close_ids(close_ids_) {
         split.chan = initial;
-        round_split.chan = initial;
-        task.preview_round = [this](const int* ids, int n) { return preview_round(ids, n); };
-        task.commit_round = [this](const int* ids, int n) { commit_round(ids, n); };
+        task.sampled_budget_watch = state.limit >= 0;
     }
 
-    int preview_round(const int* ids, int n) const {
-        if (state.limit < 0) return -1;
-        StreamSplitter preview_split = round_split;
-        q27::Utf8Gate preview_gate = round_gate;
-        for (int i = 0; i < n; i++) {
-            const auto before = preview_split.chan;
-            (void)preview_split.feed(preview_gate.feed(tok.decode_one(ids[i])));
-            if (before != StreamSplitter::THINK &&
-                preview_split.chan == StreamSplitter::THINK)
-                return i + 1;
+    void apply(q27::ThinkBudgetAction action, int current_public_tokens = 0,
+               int current_context_tokens = -1) {
+        if (action == q27::ThinkBudgetAction::NONE ||
+            eng.reasoning_transition_active(task))
+            return;
+        eng.force_reasoning_close(
+            task, close_ids, action == q27::ThinkBudgetAction::FORCE_PUBLIC,
+            current_public_tokens, current_context_tokens);
+    }
+
+    void start() { apply(state.start(split.chan)); }
+
+    void observe_token(q27::ThinkBudgetState& target_state, StreamSplitter& target_split,
+                       q27::Utf8Gate& target_gate, int id, bool forced) {
+        const auto before = target_split.chan;
+        (void)target_split.feed(target_gate.feed(tok.decode_one(id)));
+        target_state.observe(before, target_split.chan, forced);
+    }
+
+    void observe_token(int id, bool forced) {
+        observe_token(state, split, gate, id, forced);
+    }
+
+    int visible_prefix(const int* ids, int n, bool forced, bool* hits_eos) const {
+        *hits_eos = false;
+        if (forced) return n;
+        int visible = std::min(n, std::max(0, task.n_max - task.emitted));
+        for (int i = 0; i < visible; i++)
+            if (ids[i] == task.eos) {
+                *hits_eos = true;
+                return i;
+            }
+        return visible;
+    }
+
+    // Pure planning pass. Tool scanning runs only over the prefix this returns,
+    // so a discarded suffix cannot engage or poison the stateful grammar hook.
+    int preview_round(const int* ids, int n) {
+        const bool forced = task.round_forced;
+        bool hits_eos = false;
+        const int visible = visible_prefix(ids, n, forced, &hits_eos);
+        q27::ThinkBudgetState trial_state = state;
+        StreamSplitter trial_split = split;
+        q27::Utf8Gate trial_gate = gate;
+        int trip_prefix = -1;
+        for (int i = 0; i < visible; i++) {
+            observe_token(trial_state, trial_split, trial_gate, ids[i], forced);
+            if (!forced && trip_prefix < 0 && trial_state.limit >= 0 &&
+                !trial_state.transition_pending &&
+                trial_split.chan == StreamSplitter::THINK &&
+                trial_state.used >= trial_state.limit)
+                trip_prefix = i + 1;
         }
-        return -1;
+        if (hits_eos) return -1;
+
+        const auto action = trial_state.finish_round(trial_split.chan);
+        const bool natural_close_after_trip =
+            trip_prefix > 0 && action == q27::ThinkBudgetAction::NONE &&
+            trial_split.chan != StreamSplitter::THINK;
+        const bool natural_close_keeps_answer =
+            task.n_max - task.emitted - visible >= 1;
+        const bool force_full_round_fits =
+            action != q27::ThinkBudgetAction::NONE &&
+            eng.reasoning_close_fits(
+                task, visible, visible, (int)close_ids.size(),
+                action == q27::ThinkBudgetAction::FORCE_PUBLIC);
+        if ((action == q27::ThinkBudgetAction::NONE &&
+             (!natural_close_after_trip || natural_close_keeps_answer)) ||
+            force_full_round_fits)
+            return -1;
+        return trip_prefix > 0 && trip_prefix < n ? trip_prefix : -1;
     }
 
     void commit_round(const int* ids, int n) {
-        if (state.limit < 0) return;
-        for (int i = 0; i < n; i++)
-            (void)round_split.feed(round_gate.feed(tok.decode_one(ids[i])));
+        const bool forced = task.round_forced;
+        bool hits_eos = false;
+        const int visible = visible_prefix(ids, n, forced, &hits_eos);
+        for (int i = 0; i < visible; i++) observe_token(ids[i], forced);
+        // EOS wins immediately. Count only tokens before it, but never queue a
+        // close that post_round cannot commit after taking the EOS exit.
+        if (hits_eos) return;
+        apply(state.finish_round(split.chan), visible, visible);
     }
 
+    int observe_round(const int* ids, int n) {
+        const int m = preview_round(ids, n);
+        const int kept = (m >= 1 && m < n) ? m : n;
+        commit_round(ids, kept);
+        return m;
+    }
 
-    void observe(int id) {
-        const auto before = split.chan;
-        (void)split.feed(gate.feed(tok.decode_one(id)));
-        state.observe(before, split.chan, task, close_ids);
+    void observe_sampled(int id, bool forced) {
+        if (!task.sampling) return;
+        observe_token(id, forced);
+        // post_round advanced Ph before invoking the callback, but emitted is
+        // incremented afterwards: account one public token and zero context rows.
+        apply(state.finish_round(split.chan), forced ? 0 : 1, 0);
     }
 };
 
@@ -1577,27 +1646,36 @@ int main(int argc, char** argv) {
             // generated token is already inside the block, and its </think> flips
             // back to text (same mechanism as the FORCED TOOL pre-seed above).
             else if (thinking) sp.chan = StreamSplitter::THINK;
-            tb.start(bt, think_close_ids, sp.chan);
+            ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+            budget.start();
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
-            if (tc.enabled)
-                eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+            eng.on_round = [&](const int* em, int nr) {
+                int bm = budget.preview_round(em, nr);
+                int budget_kept = (bm >= 1 && bm < nr) ? bm : nr;
+                int m = tc.enabled ? tc.scan_round(em, budget_kept) : -1;
+                int kept = (m >= 1 && m <= budget_kept) ? m : budget_kept;
+                budget.commit_round(em, kept);
+                if (kept < nr) return kept;
+                return m;
+            };
             auto on_tok = [&](int id, bool forced) {
-                const auto before = sp.chan;
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
             int n = conductor
                         ? batch_generate(eng, prompt, n_max,
                                          [&](int id, bool forced) { return on_tok(id, forced); },
-                                         [&](int id) { tc.on_id(id); batch_tb.observe(id); }, stable_len, qw,
+                                         [&](int id) {
+                                             tc.on_id(id);
+                                             budget.observe_sampled(id, bt.callback_forced);
+                                         }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
@@ -1763,7 +1841,8 @@ int main(int argc, char** argv) {
                 Engine::DecodeTask bt;
                 if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
-                tb.start(bt, think_close_ids, sp.chan);
+                ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+                budget.start();
                 q27::Utf8Gate ugate;
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
@@ -1814,19 +1893,27 @@ int main(int argc, char** argv) {
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
-                if (tc.enabled)
-                    eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                eng.on_round = [&](const int* em, int nr) {
+                    int bm = budget.preview_round(em, nr);
+                    int budget_kept = (bm >= 1 && bm < nr) ? bm : nr;
+                    int m = tc.enabled ? tc.scan_round(em, budget_kept) : -1;
+                    int kept = (m >= 1 && m <= budget_kept) ? m : budget_kept;
+                    budget.commit_round(em, kept);
+                    if (kept < nr) return kept;
+                    return m;
+                };
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
-                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) { tc.on_id(id); batch_tb.observe(id); },
+                                                    [&](int id) {
+                                                        tc.on_id(id);
+                                                        budget.observe_sampled(id, bt.callback_forced);
+                                                    },
                                                     stable_len, qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
@@ -2020,7 +2107,8 @@ int main(int argc, char** argv) {
             q27::ThinkBudgetState tb{think_budget};
             Engine::DecodeTask bt;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
-            tb.start(bt, think_close_ids, sp.chan);
+            ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+            budget.start();
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -2042,17 +2130,22 @@ int main(int argc, char** argv) {
             tc.begin(tool_names_v);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
-            if (tc.enabled)
-                eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+            eng.on_round = [&](const int* em, int nr) {
+                int bm = budget.preview_round(em, nr);
+                int budget_kept = (bm >= 1 && bm < nr) ? bm : nr;
+                int m = tc.enabled ? tc.scan_round(em, budget_kept) : -1;
+                int kept = (m >= 1 && m <= budget_kept) ? m : budget_kept;
+                budget.commit_round(em, kept);
+                if (kept < nr) return kept;
+                return m;
+            };
             auto on_tok = [&](int id, bool forced) {
-                const auto before = sp.chan;
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
@@ -2061,7 +2154,10 @@ int main(int argc, char** argv) {
             int n = conductor
                         ? batch_generate(eng, prompt, n_max,
                                          [&](int id, bool forced) { return on_tok(id, forced); },
-                                         [&](int id) { tc.on_id(id); batch_tb.observe(id); }, stable_len, qw,
+                                         [&](int id) {
+                                             tc.on_id(id);
+                                             budget.observe_sampled(id, bt.callback_forced);
+                                         }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
@@ -2180,7 +2276,8 @@ int main(int argc, char** argv) {
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
-                tb.start(bt, think_close_ids, sp.chan);
+                ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+                budget.start();
                 std::string tool_buf, text_accum;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
@@ -2251,14 +2348,19 @@ int main(int argc, char** argv) {
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
-                if (tc.enabled)
-                    eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                eng.on_round = [&](const int* em, int nr) {
+                    int bm = budget.preview_round(em, nr);
+                    int budget_kept = (bm >= 1 && bm < nr) ? bm : nr;
+                    int m = tc.enabled ? tc.scan_round(em, budget_kept) : -1;
+                    int kept = (m >= 1 && m <= budget_kept) ? m : budget_kept;
+                    budget.commit_round(em, kept);
+                    if (kept < nr) return kept;
+                    return m;
+                };
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
-                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 std::string berr;
@@ -2266,7 +2368,10 @@ int main(int argc, char** argv) {
                 // a dead client flips `alive` -> the drain cancels (A3)
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) { tc.on_id(id); batch_tb.observe(id); },
+                                                    [&](int id) {
+                                                        tc.on_id(id);
+                                                        budget.observe_sampled(id, bt.callback_forced);
+                                                    },
                                                     stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
@@ -2544,6 +2649,7 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            HookGuard hooks{eng};
             eng.samp = parse_sample(body);
             eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
@@ -2566,7 +2672,11 @@ int main(int argc, char** argv) {
             q27::ThinkBudgetState tb{think_budget};
             Engine::DecodeTask bt;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
-            tb.start(bt, think_close_ids, sp.chan);
+            ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+            budget.start();
+            eng.on_round = [&](const int* em, int nr) {
+                return budget.observe_round(em, nr);
+            };
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
                     if (!ctx->think.empty()) flush_think();
@@ -2582,26 +2692,27 @@ int main(int argc, char** argv) {
                 }
             };
             q27::Utf8Gate ugate;
-            BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
             auto on_tok = [&](int id, bool forced) {
-                const auto before = sp.chan;
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
             int produced = conductor
                                ? batch_generate(eng, prompt, n_max,
                                                 [&](int id, bool forced) { return on_tok(id, forced); },
-                                                [&](int id) { batch_tb.observe(id); }, -1,
+                                                [&](int id) {
+                                                    budget.observe_sampled(id, bt.callback_forced);
+                                                }, -1,
                                                 qw, rt, bt, &berr)
                                : eng.generate(prompt, n_max, EOS,
                                               [&](int id) { return on_tok(id, bt.callback_forced); },
                                               -1, &bt);
+            eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, bat_stats(bt));
             // batch error surfacing (review pass 2): nothing emitted = 500
@@ -2647,6 +2758,7 @@ int main(int argc, char** argv) {
                 Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                HookGuard hooks{eng};
                 eng.samp = samp;
                 eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
@@ -2774,17 +2886,19 @@ int main(int argc, char** argv) {
                         {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
+                q27::Utf8Gate ugate;
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
-                tb.start(bt, think_close_ids, sp.chan);
-                q27::Utf8Gate ugate;
-                BatchThinkBudgetObserver batch_tb{tok, tb, bt, think_close_ids, sp.chan};
+                ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
+                budget.start();
+                eng.on_round = [&](const int* em, int nr) {
+                    return budget.observe_round(em, nr);
+                };
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
-                    const auto before = sp.chan;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                    if (!conductor) tb.observe(before, sp.chan, bt, think_close_ids);
+                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 // TODO(batch error surfacing): no mid-stream error event is
@@ -2795,11 +2909,14 @@ int main(int argc, char** argv) {
                 // the what().
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) { batch_tb.observe(id); }, -1,
+                                                    [&](int id) {
+                                                        budget.observe_sampled(id, bt.callback_forced);
+                                                    }, -1,
                                                     qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          return on_tok(id, bt.callback_forced);
                                      }, -1, &bt);
+                eng.on_round = nullptr;
                 eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id, bat_stats(bt));
                 const auto terminal = q27::responses_terminal_state(

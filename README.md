@@ -203,10 +203,11 @@ Two serving-side additions since: **P16 persistent prefix cache** (opt-in,
 P8 stable prefix to disk -- restart TTFT **8.15 s -> 1.20 s** on a 26,700-token
 prompt, bitwise-identical continuations, with an optional pinned host-RAM tier
 above it (`--prefix-cache-ram-gb`). And a **reasoning-token budget**, ON by
-default whenever a `<think>` block is served: the block is force-closed at half
-the request's `max_tokens` and the model still answers, because an A/B over 240
-scenarios found unbudgeted block mode truncating 28 times against inline's 0
-while scoring level on raw accuracy. See Serving for both.
+default when the rendered prompt begins inside a `<think>` block: the block is
+force-closed at half the request's `max_tokens` and the model still answers,
+because an A/B over 240 scenarios found unbudgeted block mode truncating 28
+times against inline's 0 while scoring level on raw accuracy. Later model-
+generated reasoning is capped only when explicitly armed. See Serving for both.
 
 ### Reference numbers (v0.2.0, 2026-07-16, vanilla model, 5090)
 
@@ -609,17 +610,32 @@ answer. When a client omits `max_tokens` the server defaults it to 8192
 thinking trace wants more, set it explicitly.
 
 **Reasoning budget (2026-07-30).** Tokens generated inside a prompt-seeded
-`<think>` block are capped; on trip the block is force-closed and the model
+`<think>` block are budgeted; on trip the block is force-closed and the model
 answers with what it has. It is not a hard stop -- truncating the request
-instead would reproduce the failure the cap exists to prevent. The default is
+instead would reproduce the failure the budget exists to prevent. The default is
 **half the request's `max_tokens`**, so the answer still fits after the close.
-Ordinary no-think requests remain unbounded and retain full sampled speculative
-decode width. `--think-budget N` with `N>0` explicitly arms that cap even for a
-later model-generated block; `--think-budget 0` opts out. Requests can likewise
-arm or override the budget, gated behind `--request-think`:
+The prompt-seeded scope is intentional: standard thinking-enabled serving
+starts inside the template-provided reasoning block, while a later model-
+generated block is capped only when explicitly armed. `--think-budget N` with
+`N>0` arms that later-block cap; `--think-budget 0` opts out. Requests can
+likewise arm or override the budget, gated behind `--request-think`:
 `thinking.budget_tokens` (Anthropic), `thinking_token_budget` (OpenAI/Qwen), or
-`chat_template_kwargs.thinking_budget` (llama.cpp). A trip is reported as
-`usage.reasoning_tokens` and `usage.reasoning_budget_exceeded`.
+`chat_template_kwargs.thinking_budget` (llama.cpp). Chat Completions and
+Messages report a trip as `usage.reasoning_tokens` and
+`usage.reasoning_budget_exceeded`; Responses reports the same fields under
+`usage.output_tokens_details`.
+
+Greedy checks land after the accepted speculative round, so the reasoning count
+may exceed the configured limit by that round's accepted width. A natural close
+later in the same round ends normally rather than reporting a budget trip.
+
+Bounded sampled requests intentionally use one-token acceptance rounds so every
+accepted token is a coherent budget-observation point. This disables
+speculative acceptance for the bounded request: on the reviewed RTX 5090 run,
+the exact tip measured 56.9 t/s bounded versus 143.1 t/s unbounded, a 2.51x
+reduction. Unbounded sampled requests retain normal speculative width. Restoring
+speculative width without weakening transition semantics is follow-up work.
+
 
 Why it defaults on: an 11-pack / 240-scenario A/B (BUILDLOG 2026-07-28, rescored
 07-30) found unbudgeted block mode truncating **28 times against inline's 0**

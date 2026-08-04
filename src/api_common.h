@@ -500,53 +500,57 @@ inline int max_prompt_for_think_decode(
     return 0;
 }
 
-// Request-local controller for bounded <think> spans. The decoder task is the
-// owner of enforcement: parsing alone can hide </think> from the client but
-// cannot advance model state. The first forced close uses the context reserve
-// admitted above. A later exhausted span pays for its close by reducing the
-// remaining public token allowance, so repeated transitions cannot exceed the
-// admitted context.
+// Request-local controller for bounded <think> spans. It observes semantic
+// channel transitions and decides WHEN a close is needed; the engine owns HOW
+// the tokenizer's close ids are committed through decoder state. Positive
+// budgets are checked after a whole decode round, so a trip may overshoot by
+// that round's accepted width. Request budget zero is the one pre-round case.
+enum class ThinkBudgetAction { NONE, FORCE_RESERVED, FORCE_PUBLIC };
+
 struct ThinkBudgetState {
     int limit = -1;
     int used = 0;
     bool tripped = false;
+    bool transition_pending = false;
+    bool reserved_close = true;
 
     explicit ThinkBudgetState(int cap = -1) : limit(cap) {}
 
-    template <typename Task>
-    void start(Task& task, const std::vector<int>& close_ids,
-               StreamSplitter::Chan initial = StreamSplitter::THINK) {
-        if (limit < 0) return;
-        task.accept_one = true;
-        if (limit == 0 && initial == StreamSplitter::THINK) trip(task, close_ids);
+    ThinkBudgetAction start(StreamSplitter::Chan initial = StreamSplitter::THINK) {
+        if (limit == 0 && initial == StreamSplitter::THINK) {
+            tripped = true;
+            transition_pending = true;
+            reserved_close = false;
+            return ThinkBudgetAction::FORCE_RESERVED;
+        }
+        return ThinkBudgetAction::NONE;
     }
 
-    template <typename Task>
-    void observe(StreamSplitter::Chan before, StreamSplitter::Chan after, Task& task,
-                 const std::vector<int>& close_ids) {
-        if (!tripped && before == StreamSplitter::THINK) used++;
-        if (limit < 0) return;
-        if (after != StreamSplitter::THINK) {
-            if (task.sampling) task.accept_one = true;
-            else task.release_accept_one();
-            return;
-        }
-        if (before != StreamSplitter::THINK) {
-            task.accept_one = true;
-            if (used >= limit) {
-                if (tripped) task.force_from_public_budget(close_ids);
-                else trip(task, close_ids);
-            }
-            return;
-        }
-        if (!tripped && used >= limit) trip(task, close_ids);
+    // Feed every semantically committed token in round order. Forced control
+    // ids change channel state but do not consume public reasoning usage.
+    void observe(StreamSplitter::Chan before, StreamSplitter::Chan after,
+                 bool forced = false) {
+        if (!forced && before == StreamSplitter::THINK) used++;
+        if (before == StreamSplitter::THINK && after != StreamSplitter::THINK)
+            transition_pending = false;
     }
 
-  private:
-    template <typename Task>
-    void trip(Task& task, const std::vector<int>& close_ids) {
+
+    // Call once after the complete retained round has been observed. A natural
+    // close later in the same speculative round wins: no duplicate close is
+    // queued. Once the reserved first close has tripped, any later re-entry
+    // borrows its close ids from the remaining public token allowance.
+    ThinkBudgetAction finish_round(StreamSplitter::Chan after) {
+        if (limit < 0 || transition_pending || after != StreamSplitter::THINK ||
+            used < limit)
+            return ThinkBudgetAction::NONE;
         tripped = true;
-        task.force(close_ids);
+        transition_pending = true;
+        if (reserved_close) {
+            reserved_close = false;
+            return ThinkBudgetAction::FORCE_RESERVED;
+        }
+        return ThinkBudgetAction::FORCE_PUBLIC;
     }
 };
 

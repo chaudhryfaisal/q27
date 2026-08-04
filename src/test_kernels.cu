@@ -2707,6 +2707,21 @@ static void test_spec_sample() {
     printf("    [spec chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
     check("spec rejection-sampling vs served target", chi2 < bound ? 0.0 : 1.0, 0.5);
 
+    // Reasoning-boundary cap: sampled speculation commits exactly the pending
+    // token, matching greedy k_finish_round before a forced decoder transition.
+    {
+        int one = 1;
+        CUDA_CHECK(cudaMemcpy(d_cap, &one, 4, cudaMemcpyHostToDevice));
+        int bad = 0;
+        for (int t = 0; t < 64; t++) {
+            int n, nt;
+            round(9000000 + t, 4, n, nt);
+            bad += n != 1;
+        }
+        check("spec reasoning cap commits one token", (double)bad, 0.5);
+        CUDA_CHECK(cudaMemcpy(d_cap, &zero, 4, cudaMemcpyHostToDevice));
+    }
+
     // ---- P14 max_draft (accept-walk cap) tests ----
     // Per-lane served prob p_served(dr_k)=softmax_full_k(dr_k)/mass_k (0 if the
     // draft fell outside its nucleus) for the cap tests below.

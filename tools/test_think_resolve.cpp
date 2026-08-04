@@ -15,29 +15,6 @@ static void ok(bool c, const char* n) {
     if (!c) failures++;
 }
 
-struct FakeTask {
-    bool accept_one = false;
-    int n_max = 8;
-    int emitted = 0;
-    bool cancel = false;
-    bool sampling = false;
-    std::vector<int> forced;
-    void force(const std::vector<int>& ids) {
-        forced.insert(forced.end(), ids.begin(), ids.end());
-        accept_one = true;
-    }
-    bool force_from_public_budget(const std::vector<int>& ids) {
-        const int cost = (int)ids.size();
-        if (n_max - emitted <= cost) {
-            cancel = true;
-            return false;
-        }
-        n_max -= cost;
-        force(ids);
-        return true;
-    }
-    void release_accept_one() { accept_one = false; }
-};
 
 int main() {
     // existing cases exercise the honoring path (allow_request=true, i.e. the
@@ -230,96 +207,59 @@ int main() {
     ok(q27::think_budget_default(1234, 8192) == 1234, "default: flag >0 -> absolute");
     ok(q27::think_budget_default(-1, 0) == -1, "default: no max_tokens -> unbounded");
 
-    // --- decoder-visible enforcement: exact trip, zero budget, and release ---
-    const std::vector<int> close_ids{70, 71};
+    // --- round-boundary enforcement: overshoot, natural close, and re-entry ---
+    using Action = q27::ThinkBudgetAction;
     {
-        FakeTask task;
         q27::ThinkBudgetState state(-1);
-        state.start(task, close_ids);
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(!task.accept_one && task.forced.empty() && state.used == 1 && !state.tripped,
-           "enforce: unbounded counts usage without constraining speculation");
+        ok(state.start() == Action::NONE, "enforce: unbounded start is inert");
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK);
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::NONE &&
+               state.used == 1 && !state.tripped,
+           "enforce: unbounded counts usage without forcing a close");
     }
     {
-        FakeTask task;
         q27::ThinkBudgetState state(0);
-        state.start(task, close_ids);
-        ok(task.accept_one && task.forced == close_ids && state.used == 0 && state.tripped,
-           "enforce: zero budget queues close before any model token");
+        ok(state.start() == Action::FORCE_RESERVED && state.used == 0 &&
+               state.tripped && state.transition_pending && !state.reserved_close,
+           "enforce: zero budget requests the reserved close before decoding");
     }
     {
-        FakeTask task;
         q27::ThinkBudgetState state(0);
-        state.start(task, close_ids, q27::StreamSplitter::TEXT);
-        ok(task.accept_one && task.forced.empty() && !state.tripped,
+        ok(state.start(q27::StreamSplitter::TEXT) == Action::NONE && !state.tripped,
            "enforce: zero budget stays armed outside a think span");
-        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.forced == close_ids && state.tripped,
+        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK);
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::FORCE_RESERVED &&
+               state.tripped,
            "enforce: zero budget closes a later spontaneous think span");
     }
     {
-        FakeTask task;
         q27::ThinkBudgetState state(2);
-        state.start(task, close_ids);
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.accept_one && task.forced.empty() && state.used == 1 && !state.tripped,
-           "enforce: bounded span observes one token per round before cap");
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.forced == close_ids && state.used == 2 && state.tripped,
-           "enforce: exact cap queues template close ids once");
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.forced == close_ids && state.used == 2,
-           "enforce: injected close ids are not counted or queued twice");
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT, task,
-                      close_ids);
-        ok(!task.accept_one, "enforce: completed close releases one-token acceptance cap");
-        task.emitted = 2;
-        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.accept_one && task.forced.size() == 4 && task.n_max == 6 &&
-               state.used == 2 && !task.cancel,
-           "enforce: later forced close consumes remaining public capacity");
+        ok(state.start() == Action::NONE, "enforce: positive budget starts normally");
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK);
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK);
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK);
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::FORCE_RESERVED &&
+               state.used == 3 && state.tripped && state.transition_pending,
+           "enforce: fused round may overshoot but uses its retained token count");
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::NONE,
+           "enforce: a pending transition is requested only once");
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT, true);
+        ok(state.tripped && !state.transition_pending && state.used == 3,
+           "enforce: forced close exits think without adding reasoning usage");
+        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK);
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::FORCE_PUBLIC,
+           "enforce: later re-entry borrows close capacity from public tokens");
     }
     {
-        FakeTask task;
-        q27::ThinkBudgetState state(4);
-        state.start(task, close_ids);
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT, task,
-                      close_ids);
-        ok(!task.accept_one && task.forced.empty() && state.used == 1 && !state.tripped,
-           "enforce: natural close before cap needs no forced transition");
-        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.accept_one && task.forced.empty() && state.used == 1 && !state.tripped,
-           "enforce: later think span re-arms one-token acceptance");
-    }
-    {
-        FakeTask task;
-        task.sampling = true;
-        q27::ThinkBudgetState state(4);
-        state.start(task, close_ids);
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT, task,
-                      close_ids);
-        ok(task.accept_one && !state.tripped,
-           "enforce: sampled decode stays one-token outside think for safe reentry");
-    }
-    {
-        FakeTask task;
-        task.n_max = 4;
-        task.emitted = 2;
-        q27::ThinkBudgetState state(0);
-        state.start(task, close_ids);
-        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT, task,
-                      close_ids);
-        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK, task,
-                      close_ids);
-        ok(task.cancel && task.forced.size() == 2 && task.n_max == 4,
-           "enforce: later close stops when public capacity cannot pay for it");
+        q27::ThinkBudgetState state(1);
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::THINK);
+        state.observe(q27::StreamSplitter::THINK, q27::StreamSplitter::TEXT);
+        ok(state.finish_round(q27::StreamSplitter::TEXT) == Action::NONE &&
+               state.used == 2 && !state.tripped && state.reserved_close,
+           "enforce: natural close later in the same round suppresses forcing");
+        state.observe(q27::StreamSplitter::TEXT, q27::StreamSplitter::THINK);
+        ok(state.finish_round(q27::StreamSplitter::THINK) == Action::FORCE_RESERVED,
+           "enforce: unused reserved close remains available for later re-entry");
     }
 
     printf(failures ? "\nTHINK-RESOLVE: %d FAIL\n" : "\nTHINK-RESOLVE: all pass\n", failures);

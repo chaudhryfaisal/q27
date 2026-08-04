@@ -9999,9 +9999,48 @@ malformed-tool fallback; both were fixed and regression-pinned. The final Codex
 run returned no accepted/actionable findings (`patch is correct`, confidence
 0.91).
 
-CUDA gate: CUDA 12.8.93 on Yukon successfully rebuilt the corrected source with
+CUDA gate: CUDA 12.8.93 on our local RTX 3090 successfully rebuilt the corrected
+source with
 `make -B NVCC=/home/ddbb/.local/cuda-12.8/bin/nvcc build/q27-server-w8`.
-The compile emits only warnings in unchanged `prefill.cu` and `tokenizer.cpp`.
-No live-model result is claimed for this correction: the 3090 remained occupied
-by PID 2062415 (`evidence-wt/.venv/bin/python`, 21884 MiB), so taking the card
-would have disrupted another workload.
+The compile emitted only warnings in unchanged `prefill.cu` and `tokenizer.cpp`.
+No live-model result was claimed for this correction at the time because that
+GPU was occupied by another workload.
+
+## 2026-08-03 -- reasoning PR current-upstream stabilization and sampled pricing
+
+The five-commit reasoning candidate was rebased from `e2f150ca` onto current
+upstream `5ce983d0`. The `src/` tree is byte-identical to reviewed tip
+`1de550a7bf81`; the upstream change adds the corrected per-architecture sampling
+gate and BUILDLOG records. The PR documentation now states the intended default
+scope and sampled-budget price explicitly.
+
+Exact host gates on the rebased tree pass: conductor, think resolution and
+enforcement, stream splitting, OpenAI bridge, and chat integration. An
+independent concurrency pass found the changed queue-sink paths safe:
+`callback_forced` is written and read synchronously on the conductor thread,
+client disconnect drains to queue closure, cancellation is atomic, and every
+accepted-member normal/error path finishes decode before the final queue
+close/fail edge. It also noted a pre-existing, server-unreachable registration-
+refusal path that skips `finish_decode`; the sink is never installed there, so
+the new `DecodeTask` capture is not exposed. That bookkeeping cleanup remains
+outside this bug fix.
+
+CUDA 12.8.93 / `sm_86` on our local RTX 3090 rebuilt `q27`, `q27-server-w8`,
+`test_kernels`, and `fused_smoke`. `CANON_ARCH=sm86 tools/sampling_gate.sh`
+reports `6894254e3b1a184ee3802771ddd59c2b` EXACT and all five sampling gates
+pass. The full model-backed kernel battery ends `ALL PASS`. A live width-8,
+`Q27_BATCH=1` sampled Responses request with budget 4 reports exactly four
+reasoning tokens, `reasoning_budget_exceeded: true`, and continues into answer
+text. The two-engine fused binary cannot instantiate two full-model engines on
+the 24 GiB card, including its width-8/greedy-only profile; that is the expected
+24 GiB capacity boundary, not a candidate failure. Because the rebased `src/`
+tree is unchanged, the published A40 and maintainer-run RTX 5090 fused-smoke
+passes remain exact source evidence.
+
+Product decision: bounded sampled requests keep one-token acceptance for their
+full lifetime so every accepted token is a coherent budget boundary. The
+maintainer measured 56.9 t/s bounded versus 143.1 t/s unbounded on the reviewed
+RTX 5090 tip, a 2.51x reduction. Prompt-seeded reasoning remains covered by
+default; later model-generated reasoning is capped only when explicitly armed.
+Recovering sampled speculative width without weakening those semantics is a
+separate follow-up.
