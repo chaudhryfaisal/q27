@@ -14,6 +14,7 @@
 #include "kernels.cuh"
 #include "loader.h"
 #include "prefill.cuh"
+#include "sampling.h"
 #include "spec3.cuh"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
@@ -2450,6 +2451,56 @@ static void test_wy_stream_isolation() {
     unsetenv("Q27_DS_MODE");
 }
 
+static void check_nucleus_contract(const char* name, const std::vector<float>& logits,
+                                   float temperature, float top_p) {
+    float* d_logits;
+    float* d_nucleus;
+    q27k::SampleParams* d_params;
+    CUDA_CHECK(cudaMalloc(&d_logits, logits.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_nucleus, 4 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_params, sizeof(q27k::SampleParams)));
+    CUDA_CHECK(cudaMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    const q27k::SampleParams device_params{1.0f / temperature, top_p, 0};
+    CUDA_CHECK(cudaMemcpy(d_params, &device_params, sizeof device_params,
+                          cudaMemcpyHostToDevice));
+    q27k::nucleus(d_logits, (int)logits.size(), d_params, d_nucleus);
+    float nucleus[4];
+    CUDA_CHECK(cudaMemcpy(nucleus, d_nucleus, sizeof nucleus, cudaMemcpyDeviceToHost));
+
+    const q27::SamplingParams host_params{temperature, top_p, 0, 0};
+    const auto host = q27::build_served_distribution(logits, host_params);
+    std::vector<uint8_t> host_kept(logits.size(), 0);
+    for (uint32_t token : host.tokens) host_kept[token] = 1;
+
+    int support_mismatches = 0;
+    double max_probability_error = 0.0;
+    for (uint32_t token = 0; token < logits.size(); token++) {
+        const bool device_kept = logits[token] >= nucleus[0];
+        support_mismatches += device_kept != (host_kept[token] != 0);
+        const double device_probability =
+            device_kept
+                ? std::exp((double)device_params.inv_temp * (logits[token] - nucleus[1]) -
+                           nucleus[2]) /
+                      nucleus[3]
+                : 0.0;
+        max_probability_error =
+            std::max(max_probability_error,
+                     std::fabs(device_probability - q27::served_probability(host, token)));
+    }
+
+    char label[128];
+    std::snprintf(label, sizeof label, "%s support", name);
+    check(label, (double)support_mismatches, 0.5);
+    std::snprintf(label, sizeof label, "%s probabilities", name);
+    check(label, max_probability_error, 2e-5);
+
+    CUDA_CHECK(cudaFree(d_logits));
+    CUDA_CHECK(cudaFree(d_nucleus));
+    CUDA_CHECK(cudaFree(d_params));
+}
+
 // Sampling Phase 1: nucleus stats + top-p threshold + Gumbel-max, on synthetic
 // logits (no model). Greedy argmax is untouched by construction -- this only
 // exercises the new sample() path (temp>0). Determinism lets every check use a
@@ -2459,6 +2510,13 @@ static void test_sample() {
     // spread logits so a few tokens dominate (realistic nucleus shapes)
     std::vector<float> x = rand_vec(n, 4242);
     for (auto& v : x) v *= 2.5f;
+    check_nucleus_contract("sample host/CUDA T=0.8 p=0.95", x, 0.8f, 0.95f);
+    check_nucleus_contract("sample host/CUDA T=1.5 p=0.95", x, 1.5f, 0.95f);
+    std::vector<float> tied(64, -5.0f);
+    tied[0] = 4.0f;
+    tied[1] = 3.0f;
+    tied[2] = tied[3] = tied[4] = 2.0f;
+    check_nucleus_contract("sample host/CUDA cutoff ties", tied, 1.0f, 0.8f);
     // CPU argmax + full-softmax probs at a given inv_temp
     auto cpu_argmax = [&]() {
         int bi = 0; for (int i = 1; i < n; i++) if (x[i] > x[bi]) bi = i; return bi;

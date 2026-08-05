@@ -38,6 +38,17 @@ struct BackendTensor {
     uint64_t scales_size = 0;
 };
 
+// Cache layout is an execution contract, not a backend name. Keeping the
+// format as data lets new layouts use the same vtable entry. A backend must
+// reject unsupported formats rather than silently reinterpret their buffers.
+enum class KvFormat : uint8_t {
+    F16 = 0,
+    FP8_E4M3 = 1,
+    TURBO3 = 2,
+    TURBO3V = 3,
+    TURBO5K = 4,
+};
+
 // This intentionally starts small. New primitives should describe model
 // operations, not CUDA/Metal launch mechanics. The CUDA engine remains the
 // reference while its call sites are moved behind this interface incrementally.
@@ -74,7 +85,8 @@ class ComputeBackend {
     virtual void matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
                              const BackendTensor& b, BackendBuffer& b_out,
                              const BackendBuffer& x) {
-        matvec(a, x, a_out); matvec(b, x, b_out);
+        matvec(a, x, a_out);
+        matvec(b, x, b_out);
     }
     virtual BackendQuantized allocate_quantized(uint32_t count) = 0;
     virtual void quantize(const BackendBuffer& x, BackendQuantized& out) = 0;
@@ -83,12 +95,15 @@ class ComputeBackend {
     virtual void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
                                        const BackendTensor& b, BackendBuffer& b_out,
                                        const BackendQuantized& x) {
-        matvec_quantized(a, x, a_out); matvec_quantized(b, x, b_out);
+        matvec_quantized(a, x, a_out);
+        matvec_quantized(b, x, b_out);
     }
-    virtual void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
-                                  uint32_t x_rows,BackendBuffer& y) {
-        if(x_rows!=1) throw std::runtime_error("q27: backend has no quantized matmul");
-        matvec_quantized(weight,x,y);
+    virtual void matmul_quantized(const BackendTensor& weight,
+                                  const BackendQuantized& x,
+                                  uint32_t x_rows, BackendBuffer& y) {
+        if (x_rows != 1)
+            throw std::runtime_error("q27: backend has no quantized matmul");
+        matvec_quantized(weight, x, y);
     }
     virtual void embedding_q8(const BackendTensor& weight, uint32_t token,
                               BackendBuffer& out) = 0;
@@ -97,7 +112,8 @@ class ComputeBackend {
     virtual void rmsnorm_quantized(const BackendBuffer& x, const BackendTensor& weight,
                                    BackendBuffer& out, uint32_t n, float eps,
                                    BackendQuantized& quantized) {
-        rmsnorm(x,weight,out,n,eps); quantize(out,quantized);
+        rmsnorm(x, weight, out, n, eps);
+        quantize(out, quantized);
     }
     virtual void rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
                                uint32_t heads, uint32_t head_dim, uint32_t stride,
@@ -135,28 +151,19 @@ class ComputeBackend {
         (void)x_offset_bytes;
         throw std::runtime_error("q27: backend has no top-k primitive");
     }
-    virtual void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
-                              BackendBuffer& k_cache, BackendBuffer& v_cache,
-                              uint32_t position, uint32_t row_length) = 0;
+    virtual void kv_store(const BackendBuffer& k, const BackendBuffer& v,
+                          BackendBuffer& k_cache, BackendBuffer& v_cache,
+                          uint32_t position, uint32_t kv_heads, uint32_t head_dim,
+                          KvFormat format) = 0;
     virtual void turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
                            bool inverse) = 0;
-    virtual void kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,
-                                 BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                 uint32_t position, uint32_t kv_heads) = 0;
-    // partials: caller-owned scratch for the blocked-GQA softmax partials;
-    // may be null only when the call cannot route to the blocked kernels
-    // (see attention_f16_causal below).
-    virtual void attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
-                                  const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                                  BackendBuffer& out,
-                                  uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads,
-                                  uint32_t head_dim, float scale,
-                                  BackendBuffer* partials) = 0;
-    virtual void attention_f16(const BackendBuffer& q, uint32_t q_stride,
-                               const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                               BackendBuffer& out, uint32_t seq_len,
-                               uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                               float scale, BackendBuffer* partials) = 0;
+    // partials: caller-owned scratch for blocked-GQA softmax partials; may be
+    // null only when the selected format cannot route to blocked kernels.
+    virtual void attention(const BackendBuffer& q, uint32_t q_stride,
+                           const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                           BackendBuffer& out, uint32_t seq_len, uint32_t q_heads,
+                           uint32_t kv_heads, uint32_t head_dim, float scale,
+                           KvFormat format, BackendBuffer* partials) = 0;
     virtual void gdn_gates(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
                            const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
                            BackendBuffer& g, BackendBuffer& beta, uint32_t heads) = 0;
@@ -234,44 +241,29 @@ class ComputeBackend {
         (void)position; (void)tokens; (void)freq_base;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
-    virtual void kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
-                                   BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                   uint32_t position, uint32_t row_length, uint32_t tokens) {
-        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)row_length;
-        (void)tokens;
-        throw std::runtime_error("q27: backend has no chunked execution");
-    }
-    virtual void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
-                                      BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                      uint32_t position, uint32_t kv_heads, uint32_t tokens) {
-        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)kv_heads;
-        (void)tokens;
-        throw std::runtime_error("q27: backend has no chunked execution");
+    virtual void kv_store_rows(const BackendBuffer& k, const BackendBuffer& v,
+                               BackendBuffer& k_cache, BackendBuffer& v_cache,
+                               uint32_t position, uint32_t kv_heads, uint32_t head_dim,
+                               uint32_t tokens, KvFormat format) {
+        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position;
+        (void)kv_heads; (void)head_dim; (void)tokens; (void)format;
+        throw std::runtime_error("q27: backend has no chunked KV store");
     }
     // partials: caller-owned scratch for blocked-GQA softmax partials, sized
     // once by the engine for its maximum context. May be null only when the
-    // call cannot route to the blocked kernels.
-    virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
-                                      uint32_t q_row_stride, const BackendBuffer& k_cache,
-                                      const BackendBuffer& v_cache,
-                                      BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
-                                      uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                      float scale, BackendBuffer* partials) {
+    // selected format cannot route to blocked kernels.
+    virtual void attention_causal(const BackendBuffer& q, uint32_t q_stride,
+                                  uint32_t q_row_stride,
+                                  const BackendBuffer& k_cache,
+                                  const BackendBuffer& v_cache,
+                                  BackendBuffer& out, uint32_t base_len,
+                                  uint32_t q_heads, uint32_t kv_heads,
+                                  uint32_t head_dim, uint32_t tokens, float scale,
+                                  KvFormat format, BackendBuffer* partials) {
         (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
-        (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
-        (void)head_dim; (void)tokens; (void)scale; (void)partials;
-        throw std::runtime_error("q27: backend has no chunked execution");
-    }
-    virtual void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
-                                         uint32_t q_row_stride, const BackendBuffer& k_cache,
-                                         const BackendBuffer& v_cache,
-                                         BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
-                                         uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                         float scale, BackendBuffer* partials) {
-        (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
-        (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
-        (void)head_dim; (void)tokens; (void)scale; (void)partials;
-        throw std::runtime_error("q27: backend has no chunked execution");
+        (void)out; (void)base_len; (void)q_heads; (void)kv_heads; (void)head_dim;
+        (void)tokens; (void)scale; (void)format; (void)partials;
+        throw std::runtime_error("q27: backend has no chunked attention");
     }
     virtual void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
                                        uint32_t heads, uint32_t head_dim, uint32_t tokens) {
