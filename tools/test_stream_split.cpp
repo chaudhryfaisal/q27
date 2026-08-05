@@ -75,6 +75,11 @@ int main() {
     const std::vector<Segment> text_between_want = {
         {Chan::TOOL, "a"}, {Chan::TEXT, "x"}, {Chan::TOOL, "b"}};
 
+    const std::string text_then_stray_close =
+        "<tool_call>a</tool_call>x</tool_call><think></think>";
+    const std::vector<Segment> text_then_stray_close_want = {
+        {Chan::TOOL, "a"}, {Chan::TEXT, "x"}};
+
     bool ok = true;
     ok = expect("adjacent/full", split(adjacent, false), adjacent_want) && ok;
     ok = expect("adjacent/bytewise", split(adjacent, true), adjacent_want) && ok;
@@ -82,6 +87,9 @@ int main() {
     ok = expect("empty-think/bytewise", split(empty_think, true), empty_think_want) && ok;
     ok = expect("nonempty-think/bytewise", split(nonempty_think, true), nonempty_think_want) && ok;
     ok = expect("text-between/bytewise", split(text_between, true), text_between_want) && ok;
+    ok = expect("text-before-stray clears boundary",
+                split(text_then_stray_close, false),
+                text_then_stray_close_want) && ok;
 
     q27::StreamSplitter unfinished;
     std::vector<Segment> unfinished_got = unfinished.feed("<tool_call>a</tool_call><think>");

@@ -64,7 +64,10 @@ struct StreamSplitter {
                         chan = TOOL;
                         continue;
                     }
-                    if (sc > 0) out.push_back({TEXT, hold.substr(0, sc)});
+                    if (sc > 0) {
+                        out.push_back({TEXT, hold.substr(0, sc)});
+                        tool_boundary = false;
+                    }
                     hold.erase(0, sc + strlen(C_CLOSE)); // strip stray close
                     continue;
                 }
