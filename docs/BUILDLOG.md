@@ -10037,10 +10037,69 @@ the 24 GiB card, including its width-8/greedy-only profile; that is the expected
 tree is unchanged, the published A40 and maintainer-run RTX 5090 fused-smoke
 passes remain exact source evidence.
 
-Product decision: bounded sampled requests keep one-token acceptance for their
-full lifetime so every accepted token is a coherent budget boundary. The
-maintainer measured 56.9 t/s bounded versus 143.1 t/s unbounded on the reviewed
-RTX 5090 tip, a 2.51x reduction. Prompt-seeded reasoning remains covered by
-default; later model-generated reasoning is capped only when explicitly armed.
-Recovering sampled speculative width without weakening those semantics is a
-separate follow-up.
+Stabilization baseline: until a coherent round observer existed, bounded sampled
+requests kept one-token acceptance for their full lifetime. The maintainer
+measured 56.9 t/s bounded versus 143.1 t/s unbounded on the reviewed RTX 5090
+tip, a 2.51x reduction. Prompt-seeded reasoning remained covered by default;
+later model-generated reasoning was capped only when explicitly armed. That
+baseline made sampled-width recovery, without weakening either semantic, the
+separate follow-up recorded below.
+
+## 2026-08-03 -- sampled reasoning-budget round observer
+
+The follow-up removes the full-lifetime one-token acceptance cap from bounded
+sampled requests. `Engine::post_round` now runs the existing pre-emission round
+observer for sampled as well as greedy rounds. Ordinary accepted sampled rounds
+commit at their natural width. If a crossing round would consume the reserved
+close/answer capacity, the observer returns only the prefix through the budget
+trip and `refinish_round` restores that retained hidden/KV position. The normal
+case already queued a forced close, which replaces the provisional argmax
+pending before any next model decision. If a later public-budget close cannot
+fit, `force_reasoning_close` cancels the task instead; the next-boundary cancel
+check likewise prevents that provisional pending from being consumed. Forced-
+close rounds still cap acceptance to one, so no speculative lane produced from
+the superseded pending token can commit.
+
+The obsolete sampled per-token observer and `sampled_budget_watch` state were
+deleted. The fake integration engine now drives `on_round` for sampled traffic,
+and its regression matrix covers both solo and conductor paths: a sampled
+boundary-crossing round discards its stale suffix, the forced close conditions
+the answer, a budget-4 request commits a three-token sampled round before
+truncating only the later crossing round, and a capacity-starved re-entry
+retains its opener then cancels without exposing the discarded suffix.
+
+Two independent final-review passes then found three boundary defects. A
+capacity-starved sampled refinish could hit an assertion after cancellation; a
+natural close plus public answer in the same exact-cap round could be rewound
+solely because no *later* answer slot remained; and the conductor fake emitted
+EOS plus its scripted suffix instead of stopping before callbacks. The fixes
+treat cancellation as a valid terminal refinish outcome, recognize ordinary,
+marker-buffered, and incomplete-UTF-8 public tails after a natural close, and
+make the fake's EOS contract match solo and production generation. Focused
+solo/conductor regressions cover all three cases. A final Luna review reported
+no actionable findings with 0.94 confidence.
+
+Fresh host gates on the final one-commit tree pass: extracted server/fake parity,
+chat integration, think resolver/enforcement, depth control, and conductor.
+CUDA 12.8.93 / `sm_86` rebuilt `q27`, `q27-server-w8`, `test_kernels`, and the
+fused-smoke binary on the local RTX 3090. The corrected `CANON_ARCH=sm86`
+sampling gate remains canonical `6894254e3b1a184ee3802771ddd59c2b` EXACT with
+all five gates PASS, and the full model-backed kernel battery ends `ALL PASS`.
+
+Live width-8 validation covered both `Q27_BATCH=1` and `Q27_BATCH=0` at
+temperature 0.7. Budget-1/max-2 requests expose one reasoning token plus one
+answer token in both modes; concurrent conductor requests remain isolated; a
+zero-budget request exposes no reasoning; and streaming reports the same public
+bytes and terminal usage as non-streaming. This exercises the sampled refinish
+path rather than merely a naturally one-token sampled round.
+
+Direct same-machine performance gate (`Q27_BATCH=1`, temperature 0.7, top-p
+0.95, seed 42, width-8, 256-token request): the pre-follow-up build delivered
+32.4 t/s and 0.985 public tokens/round. The follow-up delivered 89.7 t/s and
+2.639 tokens/round on the first run, 95.4 t/s and 2.813 tokens/round on repeat.
+The unbounded control delivered 100.2 t/s and 2.943 tokens/round. Conservatively,
+the bounded path recovered 2.77x over the old cap and reached 89.5% of the
+unbounded control in this single-prompt regression gate. The final boundary-
+hardening tip was not rebenchmarked; these numbers document the immediately
+preceding follow-up tree and remain directional feature evidence, not an exact-
+tip throughput measurement.

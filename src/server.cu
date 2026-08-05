@@ -103,12 +103,12 @@ struct HookGuard {
     }
 };
 
-// Greedy budgets are observed through Engine::on_round before host emission.
-// The whole retained round is parsed first, so a natural close later in that
+// Reasoning budgets are observed through Engine::on_round before host emission.
+// The whole accepted round is parsed first, so a natural close later in that
 // round wins. When an overshooting round would consume reserved close/answer
-// capacity, only the prefix through the trip is retained and re-finished.
-// Sampled rounds intentionally keep on_round unset; bounded sampled requests
-// use the engine's one-token observation fallback instead.
+// capacity, only the prefix through the trip is retained and re-finished. On
+// sampled paths that refinish immediately precedes the forced close, so the
+// provisional argmax pending is replaced before any next-token decision.
 struct ReasoningBudgetObserver {
     q27::Tokenizer& tok;
     q27::ThinkBudgetState& state;
@@ -124,7 +124,6 @@ struct ReasoningBudgetObserver {
                             StreamSplitter::Chan initial)
         : tok(tok_), state(state_), eng(eng_), task(task_), close_ids(close_ids_) {
         split.chan = initial;
-        task.sampled_budget_watch = state.limit >= 0;
     }
 
     void apply(q27::ThinkBudgetAction action, int current_public_tokens = 0,
@@ -139,15 +138,21 @@ struct ReasoningBudgetObserver {
 
     void start() { apply(state.start(split.chan)); }
 
-    void observe_token(q27::ThinkBudgetState& target_state, StreamSplitter& target_split,
-                       q27::Utf8Gate& target_gate, int id, bool forced) {
+    bool observe_token(q27::ThinkBudgetState& target_state,
+                       StreamSplitter& target_split, q27::Utf8Gate& target_gate,
+                       int id, bool forced) {
         const auto before = target_split.chan;
-        (void)target_split.feed(target_gate.feed(tok.decode_one(id)));
+        const auto segments = target_split.feed(target_gate.feed(tok.decode_one(id)));
         target_state.observe(before, target_split.chan, forced);
+        for (const auto& [ch, text] : segments)
+            if (ch != StreamSplitter::THINK &&
+                text.find_first_not_of(" \t\r\n") != std::string::npos)
+                return true;
+        return false;
     }
 
-    void observe_token(int id, bool forced) {
-        observe_token(state, split, gate, id, forced);
+    bool observe_token(int id, bool forced) {
+        return observe_token(state, split, gate, id, forced);
     }
 
     int visible_prefix(const int* ids, int n, bool forced, bool* hits_eos) const {
@@ -172,8 +177,11 @@ struct ReasoningBudgetObserver {
         StreamSplitter trial_split = split;
         q27::Utf8Gate trial_gate = gate;
         int trip_prefix = -1;
+        bool public_answer_after_trip = false;
         for (int i = 0; i < visible; i++) {
-            observe_token(trial_state, trial_split, trial_gate, ids[i], forced);
+            const bool emitted_public =
+                observe_token(trial_state, trial_split, trial_gate, ids[i], forced);
+            if (trip_prefix > 0 && emitted_public) public_answer_after_trip = true;
             if (!forced && trip_prefix < 0 && trial_state.limit >= 0 &&
                 !trial_state.transition_pending &&
                 trial_split.chan == StreamSplitter::THINK &&
@@ -186,8 +194,12 @@ struct ReasoningBudgetObserver {
         const bool natural_close_after_trip =
             trip_prefix > 0 && action == q27::ThinkBudgetAction::NONE &&
             trial_split.chan != StreamSplitter::THINK;
-        const bool natural_close_keeps_answer =
-            task.n_max - task.emitted - visible >= 1;
+        const bool buffered_public_answer =
+            trial_split.chan != StreamSplitter::THINK &&
+            (!trial_gate.pend.empty() ||
+             trial_split.hold.find_first_not_of(" \t\r\n") != std::string::npos);
+        const bool natural_close_keeps_answer = public_answer_after_trip ||
+            buffered_public_answer || task.n_max - task.emitted - visible >= 1;
         const bool force_full_round_fits =
             action != q27::ThinkBudgetAction::NONE &&
             eng.reasoning_close_fits(
@@ -218,13 +230,6 @@ struct ReasoningBudgetObserver {
         return m;
     }
 
-    void observe_sampled(int id, bool forced) {
-        if (!task.sampling) return;
-        observe_token(id, forced);
-        // post_round advanced Ph before invoking the callback, but emitted is
-        // incremented afterwards: account one public token and zero context rows.
-        apply(state.finish_round(split.chan), forced ? 0 : 1, 0);
-    }
 };
 
 int main(int argc, char** argv) {
@@ -1665,17 +1670,13 @@ int main(int argc, char** argv) {
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
             int n = conductor
                         ? batch_generate(eng, prompt, n_max,
                                          [&](int id, bool forced) { return on_tok(id, forced); },
-                                         [&](int id) {
-                                             tc.on_id(id);
-                                             budget.observe_sampled(id, bt.callback_forced);
-                                         }, stable_len, qw,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
@@ -1905,15 +1906,11 @@ int main(int argc, char** argv) {
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) {
-                                                        tc.on_id(id);
-                                                        budget.observe_sampled(id, bt.callback_forced);
-                                                    },
+                                                    [&](int id) { tc.on_id(id); },
                                                     stable_len, qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
@@ -2145,7 +2142,6 @@ int main(int argc, char** argv) {
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
@@ -2154,10 +2150,7 @@ int main(int argc, char** argv) {
             int n = conductor
                         ? batch_generate(eng, prompt, n_max,
                                          [&](int id, bool forced) { return on_tok(id, forced); },
-                                         [&](int id) {
-                                             tc.on_id(id);
-                                             budget.observe_sampled(id, bt.callback_forced);
-                                         }, stable_len, qw,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
                                          rt, bt, &berr)
                         : eng.generate(prompt, n_max, EOS, [&](int id) {
                               tc.on_id(id);
@@ -2360,7 +2353,6 @@ int main(int argc, char** argv) {
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 std::string berr;
@@ -2368,10 +2360,7 @@ int main(int argc, char** argv) {
                 // a dead client flips `alive` -> the drain cancels (A3)
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) {
-                                                        tc.on_id(id);
-                                                        budget.observe_sampled(id, bt.callback_forced);
-                                                    },
+                                                    [&](int id) { tc.on_id(id); },
                                                     stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
@@ -2698,16 +2687,13 @@ int main(int argc, char** argv) {
                         continue;
                     route(ch, t);
                 }
-                if (!conductor) budget.observe_sampled(id, forced);
                 return true;
             };
             std::string berr;
             int produced = conductor
                                ? batch_generate(eng, prompt, n_max,
                                                 [&](int id, bool forced) { return on_tok(id, forced); },
-                                                [&](int id) {
-                                                    budget.observe_sampled(id, bt.callback_forced);
-                                                }, -1,
+                                                nullptr, -1,
                                                 qw, rt, bt, &berr)
                                : eng.generate(prompt, n_max, EOS,
                                               [&](int id) { return on_tok(id, bt.callback_forced); },
@@ -2898,7 +2884,6 @@ int main(int argc, char** argv) {
                 auto on_tok = [&](int id, bool forced) {
                     forced_control_token = forced;
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                    if (!conductor) budget.observe_sampled(id, forced);
                     return alive; // stop generating once the client has disconnected
                 };
                 // TODO(batch error surfacing): no mid-stream error event is
@@ -2909,9 +2894,7 @@ int main(int argc, char** argv) {
                 // the what().
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
-                                                    [&](int id) {
-                                                        budget.observe_sampled(id, bt.callback_forced);
-                                                    }, -1,
+                                                    nullptr, -1,
                                                     qw, rt, bt, nullptr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          return on_tok(id, bt.callback_forced);

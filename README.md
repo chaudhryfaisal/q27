@@ -625,16 +625,23 @@ Messages report a trip as `usage.reasoning_tokens` and
 `usage.reasoning_budget_exceeded`; Responses reports the same fields under
 `usage.output_tokens_details`.
 
-Greedy checks land after the accepted speculative round, so the reasoning count
-may exceed the configured limit by that round's accepted width. A natural close
-later in the same round ends normally rather than reporting a budget trip.
+Positive budget checks land after the accepted speculative round, so the
+reasoning count may exceed the configured limit by that round's accepted width.
+A natural close later in the same round ends normally rather than reporting a
+budget trip.
 
-Bounded sampled requests intentionally use one-token acceptance rounds so every
-accepted token is a coherent budget-observation point. This disables
-speculative acceptance for the bounded request: on the reviewed RTX 5090 run,
-the exact tip measured 56.9 t/s bounded versus 143.1 t/s unbounded, a 2.51x
-reduction. Unbounded sampled requests retain normal speculative width. Restoring
-speculative width without weakening transition semantics is follow-up work.
+Bounded sampled requests now retain normal speculative acceptance. The accepted
+round is observed before host emission; if committing it would consume reserved
+close/answer capacity, the engine retains only the prefix through the budget
+trip, re-finishes that sampled state, and installs the forced close before the
+next model decision. On the maintainer's matched RTX 5090 A/B
+(`temperature=0.7`, `top_p=0.95`, `max_tokens=700`, n=2 per arm), bounded
+throughput moved from 56.9 t/s on master to 147.9 t/s on this PR, while the
+unbounded control held at 143.1 -> 143.5 t/s (inside noise). Both bounded PR
+reps were exactly 147.9 t/s. The bounded arm used 275 rounds against 284
+unbounded, so its slight lead reflects the budget closing the trajectory early,
+not a faster kernel. This is a single-prompt gate, not a universal throughput
+claim.
 
 
 Why it defaults on: an 11-pack / 240-scenario A/B (BUILDLOG 2026-07-28, rescored
