@@ -3,6 +3,7 @@
 #include "../../third_party/json.hpp"
 #include "../suffixdraft.h"
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -217,7 +218,7 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     if (has_mtp_) {
         mtp_embed_norm_ = alloc_f32(N_EMBD); mtp_hidden_norm_ = alloc_f32(N_EMBD);
         mtp_concat_ = alloc_f32(2 * N_EMBD); mtp_x_ = alloc_f32(N_EMBD);
-        mtp_hidden_out_ = alloc_f32(N_EMBD);
+        mtp_hidden_out_ = alloc_f32(N_EMBD); mtp_logits_ = alloc_f32(VOCAB);
         const uint64_t mtp_cache_bytes = (uint64_t)max_context_ * cache_row_bytes;
         mtp_k_cache_ = backend_.allocate(mtp_cache_bytes); mtp_v_cache_ = backend_.allocate(mtp_cache_bytes);
     }
@@ -288,6 +289,16 @@ void MetalEngine::reset() {
         if (layer.ring) backend_.zero(*layer.ring);
         // KV rows are written before they become visible through position_;
         // clearing the full reserved context would make long-context reset O(ctx).
+    }
+    // MTP attention includes row 0, but there is no predecessor hidden state
+    // from which to warm it. Keep that permanent sentinel deterministic while
+    // leaving the remaining O(context) cache rows write-before-visible.
+    if (mtp_k_cache_) {
+        std::array<uint8_t, N_KV * HEAD_DIM * sizeof(uint16_t)> zero_row{};
+        const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
+                                              : zero_row.size();
+        backend_.write(*mtp_k_cache_, 0, zero_row.data(), cache_row);
+        backend_.write(*mtp_v_cache_, 0, zero_row.data(), cache_row);
     }
 }
 
@@ -661,7 +672,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     backend_.quantize(*mtp_concat_, q10240_);
     backend_.matvec_quantized(layer_weight(layer, "nextn.eh_proj.weight"), q10240_, *mtp_x_);
 
-    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    // Drafting may stop before any lane commits; keep resident x1_/logits_ intact.
+    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"attn_norm.weight"),*h_,N_EMBD,EPS,q5120_);
     backend_.matvec_quantized(layer_weight(layer, "attn_q.weight"), q5120_, *qg_);
     backend_.rmsnorm_heads(*qg_, layer_weight(layer, "attn_q_norm.weight"),
                            N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
@@ -684,7 +696,7 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     backend_.matvec_quantized(layer_weight(layer, "attn_output.weight"), q6144_, *y_);
     backend_.add_inplace(*mtp_x_, *y_, N_EMBD);
 
-    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"post_attention_norm.weight"),*h_,N_EMBD,EPS,q5120_);
     backend_.matvec_quantized_pair(layer_weight(layer,"ffn_gate.weight"),*ffn_gate_,
                                    layer_weight(layer,"ffn_up.weight"),*ffn_up_,q5120_);
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
@@ -696,8 +708,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     const BackendTensor& head = model_.find("output_q4.weight") ? weight("output_q4.weight")
                                                                 : weight("output.weight");
     backend_.quantize(*mtp_hidden_out_, q5120_);
-    backend_.matvec_quantized(head, q5120_, *logits_);
-    backend_.argmax(*logits_, VOCAB, *token_out_);
+    backend_.matvec_quantized(head, q5120_, *mtp_logits_);
+    backend_.argmax(*mtp_logits_, VOCAB, *token_out_);
     batch.finish();
     uint32_t result = 0; backend_.read(*token_out_, 0, &result, sizeof(result));
     return result;

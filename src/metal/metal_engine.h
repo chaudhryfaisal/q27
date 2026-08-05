@@ -108,7 +108,7 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> delta_out_, gated_out_;
     std::shared_ptr<BackendBuffer> ffn_gate_, ffn_up_, logits_, token_out_;
     std::shared_ptr<BackendBuffer> mtp_embed_norm_, mtp_hidden_norm_, mtp_concat_;
-    std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_k_cache_, mtp_v_cache_;
+    std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_logits_, mtp_k_cache_, mtp_v_cache_;
     BackendQuantized q5120_, q6144_, q10240_, q17408_;
 
     // Layer-major chunked prefill state (CHUNK_MAX token rows per buffer).

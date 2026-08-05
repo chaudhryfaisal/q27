@@ -1,5 +1,6 @@
 #include "metal_engine.h"
 
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
@@ -23,6 +24,11 @@ bool rejects_pending(q27::MetalEngine& engine, uint32_t pending) {
     } catch (const std::runtime_error&) {
         return true;
     }
+}
+
+bool same_logits(const std::vector<float>& left, const std::vector<float>& right) {
+    return left.size() == right.size() &&
+           std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0;
 }
 
 } // namespace
@@ -60,24 +66,38 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        const std::vector<float> baseline_logits = engine.read_logits();
+        const std::vector<uint32_t> baseline_retry =
+            engine.generate_from_pending(pending, 2, 2);
+        engine.restore_state(*snapshot);
+
         q27::MetalEngine::StopCause cause = q27::MetalEngine::StopCause::MaxTokens;
         bool sink_called = false;
         uint32_t emitted = engine.stream_from_pending(
             pending, 2, pending, 2,
             [&](uint32_t) { sink_called = true; return true; }, cause);
-        if (emitted != 0 || cause != q27::MetalEngine::StopCause::Eos ||
-            sink_called || engine.position() != 1) {
-            std::fprintf(stderr, "MTP EOS changed unconsumed engine state\n");
+        if (emitted != 0 || cause != q27::MetalEngine::StopCause::Eos || sink_called ||
+            engine.position() != 1 || !same_logits(engine.read_logits(), baseline_logits)) {
+            std::fprintf(stderr, "MTP EOS changed unconsumed resident state\n");
             return 1;
         }
+        if (engine.generate_from_pending(pending, 2, 2) != baseline_retry) {
+            std::fprintf(stderr, "MTP EOS changed retry behavior\n");
+            return 1;
+        }
+        engine.restore_state(*snapshot);
 
         cause = q27::MetalEngine::StopCause::MaxTokens;
         emitted = engine.stream_from_pending(
             pending, 2, UINT32_MAX, 2,
             [](uint32_t) { return false; }, cause);
         if (emitted != 0 || cause != q27::MetalEngine::StopCause::Cancelled ||
-            engine.position() != 1) {
-            std::fprintf(stderr, "cancelled MTP stream changed unconsumed engine state\n");
+            engine.position() != 1 || !same_logits(engine.read_logits(), baseline_logits)) {
+            std::fprintf(stderr, "cancelled MTP stream changed unconsumed resident state\n");
+            return 1;
+        }
+        if (engine.generate_from_pending(pending, 2, 2) != baseline_retry) {
+            std::fprintf(stderr, "cancelled MTP stream changed retry behavior\n");
             return 1;
         }
 
