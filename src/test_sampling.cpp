@@ -86,12 +86,36 @@ int main() {
         }
     }
 
+    // Candidate over-sets are incomplete by definition when top_k is
+    // disabled, so sampled paths must fall back to full logits instead of
+    // silently excluding the rest of the vocabulary.
+    {
+        const std::vector<float> values = {4.0f, 3.0f, 2.0f};
+        const std::vector<uint32_t> ids = {0, 1, 2};
+        const q27::SamplingParams unlimited{1.0f, 1.0f, 0, 1};
+        bool sample_rejected = false, served_rejected = false;
+        try {
+            std::mt19937_64 candidate_rng(unlimited.seed);
+            (void)q27::sample_candidates_cpu(
+                values, ids, (uint32_t)values.size(), unlimited, candidate_rng);
+        } catch (const std::runtime_error&) {
+            sample_rejected = true;
+        }
+        try {
+            (void)q27::build_served_from_candidates(
+                values.data(), ids.data(), (uint32_t)values.size(), unlimited);
+        } catch (const std::runtime_error&) {
+            served_rejected = true;
+        }
+        if (!sample_rejected || !served_rejected) return 1;
+    }
+
     // Exact ties at the top-p cutoff all remain reachable and both sampling
     // paths map the same random draw to the same token.
     {
         std::vector<float> tied = {0.0f, 0.0f, 0.0f, -100.0f};
         std::vector<uint32_t> ids = {0, 1, 2, 3};
-        q27::SamplingParams params{1.0f, 0.5f, 0, 9001};
+        q27::SamplingParams params{1.0f, 0.5f, 4, 9001};
         std::mt19937_64 full_rng(params.seed), candidate_rng(params.seed);
         bool seen[3] = {};
         for (int i = 0; i < 300; i++) {
@@ -169,7 +193,7 @@ int main() {
             std::log(4.0f), std::log(3.0f), std::log(2.0f), 0.0f};
         const std::vector<uint32_t> ids = {2, 0, 3, 1};
         const std::vector<float> values = {full[2], full[0], full[3], full[1]};
-        const q27::SamplingParams nucleus{1.0f, 0.5f, 0, 0};
+        const q27::SamplingParams nucleus{1.0f, 0.5f, 4, 0};
         const auto full_dist = q27::build_served_distribution(full, nucleus);
         const auto candidate_dist = q27::build_served_from_candidates(
             values.data(), ids.data(), (uint32_t)ids.size(), nucleus);

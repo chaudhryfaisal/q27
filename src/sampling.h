@@ -101,6 +101,8 @@ inline uint32_t sample_candidates_cpu(const std::vector<float>& values,
     if(values.size()<count || indices.size()<count)
         throw std::runtime_error("q27: candidate list shorter than count");
     validate_logits(values.data(),count);
+    if(!p.top_k)
+        throw std::runtime_error("q27: candidate sampling requires top_k > 0");
     std::vector<uint32_t> order(count);
     for(uint32_t i=0;i<count;i++) order[i]=i;
     auto before=[&](uint32_t a,uint32_t b) {
@@ -227,6 +229,8 @@ inline ServedDistribution build_served_from_candidates(const float* values,
     if(!values || !indices || !count)
         throw std::runtime_error("q27: empty candidates for served dist");
     validate_logits(values,count);
+    if(!p.top_k)
+        throw std::runtime_error("q27: candidate served distribution requires top_k > 0");
     ServedDistribution d;
     std::vector<uint32_t> order(count);
     for(uint32_t i=0;i<count;i++) order[i]=i;
