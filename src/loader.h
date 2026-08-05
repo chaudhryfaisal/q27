@@ -7,7 +7,7 @@
 
 namespace q27 {
 
-enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3 };
+enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3, T2_G128 = 4, T3_G128 = 5, B1_G128 = 6 };
 
 const char* dtype_name(DType t);
 
@@ -24,6 +24,12 @@ struct Tensor {
     uint64_t cols() const;  // last dim
     uint64_t n_elements() const;
 };
+
+// Structural payload invariants shared by inspection and runtime loading.
+// Empty means valid; otherwise returns the first tensor-local failure.
+std::string validate_tensor_payload(const Tensor& tensor);
+bool cuda_weight_dtype_supported(DType dtype);
+
 
 struct Model {
     std::string meta_json;                        // raw JSON metadata blob
@@ -42,9 +48,21 @@ struct Model {
 
     static Model open(const std::string& path); // throws std::runtime_error
 
+    // Read-only mapped file range. Backends may wrap page-aligned subranges
+    // without copying; the Model must outlive every such device view.
+    const void* mapping_base() const { return map_base_; }
+    size_t mapping_size() const { return map_size_; }
+
   private:
     void* map_base_ = nullptr;
     size_t map_size_ = 0;
 };
+
+// Reject one tensor whose dtype or CUDA-specific role is unsupported.
+// Selective upload paths validate only the tensor they request.
+void validate_cuda_tensor(const Tensor& tensor);
+// Reject model-wide CUDA incompatibilities and require the full engine schema.
+void validate_cuda_model(const Model& model);
+
 
 } // namespace q27

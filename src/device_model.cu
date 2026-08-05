@@ -19,6 +19,8 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
     if (it != dev_.end()) return it->second;
 
     const Tensor& src = model_.get(name);
+    validate_cuda_tensor(src);
+
     DevTensor d;
     d.dtype = src.dtype;
     d.rows = src.rows();
@@ -105,6 +107,8 @@ int DeviceModel::checksum_verify(bool print) const {
 }
 
 void DeviceModel::upload_all() {
+    validate_cuda_model(model_);
+
     for (const auto& t : model_.tensors) upload(t.name);
 }
 

@@ -536,6 +536,7 @@ struct Engine {
 
   private:
     void init(int ctx, bool own_weights) {
+
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");
         kv_fp8 = kve && !strcmp(kve, "fp8");

@@ -7,8 +7,8 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean
-all: build/inspect build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
+.PHONY: all clean test-inspect
+all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -19,6 +19,16 @@ build:
 
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
+build/test_loader_contracts: src/test_loader_contracts.cpp src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) src/test_loader_contracts.cpp src/loader.cpp -o $@
+
+
+test-inspect: build/inspect build/test_loader_contracts
+	python3 tools/test_inspect.py ./build/inspect
+	./build/test_loader_contracts
+
+build/test_sampling: src/test_sampling.cpp src/sampling.h | build
+	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
@@ -45,7 +55,7 @@ build/mma16_bench: tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/l
 	$(NVCC) $(NVCCFLAGS) tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
 
 build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
-                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/sampling.h | build
 	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | build
