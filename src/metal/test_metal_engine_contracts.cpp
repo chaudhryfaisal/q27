@@ -67,6 +67,13 @@ int main(int argc, char** argv) {
         }
 
         const std::vector<float> baseline_logits = engine.read_logits();
+        const std::vector<uint32_t> unlimited_sample = engine.generate_sampled_from_logits(
+            1, q27::SamplingParams{1.0f, 0.95f, 0, 17});
+        if (unlimited_sample.size() != 1 || engine.position() != 1 ||
+            !same_logits(engine.read_logits(), baseline_logits)) {
+            std::fprintf(stderr, "top_k=0 did not use the non-mutating full-logits path\n");
+            return 1;
+        }
         const std::vector<uint32_t> baseline_retry =
             engine.generate_from_pending(pending, 2, 2);
         engine.restore_state(*snapshot);
