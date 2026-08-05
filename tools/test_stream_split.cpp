@@ -1,6 +1,7 @@
 #include "stream_split.h"
 
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,20 @@ static std::vector<Segment> split(const std::string& input, bool bytewise) {
         append(splitter.feed(input));
     }
     append(splitter.flush());
+    return out;
+}
+
+static std::vector<Segment> split_pieces(
+    std::initializer_list<std::string> pieces, Chan initial = Chan::TEXT) {
+    q27::StreamSplitter splitter;
+    splitter.chan = initial;
+    std::vector<Segment> out;
+    for (const auto& piece : pieces) {
+        auto part = splitter.feed(piece);
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    auto tail = splitter.flush();
+    out.insert(out.end(), tail.begin(), tail.end());
     return out;
 }
 
@@ -74,5 +89,52 @@ int main() {
     unfinished_got.insert(unfinished_got.end(), tail.begin(), tail.end());
     ok = expect("unfinished-empty-think/flush", unfinished_got,
                 {{Chan::TOOL, "a"}, {Chan::THINK, ""}}) && ok;
+
+    ok = expect("stray close stripped",
+                split_pieces({"hello", "</tool_call>", "world"}),
+                {{Chan::TEXT, "hello"}, {Chan::TEXT, "world"}}) && ok;
+
+    const std::vector<Segment> faisal_want = {
+        {Chan::TEXT, "{\"name\": \"read\"}\n"},
+        {Chan::TEXT, "\n{\"name\": \"read2\"}\n"},
+        {Chan::TEXT, "\n"}};
+    ok = expect("faisal multi: no </tool_call> in text",
+                split_pieces({"{\"name\": \"read\"}\n</tool_call>\n"
+                              "{\"name\": \"read2\"}\n</tool_call>\n"}),
+                faisal_want) && ok;
+
+    const std::vector<Segment> normal_pair_want = {
+        {Chan::TOOL, "{\"a\":1}"}};
+    ok = expect("normal pair -> TOOL",
+                split_pieces({"<tool_call>", "{\"a\":1}", "</tool_call>"}),
+                normal_pair_want) && ok;
+    ok = expect("normal pair TEXT=tail only",
+                split_pieces({"<tool_call>", "{\"a\":1}", "</tool_call>", "tail"}),
+                {{Chan::TOOL, "{\"a\":1}"}, {Chan::TEXT, "tail"}}) && ok;
+
+    ok = expect("split stray tag held+stripped",
+                split_pieces({"abc</tool", "_call>def"}),
+                {{Chan::TEXT, "abc"}, {Chan::TEXT, "def"}}) && ok;
+
+    const std::vector<Segment> think_want = {
+        {Chan::THINK, "reason"}, {Chan::TEXT, "ans"}};
+    ok = expect("think still routes",
+                split_pieces({"<think>", "reason", "</think>", "ans"}),
+                think_want) && ok;
+    ok = expect("think text=ans",
+                split_pieces({"<think>", "reason", "</think>", "ans"}),
+                think_want) && ok;
+
+    const std::vector<Segment> preseeded_want = {
+        {Chan::THINK, "reason"}, {Chan::THINK, "ing"},
+        {Chan::TEXT, "\n\nans"}};
+    ok = expect("preseeded THINK: reasoning routes",
+                split_pieces({"reason", "ing", "</think>", "\n\nans"},
+                             Chan::THINK),
+                preseeded_want) && ok;
+    ok = expect("preseeded THINK: answer after </think>",
+                split_pieces({"reason", "ing", "</think>", "\n\nans"},
+                             Chan::THINK),
+                preseeded_want) && ok;
     return ok ? 0 : 1;
 }
