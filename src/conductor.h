@@ -997,6 +997,15 @@ public:
             // server-agnostic and embedders deserve the check.
             if (stop) {
                 CUDA_CHECK(cudaEventDestroy(mm->draft_done));
+                // Same close-edge discipline as fail_member: finish_decode
+                // BEFORE the queue edge, so this exit stamps gs.end/dec/rounds
+                // like every other one and the [req] line cannot report a
+                // previous request's telemetry. make_decode_task() has already
+                // run (batch_generate fills the task under the prefill lease,
+                // then registers), so g0/n_max/Ph are populated and the task is
+                // safe to finish. The sink is still not installed here, which
+                // is the separate M4 rule above.
+                e->finish_decode(*t, "error");
                 q->fail("conductor stopping: registration refused");
                 return;
             }

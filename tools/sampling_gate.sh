@@ -20,10 +20,12 @@ BIN="$(dirname "$0")/../build/q27"
 # contract holds WITHIN an arch, not across them (BUILDLOG 2026-07-09):
 #   sm_120 (5090):  a2982c5197c627551b27d76a0a94b220   <- the default below
 #   sm_86  (3090, A40, and other GA10x): 6894254e3b1a184ee3802771ddd59c2b
-#     ^ PREFIX is ours (BUILDLOG 07-09); the FULL value is as REPORTED by an
-#       A40 run in issue #7 and has not been re-derived on our own 3090. The
-#       32-bit prefix agreement is strong but is not a local verification --
-#       re-run here with CANON_ARCH=sm86 on GPU 1 to make it authoritative.
+#     ^ DERIVED LOCALLY 2026-08-05 on our own RTX 3090 with CANON_ARCH=sm86,
+#       matching the A40 value reported in issue #7 exactly. Two sm_86 parts
+#       with DIFFERENT SM counts (3090 82, A40 84) agree bit-for-bit, so the
+#       canonical is SM-count-independent within an architecture -- consistent
+#       with the CLI path taking fd2 at a fixed FD2_NS rather than any
+#       SM-count-derived split.
 # A non-Blackwell run that reports 6894254e has REPRODUCED its own canonical,
 # it has not failed to reproduce this one. tools/shortbench_suite.sh learned
 # this in 07-09 and grew BENCH_GPU=; this gate did not, and in 2026-08-04 that
