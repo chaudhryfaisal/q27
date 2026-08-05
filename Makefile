@@ -8,7 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
 .PHONY: all clean
-all: build/inspect build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
+all: build/inspect build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -22,6 +22,9 @@ build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
+
+build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_stream_split.cpp -o $@
 
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
