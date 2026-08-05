@@ -597,8 +597,8 @@ static void test_margin() {
 // P14: fused draft argmax+margin. The single pass must reproduce, EXACTLY:
 //  - argmax()'s token (same tie semantics, since the grid partition matches), and
 //  - margin()'s value == CPU top1-top2 (pure selection, no fp reassociation).
-// Cases: random logits, all-equal (ties everywhere), max@0, max@last, and a
-// duplicated max value at two indices (pins margin==0 and the higher-index win).
+// Cases: random logits, all-equal (ties everywhere), max@0, max@last,
+// duplicated maxima, and both signed-zero orderings.
 static void test_argmax_top2() {
     const int N = 248320;
     float *d_x, *d_margin, *d_margin2, *d_blk2;
@@ -612,8 +612,12 @@ static void test_argmax_top2() {
     CUDA_CHECK(cudaMalloc(&d_blk1, 128 * 8));
     CUDA_CHECK(cudaMalloc(&d_blk2, 128 * 4));
     CUDA_CHECK(cudaMalloc(&d_scr, 8));
-    double worst_tok = 0, worst_cpu = 0, worst_kern = 0;
+    double worst_tok = 0, worst_cpu = 0, worst_kern = 0, worst_tie = 0;
     auto run_case = [&](std::vector<float>& logits) {
+        // Exact value ties select the lowest index across the CPU, CUDA, and
+        // Metal implementations. Assert that rule for every case.
+        int lowest = 0;
+        for (int i = 1; i < N; i++) if (logits[i] > logits[lowest]) lowest = i;
         float m1 = -1e30f, m2 = -1e30f;
         for (int i = 0; i < N; i++) {
             float v = logits[i];
@@ -633,6 +637,7 @@ static void test_argmax_top2() {
         float kmargin;
         CUDA_CHECK(cudaMemcpy(&kmargin, d_margin2, 4, cudaMemcpyDeviceToHost));
         worst_tok = std::max(worst_tok, (double)std::abs(ftok - atok));
+        worst_tie = std::max(worst_tie, (double)std::abs(atok - lowest));
         // exact float equality: any nonzero diff is a bug (both are pure selection)
         worst_cpu = std::max(worst_cpu, fmargin == cpu_margin ? 0.0 : 1.0);
         worst_kern = std::max(worst_kern, fmargin == kmargin ? 0.0 : 1.0);
@@ -643,6 +648,12 @@ static void test_argmax_top2() {
     { std::vector<float> l = rand_vec(N, 17); l[N - 1] = 1e4f; run_case(l); }    // max@last
     { std::vector<float> l = rand_vec(N, 23); l[100] = 5e3f; l[200000] = 5e3f;   // dup max
       run_case(l); }
+    { std::vector<float> l = rand_vec(N, 29); l[7] = 5e3f; l[8] = 5e3f; l[N - 2] = 5e3f;
+      run_case(l); }                                                // triple tie, adjacent pair
+    { std::vector<float> l(N, -1.0f); l[0] = -0.0f; l[N - 1] = +0.0f;
+      run_case(l); }                                                // -0 then +0
+    { std::vector<float> l(N, -1.0f); l[0] = +0.0f; l[N - 1] = -0.0f;
+      run_case(l); }                                                // +0 then -0
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_margin));
     CUDA_CHECK(cudaFree(d_margin2));
@@ -652,6 +663,7 @@ static void test_argmax_top2() {
     CUDA_CHECK(cudaFree(d_blk2));
     CUDA_CHECK(cudaFree(d_scr));
     check("argmax_top2 token == argmax()", worst_tok, 0.5);
+    check("argmax tie -> lowest index (Metal/CPU rule)", worst_tie, 0.5);
     check("argmax_top2 margin == CPU top1-top2", worst_cpu, 0.5);
     check("argmax_top2 margin == margin() kernel", worst_kern, 0.5);
 }
