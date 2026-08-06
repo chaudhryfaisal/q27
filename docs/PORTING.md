@@ -1,9 +1,9 @@
 # Porting q27 to a new Qwen checkpoint
 
 q27 is not a general engine. It implements one architecture, and most of that
-architecture is fixed at compile time in `src/engine.cuh:36-44`. A new
-checkpoint either matches those constants or it does not, and you can tell
-which from its `config.json` before downloading a single shard.
+architecture is fixed at compile time. A new checkpoint either matches those
+constants or it does not, and you can tell which from its `config.json` before
+downloading a single shard.
 
 This file is the checklist for that decision: what has to match, what is
 already data-driven, what a mismatch actually costs, and how to run the check
@@ -14,12 +14,18 @@ engine was built against.
 
 ## What is fixed at compile time
 
-Every constant in `src/engine.cuh:36-44` maps to exactly one field of the Hub
-config's `text_config` subtree. If all of these match, a new checkpoint is a
-repack job (`tools/repack.py`, container spec in `docs/FORMAT.md`) and not an
-engine job.
+**There are TWO constant tables and a port has to edit both.** The CUDA engine
+declares them at `src/engine.cuh:38-46`; `MetalEngine` declares its own private
+copy at `src/metal/metal_engine.h`. They agree exactly today, all fourteen
+values, and nothing enforces that they keep agreeing: each is checked against
+the artifact independently, so a port that updates one and forgets the other
+gets a working backend and a backend that refuses to load, not a compile error.
 
-| `engine.cuh` | value | `text_config` field |
+Every constant maps to one field of the Hub config's `text_config` subtree. If
+all of them match, a new checkpoint is a repack job (`tools/repack.py`,
+container spec in `docs/FORMAT.md`) and not an engine job.
+
+| constant | value | `text_config` field |
 |---|--:|---|
 | `N_LAYER` | 64 | `num_hidden_layers` |
 | `N_EMBD` | 5120 | `hidden_size` |
@@ -45,10 +51,31 @@ that factor.
 
 `N_ROT` is the only derived one. The model uses partial rotary embedding, so
 q27 rotates the first 64 of each 256-wide head and passes the rest through
-(`rope_neox_partial`, `engine.cuh:948`). The config also carries mrope
+(`rope_neox_partial`, `engine.cuh:1076`). The config also carries mrope
 (`mrope_interleaved`, `mrope_section [11, 11, 10]`, summing to the 32 rotary
 pairs), which only bites for multimodal position ids. q27 implements the text
 stack, so the sections collapse to ordinary rope and are not read.
+
+Metal declares two names CUDA does not. `GDN_QK_HEADS` (16) is
+`linear_num_key_heads` stated outright, where the CUDA side only carries it
+folded into `GDN_CH`, so a change to that field is a one-line edit on Metal and
+an arithmetic one on CUDA. `CHUNK_MAX` is a prefill batching parameter, not
+architecture, and no config field corresponds to it.
+
+**Both engines now refuse a mismatch rather than running at the wrong shape.**
+`validate_arch()` (`engine.cuh`, called before the weight upload) and
+`validate_architecture()` (`src/metal/metal_engine.cpp`, called before
+allocation) each check the artifact metadata against their own table and abort
+naming the offending key. So the failure mode for a wrong checkpoint is a clear
+message at startup, not silently wrong numbers. Neither validator can tell you
+a checkpoint will work; they only tell you it will not.
+
+The Metal validator is the stricter of the two, because it is a q4s-only engine
+slice: it additionally requires `quant_policy == "q4s-v1"`, the full tensor
+name/dtype/shape table, and the attention layout discussed below. The CUDA
+validator is deliberately tier-agnostic, since `quant_policy`, `q4_head` and
+`q8_extra` differ across the seven published tiers and say nothing about the
+graph.
 
 ## What is already data-driven
 
@@ -56,8 +83,8 @@ Do not add these to the checklist. They flow through without a code change.
 
 **Which layers are full attention, on the CUDA path.** `tools/repack.py:136-145`
 derives `attn_layers` by inspecting tensor names, writes it into the `.q27`
-metadata, and `engine.cuh:556-563` reads it back into `attn_layer[]`. Every
-consumer asks `is_attn_layer(il)` (`engine.cuh:2325`) rather than computing an
+metadata, and `engine.cuh:684-691` reads it back into `attn_layer[]`. Every
+consumer asks `is_attn_layer(il)` (`engine.cuh:2453`) rather than computing an
 interval. A checkpoint with a different `full_attention_interval`, or an
 irregular layout that no interval describes, needs no CUDA engine edit -- the
 KV allocation and the layer dispatch both loop over the flag.
@@ -96,11 +123,14 @@ A checkpoint can match the table above and still not run.
 
 ## Triage
 
-**Cheap -- edit the constant, repack, re-gate.** `N_LAYER`, `VOCAB`, and
-`N_EMBD` / `N_FFN` changes that stay multiples of 256. Re-derive the canonical
-md5 afterwards; it is checkpoint-specific by construction, so a new checkpoint
-gets a new canonical rather than failing the old one
-(`tools/sampling_gate.sh` header).
+**Cheap -- edit the constant in BOTH tables, repack, re-gate.** `N_LAYER`,
+`VOCAB`, and `N_EMBD` / `N_FFN` changes that stay multiples of 256. Re-derive
+the canonical md5 afterwards; it is checkpoint-specific by construction, so a
+new checkpoint gets a new canonical rather than failing the old one
+(`tools/sampling_gate.sh` header). Cheap does not mean one edit: the CUDA and
+Metal tables are separate declarations and the Metal one is only exercised on
+macOS, so a CUDA-only change looks complete from Linux and fails on the first
+Mac that loads the artifact.
 
 **Expensive.** `head_dim` off 256 (attention kernels plus both KV formats),
 `linear_value_head_dim` off 128 (the GDN block in `blocks.cu`), or a
