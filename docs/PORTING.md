@@ -141,8 +141,26 @@ adding it is not a port.
 
 ## Checking a config before the weights land
 
-The generation's config usually appears with the repo, so this is runnable the
-moment a Hub page exists. It diffs any two checkpoints and collapses
+The generation's config usually appears with the repo, so both of these are
+runnable the moment a Hub page exists, before any weights download.
+
+**`tools/check_checkpoint.py` runs this whole checklist.** It reads the
+constants out of `src/engine.cuh` and `src/metal/metal_engine.h` rather than
+restating them, so it cannot drift from the engines, and it cross-checks the
+two tables against each other on every run:
+
+```
+tools/check_checkpoint.py Qwen/Qwen3.8-27B     # Hub repo id, or a local config.json
+tools/check_checkpoint.py --tables-only        # just CUDA vs Metal
+```
+
+Exit 0 is a repack job, 1 is an engine change with the offending rows named, 2
+is a config it could not read. It also reports the shape constraints below and
+flags a mixture of experts explicitly. A pass means the constants agree; it
+does not promise the checkpoint behaves the same.
+
+The snippet below is the other half: it diffs any two checkpoints against each
+other, which is what tells you what a generation actually changed. It collapses
 `layer_types` to a count so the 64-entry list does not bury the real diffs:
 
 ```python
