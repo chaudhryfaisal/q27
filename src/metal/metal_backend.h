@@ -143,6 +143,7 @@ class MetalBackend final : public ComputeBackend {
 
     uint64_t recommended_working_set_size() const;
     uint64_t max_buffer_length() const;
+    bool uses_per_tensor_upload(const Model& model) const;
     uint64_t max_threadgroup_memory_length() const;
     bool supports_quantized_matmul() const;
 
