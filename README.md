@@ -823,7 +823,9 @@ git history (commits sometimes batch a day's entries). Design docs and
 phase plans: [docs/plans/](docs/plans/). Standing risk register, P10-A
 status, and parked levers: [docs/notes.md](docs/notes.md). Multi-slot
 throughput analysis (rewritten post-campaign):
-[docs/multislot-throughput.md](docs/multislot-throughput.md).
+[docs/multislot-throughput.md](docs/multislot-throughput.md). What a new
+Qwen checkpoint has to match before it can load, and what a mismatch costs:
+[docs/PORTING.md](docs/PORTING.md).
 
 ## License
 

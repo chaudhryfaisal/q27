@@ -1,0 +1,176 @@
+# Porting q27 to a new Qwen checkpoint
+
+q27 is not a general engine. It implements one architecture, and most of that
+architecture is fixed at compile time in `src/engine.cuh:36-44`. A new
+checkpoint either matches those constants or it does not, and you can tell
+which from its `config.json` before downloading a single shard.
+
+This file is the checklist for that decision: what has to match, what is
+already data-driven, what a mismatch actually costs, and how to run the check
+against a Hub config while the weights are still embargoed.
+
+The reference point throughout is `Qwen/Qwen3.6-27B`, the checkpoint the
+engine was built against.
+
+## What is fixed at compile time
+
+Every constant in `src/engine.cuh:36-44` maps to exactly one field of the Hub
+config's `text_config` subtree. If all of these match, a new checkpoint is a
+repack job (`tools/repack.py`, container spec in `docs/FORMAT.md`) and not an
+engine job.
+
+| `engine.cuh` | value | `text_config` field |
+|---|--:|---|
+| `N_LAYER` | 64 | `num_hidden_layers` |
+| `N_EMBD` | 5120 | `hidden_size` |
+| `N_FFN` | 17408 | `intermediate_size` |
+| `N_HEAD` | 24 | `num_attention_heads` |
+| `N_KV` | 4 | `num_key_value_heads` |
+| `HEAD_DIM` | 256 | `head_dim` |
+| `N_ROT` | 64 | `head_dim` x `partial_rotary_factor` (0.25) |
+| `FREQ_BASE` | 1e7 | `rope_parameters.rope_theta` |
+| `EPS` | 1e-6 | `rms_norm_eps` |
+| `GDN_HEADS` | 48 | `linear_num_value_heads` |
+| `GDN_DIM` | 128 | `linear_value_head_dim` |
+| `GDN_V` | 6144 | `linear_num_value_heads` x `linear_value_head_dim` |
+| `GDN_CH` | 10240 | (`linear_num_key_heads` x 2 + `linear_num_value_heads`) x 128 |
+| `VOCAB` | 248320 | `vocab_size` |
+
+`GDN_CH` is the packed q/k/v channel width the causal conv runs over: q and k
+each take `linear_num_key_heads` (16) heads and v takes
+`linear_num_value_heads` (48), all at dim 128, so (16 + 16 + 48) x 128 =
+10240. The conv ring is allocated at `3 * GDN_CH` (`engine.cu:996`), which is
+`linear_conv_kernel_dim - 1` history slots; a kernel dim other than 4 changes
+that factor.
+
+`N_ROT` is the only derived one. The model uses partial rotary embedding, so
+q27 rotates the first 64 of each 256-wide head and passes the rest through
+(`rope_neox_partial`, `engine.cuh:948`). The config also carries mrope
+(`mrope_interleaved`, `mrope_section [11, 11, 10]`, summing to the 32 rotary
+pairs), which only bites for multimodal position ids. q27 implements the text
+stack, so the sections collapse to ordinary rope and are not read.
+
+## What is already data-driven
+
+Do not add these to the checklist. They flow through without a code change.
+
+**Which layers are full attention.** `tools/repack.py:136-145` derives
+`attn_layers` by inspecting tensor names, writes it into the `.q27` metadata,
+and `engine.cuh:556-563` reads it back into `attn_layer[]`. Every consumer
+asks `is_attn_layer(il)` (`engine.cuh:2325`) rather than computing an
+interval. A checkpoint with a different `full_attention_interval`, or an
+irregular layout that no interval describes, needs no engine edit -- the KV
+allocation and the layer dispatch both loop over the flag.
+
+**Weight quantization tier.** The repack recipe is per-tensor and lives
+outside the engine (`docs/FORMAT.md`).
+
+## Constraints that are not single constants
+
+A checkpoint can match the table above and still not run.
+
+- **Decode `cols` must be a multiple of `VG_KB` = 256.** `vgemm.cuh:69`
+  documents it and `vgemm.cu:337` aborts rather than corrupt. The current
+  shapes are 5120 (20x), 6144 (24x) and 17408 (68x).
+- **The KV formats tile 128-element groups.** `QK_TURBO3` and `QK_TURBO5` are
+  both 128 (`turbo3.cuh:22`, `turbo5.cuh:33`), and the WHT group size is the
+  block size. A `head_dim` that is not a multiple of 128 breaks turbo3,
+  turbo5 and their fp8 siblings, not just one of them.
+- **The attention kernels are built at `HEAD_DIM` 256.** fd2, fdmma and H16
+  all assume it in their tiling.
+- **The MTP head is one layer.** `mtp_num_hidden_layers` is 1, and the draft
+  ladder (`D_MAX_MTP`, `docs/plans/2026-07-13-mtp-draft-head.md`) is built on
+  that shape. A checkpoint with no MTP head still decodes, but loses the
+  speculative path that most of q27's margin comes from.
+
+## Triage
+
+**Cheap -- edit the constant, repack, re-gate.** `N_LAYER`, `VOCAB`, and
+`N_EMBD` / `N_FFN` changes that stay multiples of 256. Re-derive the canonical
+md5 afterwards; it is checkpoint-specific by construction, so a new checkpoint
+gets a new canonical rather than failing the old one
+(`tools/sampling_gate.sh` header).
+
+**Expensive.** `head_dim` off 256 (attention kernels plus both KV formats),
+`linear_value_head_dim` off 128 (the GDN block in `blocks.cu`), or a
+`linear_conv_kernel_dim` change (conv ring sizing).
+
+**A different engine.** MoE. There is no expert routing anywhere in q27, and
+adding it is not a port.
+
+## Checking a config before the weights land
+
+The generation's config usually appears with the repo, so this is runnable the
+moment a Hub page exists. It diffs any two checkpoints and collapses
+`layer_types` to a count so the 64-entry list does not bury the real diffs:
+
+```python
+import json, urllib.request
+def get(m):
+    return json.load(urllib.request.urlopen(
+        f"https://huggingface.co/{m}/raw/main/config.json", timeout=30))
+def flat(d, p=""):
+    o = {}
+    for k, v in d.items():
+        key = p + k
+        if isinstance(v, dict):
+            o.update(flat(v, key + "."))
+        elif isinstance(v, list) and k == "layer_types":
+            o[key] = f"<{len(v)}: {v.count('full_attention')} full / {v.count('linear_attention')} linear>"
+        else:
+            o[key] = v
+    return o
+a, b = flat(get("Qwen/Qwen3.6-27B")), flat(get("Qwen/<new>"))
+for k in sorted(set(a) | set(b)):
+    if a.get(k, "--") != b.get(k, "--"):
+        print(f"{k:<46} {str(a.get(k,'--'))[:27]:<28} {b.get(k,'--')}")
+```
+
+## Recon log
+
+### Qwen3.8 (2026-08-05, pre-release)
+
+Announced 2026-08-03 alongside Qwen3.8-Max (2.4T total / 95B active), open
+weights promised "next week". No architecture disclosed: dense vs MoE, context
+length and layer shape are all unstated. Recon at the time of writing, ordered
+by strength of evidence.
+
+**vLLM already loads a Qwen3.8 checkpoint through the Qwen3.5 class.**
+[vllm-project/vllm#50068](https://github.com/vllm-project/vllm/pull/50068)
+touches only `models/qwen3_5.py` and exposes Gated DeltaNet cache metadata
+"so text-only Qwen3.5-compatible checkpoints such as Qwen3.8 Max FP8 can
+initialize through the causal LM path". The diff reads
+`linear_num_key_heads`, `linear_num_value_heads`, `linear_key_head_dim`,
+`linear_value_head_dim` and `linear_conv_kernel_dim` -- the same config
+surface as the table above. The author reports validating it on a two-node
+ROCm TP=8/PP=2 deployment, so real weights were involved. This is Max, not
+the 27B, but it dates the generation's architecture.
+
+**The last point release changed nothing structural at the 27B slot.**
+Diffing `Qwen3.5-27B` against `Qwen3.6-27B` with the script above: every
+shape in the checklist is identical, both still declare
+`architectures: ["Qwen3_5ForConditionalGeneration"]` and
+`model_type: qwen3_5`, and the only diffs are serialization
+(`bos_token_id` and `pad_token_id` written out, `mlp_only_layers` dropped,
+`output_gate_type: swish` and `partial_rotary_factor` hoisted to explicit,
+newer `transformers_version`). A 3.x point release in this family has been a
+retrain rather than a re-architecture.
+
+**Nobody is building a new class.** `transformers/main` carries `qwen3_5`,
+`qwen3_5_moe` and `qwen3_next`, with no `qwen3_6` or `qwen3_8` directory;
+3.6 rode `qwen3_5` and recent commits on it are generic refactors. llama.cpp
+has no Qwen3.8 issue or PR.
+
+**Nothing on the Hub yet.** The two `Qwen3.8-27B` repos that exist
+(`huginnfork/...-FP8` and `...-NVFP4A16`, created 2026-08-05) contain
+`.gitattributes` and `README.md` and nothing else; the card says so itself.
+No config to read.
+
+Weakest signal, noted for completeness: Unsloth's claim that it runs on 17 GB
+is what a 27B dense at 4 bits costs, and lands between the q4s (15.46 GB) and
+default (17.73 GB) tiers.
+
+**Conclusion.** Convergent evidence that Qwen3.8 stays on the `qwen3_5` graph,
+and no evidence either way on whether the 27B slot stays dense. Treat the
+checklist as unverified until the real config lands, then run the diff before
+downloading weights.
