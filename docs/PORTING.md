@@ -54,13 +54,24 @@ stack, so the sections collapse to ordinary rope and are not read.
 
 Do not add these to the checklist. They flow through without a code change.
 
-**Which layers are full attention.** `tools/repack.py:136-145` derives
-`attn_layers` by inspecting tensor names, writes it into the `.q27` metadata,
-and `engine.cuh:556-563` reads it back into `attn_layer[]`. Every consumer
-asks `is_attn_layer(il)` (`engine.cuh:2325`) rather than computing an
+**Which layers are full attention, on the CUDA path.** `tools/repack.py:136-145`
+derives `attn_layers` by inspecting tensor names, writes it into the `.q27`
+metadata, and `engine.cuh:556-563` reads it back into `attn_layer[]`. Every
+consumer asks `is_attn_layer(il)` (`engine.cuh:2325`) rather than computing an
 interval. A checkpoint with a different `full_attention_interval`, or an
-irregular layout that no interval describes, needs no engine edit -- the KV
-allocation and the layer dispatch both loop over the flag.
+irregular layout that no interval describes, needs no CUDA engine edit -- the
+KV allocation and the layer dispatch both loop over the flag.
+
+**The Metal engine does NOT share this property.** `MetalEngine` computes the
+layout instead of reading it: `attention_layer(l)` returns `l % 4 == 3` and
+`gdn_slot()` is derived from the same rule. That is correct for every current
+checkpoint and it fails closed rather than silently -- `validate_architecture()`
+asserts `qwen35.full_attention_interval == 4` and walks the whole `attn_layers`
+array against the generated expectation, so a different layout throws at
+construction. But it means a checkpoint that moves the interval **loads on CUDA
+and refuses on Metal**, and porting it means editing the Metal engine even
+though the CUDA constant table above is untouched. Add the interval back to the
+checklist the moment you care about the Metal backend.
 
 **Weight quantization tier.** The repack recipe is per-tensor and lives
 outside the engine (`docs/FORMAT.md`).

@@ -7,7 +7,9 @@
 #include <chrono>
 #include <functional>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -59,6 +61,131 @@ static constexpr int W_MAX = Q27_W_MAX;
 static constexpr int D_MAX_MTP = 7;
 static_assert(W_MAX >= 8 && W_MAX <= W_PLUMB,
               "Q27_W_MAX in [8, W_PLUMB] (>=8 for the maxd7 ladder, <= the lane plumbing)");
+// ARCHITECTURE GATE (2026-08-06). The loader validates the CONTAINER
+// thoroughly -- magic, version, 256-byte offset alignment, payload extents,
+// token_embd dtype (loader.cpp) -- and nothing validated the ARCHITECTURE.
+// A .q27 repacked from a different checkpoint parses cleanly and is then read
+// at THIS build's compile-time shape (N_LAYER x N_EMBD above) with no error
+// and no crash: just wrong numbers, silently. The Metal engine has checked
+// this since its first commit (metal_engine.cpp validate_architecture); this
+// closes the same gap on the CUDA side, and the constant table in
+// docs/PORTING.md is the map from each constant to the key it is checked
+// against.
+// Hand-rolled rather than third_party/json.hpp because every .cu in the build
+// includes engine.cuh, and the metadata is emitted by tools/repack.py in a
+// fixed `"key": value` shape. Deliberately TIER-AGNOSTIC: quant_policy,
+// q4_head and q8_extra differ across the seven published tiers and say nothing
+// about the graph, so they are not checked here.
+static inline void arch_fail(const char* key, const std::string& detail) {
+    fprintf(stderr, "q27: model architecture does not match this build: %s (%s)\n"
+                    "     this build is compiled for qwen35 %dL x %d (docs/PORTING.md)\n",
+            key, detail.c_str(), N_LAYER, N_EMBD);
+    exit(1);
+}
+// Returns the offset of the value for "key", or npos. Requires the quoted key
+// and the colon so a key that is a suffix of another cannot match.
+static inline size_t arch_value_at(const std::string& mj, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t p = mj.find(needle);
+    if (p == std::string::npos) return std::string::npos;
+    p += needle.size();
+    while (p < mj.size() && (mj[p] == ' ' || mj[p] == '\t')) p++;
+    if (p >= mj.size() || mj[p] != ':') return std::string::npos;
+    p++;
+    while (p < mj.size() && (mj[p] == ' ' || mj[p] == '\t')) p++;
+    return p;
+}
+static inline void arch_require_u(const std::string& mj, const char* key, uint64_t want) {
+    size_t p = arch_value_at(mj, key);
+    if (p == std::string::npos) arch_fail(key, "missing from metadata");
+    char* end = nullptr;
+    unsigned long long got = strtoull(mj.c_str() + p, &end, 10);
+    if (end == mj.c_str() + p) arch_fail(key, "not an integer");
+    if (got != want)
+        arch_fail(key, "is " + std::to_string(got) + ", this build needs " + std::to_string(want));
+}
+static inline void arch_require_f(const std::string& mj, const char* key, double want, double tol) {
+    size_t p = arch_value_at(mj, key);
+    if (p == std::string::npos) arch_fail(key, "missing from metadata");
+    char* end = nullptr;
+    double got = strtod(mj.c_str() + p, &end);
+    if (end == mj.c_str() + p) arch_fail(key, "not a number");
+    if (!(fabs(got - want) <= tol))
+        arch_fail(key, "is " + std::to_string(got) + ", this build needs " + std::to_string(want));
+}
+static inline void arch_require_s(const std::string& mj, const char* key, const char* want) {
+    size_t p = arch_value_at(mj, key);
+    if (p == std::string::npos || mj[p] != '"') arch_fail(key, "missing from metadata");
+    size_t e = mj.find('"', p + 1);
+    if (e == std::string::npos) arch_fail(key, "unterminated string");
+    const std::string got = mj.substr(p + 1, e - p - 1);
+    if (got != want) arch_fail(key, "is \"" + got + "\", this build needs \"" + want + "\"");
+}
+static inline void validate_arch(const q27::Model& model) {
+    const std::string& mj = model.meta_json;
+    arch_require_s(mj, "general.architecture", "qwen35");
+    // block_count counts the MTP layer, hence N_LAYER + 1.
+    arch_require_u(mj, "qwen35.block_count", N_LAYER + 1);
+    arch_require_u(mj, "qwen35.nextn_predict_layers", 1);
+    arch_require_u(mj, "qwen35.embedding_length", N_EMBD);
+    arch_require_u(mj, "qwen35.feed_forward_length", N_FFN);
+    arch_require_u(mj, "qwen35.attention.head_count", N_HEAD);
+    arch_require_u(mj, "qwen35.attention.head_count_kv", N_KV);
+    arch_require_u(mj, "qwen35.attention.key_length", HEAD_DIM);
+    arch_require_u(mj, "qwen35.attention.value_length", HEAD_DIM);
+    arch_require_u(mj, "qwen35.rope.dimension_count", N_ROT);
+    arch_require_u(mj, "qwen35.ssm.state_size", GDN_DIM);
+    arch_require_u(mj, "qwen35.ssm.inner_size", GDN_V);
+    arch_require_u(mj, "qwen35.ssm.time_step_rank", GDN_HEADS);
+    arch_require_u(mj, "qwen35.ssm.conv_kernel", 4);   // conv_ring is sized 3 * GDN_CH
+    // GDN_CH packs q and k at group_count heads each plus v at time_step_rank,
+    // all at state_size. Checking the derivation rather than the literal keeps
+    // the three ssm keys and GDN_CH from drifting apart independently.
+    {
+        size_t p = arch_value_at(mj, "qwen35.ssm.group_count");
+        if (p == std::string::npos) arch_fail("qwen35.ssm.group_count", "missing from metadata");
+        const uint64_t groups = strtoull(mj.c_str() + p, nullptr, 10);
+        if ((2 * groups + GDN_HEADS) * GDN_DIM != GDN_CH)
+            arch_fail("qwen35.ssm.group_count",
+                      "is " + std::to_string(groups) + ", which does not pack to GDN_CH " +
+                          std::to_string(GDN_CH));
+    }
+    // Written by repack as the float32 value, so (double)EPS matches exactly;
+    // the tolerance only guards a future writer emitting more digits.
+    arch_require_f(mj, "qwen35.attention.layer_norm_rms_epsilon", EPS, 1e-12);
+    arch_require_f(mj, "qwen35.rope.freq_base", FREQ_BASE, 0.0);
+    arch_require_s(mj, "nibble_order", "even=low");
+    arch_require_u(mj, "group_q4", 64);
+    arch_require_u(mj, "group_q8", 128);
+    // VOCAB is not a metadata key; it is the embedding row count. This is the
+    // check that catches a retrained checkpoint with a resized vocabulary,
+    // which is the likeliest shape change of the lot.
+    const q27::Tensor* emb = model.find("token_embd.weight");
+    if (!emb) arch_fail("token_embd.weight", "missing from the tensor table");
+    if (emb->shape != std::vector<uint64_t>{VOCAB, N_EMBD})
+        arch_fail("token_embd.weight",
+                  "is " + std::to_string(emb->shape.size() ? emb->shape[0] : 0) + " x " +
+                      std::to_string(emb->shape.size() > 1 ? emb->shape[1] : 0) +
+                      ", this build needs " + std::to_string(VOCAB) + " x " +
+                      std::to_string(N_EMBD));
+    // NOTE: qwen35.full_attention_interval is deliberately NOT checked. The
+    // CUDA path reads attn_layers below and never assumes an interval, so an
+    // irregular layout is legal here. MetalEngine does assume it and checks it
+    // itself (docs/PORTING.md, "What is already data-driven").
+}
+// Validate BEFORE the DeviceModel upload, not after. Engine::init() calls
+// validate_arch too and that is the backstop no construction path can skip,
+// but by then the owning ctor has already pushed the full weight set to the
+// GPU: a mismatched model would pay a 15-17 GB upload to reach the error, and
+// on a card sized for THIS architecture it could OOM first and report that
+// instead. Callers that build their own Model+DeviceModel (server.cu,
+// fused_smoke.cu) get the same fail-fast by calling validate_arch after open.
+static inline std::unique_ptr<q27::Model> open_validated(const std::string& path) {
+    auto m = std::make_unique<q27::Model>(q27::Model::open(path));
+    validate_arch(*m);
+    return m;
+}
+
 // LANE PLUMBING is FIXED at W_PLUMB (16, cuda_common.h), independent of W_MAX.
 // The per-lane verify buffers, the p[16] kernel structs, and the finish-kernel
 // outcome layout ({n, t1, dr1..dr15, pending} = 18 ints) are always W_PLUMB
@@ -512,7 +639,7 @@ struct Engine {
 
     // Owning: self-loads weights (CLI, single-slot).
     Engine(const std::string& path, int ctx)
-        : owned_model(std::make_unique<q27::Model>(q27::Model::open(path))),
+        : owned_model(open_validated(path)),
           owned_dm(std::make_unique<q27::DeviceModel>(*owned_model)),
           model(*owned_model), dm(*owned_dm), max_ctx(ctx < 32 ? 32 : ctx) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/true);
@@ -552,6 +679,7 @@ struct Engine {
             fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in, diagnostic)\n");
         else if (kv_kind == KV_T5K)
             fprintf(stderr, "KV cache: turbo5 5-bit K + turbo3 V (opt-in, ~18.6 KB/token)\n");
+        validate_arch(model);
         const std::string& mj = model.meta_json;
         size_t p = mj.find("\"attn_layers\": [");
         if (p == std::string::npos) { fprintf(stderr, "no attn_layers in meta\n"); exit(1); }

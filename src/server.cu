@@ -538,6 +538,7 @@ int main(int argc, char** argv) {
     // Upload once; borrowing engines skip the 17.7 GB weight copy. (Multi-slot
     // will construct N engines from this same pair.)
     q27::Model shared_model = q27::Model::open(model);
+    validate_arch(shared_model); // before the upload, not in Engine::init after it
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
     shared_dm.upload_all();

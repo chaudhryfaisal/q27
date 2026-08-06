@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
     // one shared weight set, two engines -- the server's P10-A1 construction
     fprintf(stderr, "loading %s\n", path);
     q27::Model shared_model = q27::Model::open(path);
+    validate_arch(shared_model); // before the upload, not in Engine::init after it
     q27::DeviceModel shared_dm(shared_model);
     shared_dm.upload_all();
     shared_dm.checksum_baseline();
