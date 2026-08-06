@@ -191,6 +191,10 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
 test-metal: test-metal-backend build/q27-metal
 	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
 	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
+	@if ./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --tokens 760 --prompt "" >/dev/null 2>&1; then \
+		echo "Metal CLI accepted --tokens with an empty --prompt" >&2; exit 1; fi
+	@if ./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --tokens "" --prompt test >/dev/null 2>&1; then \
+		echo "Metal CLI accepted an empty --tokens with --prompt" >&2; exit 1; fi
 	./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --validate-only
 	./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --tokens 760,6511,314,9338,369 \
 	       -n 2 --ctx 16 --mtp 4 --dump-token-ids build/metal-smoke.ids

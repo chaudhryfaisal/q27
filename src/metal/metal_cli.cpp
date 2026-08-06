@@ -88,11 +88,18 @@ int main(int argc, char** argv) {
         uint32_t count = 1, context = 128, mtp_width = 0;
         q27::SamplingParams sampling;
         bool validate_only = false, serial_prefill = false, turbo3_kv = false;
+        bool token_list_supplied = false, prompt_supplied = false;
 
         for (int i = 3; i < argc; i++) {
             const std::string arg = argv[i];
-            if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
-            else if (arg == "--prompt" && i + 1 < argc) prompt_text = argv[++i];
+            if (arg == "--tokens" && i + 1 < argc) {
+                token_list = argv[++i];
+                token_list_supplied = true;
+            }
+            else if (arg == "--prompt" && i + 1 < argc) {
+                prompt_text = argv[++i];
+                prompt_supplied = true;
+            }
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
@@ -120,16 +127,16 @@ int main(int argc, char** argv) {
         }
 
         q27::validate_sampling(sampling);
-        if (!token_list.empty() && !prompt_text.empty())
+        if (token_list_supplied && prompt_supplied)
             throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (sampling.temperature > 0 && mtp_width)
             throw std::runtime_error("sampling cannot be combined with --mtp");
         if (validate_only) {
-            if (!token_list.empty() || !prompt_text.empty() || mtp_width ||
+            if (token_list_supplied || prompt_supplied || mtp_width ||
                 sampling.temperature > 0 || !dump_token_ids.empty())
                 throw std::runtime_error("--validate-only cannot be combined with generation options");
         } else {
-            if (token_list.empty() && prompt_text.empty())
+            if (!token_list_supplied && !prompt_supplied)
                 throw std::runtime_error("--tokens or --prompt is required");
             if (!count) throw std::runtime_error("-n must be greater than zero");
         }
@@ -140,8 +147,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
 
         std::vector<uint32_t> prompt;
-        if (!token_list.empty()) prompt = parse_tokens(token_list);
-        else if (!prompt_text.empty()) {
+        if (token_list_supplied) prompt = parse_tokens(token_list);
+        else if (prompt_supplied) {
             for (int token : tokenizer.encode(prompt_text)) {
                 if (token < 0) throw std::runtime_error("tokenizer returned a negative id");
                 prompt.push_back(static_cast<uint32_t>(token));
