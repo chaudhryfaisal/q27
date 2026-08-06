@@ -3,8 +3,12 @@
 #include <cstring>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
 
@@ -31,6 +35,18 @@ bool same_logits(const std::vector<float>& left, const std::vector<float>& right
            std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0;
 }
 
+bool artifact_requires_per_tensor_upload(const char* path, uint64_t max_buffer_length) {
+    struct stat info {};
+    if (::stat(path, &info) != 0 || info.st_size <= 0)
+        throw std::runtime_error("could not read model artifact size");
+    const uint64_t logical_size = static_cast<uint64_t>(info.st_size);
+    const uint64_t page_size = static_cast<uint64_t>(::getpagesize());
+    if (logical_size > std::numeric_limits<uint64_t>::max() - (page_size - 1))
+        throw std::runtime_error("model artifact size overflow");
+    const uint64_t mapped_size = (logical_size + page_size - 1) / page_size * page_size;
+    return mapped_size > max_buffer_length;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -40,6 +56,16 @@ int main(int argc, char** argv) {
     }
     try {
         q27::MetalEngine engine(argv[1], 8);
+        const bool expected_per_tensor = artifact_requires_per_tensor_upload(
+            argv[1], engine.backend().max_buffer_length());
+        if (engine.used_per_tensor_upload() != expected_per_tensor) {
+            std::fprintf(stderr,
+                         "model upload path did not match artifact size and device limit: "
+                         "expected %s, got %s\n",
+                         expected_per_tensor ? "per-tensor" : "whole-mapping",
+                         engine.used_per_tensor_upload() ? "per-tensor" : "whole-mapping");
+            return 1;
+        }
         if (!rejects_logits(engine)) {
             std::fprintf(stderr, "fresh engine exposed non-resident logits\n");
             return 1;

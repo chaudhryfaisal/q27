@@ -64,6 +64,7 @@ class MetalEngine {
     uint32_t position() const { return position_; }
     SpecStats last_spec_stats() const { return last_spec_stats_; }
     MetalBackend& backend() { return backend_; }
+    bool used_per_tensor_upload() const { return per_tensor_upload_; }
     bool chunked_prefill() const { return chunked_prefill_; }
     void set_chunked_prefill(bool enabled);
 
@@ -96,6 +97,7 @@ class MetalEngine {
     MetalBackend backend_;
     uint32_t max_context_;
     bool turbo3_kv_;
+    bool per_tensor_upload_ = false;
     uint32_t position_ = 0;
     bool logits_resident_ = false;
     SpecStats last_spec_stats_;

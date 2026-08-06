@@ -182,11 +182,11 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     if (total_cache_bytes > backend_.recommended_working_set_size() / 2)
         throw std::runtime_error("q27 Metal: requested KV cache is too large for this device; use --kv turbo3 or reduce --ctx");
 
-    const bool per_tensor_upload = backend_.uses_per_tensor_upload(model_);
+    per_tensor_upload_ = backend_.uses_per_tensor_upload(model_);
     constexpr double gibibyte = 1024.0 * 1024.0 * 1024.0;
     std::fprintf(stderr,
                  "q27 Metal: model upload path: %s (mapping %.2f GiB, max buffer %.2f GiB)\n",
-                 per_tensor_upload ? "per-tensor" : "whole-mapping",
+                 per_tensor_upload_ ? "per-tensor" : "whole-mapping",
                  model_.mapping_size() / gibibyte,
                  backend_.max_buffer_length() / gibibyte);
 
