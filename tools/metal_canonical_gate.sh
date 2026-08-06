@@ -23,7 +23,7 @@ if [[ -z "${CANON_ARCH:-}" ]]; then
   fi
   chip="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
   case "$chip" in
-    "Apple M4") CANON_ARCH=metal-m4 ;;
+    "Apple M4"|"Apple M4 Pro") CANON_ARCH=metal-m4 ;;
     *)
       echo "no auto-selected Metal canonical for chip '$chip'; set CANON_ARCH after deriving one" >&2
       exit 2
