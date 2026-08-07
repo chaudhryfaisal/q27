@@ -18,6 +18,12 @@ canonical_md5_for() {
     q6f|q6f-v1) tier=q6f ;;
   esac
 
+  # sm86:default was derived on an RTX 3090 (82 SMs) and independently matched
+  # the A40 result (84 SMs) byte-for-byte, establishing SM-count independence
+  # within sm_86. A non-Blackwell `6894254e...` result therefore reproduces its
+  # own architecture's canonical rather than failing to reproduce Blackwell.
+  # Unlisted pairs require a same-device upstream/candidate differential.
+
   case "$arch:$tier" in
     sm120:default) printf '%s\n' a2982c5197c627551b27d76a0a94b220 ;;
     sm120:q4s)    printf '%s\n' f64e7c02252ca4c40cea62db662205e0 ;;

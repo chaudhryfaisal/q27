@@ -33,30 +33,56 @@ gen() { # $1=outfile ; extra args after
   grep '^generated:' "$out"
 }
 
+valid_generated() {
+  local line="$1"
+  [[ "$line" == "generated: "* && -n "${line#generated: }" ]]
+}
+
 echo "== gate 1: greedy canonical md5 (bitwise -- greedy path must be untouched)"
-gen "$tmp/canon.out" -n 128 >/dev/null
-md5="$(grep '^generated:' "$tmp/canon.out" | md5sum | cut -d' ' -f1)"
-if [[ "$md5" == "$CANON_MD5" ]]; then echo "  OK  md5=$md5"
-else echo "  FAIL md5=$md5 want $CANON_MD5" >&2; fail=1; fi
+canon="$(gen "$tmp/canon.out" -n 128)"
+if ! valid_generated "$canon"; then
+  echo "  FAIL canonical run produced no generated trajectory" >&2
+  fail=1
+else
+  md5="$(printf '%s\n' "$canon" | md5sum | cut -d' ' -f1)"
+  if [[ "$md5" == "$CANON_MD5" ]]; then echo "  OK  md5=$md5"
+  else echo "  FAIL md5=$md5 want $CANON_MD5" >&2; fail=1; fi
+fi
 
 echo "== gate 2: sampled seeded identity (same seed -> identical stream)"
 a="$(gen "$tmp/s1.out" -n 48 --temp 0.85 --top-p 0.95 --seed 42)"
 b="$(gen "$tmp/s2.out" -n 48 --temp 0.85 --top-p 0.95 --seed 42)"
-if [[ "$a" == "$b" && -n "$a" ]]; then echo "  OK  (identical across runs)"
+if ! valid_generated "$a" || ! valid_generated "$b"; then
+  echo "  FAIL seeded run produced no generated trajectory" >&2
+  fail=1
+elif [[ "$a" == "$b" ]]; then echo "  OK  (identical across runs)"
 else echo "  FAIL seeded runs differ" >&2; fail=1; fi
 
 echo "== gate 3: seed varies + sampled != greedy (sanity)"
 c="$(gen "$tmp/s3.out" -n 48 --temp 0.85 --top-p 0.95 --seed 7)"
-g="$(grep '^generated:' "$tmp/canon.out" | head -c 400)"
-[[ "$a" != "$c" ]] && echo "  OK  seed 42 != seed 7" || { echo "  FAIL seeds gave identical output" >&2; fail=1; }
-[[ "$a" != "$g" ]] && echo "  OK  sampled != greedy" || { echo "  FAIL sampled == greedy" >&2; fail=1; }
+g="${canon:0:400}"
+if ! valid_generated "$a" || ! valid_generated "$c"; then
+  echo "  FAIL seed comparison produced no generated trajectory" >&2
+  fail=1
+elif [[ "$a" != "$c" ]]; then echo "  OK  seed 42 != seed 7"
+else echo "  FAIL seeds gave identical output" >&2; fail=1; fi
+if ! valid_generated "$a" || ! valid_generated "$g"; then
+  echo "  FAIL sampled/greedy comparison produced no generated trajectory" >&2
+  fail=1
+elif [[ "$a" != "$g" ]]; then echo "  OK  sampled != greedy"
+else echo "  FAIL sampled == greedy" >&2; fail=1; fi
 
 echo "== gate 4: spec==plain trajectories both valid (full chi-square is kernel-proven)"
 sp="$(gen "$tmp/spec.out" -n 48 --temp 0.85 --top-p 0.95 --seed 3)"
 pl="$(Q27_SAMPLE_PLAIN=1 gen "$tmp/plain.out" -n 48 --temp 0.85 --top-p 0.95 --seed 3)"
-ns="$(wc -w <<<"$sp")"; np="$(wc -w <<<"$pl")"   # word count includes the 'generated:' token
-if [[ "$ns" -ge 40 && "$np" -ge 40 ]]; then echo "  OK  spec=$((ns-1)) tok, plain=$((np-1)) tok (both produced; distributions match by kernel gate)"
-else echo "  FAIL a path under-produced (spec=$ns plain=$np words)" >&2; fail=1; fi
+if ! valid_generated "$sp" || ! valid_generated "$pl"; then
+  echo "  FAIL spec/plain run produced no generated trajectory" >&2
+  fail=1
+else
+  ns="$(wc -w <<<"$sp")"; np="$(wc -w <<<"$pl")"   # word count includes the 'generated:' token
+  if [[ "$ns" -ge 40 && "$np" -ge 40 ]]; then echo "  OK  spec=$((ns-1)) tok, plain=$((np-1)) tok (both produced; distributions match by kernel gate)"
+  else echo "  FAIL a path under-produced (spec=$ns plain=$np words)" >&2; fail=1; fi
+fi
 
 echo "== gate 5: acceptance-vs-temp (tokens/round should sag as T rises)"
 for T in 0.0 0.3 0.7 1.0 1.5; do
