@@ -23,6 +23,9 @@ canonical_md5_for() {
   # within sm_86. A non-Blackwell `6894254e...` result therefore reproduces its
   # own architecture's canonical rather than failing to reproduce Blackwell.
   # Unlisted pairs require a same-device upstream/candidate differential.
+  # metal-m4:q4s was derived on a base Apple M4 and independently matched on a
+  # 24 GB Apple M4 Pro byte-for-byte using the same q4s artifact (artifact MD5
+  # 7e5454e0c0ded717136ad3e42634ba25), establishing the shared family canonical.
 
   case "$arch:$tier" in
     sm120:default) printf '%s\n' a2982c5197c627551b27d76a0a94b220 ;;
