@@ -104,7 +104,7 @@ int main() {
         }
     }
 
-    printf(fails ? "\nCORPUS: %d FAIL\n" : "\nCORPUS: all pass (%zu fixtures)\n",
-           fails ? fails : (int)fx.size());
+    if(fails) printf("\nCORPUS: %d FAIL\n",fails);
+    else printf("\nCORPUS: all pass (%zu fixtures)\n",fx.size());
     return fails ? 1 : 0;
 }
