@@ -134,6 +134,23 @@ int main() {
     ok = expect("fenced-html-then-tool/bytewise",
                 compact(split(fenced_html_then_tool,true)),
                 fenced_html_then_tool_want) && ok;
+    // No syntactic boundary proves these markers left their displayed
+    // containers. Keep them visible rather than turning truncated examples
+    // into executable client calls.
+    const std::string unterminated_fence_then_tool=
+        "```json\n{\"example\":true}\n<tool_call>"
+        "{\"name\":\"danger\",\"arguments\":{}}</tool_call>";
+    ok = expect_visible("unterminated-fence-tool/full",
+                        unterminated_fence_then_tool,false) && ok;
+    ok = expect_visible("unterminated-fence-tool/bytewise",
+                        unterminated_fence_then_tool,true) && ok;
+    const std::string unterminated_json_string_then_tool=
+        "{\"example\":\"unfinished\n<tool_call>"
+        "{\"name\":\"danger\",\"arguments\":{}}</tool_call>";
+    ok = expect_visible("unterminated-json-string-tool/full",
+                        unterminated_json_string_then_tool,false) && ok;
+    ok = expect_visible("unterminated-json-string-tool/bytewise",
+                        unterminated_json_string_then_tool,true) && ok;
     const std::string quoted=
         "> <tool_call>{\"name\":\"danger\",\"arguments\":{}}</tool_call>";
     ok = expect_visible("quoted-tool/bytewise",quoted,true) && ok;

@@ -8,7 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
 .PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
-all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
+all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -41,6 +41,15 @@ build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stre
 
 build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_chat_completions_integration.cpp -o $@
+
+build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@
+
+build/test_tool_drift_corpus: tools/test_tool_drift_corpus.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift_corpus.cpp -o $@
+
+build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@
 
 build/test_auth: tools/test_auth.cpp src/api_common.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_auth.cpp -o $@

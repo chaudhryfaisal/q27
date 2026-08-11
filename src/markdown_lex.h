@@ -717,6 +717,10 @@ inline bool markdown_context_is_displayed(
     state.settle_before_non_backtick();
     if(position<text.size()) state.leave_closed_container(text[position]);
     if(state.displayed_html() || state.displayed_markdown_metadata()) return true;
+    // An unterminated fence stays displayed through the end of the response.
+    // Unlike malformed JSON with an actual ancestor closer, it provides no
+    // trustworthy boundary after which a marker is executable; decaying at the
+    // marker itself would let truncated fenced or retrieved content call tools.
     if(state.fence_length!=0) return true;
     if(state.indented_code_line()) return true;
     if(state.displayed_markdown_line()) return true;
