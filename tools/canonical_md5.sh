@@ -23,9 +23,11 @@ canonical_md5_for() {
   # within sm_86. A non-Blackwell `6894254e...` result therefore reproduces its
   # own architecture's canonical rather than failing to reproduce Blackwell.
   # Unlisted pairs require a same-device upstream/candidate differential.
-  # metal-m4:q4s was derived on a base Apple M4 and independently matched on a
-  # 24 GB Apple M4 Pro byte-for-byte using the same q4s artifact (artifact MD5
-  # 7e5454e0c0ded717136ad3e42634ba25), establishing the shared family canonical.
+  # metal-m4:q4s was re-derived after the serving stack promoted the measured
+  # reciprocal-multiply activation quantization and revised shader arithmetic.
+  # The new trajectory was reproduced byte-for-byte on a base Apple M4 and an
+  # independent 24 GB Apple M4 Pro using the same q4s artifact (artifact MD5
+  # 7e5454e0c0ded717136ad3e42634ba25), preserving the shared family canonical.
 
   case "$arch:$tier" in
     sm120:default) printf '%s\n' a2982c5197c627551b27d76a0a94b220 ;;
@@ -33,7 +35,7 @@ canonical_md5_for() {
     sm120:q5f)    printf '%s\n' 683f7f4450ca4c60837abdb603ee3237 ;;
     sm120:q6f)    printf '%s\n' 2a4d22eafcde63e962bf2408605fe502 ;;
     sm86:default) printf '%s\n' 6894254e3b1a184ee3802771ddd59c2b ;;
-    metal-m4:q4s) printf '%s\n' 3a82b01053311807cc8bbaacdd8dcec7 ;;
+    metal-m4:q4s) printf '%s\n' f301095522174bdb99f75ec840ad1389 ;;
     *) return 1 ;;
   esac
 }

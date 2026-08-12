@@ -9,7 +9,6 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 
 .PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
-
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
@@ -63,7 +62,6 @@ check-chat-extract: tools/extract_check.sh src/server.cu tools/test_chat_complet
 SERVER ?= build/q27-server
 check-responses-integration: $(SERVER) tools/test_responses_integration.py
 	python3 tools/test_responses_integration.py --server "$(SERVER)" --model "$(MODEL)" --tokenizer "$(TOKENIZER)"
-
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
 
@@ -93,7 +91,7 @@ build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | b
 build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
+                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
@@ -138,7 +136,7 @@ build/turbo5_test: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
+                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
@@ -163,7 +161,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/prefi
 build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                       src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
+                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
@@ -188,22 +186,24 @@ build/test-metal-ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
 
 build/metal-engine.o: src/metal/metal_engine.cpp src/metal/metal_engine.h \
                       src/metal/metal_backend.h src/backend.h src/loader.h \
-                      src/sampling.h src/suffixdraft.h third_party/json.hpp | build
+                      src/sampling.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) -c src/metal/metal_engine.cpp -o $@
 
 build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
                                    src/metal/metal_engine.cpp src/metal/metal_engine.h \
                                    src/metal/metal_backend.mm src/metal/metal_backend.h \
                                    src/metal/q27_kernels.metal src/backend.h \
-                                   src/loader.cpp src/loader.h src/sampling.h src/suffixdraft.h \
+                                   src/loader.cpp src/loader.h src/sampling.h \
                                    third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) src/metal/test_metal_engine_contracts.cpp \
 	       src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
 	       $(METALLIBS) -o $@
 
-test-metal-contracts: build/test_metal_engine_contracts
+test-metal-contracts: build/test_metal_engine_contracts build/test_metal_model_contracts build/test_metal_stream
 	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
 	./build/test_metal_engine_contracts "$(MODEL)"
+	./build/test_metal_model_contracts "$(MODEL)"
+	./build/test_metal_stream
 
 metal-engine: build/metal-engine.o
 
@@ -211,12 +211,65 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
                  src/metal/metal_backend.mm src/metal/metal_engine.h \
                  src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp \
-                 src/tokenizer.h src/sampling.h src/suffixdraft.h third_party/json.hpp | build
+                 src/tokenizer.h src/sampling.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
 	       src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	       $(METALLIBS) -o $@
 
-test-metal: test-metal-backend build/q27-metal
+build/test_metal_model_contracts: src/metal/test_metal_model_contracts.cpp \
+                                  src/metal/metal_engine.cpp src/metal/metal_backend.mm \
+                                  src/metal/metal_engine.h src/metal/metal_backend.h \
+                                  src/metal/q27_kernels.metal src/backend.h src/loader.cpp | build
+	$(CXX) $(METALFLAGS) src/metal/test_metal_model_contracts.cpp \
+	       src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
+	       $(METALLIBS) -o $@
+
+test-metal-validation: build/inspect build/q27-metal
+	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
+	python3 tools/test_inspect.py ./build/inspect ./build/q27-metal "$(TOKENIZER)"
+
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp \
+                        src/metal/metal_backend.mm src/metal/metal_engine.h \
+                        src/metal/metal_backend.h src/metal/stream_format.h \
+                        src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
+                        src/metal/snapshot_evict.h \
+                        src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                        src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
+                        src/sampling.h src/tokenizer.h src/tokenizer.cpp \
+                        third_party/httplib.h third_party/json.hpp | build
+	$(CXX) $(METALFLAGS) -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.cpp \
+                             src/metal/metal_backend.mm src/metal/metal_engine.h \
+                             src/metal/metal_backend.h src/metal/stream_format.h \
+                             src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
+                             src/metal/snapshot_evict.h \
+                             src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                             src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
+                             src/sampling.h src/tokenizer.h src/tokenizer.cpp \
+                             third_party/httplib.h third_party/json.hpp | build
+	$(CXX) $(METALFLAGS) -DQ27_METAL_TEST_FAILPOINTS=1 -I src/metal \
+	        src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_backend.mm \
+	        src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h \
+                         src/metal/serving_policy.h src/api_common.h src/stream_split.h \
+                         third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src/metal src/metal/test_metal_stream.cpp -o $@
+
+build/test_snapshot_store_shared: tools/test_snapshot_store_shared.cpp \
+                                  src/metal/disk_snapshot_store.h src/metal/snapshot_evict.h | build
+	$(CXX) $(CXXFLAGS) -I src/metal tools/test_snapshot_store_shared.cpp -o $@
+
+test-metal-recovery: build/q27-metal-server-test src/metal/test_server_recovery.py
+	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
+	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
+	python3 src/metal/test_server_recovery.py ./build/q27-metal-server-test "$(MODEL)" "$(TOKENIZER)"
+
+test-metal: test-metal-backend build/test_metal_stream build/test_snapshot_store_shared build/q27-metal
+	./build/test_metal_stream
+	./build/test_snapshot_store_shared
 	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
 	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
 	@if ./build/q27-metal "$(MODEL)" "$(TOKENIZER)" --tokens 760 --prompt "" >/dev/null 2>&1; then \
@@ -242,6 +295,10 @@ metal-engine:
 	@echo "metal-engine requires macOS" >&2; exit 1
 test-metal-contracts:
 	@echo "test-metal-contracts requires macOS" >&2; exit 1
+test-metal-recovery:
+	@echo "test-metal-recovery requires macOS" >&2; exit 1
+test-metal-validation:
+	@echo "test-metal-validation requires macOS" >&2; exit 1
 
 test-metal:
 	@echo "test-metal requires macOS" >&2; exit 1
