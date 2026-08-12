@@ -17,7 +17,12 @@
 set -u
 REPO="${1:-Qwen/Qwen3.8-27B}"
 ORG="${2:-Qwen}"
-PATTERN="${3:-Qwen3\\.8}"
+# The org pattern must be specific to the model being waited on, not just its
+# generation. `Qwen3\.8` also matched Qwen3.8-2.4T-A95B (Max going open-weights
+# on 2026-08-12) and fired on a model the checklist cannot even run against --
+# and because a permanent repo keeps matching, re-arming re-fired immediately.
+# Keep the wildcard so a suffixed name (-Instruct, -FP8) still trips it.
+PATTERN="${3:-Qwen3\\.8.*27B}"
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/q27-watch}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$STATE_DIR"
