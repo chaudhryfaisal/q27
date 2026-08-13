@@ -4,6 +4,11 @@
 //  Copyright (c) 2024 Yuji Hirose. All rights reserved.
 //  MIT License
 //
+// q27 local patch: expose nonblocking peer-liveness callbacks to long-running
+// server handlers and content providers. Keep this patch when updating the
+// vendored cpp-httplib release; metal_server.cpp depends on both callbacks.
+//
+//
 
 #ifndef CPPHTTPLIB_HTTPLIB_H
 #define CPPHTTPLIB_HTTPLIB_H
@@ -535,6 +540,8 @@ public:
 
   std::function<bool(const char *data, size_t data_len)> write;
   std::function<bool()> is_writable;
+  // Nonblocking peer-disconnect probe for long-running content providers.
+  std::function<bool()> is_alive;
   std::function<void()> done;
   std::function<void(const Headers &trailer)> done_with_trailer;
   std::ostream os;
@@ -629,6 +636,8 @@ struct Request {
   Match matches;
   std::unordered_map<std::string, std::string> path_params;
 
+  // Nonblocking peer-disconnect probe for long-running server handlers.
+  std::function<bool()> is_connection_alive;
   // for client
   ResponseHandler response_handler;
   ContentReceiverWithProgress content_receiver;
@@ -661,6 +670,7 @@ struct Request {
   ContentProvider content_provider_;
   bool is_chunked_content_provider_ = false;
   size_t authorization_count_ = 0;
+
 };
 
 struct Response {
@@ -4471,6 +4481,7 @@ inline bool write_content(Stream &strm, const ContentProvider &content_provider,
   };
 
   data_sink.is_writable = [&]() -> bool { return strm.is_writable(); };
+  data_sink.is_alive = [&]() -> bool { return is_socket_alive(strm.socket()); };
 
   while (offset < end_offset && !is_shutting_down()) {
     if (!strm.is_writable()) {
@@ -4517,6 +4528,7 @@ write_content_without_length(Stream &strm,
   };
 
   data_sink.is_writable = [&]() -> bool { return strm.is_writable(); };
+  data_sink.is_alive = [&]() -> bool { return is_socket_alive(strm.socket()); };
 
   data_sink.done = [&](void) { data_available = false; };
 
@@ -4569,6 +4581,7 @@ write_content_chunked(Stream &strm, const ContentProvider &content_provider,
   };
 
   data_sink.is_writable = [&]() -> bool { return strm.is_writable(); };
+  data_sink.is_alive = [&]() -> bool { return is_socket_alive(strm.socket()); };
 
   auto done_with_trailer = [&](const Headers *trailer) {
     if (!ok) { return; }
@@ -7050,6 +7063,9 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   if (!line_reader.getline()) { return false; }
 
   Request req;
+  req.is_connection_alive = [&strm]() -> bool {
+    return detail::is_socket_alive(strm.socket());
+  };
 
   Response res;
   res.version = "HTTP/1.1";

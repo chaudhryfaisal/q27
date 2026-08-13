@@ -128,6 +128,25 @@ int test_primitives(q27::MetalBackend& backend) {
     // Stable lower-index tie break.
     std::vector<float> logits={-1,7,3,7,2}; auto lb=upload_buffer(backend,logits); auto ib=backend.allocate(4); backend.argmax(*lb,5,*ib); uint32_t index=99; backend.read(*ib,0,&index,4); if(index!=1){fprintf(stderr,"argmax: got %u want 1\n",index);failures++;}
 
+    // GPU radix selection must preserve CPU float equality for signed zero:
+    // top_k=1 needs both candidates so the host can apply lower-index tie order.
+    if(backend.gpu_topk_supported()) {
+        std::vector<float> zero_logits={-0.0f,0.0f,-1.0f};
+        auto zero_in=upload_buffer(backend,zero_logits);
+        auto top_values=backend.allocate(8*4), top_indices=backend.allocate(8*4);
+        auto top_count=backend.allocate(4);
+        backend.topk(*zero_in,3,1,*top_values,*top_indices,*top_count);
+        uint32_t count=0; backend.read(*top_count,0,&count,4);
+        std::vector<uint32_t> ids(count);
+        if(count) backend.read(*top_indices,0,ids.data(),count*4);
+        const bool saw_negative=std::find(ids.begin(),ids.end(),0)!=ids.end();
+        const bool saw_positive=std::find(ids.begin(),ids.end(),1)!=ids.end();
+        if(!saw_negative || !saw_positive) {
+            fprintf(stderr,"top-k signed-zero tie lost a candidate (count=%u)\n",count);
+            failures++;
+        }
+    }
+
     return failures;
 }
 

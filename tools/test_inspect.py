@@ -96,9 +96,12 @@ def output(result):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit(f'usage: {sys.argv[0]} build/inspect')
+    if len(sys.argv) not in (2, 4):
+        raise SystemExit(
+            f'usage: {sys.argv[0]} build/inspect [build/q27-metal TOKENIZER]')
     inspect = sys.argv[1]
+    metal = sys.argv[2] if len(sys.argv) == 4 else None
+    tokenizer = sys.argv[3] if len(sys.argv) == 4 else None
     with tempfile.TemporaryDirectory(prefix='q27-inspect-') as tmp:
         root = pathlib.Path(tmp)
         valid = root / 'valid.q27'
@@ -158,6 +161,16 @@ def main():
                 'T2 payload contains reserved code 3' not in output(invalid_t2)):
             sys.stderr.write(output(invalid_t2))
             raise SystemExit('reserved T2 code was not detected')
+
+        if metal:
+            invalid_metal = subprocess.run(
+                [metal, str(bad_t2), tokenizer, '--validate-only'],
+                text=True, capture_output=True)
+            if (invalid_metal.returncode == 0 or
+                    'T2 payload contains reserved code 3' not in
+                    output(invalid_metal)):
+                sys.stderr.write(output(invalid_metal))
+                raise SystemExit('Metal --validate-only accepted reserved T2 code')
 
         invalid_t3_range = run(inspect, bad_t3_range)
         if (invalid_t3_range.returncode == 0 or

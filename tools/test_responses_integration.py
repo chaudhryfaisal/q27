@@ -125,6 +125,106 @@ def run_response_case(port, header_label, codex_headers, stream, reasoning_limit
     print(f"{label}: PASS")
 
 
+def tool_body(max_output_tokens):
+    return {
+        "input": "Call the echo tool with text hello world. Do not answer directly.",
+        "stream": True,
+        "max_output_tokens": max_output_tokens,
+        "enable_thinking": False,
+        "tools": [{
+            "type": "function",
+            "name": "echo",
+            "description": "Echo text",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        }],
+        "tool_choice": "required",
+    }
+
+
+def require_balanced_output_items(label, events):
+    added = {
+        event.get("item", {}).get("id")
+        for event in events
+        if event.get("type") == "response.output_item.added"
+    }
+    done = {
+        event.get("item", {}).get("id")
+        for event in events
+        if event.get("type") == "response.output_item.done"
+    }
+    dangling = added - done
+    if dangling:
+        fail(f"{label}: output items left in progress: {sorted(dangling)!r}")
+
+
+def run_tool_stream_cases(port):
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "x-codex-turn-metadata": "{}",
+    }
+
+    label = "tool/stream/truncated"
+    status, response_headers, payload = request(
+        port, "POST", "/v1/responses", tool_body(12), headers
+    )
+    require_status(label, status, 200)
+    if not response_headers.get("Content-Type", "").startswith("text/event-stream"):
+        fail(f"{label}: wrong content type {response_headers!r}")
+    events = parse_sse(label, payload)
+    terminal = events[-1]
+    error = terminal.get("response", {}).get("error", {})
+    if (terminal.get("type") != "response.failed" or
+            error.get("code") != "invalid_model_output"):
+        fail(f"{label}: unexpected terminal event: {terminal!r}")
+    call_item_events = [
+        event for event in events
+        if (event.get("type") in ("response.output_item.added",
+                                  "response.output_item.done") and
+            event.get("item", {}).get("type") in ("function_call",
+                                                    "custom_tool_call"))
+    ]
+    if call_item_events:
+        fail(f"{label}: incomplete call was advertised: {call_item_events!r}")
+    print(f"{label}: PASS")
+
+    label = "tool/stream/completed"
+    status, response_headers, payload = request(
+        port, "POST", "/v1/responses", tool_body(64), headers
+    )
+    require_status(label, status, 200)
+    events = parse_sse(label, payload)
+    types = [event.get("type") for event in events]
+    required = (
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    )
+    if any(event_type not in types for event_type in required):
+        fail(f"{label}: incomplete function-call lifecycle: {types!r}")
+    positions = [types.index(event_type) for event_type in required]
+    if positions != sorted(positions):
+        fail(f"{label}: out-of-order function-call lifecycle: {types!r}")
+    done_items = [
+        event.get("item", {}) for event in events
+        if event.get("type") == "response.output_item.done"
+    ]
+    if (not done_items or done_items[-1].get("status") != "completed" or
+            done_items[-1].get("name") != "echo"):
+        fail(f"{label}: wrong completed function call: {done_items!r}")
+    arguments = parse_json(label, done_items[-1].get("arguments", ""))
+    if arguments != {"text": "hello world"}:
+        fail(f"{label}: wrong function arguments: {arguments!r}")
+    require_balanced_output_items(label, events)
+    print(f"{label}: PASS")
+
+
 def wait_ready(process, port, log_path):
     deadline = time.monotonic() + 300
     last_error = "not started"
@@ -203,6 +303,7 @@ def main():
                     run_response_case(
                         port, header_label, codex_headers, stream, reasoning_limited
                     )
+        run_tool_stream_cases(port)
         print("all production Responses integration tests passed")
     finally:
         if process.poll() is None:

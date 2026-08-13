@@ -4,6 +4,7 @@
 #include "../sampling.h"
 #include "../loader.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,39 +18,150 @@ class MetalEngine {
   public:
     struct Snapshot;
     struct SpecStats { uint64_t rounds=0,drafted=0,accepted=0; };
+    // One-per-artifact state shared by engines in the same process: the
+    // artifact mapping, the Metal queue/pipelines (the whole-mapping buffer
+    // and residency set live behind the backend), and the weight wrap.
+    // Engines sharing a Shared never map or wire the artifact twice, so the
+    // one-model-load memory policy sees a single load however many engines
+    // (e.g. an fp16-KV baseline and a turbo3-KV subject) attach to it.
+    // Contract: engines on one Shared must be constructed and driven from a
+    // single thread (or externally serialized) — they alias one command
+    // queue and one batching state, and nothing here locks.
+    struct Shared {
+        Model model;
+        MetalBackend backend;
+        std::unordered_map<std::string, BackendTensor> weights;
+        // Combined KV-cache footprint of every engine on this mapping, so a
+        // second engine cannot pass the per-engine budget check while the
+        // pair overcommits the device.
+        uint64_t cache_bytes = 0;
+        // Engine-local cache admission ceiling. Direct users retain the
+        // historical half-working-set default; servers may replace it with
+        // their explicit --budget-mb policy before constructing any slot.
+        uint64_t cache_budget = 0;
+        // Artifact path, kept for diagnostics, plus the disk-snapshot
+        // identity: SHA1 over the whole mapped artifact — the bytes this
+        // process actually opened, immune to pathname swaps — computed
+        // lazily on first snapshot use and cached, never on ordinary startup.
+        std::string path;
+        unsigned char snap_sha1[20] = {};
+        bool snap_sha_ready = false;
+        explicit Shared(Model&& opened) : model(std::move(opened)) {
+            cache_budget=backend.recommended_working_set_size()/2;
+        }
+    };
+    static std::shared_ptr<Shared> open_shared(const std::string& model_path);
     explicit MetalEngine(const std::string& model_path, uint32_t context = 128,
                          bool turbo3_kv = false);
+    MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv);
+    // Reference members alias shared GPU state; a copy with an independent
+    // position_ would corrupt its sibling. Engines are pinned to their spot.
+    MetalEngine(const MetalEngine&) = delete;
+    MetalEngine& operator=(const MetalEngine&) = delete;
+    ~MetalEngine();
+
+    // G6 admission accounting (docs/metal/plans/2026-07-16-g6-admission.md).
+    // These mirror the constructor's allocations and capture_state()'s
+    // snapshot composition — keep them paired with those sites.
+    bool has_mtp() const { return has_mtp_; }
+    // KV caches plus this engine's blocked-GQA partials scratch — every
+    // ctx-scaled reservation the constructor charges against the shared
+    // cross-engine budget (audit E2: partials are per-engine now).
+    uint64_t kv_reserved_bytes() const { return engine_cache_bytes_; }
+    uint64_t snapshot_bytes() const;               // worst case at max_context_
+    // Per-engine non-KV buffers; MTP terms exist on MTP artifacts and the
+    // chunk/verify/replay terms only when chunked prefill is available.
+    // The GQA partials are charged inside kv_reserved_bytes, not here.
+    static uint64_t fixed_state_bytes(bool chunked,bool has_mtp);
+    // Exact server-side footprint estimate before an engine allocates: KV and
+    // GQA scratch, fixed/lazy state, plus configured in-memory snapshots.
+    // Reads the same production KV-side-cache environment as the constructor.
+    static uint64_t serving_reservation_bytes(const Shared& shared,uint32_t context,
+                                              bool turbo3_kv,size_t snapshot_entries);
+    // Conservative pre-construction footprint for one fp16-KV engine:
+    // MTP-present cache, widest chunked buffers, and the smallest supported
+    // GQA block. Used by dual-engine CLI modes before either engine allocates.
+    static uint64_t fp16_engine_reservation_bytes(uint32_t context);
+    // Per-engine causal-GQA partials buffer at the widest available
+    // attention width (one token when chunked prefill is unavailable),
+    // sized from the backend's EFFECTIVE block (Q27_METAL_GQA_BLOCK-aware).
+    // Allocated eagerly by the constructor; the dispatch hot path only
+    // bounds-checks (audit C3). Sizing never depends on the GQA threshold,
+    // so runtime threshold flips (envelope instrument) only change routing.
+    static uint64_t gqa_partial_peak(uint32_t context, uint32_t block, bool chunked);
 
     void reset();
     uint32_t step(uint32_t token);
-    std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count);
+    std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count,
+                                   uint32_t eos = UINT32_MAX);
     std::vector<uint32_t> generate_mtp(const std::vector<uint32_t>& prompt,
-                                       uint32_t count, uint32_t width);
-    std::vector<uint32_t> generate_suffix(const std::vector<uint32_t>& prompt,
-                                          uint32_t count, uint32_t width,
-                                          uint32_t minimum_match = 12);
+                                       uint32_t count, uint32_t width,
+                                       uint32_t eos = UINT32_MAX);
+    // Sampled MTP whole-run driver (docs/metal/plans/2026-07-21-metal-sampled-mtp.md):
+    // sample first pending from prefill logits, then mtp_sample_round quanta.
+    // Requires has_mtp() + chunked_prefill(); temperature should be > 0.
+    std::vector<uint32_t> generate_mtp_sampled(const std::vector<uint32_t>& prompt,
+                                               uint32_t count, uint32_t width,
+                                               const SamplingParams& params,
+                                               uint32_t eos = UINT32_MAX);
+    // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
+    // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
+    // (docs/metal/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
+    // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
+    // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
+    static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
     uint32_t ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
                            bool reset_first = true);
+    // One bounded token-serial prefill quantum. Unlike step(), this optionally
+    // warms the MTP lane state between tokens and avoids an output-head
+    // projection until final_chunk. The server uses it to release the shared
+    // command-queue lease every eight tokens during serial MTP prefill.
+    static constexpr uint32_t serial_prefill_chunk_max() { return 8; }
+    uint32_t prefill_serial_chunk(const uint32_t* tokens, uint32_t count,
+                                  bool warm_mtp, bool final_chunk);
+
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
-                                                uint32_t mtp_width = 0);
+                                                uint32_t mtp_width = 0,
+                                                uint32_t eos = UINT32_MAX);
     std::vector<float> read_logits();
+    // x1_ readback for the --chunk-parity hidden-row leg; hidden-row state is
+    // also persisted by capture_state and save_state.
+    void read_hidden(std::vector<float>& out);
     // Teacher-forced NLL for tokens[0..N): returns N-1 values where
     // result[i] = -log P(tokens[i+1] | tokens[0..i]). Uses layer-major
     // chunked encode + batched output head when available.
     std::vector<float> teacher_force_nll(const std::vector<uint32_t>& tokens);
+    // Teacher-forced chunk logits for cross-engine comparison gates (e.g.
+    // the KL KV-tolerance gate): encode tokens[0..count) at the engine's
+    // current position — count 1..12; a single token takes the serial path —
+    // and fill `out` with count x vocab logits rows. The caller loops over
+    // the stream and interleaves engines; both must advance in lockstep.
+    void teacher_force_logits(const uint32_t* tokens, uint32_t count,
+                              std::vector<float>& out);
+    // Wide-path variant: encode tokens[0..count) through the prompt-ingestion
+    // chunk width (count 1..PREFILL_CHUNK_MAX; <= CHUNK_MAX delegates to
+    // teacher_force_logits) and apply the output head in CHUNK_MAX-row slices.
+    // Exposing every row's logits lets distribution-level gates cover widths
+    // 17, 48, and 96 rather than only committed-token comparisons.
+    void teacher_force_logits_wide(const uint32_t* tokens, uint32_t count,
+                                   std::vector<float>& out);
     std::vector<uint32_t> generate_sampled(const std::vector<uint32_t>& prompt,
-                                           uint32_t count,const SamplingParams& params);
+                                           uint32_t count, const SamplingParams& params,
+                                           uint32_t eos = UINT32_MAX);
     std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
-                                                       const SamplingParams& params);
+                                                       const SamplingParams& params,
+                                                       uint32_t eos = UINT32_MAX);
 
     // Streaming generation. `sink(token)` is called for each committed,
     // non-EOS token in order; return false from the sink to cancel (client
     // disconnect). Generation stops at EOS (StopCause::Eos, the EOS token is
     // not passed to the sink), when `count` tokens have been emitted
     // (StopCause::MaxTokens), or when the sink returns false
-    // (StopCause::Cancelled). Returns the number of tokens passed to the sink.
-    // These mirror the CUDA server's generate(prompt, n_max, eos, on_token)
-    // contract so the two servers report finish_reason identically.
+    // (StopCause::Cancelled). A cancelled batched-MTP stream resets the
+    // engine because a speculative round may already have committed tokens
+    // not accepted by the sink; ingest or restore state before reuse.
+    // Returns the number of tokens accepted by the sink. These mirror the
+    // CUDA server's generate(prompt, n_max, eos, on_token) result semantics.
     enum class StopCause { MaxTokens, Eos, Cancelled };
     using TokenSink = std::function<bool(uint32_t)>;
     uint32_t stream_from_pending(uint32_t pending, uint32_t count, uint32_t eos,
@@ -57,9 +169,109 @@ class MetalEngine {
     uint32_t stream_sampled_from_logits(uint32_t count, uint32_t eos,
                                         const SamplingParams& params,
                                         const TokenSink& sink, StopCause& cause);
+    // Commit decoder-control tokens through recurrent/KV state and return the
+    // next greedy pending token. The whole sequence is validated before the
+    // first step, so range/context failures leave engine state unchanged.
+    uint32_t force_tokens(const uint32_t* tokens, uint32_t count);
 
+
+    // Scheduling-quantum surface (multislot Phase 1,
+    // docs/metal/plans/2026-07-15-multislot-phase1.md): each call submits bounded
+    // GPU work so a serving scheduler can interleave engines on one Shared.
+    //
+    // prefill_chunk encodes 2..PREFILL_CHUNK_MAX prompt tokens through the
+    // layer-major chunk path without producing logits. Chunk-boundary
+    // placement is quality-neutral (--chunk-parity gate: widths 17/48/96
+    // bit-identical to 12), so the caller picks any width per call; the
+    // final prompt token still goes through step() to produce logits and
+    // the pending token, exactly like prefill()'s serial tail.
+    void prefill_chunk(const uint32_t* tokens, uint32_t count);
+    static constexpr uint32_t prefill_chunk_max() { return PREFILL_CHUNK_MAX; }
+    // One MTP draft/verify/commit round (one scheduling quantum). Appends
+    // the committed tokens (always starting with `pending`) to `committed`;
+    // the caller emits them and stops at `eos` itself — tokens after an EOS
+    // were already encoded when the verify chunk ran, exactly as in the
+    // streaming commit loop. Adapts live_width in place (callers initialize
+    // it to min(width, 4)) and returns the next pending token. When context
+    // or `remaining` (>= 2, bounds committed tokens) leaves no room to
+    // verify, falls back to one serial step — skipped when `pending` is EOS
+    // so a finished stream never encodes past its end.
+    uint32_t mtp_round(uint32_t pending, uint32_t remaining, uint32_t eos, uint32_t width,
+                       uint32_t& live_width, std::vector<uint32_t>& committed);
+    // Sampled MTP quantum (docs/metal/plans/2026-07-21-metal-sampled-mtp.md):
+    // same greedy MTP drafts + batched verify as mtp_round, but the accept
+    // tail is Leviathan/Chen rejection sampling against the served target
+    // (temperature/top_p/top_k) and the next pending is sampled, not argmax'd.
+    // Request-owned rng (like sample_from_logits). Greedy mtp_round stays
+    // bitwise-untouched. Callers should use temperature > 0; at temperature 0
+    // the walk degenerates to a delta-at-argmax accept that is not the
+    // equality path (prefer mtp_round).
+    uint32_t mtp_sample_round(uint32_t pending, uint32_t remaining, uint32_t eos,
+                              uint32_t width, uint32_t& live_width,
+                              const SamplingParams& params, std::mt19937_64& rng,
+                              std::vector<uint32_t>& committed);
+    // Sample one token from the current logits; the sampled-decode quantum
+    // is sample_from_logits + step under one GPU lease. The RNG belongs to
+    // the request, not the engine, so interleaved slots stay reproducible.
+    uint32_t sample_from_logits(const SamplingParams& params, std::mt19937_64& rng);
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
+    // Prefix snapshots to disk (docs/metal/plans/2026-07-16-prefix-snapshots.md,
+    // Phase 1): the capture/restore composition streamed through host
+    // memory with plain file I/O (no mmap — ds4's lesson). save writes
+    // path.tmp then renames; load validates the whole file structure
+    // (magic, artifact identity, kv dtype, position, every blob length)
+    // before the first GPU write, so a rejected file never leaves mixed
+    // state. tokens are prefix metadata for the Phase-2 server keying.
+    // logits_resident=false marks a snapshot taken mid-prefill (chunk path):
+    // its state is exact but the resident logits row is stale, so a resume
+    // may continue ingestion from token[position] onward but must never
+    // derive a pending token from the stored logits.
+    // Optional wrapper around each backend operation. Serving uses this to
+    // lease the shared command queue only for device transfers; file writes
+    // and durability syncs stay outside the lease.
+    using DeviceLease = std::function<void(const std::function<void()>&)>;
+    using LoadCheckpoint = std::function<void()>;
+    void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count,
+                    bool logits_resident = true, const DeviceLease& with_device = {});
+    uint32_t load_state(const std::string& path,const DeviceLease& with_device = {},
+                        const LoadCheckpoint& checkpoint = {}); // returns restored position
+    // Descriptor forms keep metadata inspection and restore pinned to one
+    // inode. The caller retains source_fd; diagnostics use label only.
+    uint32_t load_state_fd(int source_fd,const std::string& label,
+                           const std::vector<uint32_t>* expected_tokens = nullptr,
+                           const DeviceLease& with_device = {},
+                           const LoadCheckpoint& checkpoint = {});
+    // Header-only inspection for prefix keying (server): position, stored
+    // token ids, and the logits-resident flag. Validates magic only — the
+    // full structural validation happens on load_state.
+    struct SnapshotInfo { uint32_t position = 0; bool logits_resident = true;
+                          std::vector<uint32_t> tokens; };
+    static SnapshotInfo peek_snapshot(const std::string& path);
+    static SnapshotInfo peek_snapshot_fd(int source_fd,
+                                         const std::string& label);
+    // Re-run the resident-logits argmax (same GPU kernel as prompt
+    // ingestion) so generation after load_state resumes byte-identically.
+    uint32_t pending_from_logits();
+    const unsigned char* snapshot_identity();   // 20-byte SHA1, whole mapping, cached
+    // State-producing backend/shader configuration. Persistent snapshots
+    // must match this digest in both their deep header and server namespace.
+    std::array<unsigned char,20> snapshot_runtime_identity() const;
+
+    // Constrained tool decoding (BasicToolConstrainer engine surface): a
+    // request-scoped device pool of uint32 legal-token bitsets. The server
+    // resets the pool and invalidates its host-id map when a slot is assigned;
+    // ids therefore remain stable only within that request. mask_pool_add
+    // uploads one mask and returns its slot (-1 when the request exceeds the
+    // cap); set_tool_constraint selects the active slot (-1 disengages).
+    // The active mask is applied to logits inside encode_token, before argmax,
+    // so greedy decode, top-k extraction, and CPU sampling see only legal
+    // tokens. Serial decode only; Metal does not wire MTP verify-lane masks.
+    static constexpr int MASK_POOL_CAP = 64;
+    int mask_pool_used = 0;
+    int mask_pool_add(const void* bits);
+    void reset_mask_pool();
+    void set_tool_constraint(int mask_id);
     static constexpr uint32_t vocabulary_size() { return 248320; }
     uint32_t position() const { return position_; }
     SpecStats last_spec_stats() const { return last_spec_stats_; }
@@ -67,6 +279,20 @@ class MetalEngine {
     bool used_per_tensor_upload() const { return per_tensor_upload_; }
     bool chunked_prefill() const { return chunked_prefill_; }
     void set_chunked_prefill(bool enabled);
+    // True when Q27_METAL_KV_FP16_CELLS armed production fp16 exception
+    // side caches on this engine. Snapshots carry the side rows (v2,
+    // docs/metal/plans/2026-07-17-kv-except-snapshot-v2.md); the head masks are
+    // the snapshot-config identity — a snapshot only restores into an
+    // engine with the exact same cell list, and the server keys its disk
+    // store off them so mismatched configs miss instead of rejecting.
+    bool kv_fp16_except() const { return kv_fp16_except_; }
+    const uint8_t* kv_fp16_head_masks() const { return kv_fp16_head_masks_; }
+    bool gpu_sample_enabled() const { return gpu_sample_; }
+    bool resident_enabled() const { return resident_; }
+    // Side-cache codec (Q27_METAL_KV_CELLS_CODEC): 0 = fp16, 1 = e4m3
+    // (hot-cells arm, 2026-07-17-kv-e4m3-hot-cells.md). Part of the
+    // snapshot-config identity and the server's disk-store tag.
+    uint32_t kv_side_codec() const { return kv_fp16_side_codec_; }
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -82,7 +308,10 @@ class MetalEngine {
     static constexpr uint32_t GDN_QK_HEADS = 16;
     static constexpr uint32_t GDN_DIM = 128;
     static constexpr uint32_t VOCAB = 248320;
-    static constexpr uint32_t CHUNK_MAX = 12;
+    static constexpr uint32_t CHUNK_MAX = 12;          // MTP verify / NLL / KL width
+    static constexpr uint32_t PREFILL_CHUNK_MAX = 96;  // prompt-ingestion width (8x12)
+    static constexpr uint32_t TOPK_CAPACITY = 1024;
+    static constexpr uint32_t RESIDENT_MAX = 8;
     static constexpr float EPS = 1e-6f;
     static constexpr float FREQ_BASE = 1e7f;
 
@@ -93,15 +322,37 @@ class MetalEngine {
         std::shared_ptr<BackendBuffer> v_cache;
     };
 
-    Model model_;
-    MetalBackend backend_;
+    std::shared_ptr<Shared> shared_;
+    Model& model_;
+    MetalBackend& backend_;
     uint32_t max_context_;
     bool turbo3_kv_;
     bool per_tensor_upload_ = false;
+    // Production KV fp16 exception cells
+    // (docs/metal/plans/2026-07-17-kv-except-production.md): per masked head, a
+    // kv_heads=1 fp16 side cache in the turbo3 WHT domain; the head's
+    // query-head window is re-attended f16 against it, overwriting the
+    // production dispatch's output rows. Parsed from
+    // Q27_METAL_KV_FP16_CELLS (census cell numbers, per-head K+V pairs
+    // required) in the constructor; turbo3 engines only (ignored with a
+    // note on fp16 engines — those cells are already fp16). Indexed by
+    // attn_idx = layer/4. Bytes ride engine_cache_bytes_.
+    struct KvFp16Side { uint32_t head; std::shared_ptr<BackendBuffer> k, v; };
+    std::array<std::vector<KvFp16Side>, 16> kv_fp16_side_;
+    bool kv_fp16_except_ = false;
+    uint8_t kv_fp16_head_masks_[16] = {};   // snapshot-config identity (bit = head)
+    uint32_t kv_fp16_side_codec_ = 0;       // 0 fp16, 1 e4m3 side stores
+    uint64_t engine_cache_bytes_ = 0;
+    // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once
+    // in the constructor at gqa_partial_peak, GPU-private, freed with the
+    // engine. Passed into every backend attention call.
+    std::shared_ptr<BackendBuffer> gqa_partials_;
     uint32_t position_ = 0;
     bool logits_resident_ = false;
+    // True only when MTP KV rows [0, position_) match the main-model state.
+    bool mtp_cache_valid_ = false;
     SpecStats last_spec_stats_;
-    std::unordered_map<std::string, BackendTensor> weights_;
+    std::unordered_map<std::string, BackendTensor>& weights_;
     std::vector<LayerState> layers_;
 
     std::shared_ptr<BackendBuffer> h_, x1_, y_;
@@ -109,6 +360,16 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> qkv_, z_, alpha_, beta_raw_, g_, beta_, conv_out_;
     std::shared_ptr<BackendBuffer> delta_out_, gated_out_;
     std::shared_ptr<BackendBuffer> ffn_gate_, ffn_up_, logits_, token_out_;
+    // GPU-assisted sampling: top-k candidate over-set staging
+    // (Q27_METAL_GPU_SAMPLE=0 forces the full-logits readback path).
+    std::shared_ptr<BackendBuffer> topk_values_, topk_indices_, topk_count_;
+    bool gpu_sample_ = true;
+    std::shared_ptr<BackendBuffer> mask_pool_;   // lazy: MASK_POOL_CAP bitsets
+    int active_mask_ = -1;
+    // GPU-resident greedy decode: K chained steps per command buffer, token
+    // ids archived device-side (Q27_METAL_RESIDENT=0 opts out).
+    std::shared_ptr<BackendBuffer> token_ring_;
+    bool resident_ = true;
     std::shared_ptr<BackendBuffer> mtp_embed_norm_, mtp_hidden_norm_, mtp_concat_;
     std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_logits_, mtp_k_cache_, mtp_v_cache_;
     BackendQuantized q5120_, q6144_, q10240_, q17408_;
@@ -127,34 +388,37 @@ class MetalEngine {
     // accepted prefix, so no checkpoint, restore, or commit re-encode exists.
     // ctargets_/cnll_ also serve teacher-forced NLL quality gates.
     std::shared_ptr<BackendBuffer> cfinal_, clogits_, cpred_;
+    std::shared_ptr<BackendBuffer> wide_head_stage_;   // lazy, CHUNK_MAX x N_EMBD f32
     std::shared_ptr<BackendBuffer> ctargets_, cnll_;
     std::vector<std::shared_ptr<BackendBuffer>> park_qkv_, park_g_, park_beta_;
     std::shared_ptr<BackendBuffer> discard_recurrent_, discard_ring_;
 
-    // The q4s contract requires the MTP layer; retained as an explicit gate at
-    // call sites so missing state fails closed if construction ever changes.
+    // The q4s contract requires the MTP layer; call sites still fail closed.
     bool has_mtp_ = true;
 
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);
+    void initialize_mtp_sentinel();
     const BackendTensor& weight(const std::string& name) const;
     const BackendTensor& layer_weight(uint32_t layer, const char* leaf) const;
     static bool attention_layer(uint32_t layer) { return layer % 4 == 3; }
 
     void validate_architecture() const;
+    uint32_t sample_next(const SamplingParams& params, std::mt19937_64& random);
+    uint32_t decode_resident(uint32_t pending, uint32_t* out, uint32_t k);
     void project(const BackendTensor& w, const BackendBuffer& x_float,
                  const BackendQuantized& xq, BackendBuffer& out);
     void project_pair(const BackendTensor& a, BackendBuffer& a_out,
                       const BackendTensor& b, BackendBuffer& b_out,
                       const BackendBuffer& x_float, const BackendQuantized& xq);
     void gdn_block(uint32_t layer);
-    void attention_block(uint32_t layer);
+    void attention_block(uint32_t layer, uint32_t pos);
     void ffn(uint32_t layer);
-    void encode_token(uint32_t token, bool produce_logits);
+    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false,
+                      uint32_t pos_offset = 0);
     void gdn_chunk(uint32_t layer, uint32_t count, bool verify);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);
     void chunk_forward(const uint32_t* tokens, uint32_t count, bool verify = false);
-    void encode_chunk(const uint32_t* tokens, uint32_t count);
     static uint32_t gdn_slot(uint32_t layer) { return layer - (layer + 1) / 4; }
     void gdn_replay(uint32_t count);
     std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,
