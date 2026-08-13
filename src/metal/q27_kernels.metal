@@ -210,6 +210,438 @@ kernel void q27_matvec_t2_g128(
         if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
     }
 }
+
+// N=2 slot-batched select-form ternary GEMV (multislot Phase 2 probe): the
+// production serial-decode kernel (q27_matvec_t2_g128) computing two
+// activation vectors in one weight pass. The bit-extraction booleans — the
+// issue-heavy part of the select-form dot — are shared across the rows;
+// activations and outputs stay in separate buffers (no layout coupling).
+// Per-row op order matches the single kernel exactly, so each output is
+// bit-identical to two single dispatches.
+// PARKED by measurement (2026-07-16, multislot Phase-2 probe): aggregate
+// s_k 1.093 vs the 1.31 decision line — kept as the probe's reference
+// surface, never engine-routed.
+kernel void q27_matvec_t2_g128_x2(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *xa      [[buffer(2)]],
+        device const float *xb      [[buffer(3)]],
+        device       float *out_a   [[buffer(4)]],
+        device       float *out_b   [[buffer(5)]],
+        constant MatvecArgs &args   [[buffer(6)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumfa[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sumfb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *ya = xa + ix * 128 + il;
+    device const float *yb = xb + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yla[16], ylb[16];
+        float sumya = 0.0f, sumyb = 0.0f;
+        for (uint i = 0; i < 16; i++) { yla[i] = ya[i]; sumya += ya[i]; }
+        for (uint i = 0; i < 16; i++) { ylb[i] = yb[i]; sumyb += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            device const uchar *qs = weights + (ulong)row * (args.cols / 4) + ib * 32 + il / 4;
+            const float d = float(scales[(ulong)row * nb + ib]);
+            const uchar4 b = *(device const uchar4 *)qs;
+            float alo = 0.0f, ahi = 0.0f, blo = 0.0f, bhi = 0.0f;
+            for (uint i = 0; i < 16; i++) {
+                const bool lo = bool(b[i / 4] & (1u << (2 * (i % 4))));
+                const bool hi = bool(b[i / 4] & (2u << (2 * (i % 4))));
+                alo += select(0.0f, yla[i], lo);
+                ahi += select(0.0f, yla[i], hi);
+                blo += select(0.0f, ylb[i], lo);
+                bhi += select(0.0f, ylb[i], hi);
+            }
+            sumfa[r] += d * (alo + 2.0f * ahi - sumya);
+            sumfb[r] += d * (blo + 2.0f * bhi - sumyb);
+        }
+        ya += 512;
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tota = simd_sum(sumfa[r]);
+        const float totb = simd_sum(sumfb[r]);
+        if (lane == 0 && row0 + r < args.rows) {
+            out_a[row0 + r] = tota;
+            out_b[row0 + r] = totb;
+        }
+    }
+}
+
+// T3_G128: five ternary codes per byte, base-3 (243 values), 26 bytes per
+// 128-column group, scales as T2. The LUT expands a byte into five 2-bit
+// codes (bits 2t..2t+1 = code for slot t); the select-form dot then runs
+// the same math as the T2 kernel: scale * (sum(code_i * y_i) - sum(y_i)).
+// Entries 243..255 decode to all-code-1 (trit 0), so a corrupt byte is
+// inert rather than out-of-bounds.
+constant ushort t3_codes[256] = {
+    0x000, 0x001, 0x002, 0x004, 0x005, 0x006, 0x008, 0x009, 0x00a, 0x010, 0x011, 0x012, 0x014, 0x015, 0x016, 0x018,
+    0x019, 0x01a, 0x020, 0x021, 0x022, 0x024, 0x025, 0x026, 0x028, 0x029, 0x02a, 0x040, 0x041, 0x042, 0x044, 0x045,
+    0x046, 0x048, 0x049, 0x04a, 0x050, 0x051, 0x052, 0x054, 0x055, 0x056, 0x058, 0x059, 0x05a, 0x060, 0x061, 0x062,
+    0x064, 0x065, 0x066, 0x068, 0x069, 0x06a, 0x080, 0x081, 0x082, 0x084, 0x085, 0x086, 0x088, 0x089, 0x08a, 0x090,
+    0x091, 0x092, 0x094, 0x095, 0x096, 0x098, 0x099, 0x09a, 0x0a0, 0x0a1, 0x0a2, 0x0a4, 0x0a5, 0x0a6, 0x0a8, 0x0a9,
+    0x0aa, 0x100, 0x101, 0x102, 0x104, 0x105, 0x106, 0x108, 0x109, 0x10a, 0x110, 0x111, 0x112, 0x114, 0x115, 0x116,
+    0x118, 0x119, 0x11a, 0x120, 0x121, 0x122, 0x124, 0x125, 0x126, 0x128, 0x129, 0x12a, 0x140, 0x141, 0x142, 0x144,
+    0x145, 0x146, 0x148, 0x149, 0x14a, 0x150, 0x151, 0x152, 0x154, 0x155, 0x156, 0x158, 0x159, 0x15a, 0x160, 0x161,
+    0x162, 0x164, 0x165, 0x166, 0x168, 0x169, 0x16a, 0x180, 0x181, 0x182, 0x184, 0x185, 0x186, 0x188, 0x189, 0x18a,
+    0x190, 0x191, 0x192, 0x194, 0x195, 0x196, 0x198, 0x199, 0x19a, 0x1a0, 0x1a1, 0x1a2, 0x1a4, 0x1a5, 0x1a6, 0x1a8,
+    0x1a9, 0x1aa, 0x200, 0x201, 0x202, 0x204, 0x205, 0x206, 0x208, 0x209, 0x20a, 0x210, 0x211, 0x212, 0x214, 0x215,
+    0x216, 0x218, 0x219, 0x21a, 0x220, 0x221, 0x222, 0x224, 0x225, 0x226, 0x228, 0x229, 0x22a, 0x240, 0x241, 0x242,
+    0x244, 0x245, 0x246, 0x248, 0x249, 0x24a, 0x250, 0x251, 0x252, 0x254, 0x255, 0x256, 0x258, 0x259, 0x25a, 0x260,
+    0x261, 0x262, 0x264, 0x265, 0x266, 0x268, 0x269, 0x26a, 0x280, 0x281, 0x282, 0x284, 0x285, 0x286, 0x288, 0x289,
+    0x28a, 0x290, 0x291, 0x292, 0x294, 0x295, 0x296, 0x298, 0x299, 0x29a, 0x2a0, 0x2a1, 0x2a2, 0x2a4, 0x2a5, 0x2a6,
+    0x2a8, 0x2a9, 0x2aa, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155,
+};
+
+// Pure-ALU base-3 decode: five 2-bit codes from one byte, no memory access.
+inline ushort t3_decode(uint v) {
+    const uint c0 = v % 3u, v1 = v / 3u;
+    const uint c1 = v1 % 3u, v2 = v1 / 3u;
+    const uint c2 = v2 % 3u, v3 = v2 / 3u;
+    const uint c3 = v3 % 3u, c4 = v3 / 3u;
+    return (ushort)(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | (c4 << 8));
+}
+
+kernel void q27_matvec_t3_g128(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort tid                   [[thread_index_in_threadgroup]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    // Divergent per-lane byte values make a constant-memory LUT serialize;
+    // stage it in banked threadgroup memory once per threadgroup.
+    threadgroup ushort lut[256];
+    for (uint i = tid; i < 256; i += 256) lut[i] = t3_codes[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint row_bytes = nb * 26;
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // uint-aligned weight walk: one 4-byte load per row covers 20 columns.
+    // Odd group counts leave a 1..3-byte row tail (row_bytes = nb*26); the
+    // first lanes pick those up as scalar bytes after the word loop. Each
+    // byte keeps its own group scale (a word can span a group boundary);
+    // byte b with b%26 == 25 is the 3-column group tail (slots 3-4 are
+    // canonical code-1 padding).
+    // Odd nb (cols % 256 != 0) disables the word walk entirely; every byte
+    // then takes the scalar tail below. That path is slower, not wrong —
+    // test_t3_wide gates cols=1152 (nb=9) against the CPU reference.
+    const uint words_per_row = (row_bytes & 3) ? 0 : row_bytes / 4;
+    for (uint wi = lane; wi < words_per_row; wi += 32) {
+        uint wv[4];
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            wv[r] = *(device const uint *)(weights + (ulong)row * row_bytes + wi * 4);
+        }
+        for (uint i = 0; i < 4; i++) {
+            const uint b = wi * 4 + i;
+            const uint g = b / 26;
+            const uint p = b - g * 26;
+            const uint col = g * 128 + p * 5;
+            float yl[5];
+            float sumy;
+            if (p != 25) {
+                const packed_float4 y4 = *(device const packed_float4 *)(x + col);
+                yl[0] = y4.x; yl[1] = y4.y; yl[2] = y4.z; yl[3] = y4.w; yl[4] = x[col + 4];
+                sumy = yl[0] + yl[1] + yl[2] + yl[3] + yl[4];
+            } else {   // group tail: three columns
+                yl[0] = x[col]; yl[1] = x[col + 1]; yl[2] = x[col + 2];
+                yl[3] = 0.0f; yl[4] = 0.0f;
+                sumy = yl[0] + yl[1] + yl[2];
+            }
+            for (uint r = 0; r < 4; r++) {
+                const uint row = min(row0 + r, rlast);
+                const ushort codes = lut[(wv[r] >> (8 * i)) & 0xff];
+                const float d = float(scales[(ulong)row * nb + g]);
+                float acc_lo = 0.0f, acc_hi = 0.0f;
+                for (uint t = 0; t < 5; t++) {
+                    acc_lo += select(0.0f, yl[t], bool(codes & (1u << (2 * t))));
+                    acc_hi += select(0.0f, yl[t], bool(codes & (2u << (2 * t))));
+                }
+                sumf[r] += d * (acc_lo + 2.0f * acc_hi - sumy);
+            }
+        }
+    }
+    // Odd group counts make row_bytes odd, so odd rows are not word-aligned
+    // and the word walk is skipped entirely; every byte then takes this
+    // scalar lane-strided path (model shapes all have even nb and never do).
+    for (uint b = words_per_row * 4 + lane; b < row_bytes; b += 32) {
+        const uint g = b / 26;
+        const uint p = b - g * 26;
+        const uint col = g * 128 + p * 5;
+        const uint valid = min(5u, 128u - p * 5);
+        float yl[5];
+        float sumy = 0.0f;
+        for (uint t = 0; t < 5; t++) {
+            yl[t] = t < valid ? x[col + t] : 0.0f;
+            sumy += yl[t];
+        }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);
+            const ushort codes = lut[weights[(ulong)row * row_bytes + b]];
+            const float d = float(scales[(ulong)row * nb + g]);
+            float acc_lo = 0.0f, acc_hi = 0.0f;
+            for (uint t = 0; t < 5; t++) {
+                acc_lo += select(0.0f, yl[t], bool(codes & (1u << (2 * t))));
+                acc_hi += select(0.0f, yl[t], bool(codes & (2u << (2 * t))));
+            }
+            sumf[r] += d * (acc_lo + 2.0f * acc_hi - sumy);
+        }
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// B1_G128 binary weights (FORMAT.md): element i of a row -> byte i/8, 1 bit
+// at offset i%8 (sequential LSB-first, same convention as T2); bit b decodes
+// to (2b-1)*scale, one fp16 scale per 128 columns. This is the production
+// decode path for binary weights: FLOAT activations, select-form dot —
+//   sum((2b-1)*y) = 2*sum_{b=1}(y) - sum(y)
+// one conditional add per element plus one shared sum(y) per block slice
+// (T2 needs two conditional adds). Structure chosen by the Phase 0B bench
+// (docs/plans/2026-07-15-binary-tier.md: c1 select 0.504 wall ratio vs T2,
+// STRONG GO; sign-XOR measured 2.6x worse and was killed). Same shape as
+// the T2 kernel: 4 rows per simdgroup (32 per threadgroup), 4 blocks in
+// flight, the 16-float activation slice held in registers across rows; a
+// lane's 16 elements are 2 weight bytes, ushort-aligned by construction
+// (row stride cols/8 is a multiple of 16, il/8 is even).
+kernel void q27_matvec_b1_g128(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 16; i++) { yl[i] = yb[i]; sumy += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            const ushort b = *(device const ushort *)(weights + (ulong)row * (args.cols / 8) +
+                                                      ib * 16 + il / 8);
+            const float d = float(scales[(ulong)row * nb + ib]);
+            float acc_pos = 0.0f;
+            for (uint i = 0; i < 16; i++)
+                acc_pos += select(0.0f, yl[i], bool(b & (1u << i)));
+            sumf[r] += d * (2.0f * acc_pos - sumy);
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// ---- B1 Phase 0B probe kernels (bench-only, never engine-routed) ----
+// B1_G128 (FORMAT.md): 1 bit per element, LSB-first sequential within the
+// row (element i -> byte i/8, bit i%8); bit ? +d : -d, one fp16 scale d per
+// 128 columns. Three dot structures under test, pre-registered bands in
+// docs/plans/2026-07-15-binary-tier.md §Phase 0B. Candidates 1-2 reuse the
+// T2 kernel's shape: 4 rows per simdgroup, 4 blocks in flight, the 16-float
+// activation slice held in registers across rows; a lane's 16 elements are
+// 2 weight bytes, ushort-aligned by construction (row stride cols/8 is a
+// multiple of 16, il/8 is even).
+
+// Candidate 1 — select-form: sum(±y) = 2*sum_bit1(y) - sum(y). One
+// conditional accumulate per element, same select idiom as production T2.
+kernel void q27_matvec_b1_select(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 16; i++) { yl[i] = yb[i]; sumy += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            const ushort b = *(device const ushort *)(weights + (ulong)row * (args.cols / 8) +
+                                                      ib * 16 + il / 8);
+            const float d = float(scales[(ulong)row * nb + ib]);
+            float acc_pos = 0.0f;
+            for (uint i = 0; i < 16; i++)
+                acc_pos += select(0.0f, yl[i], bool(b & (1u << i)));
+            sumf[r] += d * (2.0f * acc_pos - sumy);
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// Candidate 2 — IEEE sign-bit XOR: ±y materialized by flipping y's sign bit
+// from the weight bit (bit==1 -> +y, bit==0 -> -y). Unconditional
+// accumulate, no sum(y) correction term. Exact for all finite y (a flipped
+// -0.0 contributes +0.0; float addition of signed zeros never perturbs a
+// finite accumulator).
+kernel void q27_matvec_b1_signxor(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        uint yl[16];   // activation bits, sign flip applied bitwise below
+        for (uint i = 0; i < 16; i++) yl[i] = as_type<uint>(yb[i]);
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            const uint b = *(device const ushort *)(weights + (ulong)row * (args.cols / 8) +
+                                                    ib * 16 + il / 8);
+            const float d = float(scales[(ulong)row * nb + ib]);
+            float acc = 0.0f;
+            for (uint i = 0; i < 16; i++)
+                acc += as_type<float>(yl[i] ^ ((~(b >> i) & 1u) << 31));
+            sumf[r] += d * acc;
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// Candidate 3 activation preprocessing — int8-domain offset quantization,
+// bitplane transpose, per-group sums. One 128-thread threadgroup per
+// 128-column group g:
+//   s_g   = max|x|/127 (0 if the group is all zero)
+//   u_i   = clamp(round(x_i/s_g) + 128, 0, 255)   (128 when s_g == 0)
+//   planes[g*32 + p*4 + w] = bit p of u over word w (columns w*32..w*32+31,
+//                            bit position = column%32, via simd_ballot)
+//   aux[g] = { s_g, sum(u) }
+// The dot kernel then reconstructs x_i ~= s_g*(u_i - 128) exactly in the
+// int8 model; the quantization error vs float activations is the candidate's
+// accuracy cost and is gated separately in the bench.
+kernel void q27_b1_x_prep(
+        device const float  *x      [[buffer(0)]],
+        device       uint   *planes [[buffer(1)]],
+        device       float2 *aux    [[buffer(2)]],
+        constant MatvecArgs &args   [[buffer(3)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort tid                   [[thread_index_in_threadgroup]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const float xv = x[group * 128 + tid];
+    // The max/sum phases overlap safely ONLY because pmax and psum are
+    // distinct arrays (a thread may write psum while another still reads
+    // pmax). The barrier below the pmax reads is insurance: it keeps this
+    // correct if the two arrays are ever consolidated into one.
+    threadgroup float pmax[4], psum[4];
+    float amax = simd_max(fabs(xv));
+    if (lane == 0) pmax[simdgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = max(max(pmax[0], pmax[1]), max(pmax[2], pmax[3]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float s = amax / 127.0f;
+    // B1 keeps round(xv/s), a Metal-native path with no CUDA twin; this
+    // matches its metal_gemv_bench CPU model and certified battery.
+    const uint u = s > 0.0f ? uint(clamp(round(xv / s) + 128.0f, 0.0f, 255.0f)) : 128u;
+    for (uint p = 0; p < 8; p++) {
+        const uint m = uint(uint64_t(simd_ballot(bool((u >> p) & 1u))));
+        if (lane == 0) planes[group * 32 + p * 4 + simdgroup] = m;
+    }
+    float sumu = simd_sum(float(u));
+    if (lane == 0) psum[simdgroup] = sumu;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0)
+        aux[group] = float2(s, psum[0] + psum[1] + psum[2] + psum[3]);
+}
+
+// Candidate 3 — int8 bitplane + popcount dot. Per 32-column word: 8
+// AND+popcounts of the weight-bit word against the 8 activation bitplanes,
+// plane p weighted 2^p. With w_i in {-1,+1} = 2b_i - 1 and
+// x_i ~= s*(u_i - 128):
+//   sum_i w_i*x_i = 2*sum_{b_i=1} x_i - sum_i x_i
+//                 = s*( 2*(sum_p 2^p*popc(b & u_p) - 128*popc(b))
+//                       - (sum(u) - 128*128) )
+// One simdgroup per row (8 rows per threadgroup), lanes stride the groups;
+// all popcount math stays in uint until the one float scale per group.
+kernel void q27_matvec_b1_popcount(
+        device const uint   *weights [[buffer(0)]],
+        device const half   *scales  [[buffer(1)]],
+        device const uint   *planes  [[buffer(2)]],
+        device const float2 *aux     [[buffer(3)]],
+        device       float  *out     [[buffer(4)]],
+        constant MatvecArgs &args    [[buffer(5)]],
+        uint group                    [[threadgroup_position_in_grid]],
+        ushort lane                   [[thread_index_in_simdgroup]],
+        ushort simdgroup              [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    const uint nb = args.cols / 128;
+    const ulong wbase = (ulong)row * (args.cols / 32);
+    float sum = 0.0f;
+    for (uint g = lane; g < nb; g += 32) {
+        uint planesum = 0, wpop = 0;
+        for (uint w = 0; w < 4; w++) {
+            const uint wb = weights[wbase + g * 4 + w];
+            wpop += popcount(wb);
+            for (uint p = 0; p < 8; p++)
+                planesum += popcount(wb & planes[g * 32 + p * 4 + w]) << p;
+        }
+        const float2 sa = aux[g];
+        const float d = float(scales[(ulong)row * nb + g]);
+        sum += d * sa.x * (2.0f * (float(int(planesum) - int(128 * wpop))) -
+                           (sa.y - 16384.0f));
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) out[row] = sum;
+}
+
 struct VectorArgs {
     uint n;
     uint groups;
@@ -265,6 +697,19 @@ kernel void q27_embedding_t2(
     out[gid] = float(int(code) - 1) * float(scales[si]);
 }
 
+kernel void q27_embedding_b1(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        constant uint &token        [[buffer(3)]],
+        constant uint &cols         [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const ulong wi = (ulong)token * cols + gid;   // cols % 128 == 0, so wi/8 is exact bytes
+    const uint bit = (weights[wi >> 3] >> (wi & 7)) & 1;
+    const ulong si = (ulong)token * (cols / 128) + gid / 128;
+    out[gid] = float(2 * int(bit) - 1) * float(scales[si]);
+}
 
 // GPU-resident greedy decode: identical embedding lookups, but the token id
 // comes from the device buffer the previous step's argmax wrote, so chained
@@ -298,6 +743,19 @@ kernel void q27_embedding_t2_dev(
     out[gid] = float(int(code) - 1) * float(scales[si]);
 }
 
+kernel void q27_embedding_b1_dev(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        device const uint *token    [[buffer(3)]],
+        constant uint &cols         [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const ulong wi = (ulong)token[0] * cols + gid;
+    const uint bit = (weights[wi >> 3] >> (wi & 7)) & 1;
+    const ulong si = (ulong)token[0] * (cols / 128) + gid / 128;
+    out[gid] = float(2 * int(bit) - 1) * float(scales[si]);
+}
 
 kernel void q27_rmsnorm(
         device const float *x [[buffer(0)]],
@@ -818,6 +1276,71 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
         if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
     }
 }
+
+// Round residue (docs/plans/2026-07-17-q4-rewrite-round.md): the r4 arm above
+// was PROMOTED into q27_matvec_q4_quantized (bench R = 0.957); r2 below stays
+// as the retained comparison arm (bench R = 0.826). Bench-only, dispatched by
+// matvec_q4_probe, never engine-routed.
+// The 2-row variant of the promoted structure (half the register pressure —
+// the bench decides between them). Same contracts: byte-identical per-row
+// math vs q27_matvec_q4_quantized, clamped edge rows compute and drop.
+kernel void q27_matvec_q4_quantized_r2(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 2;   // 16 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 64;
+    device const uint4 *w[2];
+    ulong sbase[2];
+    for (uint r = 0; r < 2; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float2 acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 2; r++) {
+            const uint4 wp = w[r][idx];
+            const int dot0 = q27_dot8_q4(wp.x, as_type<char4>(xp0.x), as_type<char4>(xp0.y)) +
+                             q27_dot8_q4(wp.y, as_type<char4>(xp0.z), as_type<char4>(xp0.w));
+            const int dot1 = q27_dot8_q4(wp.z, as_type<char4>(xp1.x), as_type<char4>(xp1.y)) +
+                             q27_dot8_q4(wp.w, as_type<char4>(xp1.z), as_type<char4>(xp1.w));
+            // |dot0 + dot1| <= 32*8*127 = 32512 — exact in float (see r4).
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 2; r++) {
+            const uchar2 wp = *(device const uchar2 *)((device const uchar *)w[r] + c / 2);
+            const int dot = (int(wp.x & 15u) - 8) * xp.x + (int(wp.x >> 4) - 8) * xp.y +
+                            (int(wp.y & 15u) - 8) * xp.z + (int(wp.y >> 4) - 8) * xp.w;
+            acc[r] += float(dot) * float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
+    }
+    for (uint r = 0; r < 2; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+
 // 16 sequential LSB-first 2-bit codes per uint; code c contributes (c-1)*x.
 // The integer dot is exact: |dot| <= 16*1*127 = 2032 per uint, 4064 per
 // lane-chunk, well inside float's exact-integer range.
@@ -882,6 +1405,166 @@ kernel void q27_matvec_t2_quantized(device const uchar *weights [[buffer(0)]],
     if (lane == 0) out[row] = acc;
 }
 
+// 16 sequential LSB-first 1-bit codes from the low 16 bits; bit b
+// contributes (2b-1)*x. Select form in the int domain: 2*sum_{bit=1} x -
+// sum(x) — one conditional add per element plus one shared total (the T2
+// unpack pays a shift/mask/sub per code). Exact: |dot| <= 16*127 per call,
+// well inside float's exact-integer range.
+inline int q27_dot16_b1(uint bits, int4 xp) {
+    const char4 x0 = as_type<char4>(xp.x), x1 = as_type<char4>(xp.y);
+    const char4 x2 = as_type<char4>(xp.z), x3 = as_type<char4>(xp.w);
+    int pos = 0, tot = 0, v;
+    v = int(x0.x); tot += v; pos += select(0, v, bool(bits & 0x0001u));
+    v = int(x0.y); tot += v; pos += select(0, v, bool(bits & 0x0002u));
+    v = int(x0.z); tot += v; pos += select(0, v, bool(bits & 0x0004u));
+    v = int(x0.w); tot += v; pos += select(0, v, bool(bits & 0x0008u));
+    v = int(x1.x); tot += v; pos += select(0, v, bool(bits & 0x0010u));
+    v = int(x1.y); tot += v; pos += select(0, v, bool(bits & 0x0020u));
+    v = int(x1.z); tot += v; pos += select(0, v, bool(bits & 0x0040u));
+    v = int(x1.w); tot += v; pos += select(0, v, bool(bits & 0x0080u));
+    v = int(x2.x); tot += v; pos += select(0, v, bool(bits & 0x0100u));
+    v = int(x2.y); tot += v; pos += select(0, v, bool(bits & 0x0200u));
+    v = int(x2.z); tot += v; pos += select(0, v, bool(bits & 0x0400u));
+    v = int(x2.w); tot += v; pos += select(0, v, bool(bits & 0x0800u));
+    v = int(x3.x); tot += v; pos += select(0, v, bool(bits & 0x1000u));
+    v = int(x3.y); tot += v; pos += select(0, v, bool(bits & 0x2000u));
+    v = int(x3.z); tot += v; pos += select(0, v, bool(bits & 0x4000u));
+    v = int(x3.w); tot += v; pos += select(0, v, bool(bits & 0x8000u));
+    return 2 * pos - tot;
+}
+
+// Packed-dot binary GEMV, promoted round-2 form (docs/plans/2026-07-17-b1-
+// select-round2.md, bench mix speedup 2.36x): 4 rows per simdgroup with the
+// lane's 32-column int8 x-slice and activation scale loaded once per chunk
+// serving all 4 rows — the 1-row original re-issued the full x load per row
+// and its lone 4 B weight chain couldn't fill the issue window. A lane's 32
+// columns (one uint of code bits) are 32-aligned, so they share one
+// activation-scale block and sit inside one 128-column weight-scale group;
+// per-row chunk order, dot form, and scale-multiply order match the 1-row
+// original bit for bit (byte gate). Clamped edge rows compute, don't store.
+kernel void q27_matvec_b1_quantized(device const uchar *weights [[buffer(0)]],
+                                     device const half *weight_scales [[buffer(1)]],
+                                     device const char *x [[buffer(2)]],
+                                     device const float *x_scales [[buffer(3)]],
+                                     device float *out [[buffer(4)]],
+                                     constant MatvecArgs &args [[buffer(5)]],
+                                     uint group [[threadgroup_position_in_grid]],
+                                     ushort lane [[thread_index_in_simdgroup]],
+                                     ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 4;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[4];
+    ulong sbase[4];
+    for (uint r = 0; r < 4; r++) {
+        const uint row = min(row0 + r, rlast);
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float4 acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint = 32 columns
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// B1 select round-2 residue (docs/plans/2026-07-17-b1-select-round2.md):
+// the r2 4-row arm was PROMOTED into q27_matvec_b1_quantized above (bench
+// mix speedup 2.36x); matvec_b1r2_probe candidate 2 aliases the production
+// PSO so recorded A/B invocations keep working. r3 below is the retained
+// 8-row issue-depth arm — never run in the round (r2 cleared the sub-line
+// first), bench-only, never engine-routed.
+// r3 — the 8-row issue-depth probe (run only if r2 misses the sub-line):
+// same lane-held x-slice, 8 independent 4 B weight chains per lane, at the
+// cost of x8 simd_sum/scale chains. Same byte-identity contract as r2.
+kernel void q27_matvec_b1_quantized_r3(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 8;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[8];
+    ulong sbase[8];
+    for (uint r = 0; r < 8; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint = 32 columns
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
 // Dual-row ternary dot: unpack each 2-bit code ONCE, MAC into both rows.
 // The packed-dot GEMV is issue-bound on the unpack (shift/mask/sub per
 // code), not on the weight stream, so sharing the unpack — not the bytes —
@@ -911,6 +1594,66 @@ inline void q27_dot16_t2_dual(uint packed, int4 xpa, int4 xpb,
     w = int((packed >> 28) & 3u) - 1; sa += w * a3.z; sb += w * b3.z;
     w = int((packed >> 30)      ) - 1; sa += w * a3.w; sb += w * b3.w;
 }
+
+// N=2 slot-batched ternary GEMV (multislot Phase 2 probe): one pass over
+// the weight stream computes two activation rows, sharing the per-code
+// unpack via q27_dot16_t2_dual. Layouts match the MM kernels: x row-major
+// [2, cols], x_scales [2, cols/32], out token-major [2, rows]. Per-row
+// K-striping, scale-multiply order, and simd_sum are IDENTICAL to
+// q27_matvec_t2_quantized, and the integer dots are exact, so each row's
+// output is bit-identical to the single-row kernel. (The fused-pair
+// precedent — two weights, one x — lost on register pressure; here the
+// shared work is the unpack, the actual issue-bound resource.)
+// PARKED by measurement (2026-07-16, multislot Phase-2 probe): aggregate
+// s_k 1.093 vs the 1.31 decision line — kept as the probe's reference
+// surface, never engine-routed.
+kernel void q27_matvec_t2_quantized_x2(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    device const uint2 *w2 = (device const uint2 *)(weights + (ulong)row * (args.cols / 4));
+    device const int4 *xa16 = (device const int4 *)x;
+    device const int4 *xb16 = (device const int4 *)(x + args.cols);
+    device const float *xas = x_scales;
+    device const float *xbs = x_scales + args.cols / 32;
+    const ulong scale_base = (ulong)row * (args.cols / 128);
+    float acc_a = 0.0f, acc_b = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint2 = 32 columns
+        const uint2 wp = w2[idx];
+        const uint c = chunk * 1024 + lane * 32;
+        const float ws = float(weight_scales[scale_base + c / 128]);
+        int da = 0, db = 0;
+        q27_dot16_t2_dual(wp.x, xa16[idx * 2],     xb16[idx * 2],     da, db);
+        q27_dot16_t2_dual(wp.y, xa16[idx * 2 + 1], xb16[idx * 2 + 1], da, db);
+        acc_a += float(da) * ws * xas[c / 32];
+        acc_b += float(db) * ws * xbs[c / 32];
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const uchar wp = weights[(ulong)row * (args.cols / 4) + c / 4];
+        const float ws = float(weight_scales[scale_base + c / 128]);
+        const char4 xa = *(device const char4 *)(x + c);
+        const char4 xb = *(device const char4 *)(x + args.cols + c);
+        const int da = (int(wp         & 3u) - 1) * xa.x + (int((wp >> 2) & 3u) - 1) * xa.y +
+                       (int((wp >> 4) & 3u) - 1) * xa.z + (int((wp >> 6)      ) - 1) * xa.w;
+        const int db = (int(wp         & 3u) - 1) * xb.x + (int((wp >> 2) & 3u) - 1) * xb.y +
+                       (int((wp >> 4) & 3u) - 1) * xb.z + (int((wp >> 6)      ) - 1) * xb.w;
+        acc_a += float(da) * ws * xas[c / 32];
+        acc_b += float(db) * ws * xbs[c / 32];
+    }
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+    if (lane == 0) { out[row] = acc_a; out[args.rows + row] = acc_b; }
+}
+
 // Tiled simdgroup-matrix GEMM (x_rows 1..12) for chunked prefill and
 // batched MTP verification. A 128-thread threadgroup (4 simdgroups) owns a
 // 32-row x 16-token output tile and walks K in 64-column tiles: weights are
@@ -1597,7 +2340,1405 @@ kernel void q27_matmul_t2_mm_h(
 }
 
 
+// Byte -> 2 Q4 halves (low nibble first, code n -> n-8): one constant-
+// memory gather replaces two shift/mask/int-sub/convert chains. 1 KB,
+// values -8..+7 are all exact in half.
+constant half2 q27_q4_half2_lut[256] = {
+    half2(-8.0h, -8.0h),
+    half2(-7.0h, -8.0h),
+    half2(-6.0h, -8.0h),
+    half2(-5.0h, -8.0h),
+    half2(-4.0h, -8.0h),
+    half2(-3.0h, -8.0h),
+    half2(-2.0h, -8.0h),
+    half2(-1.0h, -8.0h),
+    half2(0.0h, -8.0h),
+    half2(1.0h, -8.0h),
+    half2(2.0h, -8.0h),
+    half2(3.0h, -8.0h),
+    half2(4.0h, -8.0h),
+    half2(5.0h, -8.0h),
+    half2(6.0h, -8.0h),
+    half2(7.0h, -8.0h),
+    half2(-8.0h, -7.0h),
+    half2(-7.0h, -7.0h),
+    half2(-6.0h, -7.0h),
+    half2(-5.0h, -7.0h),
+    half2(-4.0h, -7.0h),
+    half2(-3.0h, -7.0h),
+    half2(-2.0h, -7.0h),
+    half2(-1.0h, -7.0h),
+    half2(0.0h, -7.0h),
+    half2(1.0h, -7.0h),
+    half2(2.0h, -7.0h),
+    half2(3.0h, -7.0h),
+    half2(4.0h, -7.0h),
+    half2(5.0h, -7.0h),
+    half2(6.0h, -7.0h),
+    half2(7.0h, -7.0h),
+    half2(-8.0h, -6.0h),
+    half2(-7.0h, -6.0h),
+    half2(-6.0h, -6.0h),
+    half2(-5.0h, -6.0h),
+    half2(-4.0h, -6.0h),
+    half2(-3.0h, -6.0h),
+    half2(-2.0h, -6.0h),
+    half2(-1.0h, -6.0h),
+    half2(0.0h, -6.0h),
+    half2(1.0h, -6.0h),
+    half2(2.0h, -6.0h),
+    half2(3.0h, -6.0h),
+    half2(4.0h, -6.0h),
+    half2(5.0h, -6.0h),
+    half2(6.0h, -6.0h),
+    half2(7.0h, -6.0h),
+    half2(-8.0h, -5.0h),
+    half2(-7.0h, -5.0h),
+    half2(-6.0h, -5.0h),
+    half2(-5.0h, -5.0h),
+    half2(-4.0h, -5.0h),
+    half2(-3.0h, -5.0h),
+    half2(-2.0h, -5.0h),
+    half2(-1.0h, -5.0h),
+    half2(0.0h, -5.0h),
+    half2(1.0h, -5.0h),
+    half2(2.0h, -5.0h),
+    half2(3.0h, -5.0h),
+    half2(4.0h, -5.0h),
+    half2(5.0h, -5.0h),
+    half2(6.0h, -5.0h),
+    half2(7.0h, -5.0h),
+    half2(-8.0h, -4.0h),
+    half2(-7.0h, -4.0h),
+    half2(-6.0h, -4.0h),
+    half2(-5.0h, -4.0h),
+    half2(-4.0h, -4.0h),
+    half2(-3.0h, -4.0h),
+    half2(-2.0h, -4.0h),
+    half2(-1.0h, -4.0h),
+    half2(0.0h, -4.0h),
+    half2(1.0h, -4.0h),
+    half2(2.0h, -4.0h),
+    half2(3.0h, -4.0h),
+    half2(4.0h, -4.0h),
+    half2(5.0h, -4.0h),
+    half2(6.0h, -4.0h),
+    half2(7.0h, -4.0h),
+    half2(-8.0h, -3.0h),
+    half2(-7.0h, -3.0h),
+    half2(-6.0h, -3.0h),
+    half2(-5.0h, -3.0h),
+    half2(-4.0h, -3.0h),
+    half2(-3.0h, -3.0h),
+    half2(-2.0h, -3.0h),
+    half2(-1.0h, -3.0h),
+    half2(0.0h, -3.0h),
+    half2(1.0h, -3.0h),
+    half2(2.0h, -3.0h),
+    half2(3.0h, -3.0h),
+    half2(4.0h, -3.0h),
+    half2(5.0h, -3.0h),
+    half2(6.0h, -3.0h),
+    half2(7.0h, -3.0h),
+    half2(-8.0h, -2.0h),
+    half2(-7.0h, -2.0h),
+    half2(-6.0h, -2.0h),
+    half2(-5.0h, -2.0h),
+    half2(-4.0h, -2.0h),
+    half2(-3.0h, -2.0h),
+    half2(-2.0h, -2.0h),
+    half2(-1.0h, -2.0h),
+    half2(0.0h, -2.0h),
+    half2(1.0h, -2.0h),
+    half2(2.0h, -2.0h),
+    half2(3.0h, -2.0h),
+    half2(4.0h, -2.0h),
+    half2(5.0h, -2.0h),
+    half2(6.0h, -2.0h),
+    half2(7.0h, -2.0h),
+    half2(-8.0h, -1.0h),
+    half2(-7.0h, -1.0h),
+    half2(-6.0h, -1.0h),
+    half2(-5.0h, -1.0h),
+    half2(-4.0h, -1.0h),
+    half2(-3.0h, -1.0h),
+    half2(-2.0h, -1.0h),
+    half2(-1.0h, -1.0h),
+    half2(0.0h, -1.0h),
+    half2(1.0h, -1.0h),
+    half2(2.0h, -1.0h),
+    half2(3.0h, -1.0h),
+    half2(4.0h, -1.0h),
+    half2(5.0h, -1.0h),
+    half2(6.0h, -1.0h),
+    half2(7.0h, -1.0h),
+    half2(-8.0h, 0.0h),
+    half2(-7.0h, 0.0h),
+    half2(-6.0h, 0.0h),
+    half2(-5.0h, 0.0h),
+    half2(-4.0h, 0.0h),
+    half2(-3.0h, 0.0h),
+    half2(-2.0h, 0.0h),
+    half2(-1.0h, 0.0h),
+    half2(0.0h, 0.0h),
+    half2(1.0h, 0.0h),
+    half2(2.0h, 0.0h),
+    half2(3.0h, 0.0h),
+    half2(4.0h, 0.0h),
+    half2(5.0h, 0.0h),
+    half2(6.0h, 0.0h),
+    half2(7.0h, 0.0h),
+    half2(-8.0h, 1.0h),
+    half2(-7.0h, 1.0h),
+    half2(-6.0h, 1.0h),
+    half2(-5.0h, 1.0h),
+    half2(-4.0h, 1.0h),
+    half2(-3.0h, 1.0h),
+    half2(-2.0h, 1.0h),
+    half2(-1.0h, 1.0h),
+    half2(0.0h, 1.0h),
+    half2(1.0h, 1.0h),
+    half2(2.0h, 1.0h),
+    half2(3.0h, 1.0h),
+    half2(4.0h, 1.0h),
+    half2(5.0h, 1.0h),
+    half2(6.0h, 1.0h),
+    half2(7.0h, 1.0h),
+    half2(-8.0h, 2.0h),
+    half2(-7.0h, 2.0h),
+    half2(-6.0h, 2.0h),
+    half2(-5.0h, 2.0h),
+    half2(-4.0h, 2.0h),
+    half2(-3.0h, 2.0h),
+    half2(-2.0h, 2.0h),
+    half2(-1.0h, 2.0h),
+    half2(0.0h, 2.0h),
+    half2(1.0h, 2.0h),
+    half2(2.0h, 2.0h),
+    half2(3.0h, 2.0h),
+    half2(4.0h, 2.0h),
+    half2(5.0h, 2.0h),
+    half2(6.0h, 2.0h),
+    half2(7.0h, 2.0h),
+    half2(-8.0h, 3.0h),
+    half2(-7.0h, 3.0h),
+    half2(-6.0h, 3.0h),
+    half2(-5.0h, 3.0h),
+    half2(-4.0h, 3.0h),
+    half2(-3.0h, 3.0h),
+    half2(-2.0h, 3.0h),
+    half2(-1.0h, 3.0h),
+    half2(0.0h, 3.0h),
+    half2(1.0h, 3.0h),
+    half2(2.0h, 3.0h),
+    half2(3.0h, 3.0h),
+    half2(4.0h, 3.0h),
+    half2(5.0h, 3.0h),
+    half2(6.0h, 3.0h),
+    half2(7.0h, 3.0h),
+    half2(-8.0h, 4.0h),
+    half2(-7.0h, 4.0h),
+    half2(-6.0h, 4.0h),
+    half2(-5.0h, 4.0h),
+    half2(-4.0h, 4.0h),
+    half2(-3.0h, 4.0h),
+    half2(-2.0h, 4.0h),
+    half2(-1.0h, 4.0h),
+    half2(0.0h, 4.0h),
+    half2(1.0h, 4.0h),
+    half2(2.0h, 4.0h),
+    half2(3.0h, 4.0h),
+    half2(4.0h, 4.0h),
+    half2(5.0h, 4.0h),
+    half2(6.0h, 4.0h),
+    half2(7.0h, 4.0h),
+    half2(-8.0h, 5.0h),
+    half2(-7.0h, 5.0h),
+    half2(-6.0h, 5.0h),
+    half2(-5.0h, 5.0h),
+    half2(-4.0h, 5.0h),
+    half2(-3.0h, 5.0h),
+    half2(-2.0h, 5.0h),
+    half2(-1.0h, 5.0h),
+    half2(0.0h, 5.0h),
+    half2(1.0h, 5.0h),
+    half2(2.0h, 5.0h),
+    half2(3.0h, 5.0h),
+    half2(4.0h, 5.0h),
+    half2(5.0h, 5.0h),
+    half2(6.0h, 5.0h),
+    half2(7.0h, 5.0h),
+    half2(-8.0h, 6.0h),
+    half2(-7.0h, 6.0h),
+    half2(-6.0h, 6.0h),
+    half2(-5.0h, 6.0h),
+    half2(-4.0h, 6.0h),
+    half2(-3.0h, 6.0h),
+    half2(-2.0h, 6.0h),
+    half2(-1.0h, 6.0h),
+    half2(0.0h, 6.0h),
+    half2(1.0h, 6.0h),
+    half2(2.0h, 6.0h),
+    half2(3.0h, 6.0h),
+    half2(4.0h, 6.0h),
+    half2(5.0h, 6.0h),
+    half2(6.0h, 6.0h),
+    half2(7.0h, 6.0h),
+    half2(-8.0h, 7.0h),
+    half2(-7.0h, 7.0h),
+    half2(-6.0h, 7.0h),
+    half2(-5.0h, 7.0h),
+    half2(-4.0h, 7.0h),
+    half2(-3.0h, 7.0h),
+    half2(-2.0h, 7.0h),
+    half2(-1.0h, 7.0h),
+    half2(0.0h, 7.0h),
+    half2(1.0h, 7.0h),
+    half2(2.0h, 7.0h),
+    half2(3.0h, 7.0h),
+    half2(4.0h, 7.0h),
+    half2(5.0h, 7.0h),
+    half2(6.0h, 7.0h),
+    half2(7.0h, 7.0h),
+};
 
+
+// Q4 chunk GEMM on the half-staging pattern of q27_matmul_t2_mm_h (variant
+// G-prime, docs/plans/2026-07-15-gemm-half-staging.md follow-up; port pre-
+// registered in 2026-07-17-t2-prefill-throughput.md): half tiles, raw Q4
+// codes (-8..+7) and raw int8 activations both integer-exact in half, FLOAT
+// accumulators (mixed-precision MMA). Products are bounded by 8*128 = 1024 <
+// 2048, so every product is exact in half regardless of where the MMA
+// rounds, and float accumulation keeps sums exact to 2^24 — stronger than
+// the float-staged q27_matmul_q4_mm it replaces, whose activation side
+// rounded once per value at staging. The Q4 scale group is 64 columns, so
+// each staged 64-K tile coincides with exactly one weight-scale group
+// (index c0/64, row stride cols/64); activation scales fold per 32-K
+// sub-slab at the flush exactly as in the T2 kernel.
+kernel void q27_matmul_q4_mm_h(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 64);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 64);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            // 16 columns = 8 bytes per thread: one byte-LUT gather per
+            // nibble pair, low nibble first (matches the float kernel's
+            // LSB-first order). wcb is a multiple of 16 -> half2-aligned.
+            const uint2 wp = *(device const uint2 *)(wsrc + (c0 + wcb) / 2);
+            threadgroup half2 *dst = (threadgroup half2 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_q4_half2_lut[wp.x         & 0xffu];
+            dst[1] = q27_q4_half2_lut[(wp.x >>  8) & 0xffu];
+            dst[2] = q27_q4_half2_lut[(wp.x >> 16) & 0xffu];
+            dst[3] = q27_q4_half2_lut[wp.x >> 24         ];
+            dst[4] = q27_q4_half2_lut[wp.y         & 0xffu];
+            dst[5] = q27_q4_half2_lut[(wp.y >>  8) & 0xffu];
+            dst[6] = q27_q4_half2_lut[(wp.y >> 16) & 0xffu];
+            dst[7] = q27_q4_half2_lut[wp.y >> 24         ];
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            // Raw int8 values: exact in half. The per-token 32-group scale
+            // folds at the flush below; invalid token slots stage clamped
+            // real values whose outputs are never stored.
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 64]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 64]);
+        // The two 32-K sub-slabs (activation-scale groups) accumulate into
+        // separate tile pairs so both fold in ONE barrier region per staged 64.
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// PARKED (2026-07-17, never engine-routed): Q8 on the half-staging
+// pattern FAILED the shape suite — 5.5e-4 at the high-cancellation
+// 33x5120 repro vs the 3e-4 bound. Unlike Q4/T2, Q8 PRODUCTS (up to
+// 127*127) exceed half's 2048 exact-integer range, and the failure shows
+// the mixed-precision MMA rounds products at HALF precision, not at the
+// float accumulator's — the empirical answer to the open question the Q4
+// port's exactness argument sidesteps (its products are <= 1024, exact
+// regardless). A split-nibble Q8 staging would restore exactness at 2x
+// the MMA work for a ~8%-of-wall kernel: not worth it. Q8 chunk GEMM
+// stays float-staged; kernel kept as the record of the attempt.
+kernel void q27_matmul_q8_mm_h(
+        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const int4 wp = *(device const int4 *)(wsrc + c0 + wcb);
+            const char4 w0 = as_type<char4>(wp.x), w1 = as_type<char4>(wp.y);
+            const char4 w2 = as_type<char4>(wp.z), w3 = as_type<char4>(wp.w);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = half(w0.x); dst[1]  = half(w0.y); dst[2]  = half(w0.z); dst[3]  = half(w0.w);
+            dst[4]  = half(w1.x); dst[5]  = half(w1.y); dst[6]  = half(w1.z); dst[7]  = half(w1.w);
+            dst[8]  = half(w2.x); dst[9]  = half(w2.y); dst[10] = half(w2.z); dst[11] = half(w2.w);
+            dst[12] = half(w3.x); dst[13] = half(w3.y); dst[14] = half(w3.z); dst[15] = half(w3.w);
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Nibble -> 4 binary-code halves (bit j = element j, LSB-first): one
+// constant-memory gather replaces four shift/mask/select chains. Bit b
+// stages (2b-1) as f16 — exact, so the mm kernel's math mirrors mm_h's.
+constant half4 q27_b1_half4_lut[16] = {
+    half4(-1.0h, -1.0h, -1.0h, -1.0h),
+    half4( 1.0h, -1.0h, -1.0h, -1.0h),
+    half4(-1.0h,  1.0h, -1.0h, -1.0h),
+    half4( 1.0h,  1.0h, -1.0h, -1.0h),
+    half4(-1.0h, -1.0h,  1.0h, -1.0h),
+    half4( 1.0h, -1.0h,  1.0h, -1.0h),
+    half4(-1.0h,  1.0h,  1.0h, -1.0h),
+    half4( 1.0h,  1.0h,  1.0h, -1.0h),
+    half4(-1.0h, -1.0h, -1.0h,  1.0h),
+    half4( 1.0h, -1.0h, -1.0h,  1.0h),
+    half4(-1.0h,  1.0h, -1.0h,  1.0h),
+    half4( 1.0h,  1.0h, -1.0h,  1.0h),
+    half4(-1.0h, -1.0h,  1.0h,  1.0h),
+    half4( 1.0h, -1.0h,  1.0h,  1.0h),
+    half4(-1.0h,  1.0h,  1.0h,  1.0h),
+    half4( 1.0h,  1.0h,  1.0h,  1.0h),
+};
+
+// Binary tiled chunk GEMM on the half-staging pattern of q27_matmul_t2_mm_h
+// (the production T2 route): half tiles, {-1,+1} weights and raw int8
+// activations both integer-exact in half, activation scale folded at the
+// per-32-K flush. The staging block reads one ushort (16 code bits) per
+// thread — (c0 + wcb)/8 is even because wcb is a multiple of 16, so the
+// load is ushort-aligned.
+kernel void q27_matmul_b1_mm(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 8);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const ushort wp = *(device const ushort *)(wsrc + (c0 + wcb) / 8);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_b1_half4_lut[wp         & 0xfu];
+            dst[1] = q27_b1_half4_lut[(wp >>  4) & 0xfu];
+            dst[2] = q27_b1_half4_lut[(wp >>  8) & 0xfu];
+            dst[3] = q27_b1_half4_lut[wp >> 12        ];
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            // Raw int8 values: exact in half. The per-token 32-group scale
+            // folds at the flush below; invalid token slots stage clamped
+            // real values whose outputs are never stored.
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        // Float accumulators keep int8 x {-1,+1} sums exact. The two 32-K
+        // sub-slabs (activation-scale groups) accumulate into separate tile
+        // pairs so both fold in ONE barrier region per staged 64.
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+
+// ---- A/B/C MMA roofline probes (bench-only, docs/plans/2026-07-16-mma-
+// roofline.md). Same dispatch grid, tile geometry, edge clamps, and
+// physical MMA count as q27_matmul_t2_mm_h (arm C); never engine-routed.
+
+// Arm K — function-constant specialization probe (BaseRT survey probe 2):
+// the production mm_h body with the K dimension baked as a function
+// constant, so the 64-K walk's trip count and every cols-derived address
+// expression are compile-time literals (per-shape specialized PSO). Same
+// math in the same order — output must be bit-identical to arm C.
+constant uint FC_COLS [[function_constant(0)]];
+kernel void q27_mma_roofline_k(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (FC_COLS / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * FC_COLS;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (FC_COLS / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (FC_COLS / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < FC_COLS; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (FC_COLS / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (FC_COLS / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm F — f16-accumulate probe (docs/plans/2026-07-16-f16acc-probe.md,
+// BaseRT survey import #1): the production mm_h body with half
+// accumulators and a half flush tile. The f16 sums live only within one
+// 64-K slab (|sum| <= 64*127*2, inside half range); the scale-fold and
+// cross-slab accumulation stay f32 in racc, unchanged. Bench-only.
+kernel void q27_mma_roofline_f(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup half Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_half8x8 acc0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    simdgroup_half8x8 acc1 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    simdgroup_half8x8 acc2 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    simdgroup_half8x8 acc3 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    float4 racc = 0.0f;
+    threadgroup half *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+        acc1 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+        acc2 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+        acc3 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm B — half-plumbing roofline: the mm_h body with the packed-trit
+// unpack and int8->half conversion deleted. Operands are already half in
+// device memory and stage into the same threadgroup tiles with the same
+// store pattern, barriers, MMA loops, and per-64-K ws*xs scale-fold flush.
+// B - C isolates unpack/conversion machinery only.
+kernel void q27_mma_roofline_b(
+        device const half *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const half *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            device const half4 *wp4 = (device const half4 *)(wsrc + c0 + wcb);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            const half4 w0 = wp4[0], w1 = wp4[1], w2 = wp4[2], w3 = wp4[3];
+            dst[0]  = w0.x; dst[1]  = w0.y; dst[2]  = w0.z; dst[3]  = w0.w;
+            dst[4]  = w1.x; dst[5]  = w1.y; dst[6]  = w1.z; dst[7]  = w1.w;
+            dst[8]  = w2.x; dst[9]  = w2.y; dst[10] = w2.z; dst[11] = w2.w;
+            dst[12] = w3.x; dst[13] = w3.y; dst[14] = w3.z; dst[15] = w3.w;
+        }
+        {
+            device const half4 *xp4 = (device const half4 *)(xsrc + c0 + xcb);
+            const half4 xa = xp4[0], xb = xp4[1];
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y;
+            dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y;
+            dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm B_eq — equal-traffic no-unpack roofline. Literal arm B streams eight
+// times the weight bytes of C, confounding unpack cost with bandwidth. This
+// variant loads exactly C's device bytes per thread per tile, replicates the
+// values into the same staging stores, and keeps barriers, MMA loops, and the
+// scale-fold flush identical. C/B_eq isolates unpack and conversion ALU at
+// equal traffic; MMA timing is data-independent, so values do not matter.
+kernel void q27_mma_roofline_b_eq(
+        device const half *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    // Packed-equivalent layout: cols/8 halves per row (= cols/4 bytes, C's
+    // packed weight row size).
+    device const half *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 8);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * (args.cols / 2);
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const half2 w2 = *(device const half2 *)(wsrc + (c0 + wcb) / 8);
+            // Vector stores mirror production staging so the control does not
+            // fall behind the kernel it isolates.
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = half4(w2.x, w2.y, w2.x, w2.y);
+            dst[1] = half4(w2.x, w2.y, w2.x, w2.y);
+            dst[2] = half4(w2.y, w2.x, w2.y, w2.x);
+            dst[3] = half4(w2.y, w2.x, w2.y, w2.x);
+        }
+        {
+            // Two 4-byte loads match C's two char4 loads per slot; one 8-byte
+            // load would understate load-issue cost.
+            const half2 xa2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2);
+            const half2 xb2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2 + 2);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa2.x; dst[1 * 16] = xa2.y;
+            dst[2 * 16] = xb2.x; dst[3 * 16] = xb2.y;
+            dst[4 * 16] = xb2.y; dst[5 * 16] = xb2.x;
+            dst[6 * 16] = xa2.y; dst[7 * 16] = xa2.x;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm Cx — the pre-converted-activation candidate: production packed-T2
+// weight staging (LUT unpack) with activations already half in device
+// memory (raw int8 values converted once device-side are exact in half,
+// so this candidate would be bit-identical in production; scale still
+// folds at the flush). Cx measures the ceiling of deleting the per-tile
+// char->half converts before building the production pre-pass.
+kernel void q27_mma_roofline_cx(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            // Exact copy of production weight staging; Cx differs from C only
+            // on the activation side.
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        {
+            const half4 xa = *(device const half4 *)(xsrc + c0 + xcb);
+            const half4 xb = *(device const half4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y;
+            dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y;
+            dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// ---- Lever 1: direct-RHS chunk GEMM (docs/plans/2026-07-16-lever1-
+// direct-rhs.md; bench-first, never engine-routed until it clears its
+// pre-registered line). Structure per ds4 item 2/3 phase B: stage ONLY the
+// weight tile (64 rows x 32 K, half, byte-LUT unpack), read the RHS
+// directly from device via simdgroup_load, spend threadgroup memory on
+// weights. K-tile = 32 = exactly one activation-scale group, so the
+// per-K-tile flush folds ws(row) * xs(token) onto exact integer partial
+// sums (int8 x trit, same exactness class as mm_h; fold order differs
+// from mm_h so outputs are tolerance-gated, not bit-identical).
+
+// RHS pre-pass: int8 [x_rows, cols] -> half K-major [cols, tokens_pad],
+// raw int8 values (exact in half), zero-padded token slots. args reuse:
+// simdgroups field carries tokens_pad.
+kernel void q27_x_int8_to_half_t(device const char *x [[buffer(0)]],
+                                  device half *xt [[buffer(1)]],
+                                  constant MatmulArgs &args [[buffer(2)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    const uint tokens_pad = args.simdgroups;
+    const uint c = gid / tokens_pad, t = gid % tokens_pad;
+    if (c >= args.cols) return;
+    xt[gid] = t < args.x_rows ? half(x[(ulong)t * args.cols + c]) : half(0.0h);
+}
+
+kernel void q27_matmul_t2_mm_dr(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *xt [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[64 * 32];
+    threadgroup float Sc[8 * 64];      // per-simdgroup 8x8 flush scratch
+    const uint row0 = group.x * 64;
+    const uint tok0 = group.y * 32;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint tokens_pad = args.simdgroups;   // K-major RHS row stride
+    const uint live = min(32u, args.x_rows - tok0);
+    const uint ncol = (live + 7) / 8;          // live 8-token column fragments
+    const uint wrow = tid / 4, wkb = (tid % 4) * 8;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint sgrow0 = (uint)sg * 8;          // this simdgroup's row stripe
+    // Flush mapping: lane owns elements (r = lane/8, t = lane%8) and
+    // (r + 4, t) of each 8x8 tile; racc[col*2 + {0,1}] accumulate them.
+    const uint rA = row0 + sgrow0 + lane / 8, rB = rA + 4;
+    const ulong wsrowA = (ulong)min(rA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rB, rlast) * (args.cols / 128);
+    float racc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    threadgroup float *sc = Sc + (uint)sg * 64;
+    for (uint c0 = 0; c0 < args.cols; c0 += 32) {
+        {
+            // 8 trits (one ushort) per thread -> two byte-LUT half4 stores;
+            // 256 threads cover the 64x32 tile.
+            const ushort wp = *(device const ushort *)(wsrc + (c0 + wkb) / 4);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 32 + wkb);
+            dst[0] = q27_t2_half4_lut[wp & 0xffu];
+            dst[1] = q27_t2_half4_lut[wp >> 8];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + sgrow0 * 32 + k8, 32);
+            device const half *bsrc = xt + (ulong)(c0 + k8) * tokens_pad + tok0;
+            simdgroup_load(b, bsrc, tokens_pad);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            if (ncol > 1) {
+                simdgroup_load(b, bsrc + 8, tokens_pad);
+                simdgroup_multiply_accumulate(acc1, a, b, acc1);
+            }
+            if (ncol > 2) {
+                simdgroup_load(b, bsrc + 16, tokens_pad);
+                simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            }
+            if (ncol > 3) {
+                simdgroup_load(b, bsrc + 24, tokens_pad);
+                simdgroup_multiply_accumulate(acc3, a, b, acc3);
+            }
+        }
+        // Per-K-tile flush: this K-tile is one x-scale group (c0/32) and
+        // sits inside one weight-scale group (c0/128).
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint col = 0; col < ncol; col++) {
+            switch (col) {
+                case 0: simdgroup_store(acc0, sc, 8); break;
+                case 1: simdgroup_store(acc1, sc, 8); break;
+                case 2: simdgroup_store(acc2, sc, 8); break;
+                default: simdgroup_store(acc3, sc, 8); break;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint tok = min(tok0 + col * 8 + lane % 8, args.x_rows - 1);
+            const float xs = x_scales[(ulong)tok * (args.cols / 32) + c0 / 32];
+            racc[col * 2]     += sc[lane]      * wsA * xs;
+            racc[col * 2 + 1] += sc[lane + 32] * wsB * xs;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint col = 0; col < ncol; col++) {
+        const uint tok = tok0 + col * 8 + lane % 8;
+        if (tok >= args.x_rows) continue;
+        if (rA < args.rows) out[(ulong)tok * args.rows + rA] = racc[col * 2];
+        if (rB < args.rows) out[(ulong)tok * args.rows + rB] = racc[col * 2 + 1];
+    }
+}
+
+// Lever-1 variant D2: same direct-RHS contract, remapped to cut redundant
+// device B loads. 128 threads = 4 simdgroups; the 64-row x 16-token tile
+// splits into (row-half, token-column) quadrants, so each B fragment is
+// loaded by 2 simdgroups (vs 8 in the row-stripe mapping) and every
+// simdgroup has live work at w = 12. Same K-tile-32 flush and exactness
+// argument as q27_matmul_t2_mm_dr.
+kernel void q27_matmul_t2_mm_dr2(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *xt [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[64 * 32];
+    threadgroup float Sc[4 * 64];
+    const uint row0 = group.x * 64;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint tokens_pad = args.simdgroups;
+    const uint live = min(16u, args.x_rows - tok0);
+    const uint sgrow0 = ((uint)sg / 2) * 32;      // row-half within the tile
+    const uint sgtok = ((uint)sg % 2) * 8;        // token column (8 wide)
+    const bool tok_live = sgtok < live;
+    const uint wrow = tid / 2, wkb = (tid % 2) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint rA = row0 + sgrow0 + lane / 8;     // + 8*stripe below
+    float racc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    threadgroup float *sc = Sc + (uint)sg * 64;
+    for (uint c0 = 0; c0 < args.cols; c0 += 32) {
+        {
+            // One uint (16 trits) per thread -> 4 byte-LUT half4 stores;
+            // 128 threads cover the 64x32 tile.
+            const uint wp = *(device const uint *)(wsrc + (c0 + wkb) / 4);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 32 + wkb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tok_live) {
+            simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint k8 = 0; k8 < 32; k8 += 8) {
+                simdgroup_half8x8 a, b;
+                simdgroup_load(b, xt + (ulong)(c0 + k8) * tokens_pad + tok0 + sgtok, tokens_pad);
+                simdgroup_load(a, Wt + sgrow0 * 32 + k8, 32);
+                simdgroup_multiply_accumulate(acc0, a, b, acc0);
+                simdgroup_load(a, Wt + (sgrow0 + 8) * 32 + k8, 32);
+                simdgroup_multiply_accumulate(acc1, a, b, acc1);
+                simdgroup_load(a, Wt + (sgrow0 + 16) * 32 + k8, 32);
+                simdgroup_multiply_accumulate(acc2, a, b, acc2);
+                simdgroup_load(a, Wt + (sgrow0 + 24) * 32 + k8, 32);
+                simdgroup_multiply_accumulate(acc3, a, b, acc3);
+            }
+            const uint tok = min(tok0 + sgtok + lane % 8, args.x_rows - 1);
+            const float xs = x_scales[(ulong)tok * (args.cols / 32) + c0 / 32];
+            for (uint stripe = 0; stripe < 4; stripe++) {
+                switch (stripe) {
+                    case 0: simdgroup_store(acc0, sc, 8); break;
+                    case 1: simdgroup_store(acc1, sc, 8); break;
+                    case 2: simdgroup_store(acc2, sc, 8); break;
+                    default: simdgroup_store(acc3, sc, 8); break;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                const uint r0 = rA + stripe * 8, r1 = r0 + 4;
+                const float wsA = float(weight_scales[(ulong)min(r0, rlast) * (args.cols / 128) + c0 / 128]);
+                const float wsB = float(weight_scales[(ulong)min(r1, rlast) * (args.cols / 128) + c0 / 128]);
+                racc[stripe * 2]     += sc[lane]      * wsA * xs;
+                racc[stripe * 2 + 1] += sc[lane + 32] * wsB * xs;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint tok = tok0 + sgtok + lane % 8;
+    if (tok >= args.x_rows) return;
+    for (uint stripe = 0; stripe < 4; stripe++) {
+        const uint r0 = rA + stripe * 8, r1 = r0 + 4;
+        if (r0 < args.rows) out[(ulong)tok * args.rows + r0] = racc[stripe * 2];
+        if (r1 < args.rows) out[(ulong)tok * args.rows + r1] = racc[stripe * 2 + 1];
+    }
+}
+
+// Arm A — MMA-core roofline: tiles filled once from an opaque device seed
+// (defeats constant folding), then the SAME per-64-K MMA loop count with
+// accumulators carried across the whole K walk (the acc dependency chain
+// defeats dead-code elimination), one final fold + store with the same
+// row/token edge guards. No per-tile staging, no barriers, no flushes:
+// A - B isolates staging/barrier/flush cadence at equal MMA count.
+kernel void q27_mma_roofline_a(
+        device const half *seed [[buffer(0)]],
+        device float *out [[buffer(1)]], constant MatmulArgs &args [[buffer(2)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 64];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    for (uint i = tid; i < 32 * 64; i += 128) Wt[i] = seed[i];
+    for (uint i = tid; i < 64 * 16; i += 128) Xt[i] = seed[32 * 64 + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // one-time fill
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    threadgroup float *sc = Sc + sg * 64;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+    }
+    // Single fold: acc0's tile through per-simdgroup scratch, plus a direct
+    // dependency on acc1..acc3 via their stored diagonals so no accumulator
+    // chain is dead.
+    simdgroup_store(acc0, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    float r = sc[lane];
+    simdgroup_store(acc1, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane + 32];
+    simdgroup_store(acc2, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane];
+    simdgroup_store(acc3, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane + 32];
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = r;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = r + 1.0f;
+}
 
 // Constrained tool decoding: clear grammar-illegal logits to -inf under a
 // uint32 bitset mask (bit set = legal), so GPU argmax, top-k extraction,
@@ -1612,8 +3753,8 @@ kernel void q27_mask_logits(device float *logits [[buffer(0)]],
 
 // ---- Chunked layer-major prefill (2..96 tokens per dispatch; per-path
 // caps: MTP rounds and NLL/KL teacher forcing at CHUNK_MAX=12, prompt
-// ingestion at PREFILL_CHUNK_MAX=96 and verify chunks at
-// VERIFY_CHUNK_MAX=48 ----
+// ingestion at PREFILL_CHUNK_MAX=96, suffix-burst/oracle verify chunks at
+// VERIFY_CHUNK_MAX=48 — wide-chunk phase A + lever 2) ----
 //
 // These kernels advance a whole token chunk through one operation so the
 // engine can execute prompts layer-major and route projections through the
@@ -1649,6 +3790,19 @@ kernel void q27_embedding_t2_rows(
     out[(ulong)gid.y * args.cols + gid.x] = float(int(code) - 1) * float(scales[si]);
 }
 
+kernel void q27_embedding_b1_rows(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        constant EmbedRowsArgs &args [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.cols || gid.y >= args.count) return;
+    const uint token = args.tokens[gid.y];
+    const ulong wi = (ulong)token * args.cols + gid.x;
+    const uint bit = (weights[wi >> 3] >> (wi & 7)) & 1;
+    const ulong si = (ulong)token * (args.cols / 128) + gid.x / 128;
+    out[(ulong)gid.y * args.cols + gid.x] = float(2 * int(bit) - 1) * float(scales[si]);
+}
 
 struct RowsNormArgs { uint n; uint rows; uint groups; float eps; };
 kernel void q27_rmsnorm_rows_quantized(
@@ -2368,6 +4522,96 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
     }
 }
 
+// KV-codec attribution store (kl-kv instrument): writes the fp16 KV cache,
+// but routes one side (mode 1 = K, mode 2 = V) through the exact turbo3
+// quantizer — normalize, sign flips, butterfly, 8-centroid nearest,
+// half-rounded norm-correction scale — and back through the inverse
+// transform. The engine stays on the fp16 attention kernels throughout, so
+// a KL delta against the fp16 baseline is attributable to that one side's
+// quantization alone.
+// head selects a single KV head for cell-granular attribution (census);
+// ~0u round-trips every head of the selected side. Mode 3 (step-4
+// exception probe) round-trips BOTH sides and reuses head as a per-layer
+// 8-bit exception mask (bit = head*2 + side): set bits stay clean fp16.
+// Mode 4 (fp8-KV control arm) round-trips BOTH sides of every head
+// through the e4m3 grid; head is ignored. Transform-free, so this arm is
+// production-exact — see q27_e4m3_roundtrip.
+// flags: step-2 scaling
+// arms (docs/plans/2026-07-16-kv-codec-step2.md) — SCALE32 keeps the
+// group scale in f32 through the round-trip, FEATURE descales each
+// dimension by aux[scale_off + side/head/dim] before the quantizer and
+// rescales after the inverse transform, STATS stores clean fp16 while
+// accumulating per-feature sum-of-squares for BOTH sides into aux
+// (atomic f32). aux layout: [side(K=0,V=1)][attn_idx][head][256 dims].
+constant uint Q27_ATTRIB_SCALE32 = 1;
+constant uint Q27_ATTRIB_FEATURE = 2;
+constant uint Q27_ATTRIB_STATS   = 4;
+struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; uint head;
+                         uint flags; uint scale_off; };
+kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
+                                          device const float *v [[buffer(1)]],
+                                          device half *kc [[buffer(2)]],
+                                          device half *vc [[buffer(3)]],
+                                          constant TurboAttribArgs &args [[buffer(4)]],
+                                          device float *aux [[buffer(5)]],
+                                          uint3 group [[threadgroup_position_in_grid]],
+                                          uint j [[thread_index_in_threadgroup]]) {
+    const uint h = group.x >> 1, g = group.x & 1, token = group.z;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens) return;
+    device const float *src = (group.y ? v : k) +
+        (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    device half *dst = (group.y ? vc : kc) +
+        (ulong)(args.position + token) * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    const uint aux_at = args.scale_off + group.y * 16384u + h * 256u + g * 128u + j;
+    if (args.flags & Q27_ATTRIB_STATS) {
+        // Stats pass: the stored cache stays clean fp16 (the subject IS the
+        // baseline; its KL rides along as a zero canary) while per-feature
+        // sum-of-squares accumulates for BOTH sides.
+        atomic_fetch_add_explicit((device atomic_float *)&aux[aux_at],
+                                  src[j] * src[j], memory_order_relaxed);
+        dst[j] = half(src[j]);
+        return;
+    }
+    // group.y and h are uniform across the threadgroup, so these early
+    // exits and the barriers below never diverge within a threadgroup.
+    // Mode 3 (step-4 exception probe): quantize BOTH sides unless this
+    // (head, side) bit is set in the per-layer exception mask riding
+    // args.head — bit = head*2 + side, matching census cell numbering.
+    if (args.mode == 4u) { dst[j] = half(q27_e4m3_roundtrip(src[j])); return; }
+    if (args.mode == 3u) {
+        if (args.head & (1u << (h * 2u + group.y))) { dst[j] = half(src[j]); return; }
+    } else if (args.mode != (group.y ? 2u : 1u) ||
+               (args.head != ~0u && h != args.head)) { dst[j] = half(src[j]); return; }
+    const float sj = (args.flags & Q27_ATTRIB_FEATURE) ? aux[aux_at] : 1.0f;
+    threadgroup float xs[128], red[128];
+    const float x0 = src[j] / sj;
+    xs[j] = x0; red[j] = x0 * x0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float norm = sqrt(red[0]);
+    xs[j] = xs[j] * (norm > 1e-10f ? 1.0f / norm : 0.0f) * float(turbo_s1[j]);
+    turbo_butterfly(xs, j);
+    const uint index = turbo_nearest(xs[j] * turbo_inv_sqrt_128 * float(turbo_s2[j]));
+    red[j] = turbo_centroids[index] * turbo_centroids[index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The group scale passes through half exactly as the packed block header
+    // does — unless the SCALE32 arm keeps it f32 to isolate scale precision
+    // from scale structure.
+    const float cn = sqrt(red[0]);
+    const float raw_scale = cn > 1e-10f ? norm / cn : norm;
+    const float scale = (args.flags & Q27_ATTRIB_SCALE32) ? raw_scale : float(half(raw_scale));
+    xs[j] = turbo_centroids[index] * scale * float(turbo_s2[j]);
+    turbo_butterfly(xs, j);
+    dst[j] = half(xs[j] * turbo_inv_sqrt_128 * float(turbo_s1[j]) * sj);
+}
+
 // Chunk-causal turbo3 attention, online-softmax. Mirrors the turbo3 decode
 // kernel exactly — one threadgroup per (query head, chunk token), eight
 // simdgroups striping the token's visible sequence — so a chunk token's
@@ -2742,9 +4986,76 @@ kernel void q27_attention_gqa_merge_rows(device const float *partials [[buffer(0
         out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
 }
 
-// Token-tiled causal GQA. The production factor-2 route shares each
-// dequantized KV tile across two teacher-forced tokens while preserving each
-// token's arithmetic order and the existing partials merge layout.
+// ---- Cache-block scheduling R1/R1b kernels ----
+// (docs/plans/2026-07-15-cache-block-scheduling.md, Phase 0 results.)
+// R1 (head-major layout) measured 1.00x and is PARKED — its probe kernel
+// stays bench-only (build/metal_attn_bench), never engine-routed. R1b
+// (token-tiled causal, factor 2) measured 2.0x at 32K+ and is production:
+// the causal GQA dispatch routes through the _t2 kernels.
+
+// R1 probe (parked): head-major turbo3 KV layout. Identical math to
+// q27_attention_turbo3_gqa — only the cache addressing changes. Rows of one
+// KV head are contiguous ((kvh * seq_cap + pos) * 100 bytes), so a
+// (kvh, blk) threadgroup streams one ~102 KB run instead of 100 B picks at
+// 400 B stride. Output must be bit-identical to the interleaved kernel on
+// relaid-out data (the bench memcmps before timing).
+struct AttentionGqaHmArgs {
+    uint q_stride; uint seq_len; uint seq_cap; uint q_heads; uint kv_heads;
+    uint head_dim; uint block; uint n_blocks; float scale;
+};
+
+kernel void q27_attention_turbo3_gqa_hm(device const float *q [[buffer(0)]],
+                                         device const uchar *kc [[buffer(1)]],
+                                         device const uchar *vc [[buffer(2)]],
+                                         device float *partials [[buffer(3)]],
+                                         constant AttentionGqaHmArgs &args [[buffer(4)]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         ushort lane [[thread_index_in_simdgroup]],
+                                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || blk >= args.n_blocks || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint p1 = min(p0 + args.block, args.seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    device const uchar *khead = kc + (ulong)kvh * args.seq_cap * 100;
+    device const uchar *vhead = vc + (ulong)kvh * args.seq_cap * 100;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = khead + (ulong)(t0 + r) * 100;
+            device const uchar *vb = vhead + (ulong)(t0 + r) * 100;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < 256; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < 256; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials + ((ulong)qh * args.n_blocks + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[i];
+}
+
 // R1b: token-tiled causal GQA. TF chunk tokens share one (kvh, blk)
 // threadgroup: each staged 8-row tile is dequantized once and every resident
 // token's per-simdgroup online softmax walks it in token order — the KV
@@ -2771,11 +5082,9 @@ inline void turbo3_causal_gqa_tiled_body(device const float *q,
     if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
     const uint live = min(TF, args.tokens - tile0);
     const uint p0 = blk * args.block;
-    // Exclusive sequence length for the deepest live token. `base_len` is
-    // already position + 1, so this includes that token's newest KV row.
-    const uint max_seq_len = args.base_len + tile0 + live - 1;
-    if (p0 >= max_seq_len) return;
-    const uint p1 = min(p0 + args.block, max_seq_len);
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
     const uint qh = kvh * gqa + sg;
     const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
     device const float *qp[TF];
@@ -2836,6 +5145,98 @@ inline void turbo3_causal_gqa_tiled_body(device const float *q,
         for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
     }
 }
+
+// R3 probe: barrier-free direct-read block-partial causal GQA attention
+// (docs/plans/2026-07-16-r3-barrier-free-attention.md). The tiled body with
+// the threadgroup staging and both barriers deleted: each lane dequantizes
+// its 8 K dims and 8 V dims per position directly from device into
+// registers, in the same element order (d = lane + 32·i) as the staged
+// kernels — so per-token arithmetic is unchanged and the output is
+// bit-identical to the t2 kernel at equal block size (the bench memcmps
+// before timing). Six simdgroups per threadgroup, one per GQA query head,
+// share nothing; each KV row is read gqa times (~600 B vs 100 B staged),
+// inside the byte range the fp16 A/B proved latency-tolerant. Block size
+// arrives via args.block (host override on the probe entry) — the sweep is
+// the experiment.
+template <uint TF>
+inline void turbo3_causal_gqa_bf_body(device const float *q,
+                                       device const uchar *kc,
+                                       device const uchar *vc,
+                                       device float *partials,
+                                       constant AttentionGqaCausalArgs &args,
+                                       uint3 group, ushort lane, ushort sg) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint pos = p0; pos < p1; pos++) {
+        device const uchar *kb = kc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *vb = vc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
+        float kv[8], vv[8];
+        for (uint d = lane, i = 0; d < 256; d += 32, i++)
+            kv[i] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+        for (uint d = lane, i = 0; d < 256; d += 32, i++)
+            vv[i] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        float partial[TF];
+        for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+            const float k = kv[i];
+            for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+        }
+        float corr[TF], w[TF];
+        bool vis[TF];
+        for (uint f = 0; f < TF; f++) {
+            vis[f] = f < live && pos < args.base_len + tile0 + f;
+            corr[f] = 1.0f; w[f] = 0.0f;
+            if (vis[f]) {
+                const float score = simd_sum(partial[f]) * args.scale;
+                const float m_new = max(m[f], score);
+                corr[f] = exp(m[f] - m_new);            // first iteration: exp(-inf) = 0
+                w[f] = exp(score - m_new);
+                l[f] = l[f] * corr[f] + w[f];
+                m[f] = m_new;
+            }
+        }
+        for (uint i = 0; i < 8; i++) {
+            const float v = vv[i];
+            for (uint f = 0; f < TF; f++)
+                if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+
+kernel void q27_attention_turbo3_causal_gqa_bf2(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    turbo3_causal_gqa_bf_body<2>(q, kc, vc, partials, args, group, lane, sg);
+}
+
 kernel void q27_attention_turbo3_causal_gqa_t2(device const float *q [[buffer(0)]],
         device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
         device float *partials [[buffer(3)]],
@@ -2846,6 +5247,18 @@ kernel void q27_attention_turbo3_causal_gqa_t2(device const float *q [[buffer(0)
     threadgroup float Kt[8][256], Vt[8][256];
     turbo3_causal_gqa_tiled_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
 }
+
+kernel void q27_attention_turbo3_causal_gqa_t4(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    turbo3_causal_gqa_tiled_body<4>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+
 // fp16 token-tiled causal GQA: the same tiling transform applied to
 // q27_attention_f16_causal_gqa — head_dim-parametric staging and d-loops
 // mirror the untiled kernel expression-for-expression so per-token output
@@ -2864,11 +5277,9 @@ inline void f16_causal_gqa_tiled_body(device const float *q,
     if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
     const uint live = min(TF, args.tokens - tile0);
     const uint p0 = blk * args.block;
-    // Exclusive sequence length for the deepest live token. `base_len` is
-    // already position + 1, so this includes that token's newest KV row.
-    const uint max_seq_len = args.base_len + tile0 + live - 1;
-    if (p0 >= max_seq_len) return;
-    const uint p1 = min(p0 + args.block, max_seq_len);
+    const uint seq_last = args.base_len + tile0 + live - 1;
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
     const uint qh = kvh * gqa + sg;
     const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
     device const float *qp[TF];

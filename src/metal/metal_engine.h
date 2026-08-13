@@ -14,6 +14,8 @@
 
 namespace q27 {
 
+class SuffixDraft;
+
 class MetalEngine {
   public:
     struct Snapshot;
@@ -110,12 +112,50 @@ class MetalEngine {
     // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
     // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
     static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
+    // Default drafter engage threshold: rounds whose longest suffix match is
+    // shorter fall back to one serial step (Phase-0 sim: shorter thresholds
+    // trade acceptance for round overhead on burst-hostile text).
+    static constexpr uint32_t SUFFIX_MIN_MATCH = 12;
+    // Batched suffix-burst verification (2026-07-16-suffix-burst-verify.md):
+    // SuffixDraft proposals through the VERIFY_CHUNK_MAX-wide verify chunk
+    // with mtp_round's acceptance/commit semantics. width 2..VERIFY_CHUNK_MAX;
+    // rounds with match < minimum_match fall back to one serial step.
+    std::vector<uint32_t> generate_suffix(const std::vector<uint32_t>& prompt,
+                                          uint32_t count, uint32_t width,
+                                          uint32_t minimum_match = SUFFIX_MIN_MATCH,
+                                          uint32_t eos = UINT32_MAX);
+    // The pre-lever-2 serial walk (one step() per proposal): the batched
+    // path's A/B control and byte-level reference. width 2..12.
+    std::vector<uint32_t> generate_suffix_serial(const std::vector<uint32_t>& prompt,
+                                                 uint32_t count, uint32_t width,
+                                                 uint32_t minimum_match = SUFFIX_MIN_MATCH,
+                                                 uint32_t eos = UINT32_MAX);
+    // One suffix-burst driver round (the generate_suffix loop body, extracted
+    // for the server's quantum loop): propose from the drafter, match-cap and
+    // snap-down the width, then either a suffix_round burst or one serial
+    // fallback step. Fills committed with the round's tokens (>= 1, clamped at
+    // eos exactly like mtp_round — pass the REAL eos id here; generate_suffix
+    // passes a never-matching sentinel to run to a fixed count) and returns
+    // the next pending token. remaining must be >= 2 (the caller emits the
+    // final token directly). burst, when non-null, reports whether this
+    // round dispatched a batched verify (server /stats attribution).
+    uint32_t suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
+                         uint32_t eos, uint32_t width, uint32_t minimum_match,
+                         std::vector<uint32_t>& committed, bool* burst = nullptr);
+    // Suffix-burst diagnostics for the last generate_suffix run: rounds that
+    // fell back to serial, and fired-burst lane counts by full-tile bucket.
+    struct SuffixStats {
+        uint64_t fallback_rounds = 0;
+        uint64_t burst_rounds = 0;
+        uint64_t lanes_le16 = 0, lanes_32 = 0, lanes_48 = 0; // dispatched live widths
+    };
+    SuffixStats last_suffix_stats() const { return last_suffix_stats_; }
     uint32_t ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
                            bool reset_first = true);
     // One bounded token-serial prefill quantum. Unlike step(), this optionally
     // warms the MTP lane state between tokens and avoids an output-head
     // projection until final_chunk. The server uses it to release the shared
-    // command-queue lease every eight tokens during serial MTP prefill.
+    // command-queue lease every eight tokens during MTP/Bonsai prefill.
     static constexpr uint32_t serial_prefill_chunk_max() { return 8; }
     uint32_t prefill_serial_chunk(const uint32_t* tokens, uint32_t count,
                                   bool warm_mtp, bool final_chunk);
@@ -214,6 +254,22 @@ class MetalEngine {
     // is sample_from_logits + step under one GPU lease. The RNG belongs to
     // the request, not the engine, so interleaved slots stay reproducible.
     uint32_t sample_from_logits(const SamplingParams& params, std::mt19937_64& rng);
+    // Gate 0 oracle round (sibling-drafter-probe doc): one batched verify
+    // round with the draft stage removed — `lanes` are caller-supplied
+    // reference tokens (lanes[0] = pending), commit is teacher-forced to all
+    // `live` lanes so verifier economics are measured at perfect acceptance
+    // (D=0) with no drafter in the loop. Works on artifacts without an MTP
+    // layer. Writes the per-lane argmax verdicts to `predictions[live]`
+    // (observational agreement only — never acted on). `last` marks the
+    // final round of a generation: the final token is committed but never
+    // encoded, exactly like mtp_round/serial semantics.
+    void oracle_round(const uint32_t* lanes, uint32_t live, bool last, uint32_t* predictions);
+    // Suffix-burst round: oracle_round's caller-lane verify machinery with
+    // mtp_round's real acceptance walk and early-EOS clamp. lanes[0] must be
+    // the pending token; live = 2..VERIFY_CHUNK_MAX. Returns the next pending.
+    uint32_t suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
+                          uint32_t live, std::vector<uint32_t>& committed);
+
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
     // Prefix snapshots to disk (docs/metal/plans/2026-07-16-prefix-snapshots.md,
@@ -258,15 +314,14 @@ class MetalEngine {
     // must match this digest in both their deep header and server namespace.
     std::array<unsigned char,20> snapshot_runtime_identity() const;
 
-    // Constrained tool decoding (BasicToolConstrainer engine surface): a
-    // request-scoped device pool of uint32 legal-token bitsets. The server
-    // resets the pool and invalidates its host-id map when a slot is assigned;
-    // ids therefore remain stable only within that request. mask_pool_add
-    // uploads one mask and returns its slot (-1 when the request exceeds the
-    // cap); set_tool_constraint selects the active slot (-1 disengages).
-    // The active mask is applied to logits inside encode_token, before argmax,
-    // so greedy decode, top-k extraction, and CPU sampling see only legal
-    // tokens. Serial decode only; Metal does not wire MTP verify-lane masks.
+    // Constrained tool decoding (BasicToolConstrainer engine surface): an
+    // append-only device pool of uint32 legal-token bitsets. mask_pool_add
+    // uploads one mask and returns its slot (-1 when the pool is full);
+    // set_tool_constraint selects the active slot (-1 disengages). The
+    // active mask is applied to the logits inside encode_token, before the
+    // argmax, so greedy decode, top-k extraction, and CPU sampling all see
+    // only legal tokens. Serial decode only; the MTP verify lanes
+    // (set_tool_masks5) are not wired on Metal.
     static constexpr int MASK_POOL_CAP = 64;
     int mask_pool_used = 0;
     int mask_pool_add(const void* bits);
@@ -279,6 +334,35 @@ class MetalEngine {
     bool used_per_tensor_upload() const { return per_tensor_upload_; }
     bool chunked_prefill() const { return chunked_prefill_; }
     void set_chunked_prefill(bool enabled);
+    // KV-codec attribution knob (kl-kv instrument): 0 = off, 1 = round-trip
+    // K through the turbo3 quantizer at store time, 2 = V. The engine keeps
+    // its fp16 cache and attention kernels, so the resulting KL against an
+    // fp16 baseline isolates one side's quantization error. fp16-KV engines
+    // only; set before any tokens are encoded.
+    void set_kv_attrib(uint32_t mode);
+    // Cell-granular variant (sensitivity census): restrict the round-trip
+    // to one attention layer (absolute index, layer%4==3) and one KV head.
+    // UINT32_MAX for layer/head widens that axis back to "all".
+    void set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head);
+    // Step-2 scaling arms (docs/metal/plans/2026-07-16-kv-codec-step2.md), on top
+    // of an already-selected side arm: scale32 keeps the group scale in f32
+    // through the round-trip; feature_scales (2*16*4*256 floats,
+    // [side][attn_idx][head][dim]) descale each dimension before the
+    // quantizer and rescale after the inverse transform. Instrument-only,
+    // main-stream attention layers (never the MTP layer).
+    void set_kv_attrib_rt(bool scale32, const float* feature_scales);
+    // Stats pass: subject stores clean fp16 (KL vs baseline is exactly 0 —
+    // a rode-along canary) while per-feature sum-of-squares accumulates for
+    // both sides. read_kv_attrib_stats returns the 2*16*4*256 accumulator.
+    void set_kv_attrib_stats();
+    void read_kv_attrib_stats(std::vector<float>& out);
+    // Step-4 exception probe (docs/metal/plans/2026-07-17-kv-codec-step4-probe.md):
+    // round-trip BOTH sides of every attention layer through the turbo3
+    // quantizer EXCEPT the listed census cells (attn_idx*8 + head*2 + side),
+    // which stay clean fp16. n == 0 is the control arm (everything
+    // quantized). fp16-KV engines only; set before any tokens are encoded;
+    // not combinable with the step-2 rt flags.
+    void set_kv_attrib_except(const uint32_t* cells, size_t n);
     // True when Q27_METAL_KV_FP16_CELLS armed production fp16 exception
     // side caches on this engine. Snapshots carry the side rows (v2,
     // docs/metal/plans/2026-07-17-kv-except-snapshot-v2.md); the head masks are
@@ -328,6 +412,14 @@ class MetalEngine {
     uint32_t max_context_;
     bool turbo3_kv_;
     bool per_tensor_upload_ = false;
+    uint32_t kv_attrib_ = 0;
+    uint32_t kv_attrib_layer_ = UINT32_MAX;
+    uint32_t kv_attrib_head_ = UINT32_MAX;
+    uint32_t kv_attrib_flags_ = 0;
+    // Mode-3 per-attn-layer exception masks (bit = head*2 + side); rides
+    // the kernel's head argument at the attrib store call sites.
+    uint8_t kv_attrib_masks_[16] = {};
+    std::shared_ptr<BackendBuffer> kv_attrib_aux_;
     // Production KV fp16 exception cells
     // (docs/metal/plans/2026-07-17-kv-except-production.md): per masked head, a
     // kv_heads=1 fp16 side cache in the turbo3 WHT domain; the head's
@@ -352,6 +444,7 @@ class MetalEngine {
     // True only when MTP KV rows [0, position_) match the main-model state.
     bool mtp_cache_valid_ = false;
     SpecStats last_spec_stats_;
+    SuffixStats last_suffix_stats_;
     std::unordered_map<std::string, BackendTensor>& weights_;
     std::vector<LayerState> layers_;
 
@@ -393,7 +486,7 @@ class MetalEngine {
     std::vector<std::shared_ptr<BackendBuffer>> park_qkv_, park_g_, park_beta_;
     std::shared_ptr<BackendBuffer> discard_recurrent_, discard_ring_;
 
-    // The q4s contract requires the MTP layer; call sites still fail closed.
+    // Ternary artifacts (quant_policy bonsai-t2-v1) carry no MTP layer.
     bool has_mtp_ = true;
 
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);

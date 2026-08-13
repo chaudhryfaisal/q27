@@ -210,6 +210,7 @@ struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
 struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head, flags, scale_off; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
@@ -228,7 +229,10 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8;
     id<MTLComputePipelineState> q4;
     id<MTLComputePipelineState> t2;
+    id<MTLComputePipelineState> t3;
+    id<MTLComputePipelineState> b1;
     id<MTLComputePipelineState> t2_quantized_matmul_h;
+    id<MTLComputePipelineState> q4_quantized_matmul_h;
     id<MTLComputePipelineState> mask_logits_p;
     // Half-staging chunk GEMMs: default ON (T2 landed at 1.22x chunk rate at
     // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
@@ -236,19 +240,32 @@ struct MetalBackend::Impl {
     // reproduces the float-staged routes (used to attribute the kl-kv
     // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
     bool gemm_half = true;
+    // Q4 half port remains probe-only pending a valid quiet gate
+    // (2026-07-17-t2-prefill-throughput.md asks >=1.7x). The 0.855 run was
+    // forced with idle>=0 and is explicitly rejected in
+    // logs/q4port-20260717/QUIET_BENCH_EVIDENCE.md. Correctness-gated;
+    // never the default until a valid quiet run clears the ship line.
+    bool gemm_half_q4 = false;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
     id<MTLComputePipelineState> t2_quantized;
+    id<MTLComputePipelineState> b1_quantized;
+    id<MTLComputePipelineState> t2_quantized_x2;
+    id<MTLComputePipelineState> t2_x2;
     id<MTLComputePipelineState> f16_pair;
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
     id<MTLComputePipelineState> t2_quantized_matmul;
+    id<MTLComputePipelineState> b1_quantized_matmul;
     id<MTLComputePipelineState> embedding;
     id<MTLComputePipelineState> embedding_t2;
+    id<MTLComputePipelineState> embedding_b1;
     id<MTLComputePipelineState> embedding_dev;
     id<MTLComputePipelineState> embedding_t2_dev;
+    id<MTLComputePipelineState> embedding_b1_dev;
     id<MTLComputePipelineState> embedding_t2_rows;
+    id<MTLComputePipelineState> embedding_b1_rows;
     id<MTLComputePipelineState> rms;
     id<MTLComputePipelineState> rms_quantized;
     id<MTLComputePipelineState> rms_heads;
@@ -279,6 +296,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> rope_rows;
     id<MTLComputePipelineState> kv_store_rows;
     id<MTLComputePipelineState> kv_store_turbo3_rows;
+    id<MTLComputePipelineState> kv_store_attrib_rows;
+    id<MTLBuffer> attrib_dummy;
     id<MTLComputePipelineState> attention_causal;
     id<MTLComputePipelineState> attention_causal_win;
     id<MTLComputePipelineState> kv_store_head_rows;
@@ -293,7 +312,34 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
     id<MTLComputePipelineState> attention_gqa_merge_rows_p;
     // R1b token-tiled causal GQA (t2 = production route, t4 + hm = bench).
+    id<MTLComputePipelineState> attention_turbo3_gqa_hm_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_bf2_p;
+    id<MTLComputePipelineState> mma_roofline_a_p;
+    id<MTLComputePipelineState> mma_roofline_b_p;
+    id<MTLComputePipelineState> mma_roofline_b_eq_p;
+    id<MTLComputePipelineState> mma_roofline_cx_p;
+    id<MTLComputePipelineState> mma_roofline_f_p;
+    id<MTLComputePipelineState> b1_select_p;
+    id<MTLComputePipelineState> b1_signxor_p;
+    id<MTLComputePipelineState> b1_popcount_p;
+    id<MTLComputePipelineState> b1_x_prep_p;
+    // Q4-round retained comparison arm (bench-only): built on first
+    // matvec_q4_probe use (the roofline-k pattern), so production startup
+    // never creates it. r4 was promoted into q4_quantized; the q8 twin was
+    // killed by measurement (2026-07-17 round doc).
+    id<MTLComputePipelineState> q4_r2_p;
+    // B1 round-2 retained 8-row arm (bench-only): built on first
+    // matvec_b1r2_probe use, same lazy pattern as q4_r2_p above. The 4-row
+    // r2 arm was promoted into b1_quantized (2026-07-17 round).
+    id<MTLComputePipelineState> b1_r3_p;
+    // Arm K (function-constant probe): one specialized PSO per baked cols.
+    std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
+    id<MTLComputePipelineState> mm_dr_p;
+    id<MTLComputePipelineState> mm_dr2_p;
+    id<MTLComputePipelineState> x_to_half_t_p;
+    id<MTLBuffer> dr_xt_scratch;
     id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
@@ -627,11 +673,20 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
         impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
         impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
+        impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
+        impl_->b1 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_g128");
         impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
+        impl_->b1_select_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_select");
+        impl_->b1_signxor_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_signxor");
+        impl_->b1_popcount_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_popcount");
+        impl_->b1_x_prep_p = make_pipeline(impl_->device, impl_->library, @"q27_b1_x_prep");
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
         impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
+        impl_->b1_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_quantized");
+        impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
+        impl_->t2_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_x2");
         impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
@@ -640,14 +695,32 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+            // q27_matmul_q4_mm_h is probe-only pending its valid quiet gate
+            // and routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
+            // first use so production startup never compiles it (same pattern
+            // as the probe-only q4_r2_p/b1_r3_p PSOs).
+            impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
+            impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+            impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
+            impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
+            impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
+            impl_->mma_roofline_f_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_f");
+            impl_->mm_dr_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr");
+            impl_->mm_dr2_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr2");
+            impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+            if (const char* env = getenv("Q27_METAL_GEMM_HALF_Q4"); env && *env)
+                impl_->gemm_half_q4 = strtoul(env, nullptr, 10) != 0;
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
+        impl_->embedding_b1 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1");
         impl_->embedding_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_dev");
         impl_->embedding_t2_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_dev");
+        impl_->embedding_b1_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_dev");
         impl_->embedding_t2_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_rows");
+        impl_->embedding_b1_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_rows");
         impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
         impl_->rms_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_quantized");
         impl_->rms_heads = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_heads");
@@ -678,6 +751,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
         impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
         impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
+        impl_->kv_store_attrib_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_attrib_rows");
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
         impl_->attention_causal_win = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_win");
         impl_->kv_store_head_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_head_rows");
@@ -691,7 +765,10 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
         impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");
         impl_->attention_gqa_merge_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge_rows");
+        impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
         impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
+        impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
+        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2");
         impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
         if (const char* env = getenv("Q27_METAL_GQA_TILE"); env && *env) {
             const unsigned long tile = strtoul(env, nullptr, 10);
@@ -764,6 +841,7 @@ const char* MetalBackend::shader_abi_tag() { return kShaderAbiTag; }
 
 std::string MetalBackend::shader_source_sha1() const { return impl_->shader_hash; }
 bool MetalBackend::gemm_half_enabled() const { return impl_->gemm_half; }
+bool MetalBackend::gemm_half_q4_enabled() const { return impl_->gemm_half_q4; }
 uint32_t MetalBackend::gqa_tile() const { return impl_->gqa_tile; }
 uint32_t MetalBackend::gqa_block() const { return impl_->gqa_block; }
 uint32_t MetalBackend::gqa_threshold() const { return impl_->gqa_threshold; }
@@ -1019,6 +1097,8 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     MetalBuffer& output = metal_buffer(y);
     const uint64_t quant_group = weight.dtype == DType::Q8_G128 ? 128 :
                                  weight.dtype == DType::T2_G128 ? 128 :
+                                 weight.dtype == DType::T3_G128 ? 128 :
+                                 weight.dtype == DType::B1_G128 ? 128 :
                                  weight.dtype == DType::Q4_G64 ? 64 : 0;
     if (quant_group && weight.cols % quant_group)
         throw std::runtime_error("q27 Metal: matvec columns do not match quantization group");
@@ -1028,6 +1108,9 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (weight.dtype == DType::F16) data_bytes = checked_mul(elements, 2, "matvec weight");
     if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
     if (weight.dtype == DType::T2_G128) data_bytes /= 4;
+    if (weight.dtype == DType::T3_G128)
+        data_bytes = checked_mul(weight.rows, checked_mul(weight.cols / 128, 26, "matvec weight"), "matvec weight");
+    if (weight.dtype == DType::B1_G128) data_bytes /= 8;
     check_range(x.size(), 0, weight.cols * sizeof(float), "matvec input");
     check_range(y.size(), 0, weight.rows * sizeof(float), "matvec output");
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset, data_bytes, "matvec weight");
@@ -1039,9 +1122,8 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         case DType::Q8_G128: pipeline = impl_->q8; label = "q27_matvec_q8_g128"; break;
         case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
         case DType::T2_G128: pipeline = impl_->t2; label = "q27_matvec_t2_g128"; break;
-        case DType::T3_G128:
-        case DType::B1_G128:
-            throw std::runtime_error("q27 Metal: packed dtype is not supported by this backend");
+        case DType::T3_G128: pipeline = impl_->t3; label = "q27_matvec_t3_g128"; break;
+        case DType::B1_G128: pipeline = impl_->b1; label = "q27_matvec_b1_g128"; break;
     }
     const MetalBuffer* quant_scales = nullptr;
     if (quant_group) {
@@ -1069,8 +1151,10 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
             [encoder setBuffer:output.handle() offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         }
-        // T2 runs 4 rows per simdgroup (32 per threadgroup); others run 1 (8).
-        const NSUInteger row_groups = weight.dtype == DType::T2_G128
+        // T2/T3/B1 run 4 rows per simdgroup (32 per threadgroup); others 1 (8).
+        const bool ternary = weight.dtype == DType::T2_G128 || weight.dtype == DType::T3_G128 ||
+                             weight.dtype == DType::B1_G128;
+        const NSUInteger row_groups = ternary
             ? (NSUInteger)(weight.rows + 31) / 32 : (NSUInteger)(weight.rows + 7) / 8;
         [encoder dispatchThreadgroups:MTLSizeMake(row_groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1134,8 +1218,8 @@ void MetalBackend::quantize(const BackendBuffer& x, BackendQuantized& out) {
 void MetalBackend::matvec_quantized(const BackendTensor& weight,
                                      const BackendQuantized& x, BackendBuffer& y) {
     if ((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
-         weight.dtype!=DType::T2_G128) || !weight.data || !weight.scales)
-        throw std::runtime_error("q27 Metal: quantized matvec requires Q4/Q8/T2 weight");
+         weight.dtype!=DType::T2_G128 && weight.dtype!=DType::B1_G128) || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: quantized matvec requires Q4/Q8/T2/B1 weight");
     const uint64_t group=weight.dtype==DType::Q4_G64?64:128;
     if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
         weight.cols%group)
@@ -1145,7 +1229,8 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     check_range(y.size(),0,weight.rows*4,"quantized matvec output");
     const MetalBuffer& data=metal_buffer_view(weight.data); const MetalBuffer& ws=metal_buffer_view(weight.scales);
     const MetalBuffer& xv=metal_buffer_view(x.values); const MetalBuffer& xs=metal_buffer_view(x.scales); MetalBuffer& out=metal_buffer(y);
-    const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
+    const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+                           weight.dtype==DType::B1_G128?8:1;
     const uint64_t data_bytes=weight.rows*weight.cols/divisor;
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,data_bytes,"quantized matvec weight");
     check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matvec weight scales");
@@ -1154,19 +1239,96 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own,
             weight.dtype==DType::Q8_G128?"q27_matvec_q8_quantized":
-            weight.dtype==DType::T2_G128?"q27_matvec_t2_quantized":"q27_matvec_q4_quantized");
+            weight.dtype==DType::T2_G128?"q27_matvec_t2_quantized":
+            weight.dtype==DType::B1_G128?"q27_matvec_b1_quantized":"q27_matvec_q4_quantized");
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized:
-                                     weight.dtype==DType::T2_G128?impl_->t2_quantized:impl_->q4_quantized];
+                                     weight.dtype==DType::T2_G128?impl_->t2_quantized:
+                                     weight.dtype==DType::B1_G128?impl_->b1_quantized:impl_->q4_quantized];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        // Q4 runs its promoted 4-rows-per-simdgroup kernel; Q8/T2 keep one row.
-        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+        // Q4 and B1 run their promoted 4-rows-per-simdgroup kernels (32
+        // rows/group; q4 round + b1 select round 2, both 2026-07-17); the
+        // other dtypes keep 1 row/simdgroup.
+        const NSUInteger rpg = (weight.dtype==DType::Q4_G64 ||
+                                weight.dtype==DType::B1_G128) ? 32 : 8;
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized matvec");
     }
 }
+
+// N=2 slot-batched select-form T2 GEMV (multislot Phase 2 probe): the
+// float-activation production serial-decode path with two independent
+// activation/output buffer pairs. PARKED by measurement (2026-07-16):
+// aggregate s_k 1.093 vs the 1.31 decision line — bench-only reference
+// surface, never engine-routed.
+void MetalBackend::matvec_x2(const BackendTensor& weight,
+                             const BackendBuffer& x_a, const BackendBuffer& x_b,
+                             BackendBuffer& y_a, BackendBuffer& y_b) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    check_range(x_a.size(),0,weight.cols*sizeof(float),"x2 matvec input a");
+    check_range(x_b.size(),0,weight.cols*sizeof(float),"x2 matvec input b");
+    check_range(y_a.size(),0,weight.rows*sizeof(float),"x2 matvec output a");
+    check_range(y_b.size(),0,weight.rows*sizeof(float),"x2 matvec output b");
+    const MetalBuffer& data=metal_buffer_view(weight.data); const MetalBuffer& ws=metal_buffer_view(weight.scales);
+    const MetalBuffer& xa=metal_buffer(x_a); const MetalBuffer& xb=metal_buffer(x_b);
+    MetalBuffer& ya=metal_buffer(y_a); MetalBuffer& yb=metal_buffer(y_b);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_g128_x2");
+        [enc setComputePipelineState:impl_->t2_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xa.handle() offset:0 atIndex:2]; [enc setBuffer:xb.handle() offset:0 atIndex:3];
+        [enc setBuffer:ya.handle() offset:0 atIndex:4]; [enc setBuffer:yb.handle() offset:0 atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 matvec");
+    }
+}
+
+// N=2 slot-batched T2 GEMV (multislot Phase 2 probe): x carries two
+// activation rows ([2, cols] values, [2, cols/32] scales), out is token-
+// major [2, rows] — the matmul_quantized layouts at x_rows=2. Metal-only
+// surface (not on the Backend interface). PARKED by measurement
+// (2026-07-16, docs/plans/2026-07-16-multislot-phase2-probe.md): aggregate
+// s_k 1.093 vs the 1.31 decision line — bench-only reference surface,
+// never engine-routed.
+void MetalBackend::matvec_quantized_x2(const BackendTensor& weight,
+                                       const BackendQuantized& x, BackendBuffer& y) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    if ((uint64_t)x.count!=(uint64_t)weight.cols*2 || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec activation mismatch (needs 2 rows)");
+    check_range(y.size(),0,weight.rows*2*4,"x2 matvec output");
+    const MetalBuffer& data=metal_buffer_view(weight.data); const MetalBuffer& ws=metal_buffer_view(weight.scales);
+    const MetalBuffer& xv=metal_buffer_view(x.values); const MetalBuffer& xs=metal_buffer_view(x.scales); MetalBuffer& out=metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    check_range(xv.size(),0,x.count,"x2 matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"x2 matvec activation scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_quantized_x2");
+        [enc setComputePipelineState:impl_->t2_quantized_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 quantized matvec");
+    }
+}
+
 // Two independent packed-dot dispatches now beat a fused pair kernel: the
 // rewritten GEMV is weight-stream-bound, so sharing the (cached) activation
 // bytes buys nothing, while the fused kernel's doubled register pressure
@@ -1186,8 +1348,8 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         throw std::runtime_error("q27 Metal: quantized matmul requires Apple GPU family 7 or newer");
     }
     if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
-        weight.dtype!=DType::T2_G128) || !weight.data || !weight.scales)
-        throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8/T2 weight");
+        weight.dtype!=DType::T2_G128 && weight.dtype!=DType::B1_G128) || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8/T2/B1 weight");
     uint64_t group=weight.dtype==DType::Q4_G64?64:128;
     // Wide prefill chunks: the kernels tile tokens 16 per threadgroup on
     // grid.y (docs/plans/2026-07-15-wide-chunks.md phase A). 96 = 8x12.
@@ -1197,20 +1359,37 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     check_range(y.size(),0,weight.rows*x_rows*4,"quantized matmul output");
     const MetalBuffer& data=metal_buffer_view(weight.data); const MetalBuffer& ws=metal_buffer_view(weight.scales);
     const MetalBuffer& xv=metal_buffer_view(x.values); const MetalBuffer& xs=metal_buffer_view(x.scales); MetalBuffer& out=metal_buffer(y);
-    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
+    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+                     weight.dtype==DType::B1_G128?8:1;
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/divisor,"quantized matmul weight");
     check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matmul weight scales");
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
-        // Q27_METAL_GEMM_HALF controls the production T2 half-staging GEMM.
-        // Q4 and Q8 stay on their validated float-staged kernels.
+        // Q27_METAL_GEMM_HALF=1: half-staging T2 GEMM (A/B lever, see
+        // docs/plans/2026-07-15-gemm-half-staging.md). Q4's half twin is
+        // correctness-gated but default-off pending its valid >=1.7x quiet
+        // ship-line run (QUIET_BENCH_EVIDENCE.md rejects the idle>=0 run);
+        // Q27_METAL_GEMM_HALF_Q4=1 routes it for re-measurement only. Q8
+        // stays on the float-staged kernel: its half variant failed the
+        // shape suite (5.5e-4 at the high-cancellation 33x5120 repro vs the
+        // 3e-4 bound) because half-operand MMA products up to 127*127 round
+        // past half's 2048 exact-integer range — the parked
+        // q27_matmul_q8_mm_h records the attempt.
         const bool h = impl_->gemm_half;
+        const bool h4 = impl_->gemm_half_q4;
+        if (h4 && !impl_->q4_quantized_matmul_h)
+            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library,
+                                                         @"q27_matmul_q4_mm_h");
         bool own; auto enc=impl_->encoder_for_operation(own,
             weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
-            weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):"q27_matmul_q4_mm");
+            weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
+            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":
+            (h4?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
-                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):impl_->q4_quantized_matmul];
+                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
+                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:
+                                     (h4?impl_->q4_quantized_matmul_h:impl_->q4_quantized_matmul)];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
@@ -1218,10 +1397,399 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         if(own) impl_->finish_command("quantized simdgroup matmul");
     }
 }
+
+// A/B/C MMA roofline probe entries (bench-only, docs/plans/2026-07-16-mma-
+// roofline.md): same dispatch grid and MatmulArgs as the production T2
+// GEMM. Arm 'b' takes half operands + half weight scales + float
+// activation scales; arm 'a' takes only the opaque tile seed. Never
+// engine-routed.
+void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t x_rows,
+                                const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
+                                const BackendBuffer* x, const BackendBuffer* x_scales,
+                                BackendBuffer& y) {
+    if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
+        throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
+    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2' &&
+         arm != 'f' && arm != 'k') || !rows || !cols ||
+        !x_rows || x_rows > 96 || cols % 128)
+        throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
+    // Arms 'f' (f16-accumulate, docs/plans/2026-07-16-f16acc-probe.md) and
+    // 'k' (function-constant cols baking, BaseRT survey probe 2): the
+    // production mm_h operands and grid; 'k' resolves a per-cols
+    // specialized PSO on first use.
+    if (arm == 'f' || arm == 'k') {
+        if (arm == 'k' && !impl_->mma_roofline_k_p.count(cols)) {
+            MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+            [fc setConstantValue:&cols type:MTLDataTypeUInt atIndex:0];
+            NSError* err = nil;
+            id<MTLFunction> fn = [impl_->library newFunctionWithName:@"q27_mma_roofline_k"
+                                                      constantValues:fc
+                                                               error:&err];
+            id<MTLComputePipelineState> pso =
+                fn ? [impl_->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!pso)
+                throw std::runtime_error(std::string("q27 Metal: roofline k specialization failed: ") +
+                                         (err ? err.localizedDescription.UTF8String : "unknown"));
+            impl_->mma_roofline_k_p[cols] = pso;
+        }
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm f needs scales and activations");
+        const MetalBuffer& wb = metal_buffer(w_or_seed);
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        MetalBuffer& out = metal_buffer(y);
+        check_range(wb.size(), 0, (uint64_t)rows * cols / 4, "roofline f weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline f weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols, "roofline f activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline f activation scales");
+        check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline f output");
+        MatmulArgs args{rows, cols, x_rows, 1};
+        @autoreleasepool {
+            bool own;
+            auto enc = impl_->encoder_for_operation(
+                own, arm == 'k' ? "q27_mma_roofline_k" : "q27_mma_roofline_f");
+            [enc setComputePipelineState:arm == 'k' ? impl_->mma_roofline_k_p[cols]
+                                                    : impl_->mma_roofline_f_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:xb.handle() offset:0 atIndex:2];
+            [enc setBuffer:xs.handle() offset:0 atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32,
+                                                  (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command(arm == 'k' ? "mma roofline k" : "mma roofline f");
+        }
+        return;
+    }
+    // Arm 'd' — lever 1 direct-RHS probe (docs/plans/2026-07-16-lever1-
+    // direct-rhs.md): w_or_seed = packed T2 weight bytes, x = int8
+    // activation values, x_scales = float per-32 scales. Encodes the RHS
+    // pre-pass (int8 -> K-major half, charged to this arm) and the 64x32
+    // direct-RHS GEMM.
+    if (arm == 'd' || arm == '2') {
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm d needs scales and activations");
+        const MetalBuffer& wb = metal_buffer(w_or_seed);
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        MetalBuffer& out = metal_buffer(y);
+        check_range(wb.size(), 0, (uint64_t)rows * cols / 4, "roofline d weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline d weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols, "roofline d activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline d activation scales");
+        check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline d output");
+        const uint32_t tokens_pad = (x_rows + 7) / 8 * 8;
+        const uint64_t xt_bytes = (uint64_t)cols * tokens_pad * 2;
+        if (!impl_->dr_xt_scratch || impl_->dr_xt_scratch.length < xt_bytes)
+            impl_->dr_xt_scratch = [impl_->device newBufferWithLength:(NSUInteger)xt_bytes
+                                                              options:MTLResourceStorageModePrivate];
+        if (!impl_->dr_xt_scratch) throw std::runtime_error("q27 Metal: dr xT allocation failed");
+        MatmulArgs args{rows, cols, x_rows, tokens_pad};
+        @autoreleasepool {
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_matmul_t2_mm_dr");
+            [enc setComputePipelineState:impl_->x_to_half_t_p];
+            [enc setBuffer:xb.handle() offset:0 atIndex:0];
+            [enc setBuffer:impl_->dr_xt_scratch offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            const uint64_t pre_threads = (uint64_t)cols * tokens_pad;
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((pre_threads + 255) / 256), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            // The GEMM reads the xT the pre-pass wrote, ordered by default
+            // per-resource hazard tracking rather than the encoder.
+            [enc setComputePipelineState:arm == '2' ? impl_->mm_dr2_p : impl_->mm_dr_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:impl_->dr_xt_scratch offset:0 atIndex:2];
+            [enc setBuffer:xs.handle() offset:0 atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 63) / 64,
+                                                  (NSUInteger)(x_rows + (arm == '2' ? 15 : 31)) /
+                                                      (arm == '2' ? 16 : 32), 1)
+                threadsPerThreadgroup:MTLSizeMake(arm == '2' ? 128 : 256, 1, 1)];
+            if (own) impl_->finish_command("mm direct-rhs probe");
+        }
+        return;
+    }
+    const MetalBuffer& wb = metal_buffer(w_or_seed);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline output");
+    MatmulArgs args{rows, cols, x_rows, 1};
+    @autoreleasepool {
+        if (arm == 'a') {
+            check_range(wb.size(), 0, (32 * 64 + 64 * 16) * 2, "roofline seed");
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_a");
+            [enc setComputePipelineState:impl_->mma_roofline_a_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:out.handle() offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command("mma roofline a");
+            return;
+        }
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm b needs scales and activations");
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        // 'e' (equal-traffic) reads C's device byte volume: cols/8 halves per
+        // weight row, cols/2 halves per activation row. 'x' (pre-converted
+        // activations) reads C's packed T2 weight bytes and full half
+        // activations.
+        const uint64_t wbytes = arm == 'e' ? (uint64_t)rows * (cols / 8) * 2
+                              : arm == 'x' ? (uint64_t)rows * cols / 4
+                                           : (uint64_t)rows * cols * 2;
+        const uint64_t xdiv = arm == 'e' ? 2 : 1;
+        check_range(wb.size(), 0, wbytes, "roofline b weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline b weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * (cols / xdiv) * 2, "roofline b activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline b activation scales");
+        bool own; auto enc = impl_->encoder_for_operation(own,
+            arm == 'e' ? "q27_mma_roofline_b_eq" :
+            arm == 'x' ? "q27_mma_roofline_cx" : "q27_mma_roofline_b");
+        [enc setComputePipelineState:arm == 'e' ? impl_->mma_roofline_b_eq_p :
+                                     arm == 'x' ? impl_->mma_roofline_cx_p
+                                                : impl_->mma_roofline_b_p];
+        [enc setBuffer:wb.handle() offset:0 atIndex:0];
+        [enc setBuffer:ws.handle() offset:0 atIndex:1];
+        [enc setBuffer:xb.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (own) impl_->finish_command("mma roofline b");
+    }
+}
+
+// B1 Phase 0B probe (bench-only): raw bits/scales buffers, no DType.
+// Candidate 3 encodes its activation preprocess and the dot on the same
+// serial encoder, so a timed dispatch always pays the preprocessing (the
+// plan's kill rule: a candidate that wins only with preprocessing excluded
+// is a kill).
+void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
+                                   const BackendBuffer& bits, const BackendBuffer& scales,
+                                   const BackendBuffer& x, BackendBuffer* scratch,
+                                   BackendBuffer& y) {
+    if (candidate < 1 || candidate > 3 || !rows || !cols || cols % 128)
+        throw std::runtime_error("q27 Metal: invalid b1 probe arguments");
+    const uint32_t nb = cols / 128;
+    const MetalBuffer& wb = metal_buffer(bits);
+    const MetalBuffer& ws = metal_buffer(scales);
+    const MetalBuffer& xb = metal_buffer(x);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(wb.size(), 0, (uint64_t)rows * cols / 8, "b1 probe bits");
+    check_range(ws.size(), 0, (uint64_t)rows * nb * 2, "b1 probe scales");
+    check_range(xb.size(), 0, (uint64_t)cols * 4, "b1 probe activations");
+    check_range(out.size(), 0, (uint64_t)rows * 4, "b1 probe output");
+    MatvecArgs args{rows, cols};
+    @autoreleasepool {
+        if (candidate == 3) {
+            if (!scratch) throw std::runtime_error("q27 Metal: b1 popcount needs scratch");
+            MetalBuffer& sb = metal_buffer(*scratch);
+            // planes: nb*32 uints; aux: nb float2, aux base kept 8-aligned.
+            const uint64_t planes_bytes = (uint64_t)nb * 32 * 4;
+            check_range(sb.size(), 0, planes_bytes + (uint64_t)nb * 8, "b1 probe scratch");
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_matvec_b1_popcount");
+            [enc setComputePipelineState:impl_->b1_x_prep_p];
+            [enc setBuffer:xb.handle() offset:0 atIndex:0];
+            [enc setBuffer:sb.handle() offset:0 atIndex:1];
+            [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:2];
+            [enc setBytes:&args length:sizeof(args) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            // The dot reads what the preprocess wrote, ordered by default
+            // per-resource hazard tracking rather than the encoder.
+            [enc setComputePipelineState:impl_->b1_popcount_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:sb.handle() offset:0 atIndex:2];
+            [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 7) / 8, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (own) impl_->finish_command("b1 popcount probe");
+            return;
+        }
+        const bool sel = candidate == 1;
+        bool own; auto enc = impl_->encoder_for_operation(
+            own, sel ? "q27_matvec_b1_select" : "q27_matvec_b1_signxor");
+        [enc setComputePipelineState:sel ? impl_->b1_select_p : impl_->b1_signxor_p];
+        [enc setBuffer:wb.handle() offset:0 atIndex:0];
+        [enc setBuffer:ws.handle() offset:0 atIndex:1];
+        [enc setBuffer:xb.handle() offset:0 atIndex:2];
+        [enc setBuffer:out.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command(sel ? "b1 select probe" : "b1 signxor probe");
+    }
+}
+
+// Q4 rewrite-round candidate arms (bench-only, docs/plans/2026-07-17-q4-
+// rewrite-round.md): the production quantized-matvec validation, then
+// candidate routing. Candidate 1 re-dispatches the production PSO so the
+// bench's A/B runs one code path; 2/3 are the Q4 multi-row arms, 4 the Q8
+// twin. Candidate PSOs build lazily on first use (the roofline-k pattern) —
+// production startup never creates them. Never engine-routed.
+void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
+                                   const BackendQuantized& x, BackendBuffer& y) {
+    if (candidate < 1 || candidate > 4)
+        throw std::runtime_error("q27 Metal: invalid q4 probe candidate");
+    if ((weight.dtype != DType::Q4_G64 && weight.dtype != DType::Q8_G128) ||
+        !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: q4 probe requires Q4/Q8 weight");
+    if ((candidate == 2 || candidate == 3) && weight.dtype != DType::Q4_G64)
+        throw std::runtime_error("q27 Metal: q4 probe candidates 2-3 require Q4_G64");
+    if (candidate == 4 && weight.dtype != DType::Q8_G128)
+        throw std::runtime_error("q27 Metal: q4 probe candidate 4 requires Q8_G128");
+    const uint64_t group = weight.dtype == DType::Q4_G64 ? 64 : 128;
+    if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
+        weight.cols % group)
+        throw std::runtime_error("q27 Metal: invalid q4 probe dimensions");
+    if (x.count != weight.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: q4 probe activation mismatch");
+    check_range(y.size(), 0, weight.rows * 4, "q4 probe output");
+    const MetalBuffer& data = metal_buffer_view(weight.data);
+    const MetalBuffer& ws = metal_buffer_view(weight.scales);
+    const MetalBuffer& xv = metal_buffer_view(x.values);
+    const MetalBuffer& xs = metal_buffer_view(x.scales);
+    MetalBuffer& out = metal_buffer(y);
+    const uint64_t data_bytes = weight.rows * weight.cols /
+                                (weight.dtype == DType::Q4_G64 ? 2 : 1);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size),
+                weight.data_offset, data_bytes, "q4 probe weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size),
+                weight.scales_offset, weight.rows * (weight.cols / group) * 2,
+                "q4 probe weight scales");
+    check_range(xv.size(), 0, x.count, "q4 probe values");
+    check_range(xs.size(), 0, (uint64_t)(x.count / 32) * 4, "q4 probe activation scales");
+    const bool q8 = weight.dtype == DType::Q8_G128;
+    id<MTLComputePipelineState> pso = nil;
+    const char* label = nullptr;
+    switch (candidate) {
+        case 1:
+            pso = q8 ? impl_->q8_quantized : impl_->q4_quantized;
+            label = q8 ? "q27_matvec_q8_quantized" : "q27_matvec_q4_quantized";
+            break;
+        case 2:
+            if (!impl_->q4_r2_p)
+                impl_->q4_r2_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_q4_quantized_r2");
+            pso = impl_->q4_r2_p;
+            label = "q27_matvec_q4_quantized_r2";
+            break;
+        case 3:
+            // r4 was PROMOTED into the production kernel (q4 round
+            // 2026-07-17) — alias so recorded A/B invocations keep working.
+            pso = impl_->q4_quantized;
+            label = "q27_matvec_q4_quantized";
+            break;
+        default:
+            throw std::runtime_error("q27 Metal: q4 probe candidate 4 (q8 r4 twin) was "
+                "KILLED by measurement — regressed the head shape "
+                "(docs/plans/2026-07-17-q4-rewrite-round.md RESULTS)");
+    }
+    // Rows per 256-thread group: post-promotion Q4 production runs 4 rows
+    // per simdgroup (32/group); Q8 production and legacy stay 1 (8/group).
+    const uint32_t rows_per_group = candidate == 2 ? 16 : q8 ? 8 : 32;
+    MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, label);
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("q4 probe");
+    }
+}
+
+// B1 select round-2 candidate arms (bench-only, docs/plans/2026-07-17-b1-
+// select-round2.md): validation as matvec_quantized, then candidate
+// routing. Candidate 1 re-dispatches the production PSO so the bench's A/B
+// runs one code path; 2/3 are the multi-row arms. Candidate PSOs build
+// lazily on first use (the roofline-k pattern) — production startup never
+// creates them. Never engine-routed.
+void MetalBackend::matvec_b1r2_probe(int candidate, const BackendTensor& weight,
+                                     const BackendQuantized& x, BackendBuffer& y) {
+    if (candidate < 1 || candidate > 3)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe candidate");
+    if (weight.dtype != DType::B1_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe requires B1_G128 weight");
+    if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX ||
+        weight.cols > UINT32_MAX || weight.cols % 128)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe dimensions");
+    if (x.count != weight.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe activation mismatch");
+    check_range(y.size(), 0, weight.rows * 4, "b1 r2 probe output");
+    const MetalBuffer& data = metal_buffer_view(weight.data);
+    const MetalBuffer& ws = metal_buffer_view(weight.scales);
+    const MetalBuffer& xv = metal_buffer_view(x.values);
+    const MetalBuffer& xs = metal_buffer_view(x.scales);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size),
+                weight.data_offset, weight.rows * weight.cols / 8, "b1 r2 probe weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size),
+                weight.scales_offset, weight.rows * (weight.cols / 128) * 2,
+                "b1 r2 probe weight scales");
+    check_range(xv.size(), 0, x.count, "b1 r2 probe values");
+    check_range(xs.size(), 0, (uint64_t)(x.count / 32) * 4, "b1 r2 probe activation scales");
+    id<MTLComputePipelineState> pso = nil;
+    const char* label = nullptr;
+    switch (candidate) {
+        case 1:
+        case 2:
+            // r2 was PROMOTED into the production kernel (b1 round 2,
+            // 2026-07-17) — candidate 2 aliases it so recorded A/B
+            // invocations keep working.
+            pso = impl_->b1_quantized;
+            label = "q27_matvec_b1_quantized";
+            break;
+        default:
+            if (!impl_->b1_r3_p)
+                impl_->b1_r3_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_b1_quantized_r3");
+            pso = impl_->b1_r3_p;
+            label = "q27_matvec_b1_quantized_r3";
+            break;
+    }
+    // Rows per 256-thread group: post-promotion production runs 4 rows per
+    // simdgroup (32/group); r3 runs 8 (64/group).
+    const uint32_t rows_per_group = candidate == 3 ? 64 : 32;
+    MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, label);
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("b1 r2 probe");
+    }
+}
+
 void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
                                  BackendBuffer& out) {
     const bool t2 = weight.dtype == DType::T2_G128;
-    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
+    const bool b1 = weight.dtype == DType::B1_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2 && !b1) || !weight.data || !weight.scales ||
         token >= weight.rows ||
         !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
         weight.cols % 128)
@@ -1230,14 +1798,15 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
     const MetalBuffer& data = metal_buffer_view(weight.data);
     const MetalBuffer& scales = metal_buffer_view(weight.scales);
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
-                weight.rows * weight.cols / (t2 ? 4 : 1), "embedding weight");
+                weight.rows * weight.cols / (t2 ? 4 : b1 ? 8 : 1), "embedding weight");
     check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,
                 weight.rows * (weight.cols / 128) * 2, "embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
         bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own,
-            t2 ? "q27_embedding_t2" : "q27_embedding_q8");
-        [enc setComputePipelineState:t2 ? impl_->embedding_t2 : impl_->embedding];
+            t2 ? "q27_embedding_t2" : b1 ? "q27_embedding_b1" : "q27_embedding_q8");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2 :
+                                     b1 ? impl_->embedding_b1 : impl_->embedding];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
@@ -1256,7 +1825,8 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
 void MetalBackend::embedding_from_device(const BackendTensor& weight, const BackendBuffer& token,
                                          BackendBuffer& out) {
     const bool t2 = weight.dtype == DType::T2_G128;
-    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
+    const bool b1 = weight.dtype == DType::B1_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2 && !b1) || !weight.data || !weight.scales ||
         !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
         weight.cols % 128)
         throw std::runtime_error("q27 Metal: invalid embedding tensor");
@@ -1266,14 +1836,15 @@ void MetalBackend::embedding_from_device(const BackendTensor& weight, const Back
     const MetalBuffer& data = metal_buffer_view(weight.data);
     const MetalBuffer& scales = metal_buffer_view(weight.scales);
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
-                weight.rows * weight.cols / (t2 ? 4 : 1), "embedding weight");
+                weight.rows * weight.cols / (t2 ? 4 : b1 ? 8 : 1), "embedding weight");
     check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,
                 weight.rows * (weight.cols / 128) * 2, "embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
         bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own,
-            t2 ? "q27_embedding_t2_dev" : "q27_embedding_q8_dev");
-        [enc setComputePipelineState:t2 ? impl_->embedding_t2_dev : impl_->embedding_dev];
+            t2 ? "q27_embedding_t2_dev" : b1 ? "q27_embedding_b1_dev" : "q27_embedding_q8_dev");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2_dev :
+                                     b1 ? impl_->embedding_b1_dev : impl_->embedding_dev];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
@@ -1616,6 +2187,171 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
     }
 }
 
+// Phase-0 R1 probe: same dispatch shape as the GQA decode path, head-major
+// cache addressing. The merge kernel is reused unchanged (partials layout is
+// identical); its AttentionGqaArgs is built alongside the probe args.
+void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32_t q_stride,
+                                                  const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                                  BackendBuffer& out, uint32_t seq_len, uint32_t seq_cap,
+                                                  uint32_t q_heads, uint32_t kv_heads,
+                                                  uint32_t head_dim, float scale,
+                                                  BackendBuffer& partials) {
+    const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
+    if (!seq_len || seq_len > seq_cap || !kv_heads || q_heads % kv_heads ||
+        head_dim != 256 || gqa < 2 || gqa > 8)
+        throw std::runtime_error("q27 Metal: invalid head-major probe dimensions");
+    const MetalBuffer& qb = metal_buffer(q);
+    const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& output = metal_buffer(out);
+    check_range(qb.size(), 0, ((uint64_t)(q_heads - 1) * q_stride + head_dim) * 4, "hm probe Q");
+    const uint64_t cache_bytes = (uint64_t)seq_cap * kv_heads * 100;
+    check_range(kc.size(), 0, cache_bytes, "hm probe K cache");
+    check_range(vc.size(), 0, cache_bytes, "hm probe V cache");
+    check_range(output.size(), 0, (uint64_t)q_heads * head_dim * 4, "hm probe output");
+    const uint32_t block = impl_->gqa_block;
+    const uint32_t n_blocks = 1 + (seq_len - 1) / block;
+    const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "hm probe partials");
+    struct HmArgs { uint32_t q_stride, seq_len, seq_cap, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
+    HmArgs args{q_stride, seq_len, seq_cap, q_heads, kv_heads, head_dim, block, n_blocks, scale};
+    AttentionGqaArgs margs{q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_gqa_hm");
+        [enc setComputePipelineState:impl_->attention_turbo3_gqa_hm_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        id<MTLResource> partial_resources[] = { gqa_partials.handle() };
+        [enc memoryBarrierWithResources:partial_resources count:1];
+        [enc setComputePipelineState:impl_->attention_gqa_merge_p];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&margs length:sizeof(margs) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (own) impl_->finish_command("hm probe attention");
+    }
+}
+
+// Phase-0 R1b probe: token-tiled causal GQA at tile 2 or 4. Interleaved
+// production cache layout; merge kernel reused unchanged.
+// R3 probe entry (bench-only): barrier-free direct-read block-partial causal
+// GQA, token factor 2, with an explicit block-size override — the sweep is
+// the experiment (docs/plans/2026-07-16-r3-barrier-free-attention.md). At
+// block == gqa_block the output is bit-identical to the t2 route.
+void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32_t q_stride,
+                                                  uint32_t q_row_stride,
+                                                  const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                                  BackendBuffer& out, uint32_t base_len,
+                                                  uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                                  uint32_t tokens, uint32_t block, float scale,
+                                                  BackendBuffer& partials) {
+    const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
+    if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
+        gqa < 2 || gqa > 8 || !block || block % 8 ||
+        base_len > UINT32_MAX - tokens)
+        throw std::runtime_error("q27 Metal: invalid bf probe dimensions");
+    const MetalBuffer& qb = metal_buffer(q);
+    const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens - 1) * q_row_stride + (uint64_t)(q_heads - 1) * q_stride + head_dim) * 4,
+                "bf probe Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    check_range(kc.size(), 0, cache_bytes, "bf probe K cache");
+    check_range(vc.size(), 0, cache_bytes, "bf probe V cache");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "bf probe output");
+    const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
+    const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "bf probe partials");
+    AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
+                                head_dim, block, n_blocks_max, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal_gqa_bf2");
+        [enc setComputePipelineState:impl_->attention_turbo3_causal_gqa_bf2_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        id<MTLResource> partial_resources[] = { gqa_partials.handle() };
+        [enc memoryBarrierWithResources:partial_resources count:1];
+        [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (own) impl_->finish_command("bf probe attention");
+    }
+}
+
+void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
+                                                     uint32_t q_row_stride,
+                                                     const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                                     BackendBuffer& out, uint32_t base_len,
+                                                     uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                                     uint32_t tokens, uint32_t tile, float scale,
+                                                     BackendBuffer& partials) {
+    const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
+    if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
+        gqa < 2 || gqa > 8 || (tile != 2 && tile != 4) ||
+        base_len > UINT32_MAX - tokens)
+        throw std::runtime_error("q27 Metal: invalid tiled probe dimensions");
+    const MetalBuffer& qb = metal_buffer(q);
+    const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens - 1) * q_row_stride + (uint64_t)(q_heads - 1) * q_stride + head_dim) * 4,
+                "tiled probe Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    check_range(kc.size(), 0, cache_bytes, "tiled probe K cache");
+    check_range(vc.size(), 0, cache_bytes, "tiled probe V cache");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "tiled probe output");
+    const uint32_t block = impl_->gqa_block;
+    const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
+    const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "tiled probe partials");
+    AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
+                                head_dim, block, n_blocks_max, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own,
+            tile == 2 ? "q27_attention_turbo3_causal_gqa_t2" : "q27_attention_turbo3_causal_gqa_t4");
+        [enc setComputePipelineState:tile == 2 ? impl_->attention_turbo3_causal_gqa_t2_p
+                                               : impl_->attention_turbo3_causal_gqa_t4_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + tile - 1) / tile)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        id<MTLResource> partial_resources[] = { gqa_partials.handle() };
+        [enc memoryBarrierWithResources:partial_resources count:1];
+        [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (own) impl_->finish_command("tiled probe attention");
+    }
+}
+
 void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                   BackendBuffer& out, uint32_t seq_len,
@@ -1719,7 +2455,8 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
     if (!tokens || !count || count > 96)
         throw std::runtime_error("q27 Metal: chunked embedding requires 1..96 tokens");
     const bool t2 = weight.dtype == DType::T2_G128;
-    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
+    const bool b1 = weight.dtype == DType::B1_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2 && !b1) || !weight.data || !weight.scales ||
         !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
         weight.cols % 128)
         throw std::runtime_error("q27 Metal: invalid chunked embedding tensor");
@@ -1732,13 +2469,14 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
     const MetalBuffer& data = metal_buffer_view(weight.data);
     const MetalBuffer& scales = metal_buffer_view(weight.scales);
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
-                weight.rows * weight.cols / (t2 ? 4 : 1), "chunked embedding weight");
+                weight.rows * weight.cols / (t2 ? 4 : b1 ? 8 : 1), "chunked embedding weight");
     check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own,
-            t2 ? "q27_embedding_t2_rows" : "q27_embedding_q8_rows");
-        [enc setComputePipelineState:t2 ? impl_->embedding_t2_rows : impl_->embedding_rows];
+            t2 ? "q27_embedding_t2_rows" : b1 ? "q27_embedding_b1_rows" : "q27_embedding_q8_rows");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2_rows :
+                                     b1 ? impl_->embedding_b1_rows : impl_->embedding_rows];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
@@ -2113,6 +2851,69 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
                 threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
         if (own) impl_->finish_command("chunked turbo3 KV store");
+    }
+}
+
+void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                            BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                            uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                            uint32_t mode, uint32_t head, uint32_t flags,
+                                            uint32_t scale_off, BackendBuffer* aux) {
+    if (!kv_heads || !tokens || tokens > 96)
+        throw std::runtime_error("q27 Metal: invalid KV attribution store");
+    if (mode != 1 && mode != 2 && mode != 3 && mode != 4)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), 3 (except-mask), or 4 (e4m3 both sides)");
+    if (mode == 3) {
+        // Exception mode: head carries the per-layer (head, side) bitmask
+        // (bit = head*2 + side); flags modifiers are side-arm-only.
+        if (head > 0xffu)
+            throw std::runtime_error("q27 Metal: KV exception mask out of range");
+        if (flags)
+            throw std::runtime_error("q27 Metal: KV exception mode takes no round-trip flags");
+    } else if (mode == 4) {
+        // fp8 control arm: head is ignored, no turbo3 scale to modify.
+        if (flags)
+            throw std::runtime_error("q27 Metal: KV e4m3 mode takes no round-trip flags");
+    } else if (head != UINT32_MAX && head >= kv_heads)
+        throw std::runtime_error("q27 Metal: KV attribution head out of range");
+    if (flags & ~7u)
+        throw std::runtime_error("q27 Metal: unknown KV attribution flags");
+    const bool needs_aux = (flags & 6u) != 0;   // FEATURE or STATS
+    if (needs_aux && !aux)
+        throw std::runtime_error("q27 Metal: KV attribution flags need an aux buffer");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
+    const uint64_t row_floats = (uint64_t)kv_heads * 256;
+    check_range(kb.size(), 0, row_floats * tokens * 4, "attrib K rows");
+    check_range(vb.size(), 0, row_floats * tokens * 4, "attrib V rows");
+    check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
+    check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
+    if (needs_aux) {
+        // Highest index the kernel touches for this layer: the V side's
+        // slice at this scale_off, not the layer offset added to both full
+        // side regions.
+        const uint64_t need = ((uint64_t)scale_off + 16384 + (uint64_t)kv_heads * 256) * 4;
+        check_range(metal_buffer(*aux).size(), 0, need, "attrib aux");
+    }
+    // buffer(5) must always be bound; a 4-byte dummy covers flag-free calls.
+    if (!aux && !impl_->attrib_dummy) {
+        impl_->attrib_dummy = [impl_->device newBufferWithLength:4
+                                                         options:MTLResourceStorageModePrivate];
+        if (!impl_->attrib_dummy)
+            throw std::runtime_error("q27 Metal: cannot allocate attribution dummy buffer");
+    }
+    TurboAttribArgs args{position, kv_heads, tokens, mode, head, flags, scale_off};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_attrib_rows");
+        [enc setComputePipelineState:impl_->kv_store_attrib_rows];
+        [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        if (aux) [enc setBuffer:metal_buffer(*aux).handle() offset:0 atIndex:5];
+        else [enc setBuffer:impl_->attrib_dummy offset:0 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
+                threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
+        if (own) impl_->finish_command("KV attribution store");
     }
 }
 

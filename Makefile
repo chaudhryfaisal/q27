@@ -201,7 +201,8 @@ build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
 
 test-metal-contracts: build/test_metal_engine_contracts build/test_metal_model_contracts build/test_metal_stream
 	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
-	./build/test_metal_engine_contracts "$(MODEL)"
+	@test -n "$(BONSAI_MODEL)" || { echo "set BONSAI_MODEL=...bonsai-t2.q27" >&2; exit 2; }
+	./build/test_metal_engine_contracts "$(MODEL)" "$(BONSAI_MODEL)"
 	./build/test_metal_model_contracts "$(MODEL)"
 	./build/test_metal_stream
 
