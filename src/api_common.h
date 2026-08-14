@@ -241,16 +241,33 @@ inline std::string strip_ctrl(std::string s) {
     return s;
 }
 
+inline bool tool_dialect_xml() {
+    const char* d = getenv("Q27_TOOL_DIALECT");
+    return d && !strcmp(d, "xml");
+}
+// Q27_TOOL_DIALECT=xml swaps the calling instruction for the dialect the
+// checkpoint was trained on (see parse_native_xml_call above). Default stays
+// JSON: 3.6 complied with it well, and the A/B that would justify flipping the
+// default is exactly what this knob exists to run.
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-
     // authored) description strings -- same forgery surface as message
     // content (review 2026-07-09 P1 #5)
     for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
-    s += "\n</tools>\n\nFor each function call, return a JSON object with the function name "
-         "and arguments inside <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": "
-         "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n"
-         "- Required parameters MUST be specified.\n- You may provide optional reasoning "
+    s += "\n</tools>\n\n";
+    if (tool_dialect_xml())
+        s += "For each function call, emit it inside <tool_call></tool_call> tags "
+             "using this exact format with NO suffix:\n\n<tool_call>\n"
+             "<function=example_function_name>\n"
+             "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+             "<parameter=example_parameter_2>\nmulti-line values are\nallowed\n</parameter>\n"
+             "</function>\n</tool_call>\n\n<IMPORTANT>\n";
+    else
+        s += "For each function call, return a JSON object with the function name "
+             "and arguments inside <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": "
+             "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n";
+    s += "- Required parameters MUST be specified.\n- You may provide optional reasoning "
          "before the function call, but never after it.\n- If no function call is needed, "
          "answer normally and do not mention the tool interface.\n</IMPORTANT>";
     return s;
@@ -2037,6 +2054,51 @@ inline bool tool_strict() {
     return v == 1;
 }
 
+// NATIVE XML TOOL DIALECT (2026-08-14). Qwen3.8's chat template trains
+//   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>...\n</function>\n</tool_call>
+// while tools_preamble historically instructed JSON-in-<tool_call>. The 3.8
+// drift catalogue (modes 14-16) is the model reverting to this trained form
+// under a JSON instruction; parsing the well-formed dialect first-class treats
+// the cause rather than the symptoms. Value typing follows the template's own
+// serialization: non-strings are written with tojson, so a value that parses
+// as non-string JSON is used parsed, anything else stays a raw string.
+inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
+    size_t b = seg.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos || seg.compare(b, 10, "<function=") != 0) return false;
+    size_t ns = b + 10;
+    size_t ne = seg.find('>', ns);
+    if (ne == std::string::npos) return false;
+    tc.name = seg.substr(ns, ne - ns);
+    if (tc.name.empty()) return false;
+    tc.arguments = json::object();
+    size_t p = ne + 1;
+    static const std::string PO = "<parameter=", PC = "</parameter>";
+    while (true) {
+        size_t ps = seg.find(PO, p);
+        if (ps == std::string::npos) break;
+        size_t ks = ps + PO.size();
+        size_t ke = seg.find('>', ks);
+        if (ke == std::string::npos) return false;
+        const std::string key = seg.substr(ks, ke - ks);
+        size_t vs = ke + 1;
+        if (vs < seg.size() && seg[vs] == '\n') vs++;
+        size_t ve = seg.find(PC, vs);
+        if (ve == std::string::npos) return false;   // truncated parameter: refuse
+        size_t vend = ve;
+        if (vend > vs && seg[vend - 1] == '\n') vend--;
+        std::string val = seg.substr(vs, vend - vs);
+        if (key.empty()) return false;
+        json parsed;
+        bool as_json = false;
+        try { parsed = json::parse(val); as_json = !parsed.is_string(); } catch (...) {}
+        if (as_json) tc.arguments[key] = parsed;
+        else tc.arguments[key] = val;
+        p = ve + PC.size();
+    }
+    tc.ok = true;   // zero-parameter calls are legal
+    return true;
+}
+
 inline ToolCall parse_tool_call(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
@@ -2065,6 +2127,7 @@ inline ToolCall parse_tool_call(const std::string& seg) {
         }
         return tc;
     }
+    if (parse_native_xml_call(seg, tc)) return tc;   // trained XML dialect
     try {
         json j = json::parse(escape_content_tags(seg));
         tc.name = j.value("name", std::string());

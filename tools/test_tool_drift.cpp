@@ -127,6 +127,41 @@ static void test_mode16_and_15_variants() {
     ok(v3.empty(), "hallucinated <result>/<output> block is NOT rescued as a call");
 }
 
+// Native XML dialect (2026-08-14): the format Qwen3.8's chat template trains.
+// Not a drift mode -- the first-class wrapped-body format, parsed by
+// parse_tool_call via parse_native_xml_call. Round-trips the template's own
+// example shape, typed values, multi-line values, zero-parameter calls, and
+// refuses a truncated parameter rather than guessing.
+static void test_native_xml_dialect() {
+    q27::ToolCall tc;
+    ok(q27::parse_native_xml_call(
+           "\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+           "<parameter=units>\nmetric\n</parameter>\n</function>\n", tc) &&
+           tc.ok && tc.name == "get_weather" &&
+           tc.arguments.value("city", std::string()) == "Paris" &&
+           tc.arguments.value("units", std::string()) == "metric",
+       "native-xml: two scalar parameters round-trip");
+    q27::ToolCall t2;
+    ok(q27::parse_native_xml_call(
+           "<function=Write>\n<parameter=content>\nline one\nline two\n</parameter>\n"
+           "<parameter=count>\n3\n</parameter>\n<parameter=force>\ntrue\n</parameter>\n"
+           "</function>", t2) &&
+           t2.arguments.value("content", std::string()) == "line one\nline two" &&
+           t2.arguments.value("count", 0) == 3 && t2.arguments.value("force", false) == true,
+       "native-xml: multi-line string, tojson-typed number and bool");
+    q27::ToolCall t3;
+    ok(q27::parse_native_xml_call("<function=list_files>\n</function>", t3) &&
+           t3.ok && t3.arguments.empty(),
+       "native-xml: zero-parameter call is legal");
+    q27::ToolCall t4;
+    ok(!q27::parse_native_xml_call(
+           "<function=Write>\n<parameter=content>\ntruncated with no closer", t4),
+       "native-xml: truncated parameter is refused, not guessed");
+    q27::ToolCall t5;
+    ok(!q27::parse_native_xml_call("plain text, no dialect", t5),
+       "native-xml: non-dialect text is not consumed");
+}
+
 static void test_mode14_tool_name_xml_dialect() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
     // Verbatim bytes from the captured transcript.
@@ -184,6 +219,7 @@ static void test_mode13_truncated_mid_escape() {
 
 int main() {
     test_mode13_truncated_mid_escape();
+    test_native_xml_dialect();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();
