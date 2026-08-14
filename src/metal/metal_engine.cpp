@@ -1,6 +1,7 @@
 #include "metal_engine.h"
 
 #include "../../third_party/json.hpp"
+#include "../suffixdraft.h"
 
 #include <algorithm>
 #include <cassert>
@@ -23,6 +24,13 @@
 
 namespace q27 {
 namespace {
+
+// Bonsai matrix tiers (T2 ternary / B1 binary): exact select-form math on
+// float activations, no activation quantization — one dispatch policy for
+// both (binary-tier plan, Phase 3). Q4/Q8 keep the packed-dot quantized path.
+bool is_bonsai_dtype(DType dtype) {
+    return dtype == DType::T2_G128 || dtype == DType::B1_G128;
+}
 
 class CommandBatch {
   public:
@@ -88,10 +96,46 @@ void MetalEngine::validate_architecture() const {
     };
     if (meta.value("general.architecture", std::string()) != "qwen35")
         throw std::runtime_error("q27 Metal: expected qwen35 architecture");
-    if (meta.value("quant_policy", std::string()) != "q4s-v1" ||
-        !meta.value("q4_head", false))
-        throw std::runtime_error("q27 Metal: expected q4s-v1 artifact");
-    exact("qwen35.block_count", 65); exact("qwen35.embedding_length", N_EMBD);
+    // Bonsai artifacts (T2 ternary / B1 binary repacks): 64 blocks, no MTP
+    // layer, bonsai-dtype embeddings/head/alpha/beta. The sibling packs
+    // share this architecture even though their trained tensor bytes differ.
+    const std::string policy = meta.value("quant_policy", std::string());
+    const bool ternary = policy == "bonsai-t2-v1";
+    const bool binary = policy == "bonsai-b1-v1";
+    // Mixed-tier census packs (docs/metal/plans/2026-07-17-mixed-tier-census.md,
+    // tools/q27_mix.py): per-tensor T2/B1 routing over the same bonsai
+    // shape. Both tiers' layout declarations are demanded below.
+    const bool mixed = policy == "bonsai-mixed-v1";
+    const bool bonsai = ternary || binary || mixed;
+    // Published Q-tier packs are exact recipes, not arbitrary mixtures of
+    // otherwise executable Q4/Q8 tensors. Pin both the policy name and the
+    // repack metadata so a malformed or unknown tier fails before upload.
+    bool q4_head=false;
+    const char* q8_extra=nullptr;
+    if (!bonsai) {
+        if (policy=="q4s-v1") q4_head=true;
+        else if (policy=="q5f-v1") { q4_head=true; q8_extra="(ffn_down)\\."; }
+        else if (policy=="q6-v1") q8_extra="(ssm_out|attn_output|ffn_down)\\.";
+        else if (policy=="q6f-v1") { q4_head=true; q8_extra="(ffn_down|ffn_gate)\\."; }
+        else if (policy=="q6k-v1") q8_extra="(ssm_out|attn_output|ffn_down|ffn_gate)\\.";
+        else if (policy=="q8-v1") q8_extra=".*";
+        else if (policy=="v1.4") q8_extra="(ssm_out|attn_output)\\.";
+        else throw std::runtime_error("q27 Metal: unsupported quantization policy: "+policy);
+        if (q4_head) {
+            if (!meta.contains("q4_head") || !meta["q4_head"].is_boolean() ||
+                !meta["q4_head"].get<bool>())
+                throw std::runtime_error("q27 Metal: quantization policy requires q4_head");
+        } else if (meta.contains("q4_head")) {
+            throw std::runtime_error("q27 Metal: unexpected q4_head metadata");
+        }
+        if (q8_extra) {
+            if (meta.value("q8_extra",std::string())!=q8_extra)
+                throw std::runtime_error("q27 Metal: q8_extra does not match quantization policy");
+        } else if (meta.contains("q8_extra")) {
+            throw std::runtime_error("q27 Metal: unexpected q8_extra metadata");
+        }
+    }
+    exact("qwen35.block_count", bonsai ? 64 : 65); exact("qwen35.embedding_length", N_EMBD);
     exact("qwen35.feed_forward_length", N_FFN); exact("qwen35.attention.head_count", N_HEAD);
     exact("qwen35.attention.head_count_kv", N_KV); exact("qwen35.attention.key_length", HEAD_DIM);
     exact("qwen35.attention.value_length", HEAD_DIM); exact("qwen35.ssm.state_size", GDN_DIM);
@@ -99,8 +143,24 @@ void MetalEngine::validate_architecture() const {
     exact("qwen35.context_length", 262144); exact("qwen35.rope.dimension_count", N_ROT);
     exact("qwen35.ssm.conv_kernel", 4); exact("qwen35.ssm.time_step_rank", GDN_HEADS);
     exact("qwen35.full_attention_interval", 4);
-    exact("qwen35.nextn_predict_layers", 1);
+    if (!bonsai) exact("qwen35.nextn_predict_layers", 1);
     exact("group_q4", 64); exact("group_q8", 128);
+    auto exact_str = [&](const char* key, const char* expected) {
+        if (meta.value(key, std::string()) != expected)
+            throw std::runtime_error(std::string("q27 Metal: architecture mismatch: ") + key);
+    };
+    // The kernels hardcode the pack encodings; the metadata strings declare
+    // exactly what the repack wrote for both ternary and binary weights.
+    if (ternary || mixed) {
+        exact("group_t2", 128);
+        exact_str("t2_codes", "0=-1,1=0,2=+1;3 forbidden");
+        exact_str("t2_slot_order", "seq-lsb-first");
+    }
+    if (binary || mixed) {
+        exact("group_b1", 128);
+        exact_str("b1_codes", "1=+d,0=-d");
+        exact_str("b1_bit_order", "seq-lsb-first");
+    }
     if (meta.value("nibble_order", std::string()) != "even=low")
         throw std::runtime_error("q27 Metal: incompatible Q4 nibble order");
     auto exact_float = [&](const char* key, double expected, double tolerance) {
@@ -117,13 +177,13 @@ void MetalEngine::validate_architecture() const {
 
     std::vector<uint32_t> expected_attention;
     for (uint32_t i = 3; i < N_LAYER; i += 4) expected_attention.push_back(i);
-    const size_t expected_map = expected_attention.size() + 1;
+    const size_t expected_map = expected_attention.size() + (bonsai ? 0 : 1);
     if (!meta.contains("attn_layers") || meta["attn_layers"].size() != expected_map)
         throw std::runtime_error("q27 Metal: invalid attention layer map");
     for (size_t i = 0; i < expected_attention.size(); i++)
         if (meta["attn_layers"][i].get<uint32_t>() != expected_attention[i])
             throw std::runtime_error("q27 Metal: unexpected attention layer map");
-    if (meta["attn_layers"].back().get<uint32_t>() != 64)
+    if (!bonsai && meta["attn_layers"].back().get<uint32_t>() != 64)
         throw std::runtime_error("q27 Metal: missing MTP attention layer");
 
     auto require = [&](const std::string& name, DType dtype, std::initializer_list<uint64_t> shape) {
@@ -131,59 +191,129 @@ void MetalEngine::validate_architecture() const {
         if (!tensor || tensor->dtype != dtype || tensor->shape != std::vector<uint64_t>(shape))
             throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
     };
-    auto matrix = [&](const std::string& name, DType dtype, uint64_t rows, uint64_t cols) {
+    // Pure/mixed Bonsai policies pin their packed dtype. Published Q tiers
+    // use the exact repack recipe named by quant_policy above.
+    auto bonsai_matrix_dtype_ok = [&](DType dtype) {
+        if (ternary) return dtype == DType::T2_G128;
+        if (binary) return dtype == DType::B1_G128;
+        return mixed && (dtype == DType::T2_G128 || dtype == DType::B1_G128);
+    };
+    auto has_suffix = [](const std::string& name,const char* suffix) {
+        const size_t n=std::strlen(suffix);
+        return name.size()>=n && name.compare(name.size()-n,n,suffix)==0;
+    };
+    auto q_matrix_dtype = [&](const std::string& name) {
+        if (name.compare(0,7,"blk.64.")==0 ||
+            has_suffix(name,".attn_k.weight") || has_suffix(name,".attn_v.weight"))
+            return DType::Q8_G128;
+        if (policy=="q8-v1") return DType::Q8_G128;
+        if ((policy=="v1.4" || policy=="q6-v1" || policy=="q6k-v1") &&
+            (has_suffix(name,".ssm_out.weight") || has_suffix(name,".attn_output.weight")))
+            return DType::Q8_G128;
+        if ((policy=="q5f-v1" || policy=="q6-v1" ||
+             policy=="q6f-v1" || policy=="q6k-v1") &&
+            has_suffix(name,".ffn_down.weight"))
+            return DType::Q8_G128;
+        if ((policy=="q6f-v1" || policy=="q6k-v1") &&
+            has_suffix(name,".ffn_gate.weight"))
+            return DType::Q8_G128;
+        return DType::Q4_G64;
+    };
+    auto matrix = [&](const std::string& name, uint64_t rows, uint64_t cols) {
         const Tensor* tensor = model_.find(name);
-        if (!tensor || tensor->dtype != dtype || tensor->shape != std::vector<uint64_t>{rows, cols})
+        const bool dtype_ok=tensor && (bonsai ? bonsai_matrix_dtype_ok(tensor->dtype)
+                                             : tensor->dtype==q_matrix_dtype(name));
+        if (!dtype_ok || tensor->shape != std::vector<uint64_t>{rows, cols})
             throw std::runtime_error("q27 Metal: required matrix mismatch: " + name);
     };
 
-    require("token_embd.weight", DType::Q8_G128, {VOCAB, N_EMBD});
-    require("output.weight", DType::Q4_G64, {VOCAB, N_EMBD});
-    if (model_.find("output_q4.weight"))
-        throw std::runtime_error("q27 Metal: q4s artifact must not duplicate the output head");
+    // Tensors whose tier follows the pack policy: mixed admits either
+    // bonsai dtype (per-tensor routing decides at dispatch), the pure
+    // packs stay pinned exactly.
+    auto require_tier = [&](const std::string& name, DType pure,
+                            std::initializer_list<uint64_t> shape) {
+        if (!mixed) { require(name, pure, shape); return; }
+        const Tensor* tensor = model_.find(name);
+        if (!tensor || (tensor->dtype != DType::T2_G128 && tensor->dtype != DType::B1_G128) ||
+            tensor->shape != std::vector<uint64_t>(shape))
+            throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
+    };
+    const DType vocab_dtype = ternary ? DType::T2_G128
+                            : binary ? DType::B1_G128 : DType::Q8_G128;   // unused under mixed
+    // Vocabulary tensors are policy-pinned too. Q-tier packs keep the token
+    // embedding at Q8; q4-head tiers replace the Q8 lm_head and omit the
+    // draft-only duplicate, while every other tier carries both heads.
+    if (bonsai) {
+        require_tier("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
+        require_tier("output.weight", vocab_dtype, {VOCAB, N_EMBD});
+    } else {
+        require("token_embd.weight", DType::Q8_G128, {VOCAB, N_EMBD});
+        require("output.weight", q4_head ? DType::Q4_G64 : DType::Q8_G128,
+                {VOCAB, N_EMBD});
+        if (q4_head) {
+            if (model_.find("output_q4.weight"))
+                throw std::runtime_error("q27 Metal: q4-head tier must not duplicate the output head");
+        } else {
+            require("output_q4.weight", DType::Q4_G64, {VOCAB, N_EMBD});
+        }
+    }
     require("output_norm.weight", DType::F32, {N_EMBD});
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         const std::string p = "blk." + std::to_string(layer) + ".";
         require(p + "attn_norm.weight", DType::F32, {N_EMBD});
         require(p + "post_attention_norm.weight", DType::F32, {N_EMBD});
-        matrix(p + "ffn_gate.weight", DType::Q4_G64, N_FFN, N_EMBD);
-        matrix(p + "ffn_up.weight", DType::Q4_G64, N_FFN, N_EMBD);
-        matrix(p + "ffn_down.weight", DType::Q4_G64, N_EMBD, N_FFN);
+        matrix(p + "ffn_gate.weight", N_FFN, N_EMBD);
+        matrix(p + "ffn_up.weight", N_FFN, N_EMBD);
+        matrix(p + "ffn_down.weight", N_EMBD, N_FFN);
         if (attention_layer(layer)) {
-            matrix(p + "attn_q.weight", DType::Q4_G64, 2 * N_HEAD * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_k.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_v.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
-            matrix(p + "attn_output.weight", DType::Q4_G64, N_EMBD, N_HEAD * HEAD_DIM);
+            matrix(p + "attn_q.weight", 2 * N_HEAD * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_k.weight", N_KV * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_v.weight", N_KV * HEAD_DIM, N_EMBD);
+            matrix(p + "attn_output.weight", N_EMBD, N_HEAD * HEAD_DIM);
             require(p + "attn_q_norm.weight", DType::F32, {HEAD_DIM});
             require(p + "attn_k_norm.weight", DType::F32, {HEAD_DIM});
         } else {
-            matrix(p + "attn_qkv.weight", DType::Q4_G64, GDN_CH, N_EMBD);
-            matrix(p + "attn_gate.weight", DType::Q4_G64, GDN_V, N_EMBD);
-            require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
-            require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
+            matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
+            matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
+            if (bonsai) {
+                require_tier(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+                require_tier(p + "ssm_beta.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+            } else {
+                require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
+                require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
+            }
             require(p + "ssm_a", DType::F32, {GDN_HEADS});
             require(p + "ssm_dt.bias", DType::F32, {GDN_HEADS});
             require(p + "ssm_conv1d.weight", DType::F32, {GDN_CH, 4});
             require(p + "ssm_norm.weight", DType::F32, {GDN_DIM});
-            matrix(p + "ssm_out.weight", DType::Q4_G64, N_EMBD, GDN_V);
+            matrix(p + "ssm_out.weight", N_EMBD, GDN_V);
         }
+    }
+    if (bonsai) {
+        // No MTP layer in bonsai packs; a partial blk.64 would mean a broken
+        // repack, so its absence is asserted rather than tolerated silently.
+        if (model_.find("blk.64.attn_norm.weight") || model_.find("output_q4.weight"))
+            throw std::runtime_error("q27 Metal: unexpected MTP tensors in a bonsai artifact");
+        return;
     }
     const std::string p = "blk.64.";
     require(p + "nextn.enorm.weight", DType::F32, {N_EMBD});
     require(p + "nextn.hnorm.weight", DType::F32, {N_EMBD});
     require(p + "nextn.shared_head_norm.weight", DType::F32, {N_EMBD});
-    matrix(p + "nextn.eh_proj.weight", DType::Q8_G128, N_EMBD, 2 * N_EMBD);
+    matrix(p + "nextn.eh_proj.weight", N_EMBD, 2 * N_EMBD);
     require(p + "attn_norm.weight", DType::F32, {N_EMBD});
     require(p + "post_attention_norm.weight", DType::F32, {N_EMBD});
     require(p + "attn_q_norm.weight", DType::F32, {HEAD_DIM});
     require(p + "attn_k_norm.weight", DType::F32, {HEAD_DIM});
-    matrix(p + "attn_q.weight", DType::Q8_G128, 2 * N_HEAD * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_k.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_v.weight", DType::Q8_G128, N_KV * HEAD_DIM, N_EMBD);
-    matrix(p + "attn_output.weight", DType::Q8_G128, N_EMBD, N_HEAD * HEAD_DIM);
-    matrix(p + "ffn_gate.weight", DType::Q8_G128, N_FFN, N_EMBD);
-    matrix(p + "ffn_up.weight", DType::Q8_G128, N_FFN, N_EMBD);
-    matrix(p + "ffn_down.weight", DType::Q8_G128, N_EMBD, N_FFN);
+    matrix(p + "attn_q.weight", 2 * N_HEAD * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_k.weight", N_KV * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_v.weight", N_KV * HEAD_DIM, N_EMBD);
+    matrix(p + "attn_output.weight", N_EMBD, N_HEAD * HEAD_DIM);
+    matrix(p + "ffn_gate.weight", N_FFN, N_EMBD);
+    matrix(p + "ffn_up.weight", N_FFN, N_EMBD);
+    matrix(p + "ffn_down.weight", N_EMBD, N_FFN);
 }
 
 std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string& model_path) {
@@ -431,8 +561,10 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
                         backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2)});
 
     // Layer-major chunked prefill routes every projection through
-    // activation-quantized simdgroup GEMM. The q4s artifact carries the
-    // required MTP layer, so the device-family capability is the remaining gate.
+    // activation-quantized simdgroup GEMM. Official Q4/Q8 models use that
+    // contract; Bonsai T2/B1/mixed serial projection deliberately keeps
+    // float activations, so it must remain serial until an equivalent
+    // batched float-activation path exists.
     chunked_prefill_ = chunk_capable;
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
@@ -485,10 +617,104 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
 
 void MetalEngine::set_chunked_prefill(bool enabled) {
     if (enabled && !has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; chunked prefill is unavailable");
+        throw std::runtime_error("q27 Metal: Bonsai models require serial float-activation prefill");
     if (enabled && !ch_)
         throw std::runtime_error("q27 Metal: chunked prefill requires quantized matmul support");
     chunked_prefill_ = enabled;
+}
+
+void MetalEngine::set_kv_attrib(uint32_t mode) {
+    // Mode 4 (fp8-KV control arm): e4m3 round-trip of BOTH sides, every
+    // head — production-exact for a transform-free codec. Mode 3 is set
+    // via set_kv_attrib_except only (it needs the cell masks).
+    if (mode > 2 && mode != 4)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), 2 (V), or 4 (e4m3 both sides)");
+    if (mode && turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    // Any change after rows are cached — including turning attribution off
+    // or widening a cell back to all layers/heads — would leave a mixed
+    // cache behind position_.
+    if (position_ && (mode != kv_attrib_ ||
+                      kv_attrib_layer_ != UINT32_MAX || kv_attrib_head_ != UINT32_MAX))
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_ = mode;
+    kv_attrib_layer_ = UINT32_MAX;
+    kv_attrib_head_ = UINT32_MAX;
+    kv_attrib_flags_ = 0;
+    kv_attrib_aux_.reset();
+}
+
+void MetalEngine::set_kv_attrib_rt(bool scale32, const float* feature_scales) {
+    // Side arms (1/2) only: modes 3/4 have no turbo3 scale to modify.
+    if (!kv_attrib_ || (kv_attrib_flags_ & 4u) || kv_attrib_ >= 3)
+        throw std::runtime_error("q27 Metal: KV round-trip modifiers need a side arm (set_kv_attrib first)");
+    if (position_)
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_flags_ = (scale32 ? 1u : 0u) | (feature_scales ? 2u : 0u);
+    if (feature_scales) {
+        kv_attrib_aux_ = backend_.allocate(2ull * 16 * 4 * 256 * 4);
+        backend_.write(*kv_attrib_aux_, 0, feature_scales, 2ull * 16 * 4 * 256 * 4);
+    }
+}
+
+void MetalEngine::set_kv_attrib_stats() {
+    if (turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (position_)
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_ = 1;              // ignored by the STATS branch; enables routing
+    kv_attrib_layer_ = UINT32_MAX;
+    kv_attrib_head_ = UINT32_MAX;
+    kv_attrib_flags_ = 4u;
+    kv_attrib_aux_ = backend_.allocate(2ull * 16 * 4 * 256 * 4);
+    backend_.zero(*kv_attrib_aux_);
+}
+
+void MetalEngine::read_kv_attrib_stats(std::vector<float>& out) {
+    if (!(kv_attrib_flags_ & 4u) || !kv_attrib_aux_)
+        throw std::runtime_error("q27 Metal: no KV attribution stats pass is active");
+    backend_.synchronize();
+    out.resize(2ull * 16 * 4 * 256);
+    backend_.read(*kv_attrib_aux_, 0, out.data(), out.size() * 4);
+}
+
+void MetalEngine::set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head) {
+    if (mode != 1 && mode != 2)
+        throw std::runtime_error("q27 Metal: KV attribution cell mode must be 1 (K) or 2 (V)");
+    if (turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (layer != UINT32_MAX && (layer >= 64 || layer % 4 != 3))
+        throw std::runtime_error("q27 Metal: KV attribution layer must be an attention layer (layer%4==3)");
+    if (head != UINT32_MAX && head >= N_KV)
+        throw std::runtime_error("q27 Metal: KV attribution head out of range");
+    if (position_ && (mode != kv_attrib_ || layer != kv_attrib_layer_ || head != kv_attrib_head_))
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_ = mode;
+    kv_attrib_layer_ = layer;
+    kv_attrib_head_ = head;
+    kv_attrib_flags_ = 0;
+    kv_attrib_aux_.reset();
+}
+
+void MetalEngine::set_kv_attrib_except(const uint32_t* cells, size_t n) {
+    if (turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (position_)
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    if (n && !cells)
+        throw std::runtime_error("q27 Metal: KV exception cells pointer is null");
+    uint8_t masks[sizeof kv_attrib_masks_] = {};
+    for (size_t i = 0; i < n; i++) {
+        if (cells[i] >= 128)
+            throw std::runtime_error("q27 Metal: KV exception cell must be 0..127");
+        masks[cells[i] >> 3] |= uint8_t(1u << (cells[i] & 7u));
+    }
+    kv_attrib_ = 3;
+    kv_attrib_layer_ = UINT32_MAX;
+    kv_attrib_head_ = UINT32_MAX;
+    kv_attrib_flags_ = 0;
+    kv_attrib_aux_.reset();
+    std::memcpy(kv_attrib_masks_, masks, sizeof masks);
 }
 
 void MetalEngine::initialize_mtp_sentinel() {
@@ -826,6 +1052,7 @@ std::array<unsigned char,20> MetalEngine::snapshot_runtime_identity() const {
     add_string(backend_.shader_source_sha1());
     add_string(backend_.name());
     add_u32(backend_.gemm_half_enabled());
+    add_u32(backend_.gemm_half_q4_enabled());
     add_u32(backend_.gqa_tile());
     add_u32(backend_.gqa_block());
     add_u32(backend_.gqa_threshold());
@@ -839,6 +1066,8 @@ std::array<unsigned char,20> MetalEngine::snapshot_runtime_identity() const {
 void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                              uint32_t token_count, bool logits_resident,
                              const DeviceLease& with_device) {
+    if (kv_attrib_)
+        throw std::runtime_error("q27 Metal: snapshots are unavailable during KV attribution");
     if (token_count && !tokens)
         throw std::runtime_error("q27 Metal: snapshot token metadata is null");
     if (logits_resident && !logits_resident_)
@@ -1040,6 +1269,8 @@ uint32_t MetalEngine::load_state_fd(int source_fd,const std::string& path,
                                     const std::vector<uint32_t>* expected_tokens,
                                     const DeviceLease& with_device,
                                     const LoadCheckpoint& checkpoint) {
+    if (kv_attrib_)
+        throw std::runtime_error("q27 Metal: snapshots are unavailable during KV attribution");
     auto check_cancel = [&] { if (checkpoint) checkpoint(); };
     auto run_device = [&](const std::function<void()>& operation) {
         check_cancel();
@@ -1299,18 +1530,26 @@ uint32_t MetalEngine::pending_from_logits() {
     return pending;
 }
 
-// Both operand sets are live at these call sites because rmsnorm_quantized
-// produces the float output and packed activation together. The official q4s
-// contract routes projections through the quantized kernels.
-void MetalEngine::project(const BackendTensor& w, const BackendBuffer&,
+// Serial-decode projection dispatch: bonsai (T2/B1) weights route to the
+// float-activation select-form GEMV (exact math, no activation quantization
+// — ternary/binary-tier plans, Phase 2); Q4/Q8 keep the packed-dot quantized path. Both
+// operand sets are always live at the call sites: the fused rmsnorm/quantize
+// kernels produce the float output and the int8 copy together.
+void MetalEngine::project(const BackendTensor& w, const BackendBuffer& x_float,
                           const BackendQuantized& xq, BackendBuffer& out) {
-    backend_.matvec_quantized(w, xq, out);
+    if (is_bonsai_dtype(w.dtype)) backend_.matvec(w, x_float, out);
+    else backend_.matvec_quantized(w, xq, out);
 }
 
 void MetalEngine::project_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
-                               const BackendBuffer&, const BackendQuantized& xq) {
-    backend_.matvec_quantized_pair(a, a_out, b, b_out, xq);
+                               const BackendBuffer& x_float, const BackendQuantized& xq) {
+    if (is_bonsai_dtype(a.dtype) || is_bonsai_dtype(b.dtype)) {
+        project(a, x_float, xq, a_out);
+        project(b, x_float, xq, b_out);
+    } else {
+        backend_.matvec_quantized_pair(a, a_out, b, b_out, xq);
+    }
 }
 
 void MetalEngine::gdn_block(uint32_t layer) {
@@ -1329,7 +1568,7 @@ void MetalEngine::gdn_block(uint32_t layer) {
     backend_.gated_norm_gdn(*delta_out_, layer_weight(layer, "ssm_norm.weight"), *z_,
                             *gated_out_, GDN_HEADS, GDN_DIM, EPS);
     const BackendTensor& ssm_out_w = layer_weight(layer, "ssm_out.weight");
-    backend_.quantize(*gated_out_, q6144_);
+    if (!is_bonsai_dtype(ssm_out_w.dtype)) backend_.quantize(*gated_out_, q6144_);
     project(ssm_out_w, *gated_out_, q6144_, *y_);
 }
 
@@ -1372,7 +1611,15 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
                                           1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV * HEAD_DIM);
+        if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
+            backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache,
+                                              pos, N_KV, 1, kv_attrib_,
+                                              kv_attrib_ == 3 ? kv_attrib_masks_[layer / 4]
+                                                              : kv_attrib_head_,
+                                              kv_attrib_flags_, (layer / 4) * 1024,
+                                              kv_attrib_aux_.get());
+        else
+            backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                *attn_out_, pos + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
@@ -1380,7 +1627,7 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
     const BackendTensor& attn_out_w = layer_weight(layer, "attn_output.weight");
-    backend_.quantize(*attn_out_, q6144_);
+    if (!is_bonsai_dtype(attn_out_w.dtype)) backend_.quantize(*attn_out_, q6144_);
     project(attn_out_w, *attn_out_, q6144_, *y_);
 }
 
@@ -1389,13 +1636,13 @@ void MetalEngine::ffn(uint32_t layer) {
                  layer_weight(layer,"ffn_up.weight"),*ffn_up_,*x1_,q5120_);
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
     const BackendTensor& ffn_down_w = layer_weight(layer, "ffn_down.weight");
-    backend_.quantize(*ffn_gate_, q17408_);
+    if (!is_bonsai_dtype(ffn_down_w.dtype)) backend_.quantize(*ffn_gate_, q17408_);
     project(ffn_down_w, *ffn_gate_, q17408_, *y_);
 }
 
 // position_ advances at the call site after successful finish, so a backend
-// throw leaves host state describing only completed work. mtp_round follows
-// the same rule.
+// throw leaves host state describing only completed work. mtp_round and
+// suffix_round follow the same rule.
 // pos_offset places the row for multi-token command batches (prefill,
 // resident decode): the token encodes at position_ + pos_offset.
 void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_from_device,
@@ -1432,9 +1679,16 @@ void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
     backend_.matmul_quantized(layer_weight(layer, "attn_qkv.weight"), x5, count, *cqkv_);
     backend_.matmul_quantized(layer_weight(layer, "attn_gate.weight"), x5, count, *cz_);
+    // Official tier: fused F16 pair-rows kernel. Bonsai tiers: alpha/beta
+    // are T2/B1 matrices; their chunk GEMMs write the same [token][row] layout.
     const BackendTensor& alpha_w = layer_weight(layer, "ssm_alpha.weight");
     const BackendTensor& beta_w = layer_weight(layer, "ssm_beta.weight");
-    backend_.matvec_f16_pair_rows(alpha_w, *calpha_, beta_w, *cbeta_raw_, *cx1_, count);
+    if (is_bonsai_dtype(alpha_w.dtype)) {
+        backend_.matmul_quantized(alpha_w, x5, count, *calpha_);
+        backend_.matmul_quantized(beta_w, x5, count, *cbeta_raw_);
+    } else {
+        backend_.matvec_f16_pair_rows(alpha_w, *calpha_, beta_w, *cbeta_raw_, *cx1_, count);
+    }
     backend_.gdn_gates_rows(*calpha_, *cbeta_raw_, layer_weight(layer, "ssm_a"),
                             layer_weight(layer, "ssm_dt.bias"), *cg_, *cbeta_, GDN_HEADS, count);
     LayerState& state = layers_[layer];
@@ -1506,8 +1760,16 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
                                                  HEAD_DIM, count, scale);
         backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
-                                   position_, N_KV * HEAD_DIM, count);
+        if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
+            backend_.kv_store_f16_attrib_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                              position_, N_KV, count, kv_attrib_,
+                                              kv_attrib_ == 3 ? kv_attrib_masks_[layer / 4]
+                                                              : kv_attrib_head_,
+                                              kv_attrib_flags_, (layer / 4) * 1024,
+                                              kv_attrib_aux_.get());
+        else
+            backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                       position_, N_KV * HEAD_DIM, count);
         backend_.attention_f16_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                       *state.k_cache, *state.v_cache,
                                       *cattn_out_, position_ + 1, N_HEAD, N_KV,
@@ -1640,7 +1902,7 @@ uint32_t MetalEngine::prefill_serial_chunk(const uint32_t* tokens, uint32_t coun
 
 void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t position) {
     if (!has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     constexpr uint32_t layer = 64;
     backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
     backend_.rmsnorm(*h_, layer_weight(layer, "nextn.enorm.weight"), *mtp_embed_norm_, N_EMBD, EPS);
@@ -1656,6 +1918,16 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
     if (turbo3_kv_)
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
+    else if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
+        // Plain round-trip only: step-2 flags index per-attn-layer slots
+        // that do not exist for the MTP layer (instrument never runs MTP).
+        // Mode 3: MTP KV is not a census cell, so it is never excepted
+        // (mask 0 = both sides quantized), keeping the empty-mask control
+        // arm comparable to the modes-1/2 full-side treatment.
+        backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
+                                          position, N_KV, 1, kv_attrib_,
+                                          kv_attrib_ == 3 ? 0u : kv_attrib_head_,
+                                          0, 0, nullptr);
     else
         backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
 }
@@ -1728,7 +2000,7 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     if (active_mask_ >= 0)
         throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (!mtp_cache_valid_)
         throw std::runtime_error("q27 Metal: MTP cache is not valid for this prefix");
     if (position >= max_context_) throw std::runtime_error("q27 Metal: MTP context exhausted");
@@ -1762,7 +2034,13 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
                                   gqa_partials_.get());
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
+        if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
+            backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
+                                              position, N_KV, 1, kv_attrib_,
+                                              kv_attrib_ == 3 ? 0u : kv_attrib_head_,
+                                              0, 0, nullptr);
+        else
+            backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
                                *attn_out_, position + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
@@ -1826,7 +2104,7 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
     if (active_mask_ >= 0)
         throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (!mtp_cache_valid_)
         throw std::runtime_error("q27 Metal: MTP cache is not valid for this prefix");
     if (width < 2 || width > CHUNK_MAX)
@@ -2068,6 +2346,74 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
     return sample_served(lane_dists[commit_n - 1], rng, /*exclude=*/-1);
 }
 
+// Gate 0 oracle round: mtp_round with the layer-64 draft stage replaced by
+// caller-supplied reference lanes and the acceptance walk replaced by a
+// teacher-forced full commit. The verify chunk, batched output head,
+// per-lane argmax, and gdn_replay commit are shared verbatim, so the round
+// cost is exactly V(w)+O(w) — what a perfect drafter would pay. Because the
+// committed tokens ARE the lanes, KV rows written during the verify chunk
+// are all real and the replayed GDN state matches a serial walk over the
+// same tokens bit-exactly (both chunk kernels are sequential in-kernel).
+void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
+                               uint32_t* predictions) {
+    if (live < 2 || live > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: oracle width must be 2..VERIFY_CHUNK_MAX");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: oracle round requires chunked prefill");
+    // The verify chunk stores a KV row for every lane, so all `live` rows
+    // must fit the reserved context even on a `last` round whose final
+    // token never advances position_ — unlike the serial walk, which can
+    // end at max_context_+1 because it never encodes the final token.
+    // --oracle therefore needs --ctx >= prompt+count, one more than serial.
+    if ((uint64_t)position_ + live > max_context_)
+        throw std::runtime_error("q27 Metal: oracle verify rows exceed context; --oracle needs --ctx >= prompt+count");
+    for (uint32_t lane = 0; lane < live; lane++)
+        if (lanes[lane] >= VOCAB)
+            throw std::runtime_error("q27 Metal: oracle lane token out of range");
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    // Round-anatomy trace (verify-round-cost plan P0): verify batch vs
+    // prediction readback vs commit batch, per round.
+    static const bool trace = getenv("Q27_ORACLE_TRACE") != nullptr;
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto verify_start = clock();
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes, live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        batch.finish();
+    }
+    const double verify_ms = trace ? ms_since(verify_start) : 0.0;
+    auto read_start = clock();
+    backend_.read(*cpred_, 0, predictions, live * sizeof(uint32_t));
+    const double read_ms = trace ? ms_since(read_start) : 0.0;
+    auto commit_start = clock();
+    // Teacher-forced commit of every lane; the final output token of a
+    // generation is never encoded, exactly like the serial walk.
+    const uint32_t encoded = last ? live - 1 : live;
+    last_spec_stats_.accepted += live - 1;
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+    if (trace)
+        fprintf(stderr, "oracle round: live %u | verify %.2f ms read %.2f ms commit %.2f ms\n",
+                live, verify_ms, read_ms, ms_since(commit_start));
+}
+
 uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
                                          uint32_t eos, const TokenSink& sink, StopCause& cause) {
     if (active_mask_ >= 0)
@@ -2287,8 +2633,7 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
         }
         done++;
     }
-    // reset() creates a row-0 MTP sentinel, but teacher forcing never warms
-    // layer-64 rows for the advanced main-model prefix.
+    // Teacher forcing advances only the main model, never the MTP layer.
     mtp_cache_valid_ = false;
     if (n_encode >= CHUNK_MAX) fprintf(stderr, "\n");
     return result;
@@ -2507,7 +2852,7 @@ uint32_t MetalEngine::stream_from_pending(uint32_t pending, uint32_t count, uint
     if (mtp_width && active_mask_ >= 0)
         throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (mtp_width && !has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
         throw std::runtime_error("q27 Metal: MTP width must be 2..12");
     if ((uint64_t)position_ + (count ? count - 1 : 0) > max_context_)
@@ -2538,7 +2883,7 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
     if (mtp_width && active_mask_ >= 0)
         throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (mtp_width && !has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
         throw std::runtime_error("q27 Metal: MTP width must be 2..12");
     if ((uint64_t)position_ + (count ? count - 1 : 0) > max_context_)
@@ -2628,7 +2973,7 @@ std::vector<uint32_t> MetalEngine::generate_mtp(const std::vector<uint32_t>& pro
     if (active_mask_ >= 0)
         throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
-        throw std::runtime_error("q27 Metal: artifact has no MTP layer; MTP is unavailable for this artifact");
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if ((uint64_t)prompt.size() + count > max_context_ + 1)
         throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
     uint32_t pending = ingest_prompt(prompt, true, true);
@@ -2680,5 +3025,193 @@ std::vector<uint32_t> MetalEngine::generate_mtp_sampled(const std::vector<uint32
     return generated;
 }
 
+// Suffix-burst round (2026-07-16-suffix-burst-verify.md): oracle_round's
+// caller-lane verify chunk + batched head + argmax, then mtp_round's REAL
+// acceptance walk, commit_n/encoded rules, and early-EOS clamp (e765dde) —
+// verbatim semantics, lanes from the CPU-side SuffixDraft instead of the
+// layer-64 draft head. Committed tokens are greedy-identical to the serial
+// walk by the same argument as mtp_round (modulo the documented
+// tolerance-gated chunk-GEMM class).
+uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
+                                   uint32_t live, std::vector<uint32_t>& committed) {
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: suffix round needs remaining >= 2 (emit the last token directly)");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: suffix rounds are unmasked; tool constraints require serial decode");
+    if (live < 2 || live > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix round live width must be 2..VERIFY_CHUNK_MAX");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: suffix round requires chunked prefill");
+    if ((uint64_t)position_ + live > max_context_)
+        throw std::runtime_error("q27 Metal: suffix verify rows exceed context");
+    for (uint32_t lane = 0; lane < live; lane++)
+        if (lanes[lane] >= VOCAB)
+            throw std::runtime_error("q27 Metal: suffix lane token out of range");
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes, live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        batch.finish();
+    }
+    std::vector<uint32_t> predictions(live);
+    backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+    uint32_t accepted = 0;
+    while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+    uint32_t commit_n = std::min(accepted + 1, remaining);
+    uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    for (uint32_t i = 0; i < commit_n; i++)
+        if (lanes[i] == eos) {
+            commit_n = i + 1;
+            encoded = i;
+            break;
+        }
+    last_spec_stats_.accepted += commit_n - 1;
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+    committed.insert(committed.end(), lanes, lanes + commit_n);
+    // Dispatch evidence for the width gates (vacuous-gate lesson): printed
+    // at the dispatch site, not the driver's bookkeeping.
+    static const bool trace = getenv("Q27_SUFFIX_TRACE") != nullptr;
+    if (trace)
+        fprintf(stderr, "suffix round: live %u accepted %u committed %u\n", live, accepted, commit_n);
+    return predictions[commit_n - 1];
+}
+
+uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
+                                  uint32_t eos, uint32_t width, uint32_t minimum_match,
+                                  std::vector<uint32_t>& committed, bool* burst) {
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: suffix step needs remaining >= 2 (emit the last token directly)");
+    if (width < 2 || width > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix width must be 2..VERIFY_CHUNK_MAX");
+    committed.clear();
+    if (burst) *burst = false;
+    // A pending eos commits without encoding, mirroring suffix_round's lane
+    // clamp — the serial fallback below must never step() the eos token.
+    // Unreachable from generate_suffix (its sentinel never matches).
+    if (pending == eos) { committed.push_back(eos); return eos; }
+    // Propose up to width-1 continuation tokens; the verify chunk also
+    // needs one KV row per lane inside the reserved context.
+    uint32_t max_lanes = std::min<uint32_t>(width, remaining);
+    if ((uint64_t)position_ + max_lanes > max_context_)
+        max_lanes = (uint32_t)(max_context_ - position_);
+    int proposals[VERIFY_CHUNK_MAX];
+    int match = 0;
+    if (max_lanes >= 2)
+        match = drafter.propose_with((int)pending, (int)(max_lanes - 1), proposals);
+    // Match-capped width: forward lanes are bounded by the matched suffix
+    // length. Proposals past that evidence are lag-copy extrapolation, and
+    // dispatching them would measure speculation beyond the justified match.
+    uint32_t live = match >= (int)minimum_match
+                        ? std::min<uint32_t>(max_lanes, (uint32_t)match + 1) : 0;
+    // Full-tile snap-down (lever 2: round cost steps one full weight
+    // stream per 16-token tile): a partial second/third tile pays a
+    // whole stream for < 16 possible tokens — never worth it. 17..31
+    // lanes snap to 16, 33..47 snap to 32.
+    if (live > 16 && live < 32) live = 16;
+    else if (live > 32 && live < 48) live = 32;
+    if (live >= 2) {
+        last_suffix_stats_.burst_rounds++;
+        if (live <= 16) last_suffix_stats_.lanes_le16++;
+        else if (live == 32) last_suffix_stats_.lanes_32++;
+        else last_suffix_stats_.lanes_48++;
+        if (burst) *burst = true;
+        uint32_t lanes[VERIFY_CHUNK_MAX];
+        lanes[0] = pending;
+        for (uint32_t i = 1; i < live; i++) lanes[i] = (uint32_t)proposals[i - 1];
+        pending = suffix_round(remaining, eos, lanes, live, committed);
+        for (uint32_t tok : committed) drafter.append((int)tok);
+        return pending;
+    }
+    last_suffix_stats_.fallback_rounds++;
+    last_spec_stats_.rounds++;
+    committed.push_back(pending);
+    drafter.append((int)pending);
+    return step(pending);
+}
+
+std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& prompt,
+                                                   uint32_t count, uint32_t width,
+                                                   uint32_t minimum_match, uint32_t eos) {
+    if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if (width < 2 || width > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix width must be 2..VERIFY_CHUNK_MAX");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: batched suffix requires chunked prefill; use --suffix-serial");
+    // Reject constraints at entry: burst rounds argmax unmasked logits while
+    // a serial-fallback round would mask them. A mixed stream is worse than a
+    // loud error. This matches the GPU-resident greedy contract.
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: batched suffix refuses active tool constraints; use serial decode");
+    if ((uint64_t)prompt.size() + count > max_context_ + 1)
+        throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
+    uint32_t pending = ingest_prompt(prompt, false, true);
+    last_spec_stats_ = {};
+    last_suffix_stats_ = {};
+    std::vector<int> history(prompt.begin(), prompt.end());
+    SuffixDraft drafter;
+    drafter.reset(history);
+    std::vector<uint32_t> output;
+    output.reserve(count);
+    std::vector<uint32_t> committed;
+    while (output.size() < count) {
+        if (pending == eos) break;
+        if (output.size() + 1 == count) { output.push_back(pending); break; }
+        pending = suffix_step(drafter, pending, (uint32_t)(count - output.size()),
+                              eos, width, minimum_match, committed);
+        for (uint32_t token : committed) {
+            if (token == eos) return output;
+            output.push_back(token);
+        }
+    }
+    return output;
+}
+
+std::vector<uint32_t> MetalEngine::generate_suffix_serial(const std::vector<uint32_t>& prompt,
+                                                          uint32_t count, uint32_t width,
+                                                          uint32_t minimum_match, uint32_t eos) {
+    if(prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if(width<2 || width>12) throw std::runtime_error("q27 Metal: suffix width must be 2..12");
+    if((uint64_t)prompt.size()+count>max_context_+1)
+        throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
+    uint32_t pending=ingest_prompt(prompt,false,true); last_spec_stats_={};
+    std::vector<int> history(prompt.begin(),prompt.end()); SuffixDraft drafter; drafter.reset(history);
+    std::vector<uint32_t> output; output.reserve(count);
+    while(output.size()<count) {
+        if(pending==eos) break;
+        if(output.size()+1==count) { output.push_back(pending); break; }
+        const uint32_t lanes=std::min<uint32_t>(width-1,(uint32_t)(count-output.size()-1));
+        std::vector<int> proposals(lanes);
+        int match=drafter.propose_with((int)pending,(int)lanes,proposals.data());
+        last_spec_stats_.rounds++;
+        if(match>=(int)minimum_match) last_spec_stats_.drafted+=proposals.size();
+        output.push_back(pending); drafter.append((int)pending);
+        uint32_t prediction=step(pending);
+        if(match>=(int)minimum_match) for(int proposal:proposals) {
+            if(prediction==eos) { pending=prediction; break; }
+            if(prediction!=(uint32_t)proposal) break;
+            last_spec_stats_.accepted++;
+            output.push_back((uint32_t)proposal); drafter.append(proposal);
+            if(output.size()==count) return output;
+            prediction=step((uint32_t)proposal);
+        }
+        pending=prediction;
+    }
+    return output;
+}
 
 } // namespace q27

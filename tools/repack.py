@@ -6,6 +6,13 @@ Usage:
 
 --only limits to tensors matching REGEX (smoke tests).
 --report prints the N worst tensors by relative RMSE after quantization.
+
+Ternary source packs (PrismML fork "Q2_0", ggml type 42) are detected
+automatically and repacked losslessly to T2_G128 (quant_policy bonsai-t2-v1);
+see docs/FORMAT.md and docs/metal/plans/2026-07-14-ternary-tier.md for the encoding.
+Binary source packs (fork "Q1_0", ggml type 41) likewise repack losslessly
+to B1_G128 (quant_policy bonsai-b1-v1); see
+docs/metal/plans/2026-07-15-binary-tier.md.
 """
 import argparse
 import json
@@ -15,15 +22,35 @@ import sys
 import time
 
 import numpy as np
+import gguf.constants as _ggc
 from gguf import GGUFReader
+
+# The PrismML fork's types are absent from mainline gguf-py; forge the enum
+# members so GGUFReader can parse their packs. (block_size, type_size) per
+# ggml/src/ggml-common.h at tag prism-b9591-62061f9.
+def _forge_fork_type(name, value, blck, tsize):
+    if value in _ggc.GGMLQuantizationType._value2member_map_:
+        return _ggc.GGMLQuantizationType(value)
+    m = int.__new__(_ggc.GGMLQuantizationType, value)
+    m._name_, m._value_ = name, value
+    _ggc.GGMLQuantizationType._member_map_[name] = m
+    _ggc.GGMLQuantizationType._value2member_map_[value] = m
+    _ggc.GGML_QUANT_SIZES[m] = (blck, tsize)
+    return m
+
+_forge_fork_type("Q2_0", 42, 128, 34)
+_forge_fork_type("Q1_0", 41, 128, 18)
 
 MAGIC = 0x46373251  # "Q27F" LE
 VERSION = 1
 ALIGN = 256
 
-DTYPE_F32, DTYPE_F16, DTYPE_Q8, DTYPE_Q4 = 0, 1, 2, 3
-DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4: "Q4_G64"}
-GROUP_Q4, GROUP_Q8 = 64, 128
+# dtype 5 is reserved for the parked T3_G128 (never emitted; see FORMAT.md).
+DTYPE_F32, DTYPE_F16, DTYPE_Q8, DTYPE_Q4, DTYPE_T2 = 0, 1, 2, 3, 4
+DTYPE_B1 = 6
+DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4: "Q4_G64",
+               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128"}
+GROUP_Q4, GROUP_Q8, GROUP_T2, GROUP_B1 = 64, 128, 128, 128
 
 
 Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
@@ -94,6 +121,96 @@ def quant_q8(w: np.ndarray):
     return q.tobytes(), scale.astype(np.float16).tobytes(), deq
 
 
+def repack_t2(t):
+    """Fork Q2_0 tensor -> (data, scales, zero_frac). Lossless byte-copy.
+
+    Source blocks are {fp16 d; uint8 qs[32]} x (n/128); codes are sequential
+    LSB-first 2-bit fields, code c decodes to (c-1)*d. T2_G128 keeps the code
+    bytes verbatim and splits scales into the usual contiguous fp16 blob, so
+    the round-trip is exact by construction — still verified below.
+    Hard-fails on code 3 (+2): the Bonsai packs must be strictly ternary.
+    """
+    shape = tuple(reversed([int(d) for d in t.shape]))  # ne[0] innermost -> last
+    rows, cols = int(np.prod(shape[:-1])), shape[-1]
+    if cols % GROUP_T2 != 0:  # hard contract, must survive python -O (codex P2)
+        raise ValueError(f"{t.name}: cols {cols} not divisible by {GROUP_T2}")
+    nblocks = rows * cols // GROUP_T2
+    blocks = np.asarray(t.data).reshape(nblocks, 34)
+    scales = blocks[:, :2].copy()                       # fp16 LE bytes, [rows, cols/128]
+    qs = np.ascontiguousarray(blocks[:, 2:])            # [nblocks, 32] code bytes
+
+    n_zero = 0
+    for shift in (0, 2, 4, 6):
+        c = (qs >> shift) & 3
+        if np.any(c == 3):
+            raise ValueError(f"{t.name}: code 3 (+2) present — pack is not strictly ternary; "
+                             f"T2_G128 cannot represent it losslessly as ternary")
+        n_zero += int(np.count_nonzero(c == 1))
+    zero_frac = n_zero / (rows * cols)
+
+    # Round-trip gate: dequantize the GGUF blocks per the fork's reference
+    # (dequantize_row_q2_0) and our (data, scales) blobs per FORMAT.md, compare
+    # bit-exact, chunked by rows to bound memory on token_embd.
+    d_f32 = scales.view(np.float16).astype(np.float32).reshape(rows, cols // GROUP_T2)
+    qs_rows = qs.reshape(rows, cols // 4)
+    step = max(1, (1 << 25) // cols)  # ~128 MB f32 per chunk
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        blk = blocks.reshape(rows, cols // GROUP_T2, 34)[r0:r1]
+        codes_g = np.stack([(blk[..., 2:] >> s) & 3 for s in (0, 2, 4, 6)],
+                           axis=-1).reshape(r1 - r0, cols)
+        deq_gguf = ((codes_g.astype(np.float32) - 1.0)
+                    * np.repeat(blk[..., :2].copy().view(np.float16).astype(np.float32)
+                                .reshape(r1 - r0, cols // GROUP_T2), GROUP_T2, axis=1))
+        q = qs_rows[r0:r1]
+        codes_o = np.stack([(q >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(r1 - r0, cols)
+        deq_ours = ((codes_o.astype(np.float32) - 1.0)
+                    * np.repeat(d_f32[r0:r1], GROUP_T2, axis=1))
+        if not np.array_equal(deq_gguf, deq_ours):
+            raise ValueError(f"{t.name}: T2 round-trip mismatch in rows {r0}:{r1}")
+
+    return qs.tobytes(), scales.tobytes(), zero_frac
+
+
+def repack_b1(t):
+    """Fork Q1_0 tensor -> (data, scales). Lossless byte-copy (B1_G128, dtype 6).
+
+    Source blocks are {fp16 d; uint8 qs[16]} x (n/128); bit j of a group lives
+    at qs[j/8] bit (j%8) — sequential LSB-first like type 42 — and decodes to
+    (2b-1)*d (dequantize_row_q1_0 at tag prism-b9591-62061f9). B1_G128 keeps
+    the code bytes verbatim and splits scales into the contiguous fp16 blob,
+    exactly the binary-tier plan's Phase-1 layout. Round-trip verified below.
+    """
+    shape = tuple(reversed([int(d) for d in t.shape]))  # ne[0] innermost -> last
+    rows, cols = int(np.prod(shape[:-1])), shape[-1]
+    if cols % GROUP_B1 != 0:  # hard contract, must survive python -O (codex P2)
+        raise ValueError(f"{t.name}: cols {cols} not divisible by {GROUP_B1}")
+    nblocks = rows * cols // GROUP_B1
+    blocks = np.asarray(t.data).reshape(nblocks, 18)
+    scales = blocks[:, :2].copy()                       # fp16 LE bytes
+    qs = np.ascontiguousarray(blocks[:, 2:])            # [nblocks, 16] code bytes
+
+    d_f32 = scales.view(np.float16).astype(np.float32).reshape(rows, cols // GROUP_B1)
+    qs_rows = qs.reshape(rows, cols // 8)
+    step = max(1, (1 << 25) // cols)  # ~128 MB f32 per chunk
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        blk = blocks.reshape(rows, cols // GROUP_B1, 18)[r0:r1]
+        bits_g = np.unpackbits(blk[..., 2:], axis=-1,
+                               bitorder="little").reshape(r1 - r0, cols)
+        deq_gguf = ((bits_g.astype(np.float32) * 2.0 - 1.0)
+                    * np.repeat(blk[..., :2].copy().view(np.float16).astype(np.float32)
+                                .reshape(r1 - r0, cols // GROUP_B1), GROUP_B1, axis=1))
+        bits_o = np.unpackbits(qs_rows[r0:r1], axis=-1,
+                               bitorder="little").reshape(r1 - r0, cols)
+        deq_ours = ((bits_o.astype(np.float32) * 2.0 - 1.0)
+                    * np.repeat(d_f32[r0:r1], GROUP_B1, axis=1))
+        if not np.array_equal(deq_gguf, deq_ours):
+            raise ValueError(f"{t.name}: B1 round-trip mismatch in rows {r0}:{r1}")
+
+    return qs.tobytes(), scales.tobytes()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -115,10 +232,26 @@ def main():
 
     t0 = time.time()
     r = GGUFReader(args.input)
+    ternary = any(t.tensor_type.name == "Q2_0" for t in r.tensors)
+    binary = any(t.tensor_type.name == "Q1_0" for t in r.tensors)
+    if binary and ternary:
+        raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
 
     meta = {"q27_version": VERSION,
-            "quant_policy": args.tag or ("v1.4" if args.q8 else "v1.3"),
+            "quant_policy": args.tag or ("bonsai-t2-v1" if ternary
+                                         else "bonsai-b1-v1" if binary
+                                         else "v1.4" if args.q8 else "v1.3"),
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
+    if ternary:
+        meta["group_t2"] = GROUP_T2
+        meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
+        meta["t2_slot_order"] = "seq-lsb-first"
+    if binary:
+        # Verbatim fork Q1_0 encoding; see the repack_b1 docstring and the
+        # binary-tier plan.
+        meta["group_b1"] = GROUP_B1
+        meta["b1_codes"] = "1=+d,0=-d"
+        meta["b1_bit_order"] = "seq-lsb-first"
     if args.q8:
         meta["q8_extra"] = args.q8
     if args.q4_head:
@@ -153,15 +286,50 @@ def main():
 
     extra = []
     for t in r.tensors:
-        if t.name == "output.weight" and not args.q4_head:
+        # MTP draft head copy: only for non-quantized-head packs and pack
+        # types that carry MTP (no MTP in ternary/binary packs).
+        if t.name == "output.weight" and not args.q4_head \
+                and not ternary and not binary:
             extra.append(("output_q4.weight", t))
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
     tensor_iter = list(r.tensors) + [_Alias(n, t) for n, t in extra]
+    zero_fracs = []
     for t in tensor_iter:
         if only and not only.search(t.name):
             continue
+        verbatim = None  # (dtype, repack_fn) for lossless byte-copy source types
+        if t.tensor_type.name == "Q2_0":
+            verbatim = (DTYPE_T2, repack_t2)
+        elif binary and t.tensor_type.name == "Q1_0":
+            verbatim = (DTYPE_B1, repack_b1)
+        if verbatim is not None:
+            vdt, fn = verbatim
+            shape = tuple(reversed([int(d) for d in t.shape]))
+            out = fn(t)
+            if vdt == DTYPE_T2:
+                data, scales, zero_frac = out
+                zero_fracs.append((zero_frac, int(np.prod(shape)), t.name))
+            else:
+                data, scales = out
+            n_bytes_in += int(np.prod(shape)) * 4
+            n_bytes_out += len(data) + len(scales)
+            errors.append((0.0, t.name, DTYPE_NAMES[vdt]))  # lossless, gate-verified
+            data_off = offset
+            offset = (offset + len(data) + ALIGN - 1) // ALIGN * ALIGN
+            scale_off = offset
+            offset = (offset + len(scales) + ALIGN - 1) // ALIGN * ALIGN
+            entries.append((t.name, vdt, shape, data_off, len(data), scale_off, len(scales)))
+            blobs.append((data_off, data))
+            blobs.append((scale_off, scales))
+            continue
+        if ternary and t.tensor_type.name != "F32":
+            raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in a "
+                             f"ternary pack (expected Q2_0 or F32 only)")
+        if binary and t.tensor_type.name != "F32":
+            raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in a "
+                             f"binary pack (expected Q1_0 or F32 only)")
         w = to_f32(t)
         n_bytes_in += w.nbytes
         dt = policy(t.name)
@@ -227,6 +395,15 @@ def main():
     print(f"\nworst {args.report} tensors by relative RMSE:")
     for rmse, name, dtn in errors[:args.report]:
         print(f"  {rmse:.4f}  {dtn:8s} {name}")
+
+    if zero_fracs:
+        total = sum(n for _, n, _ in zero_fracs)
+        mean_zero = sum(z * n for z, n, _ in zero_fracs) / total
+        zero_fracs.sort()
+        print(f"\nT2 slot verification passed on {len(zero_fracs)} tensors "
+              f"({total/1e9:.2f} B ternary weights, {mean_zero:.1%} zeros overall)")
+        print(f"  least sparse: {zero_fracs[0][0]:.1%} {zero_fracs[0][2]}")
+        print(f"  most sparse:  {zero_fracs[-1][0]:.1%} {zero_fracs[-1][2]}")
 
 
 if __name__ == "__main__":
