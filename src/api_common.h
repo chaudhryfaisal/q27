@@ -3240,6 +3240,71 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         }
     }
 
+    // DRIFT MODE 17 + BARE NATIVE DIALECT (2026-08-14, Qwen3.8 THINK mode).
+    // Thinking-on emission degrades the wrapper two new ways, both captured
+    // verbatim from archived thunderdome transcripts:
+    //   (a) bare well-formed dialect, no <tool_call> wrapper:
+    //         <function=Read>\n<parameter=file_path>\n/x\n</parameter>\n</function>
+    //   (b) the CHIMERA that killed bench-time-tracker: JSON head, XML params:
+    //         {"name": "Write",\n<parameter=file_path>\n/x\n</parameter>\n<parameter=content>\n...
+    // (a) reuses parse_native_xml_call on the spanned substring. (b) extracts
+    // the name from the JSON head and hands the rest to the XML parameter
+    // walk. Both engage only on a declared name; anything carrying <result> or
+    // <output> stays text (the hallucinated-result rule).
+    if (tools && tools->is_array() &&
+        text_in.find("<result>") == std::string::npos &&
+        text_in.find("<output>") == std::string::npos) {
+        auto declared = [&](const std::string& nm) {
+            for (const auto& t : *tools)
+                if (t.contains("function") &&
+                    t["function"].value("name", std::string()) == nm) return true;
+            return false;
+        };
+        // (a) bare <function=NAME>
+        size_t fb = text_in.find("<function=");
+        if (fb != std::string::npos) {
+            ToolCall tc;
+            std::string span = text_in.substr(fb);
+            size_t fe = span.find("</function>");
+            if (fe != std::string::npos) span = span.substr(0, fe + 11);
+            if (parse_native_xml_call(span, tc) && declared(tc.name)) {
+                if (prefix) *prefix = text_in.substr(0, fb);
+                if (remaining_text) *remaining_text = "";
+                fprintf(stderr, "[q27] bare native-dialect call recovered: %s\n", tc.name.c_str());
+                return std::vector<ToolCall>{std::move(tc)};
+            }
+        }
+        // (b) the chimera
+        size_t jb = text_in.find("{\"name\"");
+        if (jb != std::string::npos) {
+            size_t pp = text_in.find("<parameter=", jb);
+            if (pp != std::string::npos) {
+                // name = first JSON string value after {"name"
+                size_t q1 = text_in.find('"', text_in.find(':', jb) + 1);
+                size_t q2 = q1 == std::string::npos ? q1 : text_in.find('"', q1 + 1);
+                if (q2 != std::string::npos && q2 < pp) {
+                    const std::string nm = text_in.substr(q1 + 1, q2 - q1 - 1);
+                    if (declared(nm)) {
+                        // reuse the XML walk by synthesizing a well-formed span;
+                        // a missing final </parameter> is tolerated by closing at EOF
+                        std::string span = "<function=" + nm + ">\n" + text_in.substr(pp);
+                        if (span.find("</parameter>", span.rfind("<parameter=")) == std::string::npos)
+                            span += "\n</parameter>";
+                        span += "\n</function>";
+                        ToolCall tc;
+                        if (parse_native_xml_call(span, tc)) {
+                            if (prefix) *prefix = text_in.substr(0, jb);
+                            if (remaining_text) *remaining_text = "";
+                            fprintf(stderr, "[q27] drift mode 17: chimera json-head/xml-params %s\n",
+                                    nm.c_str());
+                            return std::vector<ToolCall>{std::move(tc)};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
     struct SourceMappedText {
         std::string value;

@@ -134,6 +134,37 @@ static void test_mode16_and_15_variants() {
 // refuses a truncated parameter rather than guessing.
 // Per-model dialect default (keyed on general.name, normalized because
 // conversion mangles it -- the real 3.8 artifact says "Qwen38 27b Hf").
+// Think-mode drift (2026-08-14): bare native dialect without the wrapper, and
+// the JSON-head/XML-params chimera that killed bench-time-tracker at turn 4.
+static void test_think_mode_drift() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}])");
+    std::string pre;
+    // bare <function=NAME>, no <tool_call> wrapper (task-queue stray blocks)
+    auto v1 = q27::parse_bare_tool_calls(
+        "\n<function=Read>\n<parameter=file_path>\n/workspace/tests/phase-06.test.ts\n</parameter>\n</function>\n",
+        &pre, &tools);
+    ok(v1.size() == 1 && v1[0].ok && v1[0].name == "Read" &&
+           v1[0].arguments.value("file_path", std::string()) ==
+               "/workspace/tests/phase-06.test.ts",
+       "bare native dialect without wrapper recovered");
+    // the chimera, verbatim shape from the archived transcript
+    auto v2 = q27::parse_bare_tool_calls(
+        "The test suite is clear. Writing the implementation:\n\n"
+        "{\"name\": \"Write\",\n<parameter=file_path>\n/workspace/src/index.ts\n</parameter>\n"
+        "<parameter=content>\nimport { existsSync, mkdirSync } from 'fs';\nconst x = 1;\n</parameter>",
+        &pre, &tools);
+    ok(v2.size() == 1 && v2[0].ok && v2[0].name == "Write" &&
+           v2[0].arguments.value("file_path", std::string()) == "/workspace/src/index.ts" &&
+           v2[0].arguments.value("content", std::string()).rfind("import { existsSync", 0) == 0,
+       "mode17: json-head/xml-params chimera recovered");
+    ok(pre.find("Writing the implementation") != std::string::npos,
+       "mode17: prose before the chimera preserved as prefix");
+    // an UNDECLARED chimera name stays text
+    auto v3 = q27::parse_bare_tool_calls(
+        "{\"name\": \"NotATool\",\n<parameter=x>\n1\n</parameter>", &pre, &tools);
+    ok(v3.empty(), "mode17: undeclared chimera name is not rescued");
+}
+
 static void test_dialect_default_keying() {
     unsetenv("Q27_TOOL_DIALECT");
     auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
@@ -243,6 +274,7 @@ static void test_mode13_truncated_mid_escape() {
 
 int main() {
     test_mode13_truncated_mid_escape();
+    test_think_mode_drift();
     test_dialect_default_keying();
     test_native_xml_dialect();
     test_mode14_tool_name_xml_dialect();
