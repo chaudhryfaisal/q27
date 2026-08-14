@@ -10257,3 +10257,32 @@ Process cost, owned: all four raw transcripts were destroyed by running
 `thunderdome rescore` before archiving them (rescore rebuilds workspaces).
 The table above was extracted before the rescore; the XML leg's verbatim
 tool-call bytes are gone. Archive transcripts BEFORE rescoring, always.
+
+**THINKING A/B + THINK-MODE DRIFT FIXES -- DONE 2026-08-14: Qwen3.8-27B q5f
+reaches 1.000 hidden tests on both thunderdome tasks.** The final table, all
+legs same model/binary lineage, one trial each:
+
+| leg | time-tracker | task-queue |
+|---|---|---|
+| no-think, JSON preamble | 0.000 (9 turns) | 0.000 (2 turns, died) |
+| no-think, XML dialect | 0.000 (9 turns) | 0.000 (7 turns) |
+| think, XML | 0.000 (died turn 4 on mode-17 chimera) | **0.977** / agent 1.000 (39 turns) |
+| think, XML, + mode 17 & bare-dialect rescues | **1.000** / cov 0.953 | **1.000** / cov 0.875 |
+
+Two findings compose. THINKING IS THE COMPETENCE SWITCH: no-think 3.8 runs
+7-9 plausible turns, declares done, and fails every hidden test; think-mode
+works the task (39 turns, 10.6 min on task-queue) and passes. The trained
+reasoning-effort machinery in 3.8's template is not optional dressing for
+agentic work. And THINK-MODE EMISSION DRIFTS DIFFERENTLY: it produced the
+bare unwrapped native dialect (a gap in the first native-dialect commit,
+which wired the wrapped parser only) and mode 17, a JSON-head/XML-params
+chimera ({"name": "Write", then <parameter=...>) that no path could touch
+and that killed time-tracker at turn 4. Both rescues landed in 74b6a09 with
+verbatim-byte fixtures; the perfect rerun then fired ZERO rescues -- the
+nets exist for when drift recurs, not because it always does.
+
+Context for the number: 3.6's documented best on this harness was 0.55.
+One-trial legs, greedy-free sampled serving, so treat as a demonstrated
+capability rather than a distribution -- but 0.000 -> 1.000 on both tasks is
+not noise. Serving recipe for 3.8 agentic: --think, dialect auto (xml via
+general.name), modes 14-17 armed.
