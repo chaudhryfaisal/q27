@@ -10188,3 +10188,39 @@ concatenated and disagreeing conventions between them, and **mode 15**
 engage only on a declared tool name. Measured effect: 2 turns with 0 tool calls
 -> 3 turns with 2 parsed. The score is still 0.000; this is a catalogue problem
 like 3.6's nine-mode climb from 0.00 to 0.55, not a single-fix problem.
+
+**CONCURRENT-DECODE LADDER vs ninfer -- DONE 2026-08-14: the C=8 gap is
+ARCHITECTURAL, not kernel-level.** Trigger: ninfer published a saturated-decode
+table (27B groupwise-int 185.8 C=1 -> 535.0 C=8, 2.88x; 27B NVFP4 202.4 ->
+1,146.9, 5.67x; steady-interval accounting, sampled 0.6/0.95, INT8-G64 KV,
+n=1 per point). Replicated their accounting on vanilla 3.6-q4s, fp8 KV,
+Q27_BATCH=1, temp 0.6/top-p 0.95 (no top-k/presence -- q27 lacks both),
+aggregate = sum(dec)/union-of-decode-intervals from [req] telemetry, 8,192-token
+generations:
+
+| C | q27 aggregate | scaling |
+|--:|--:|--:|
+| 1 | 143.0 t/s (sampled) | -- |
+| 2 | 183.7 | 1.28x |
+| 4 | 185.6 | 1.30x (clamped: only 2 slots fit) |
+| 8 | UNREACHABLE | -- |
+
+Default boot is SINGLE-slot (that is why the first ladder ran serial at ~143
+flat); `--slots 8 --ctx 16384` yielded only **2 slots on a 32 GB card**:
+`slot 2 SKIPPED: 4.6 GB free < 8.2 GB needed`. **Each q27 slot costs ~8.2 GB of
+FIXED engine stack** (role buffers + per-slot graph zoo), so 15.76 GB
+post-weights fits 2. The published 2-slot 1.41x was not a sample of a curve; it
+was the ceiling of the current architecture on this card.
+
+ninfer batches 8 requests inside ONE engine -- marginal per-request cost is
+approximately KV only -- and its 5.67x NVFP4 scaling additionally rides the fp4
+MMA path that engages at batch (verify width crosses their tokens>=4-8 W4A4
+routing threshold; see the ninfer recon). Their C=1 numbers are protocol-close
+to ours (sampled q27 143 vs their 185.8 int / 202.4 nvfp4; greedy q27 ~200);
+the divergence is entirely in slots-vs-batch.
+
+Conclusion filed, not built: matching the C=8 class requires a SHARED-ENGINE
+batched decode path (one engine, per-request KV, one batched weight sweep),
+which is a redesign of the conductor's engine-per-slot model, plus optionally
+the reopened sm_120a fp4 MMA for the batched sweep. Neither is a small lever.
+Single-stream and 2-slot serving, where q27's numbers stand, are unaffected.
