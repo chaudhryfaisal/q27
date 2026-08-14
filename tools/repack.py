@@ -10,9 +10,9 @@ Usage:
 Ternary source packs (PrismML fork "Q2_0", ggml type 42) are detected
 automatically and repacked losslessly to T2_G128 (quant_policy bonsai-t2-v1);
 see docs/FORMAT.md and docs/metal/plans/2026-07-14-ternary-tier.md for the encoding.
-Binary source packs (fork "Q1_0", ggml type 41, non-dspark arch) likewise
-repack losslessly to B1_G128 (quant_policy bonsai-b1-v1);
-see docs/metal/plans/2026-07-15-binary-tier.md.
+Binary source packs (fork "Q1_0", ggml type 41) likewise repack losslessly
+to B1_G128 (quant_policy bonsai-b1-v1); see
+docs/metal/plans/2026-07-15-binary-tier.md.
 """
 import argparse
 import json
@@ -47,10 +47,10 @@ ALIGN = 256
 
 # dtype 5 is reserved for the parked T3_G128 (never emitted; see FORMAT.md).
 DTYPE_F32, DTYPE_F16, DTYPE_Q8, DTYPE_Q4, DTYPE_T2 = 0, 1, 2, 3, 4
-DTYPE_B1, DTYPE_Q41 = 6, 7
+DTYPE_B1 = 6
 DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4: "Q4_G64",
-               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128", DTYPE_Q41: "Q4_1_G32"}
-GROUP_Q4, GROUP_Q8, GROUP_T2, GROUP_B1, GROUP_Q41 = 64, 128, 128, 128, 32
+               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128"}
+GROUP_Q4, GROUP_Q8, GROUP_T2, GROUP_B1 = 64, 128, 128, 128
 
 
 Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
@@ -211,51 +211,6 @@ def repack_b1(t):
     return qs.tobytes(), scales.tobytes()
 
 
-def repack_q41(t):
-    """Mainline Q4_1 tensor -> (data, scales). Lossless byte-copy (Q4_1_G32, dtype 7).
-
-    Source blocks are {fp16 d; fp16 m; uint8 qs[16]} x (n/32); low nibble of
-    qs[j] is element j, high nibble is element j+16, and both decode to
-    q*d + m (dequantize_row_q4_1, mainline layout confirmed at the fork tag).
-    Q4_1_G32 keeps the code bytes verbatim; the scale blob is the contiguous
-    {d, m} fp16 pairs, one pair per 32-element group. Round-trip verified.
-    """
-    shape = tuple(reversed([int(d) for d in t.shape]))
-    rows, cols = int(np.prod(shape[:-1])), shape[-1]
-    if cols % GROUP_Q41 != 0:  # hard contract, must survive python -O (codex P2)
-        raise ValueError(f"{t.name}: cols {cols} not divisible by {GROUP_Q41}")
-    nblocks = rows * cols // GROUP_Q41
-    blocks = np.asarray(t.data).reshape(nblocks, 20)
-    scales = blocks[:, :4].copy()                       # {d, m} fp16 LE pairs
-    qs = np.ascontiguousarray(blocks[:, 4:])            # [nblocks, 16] nibble bytes
-
-    def _deq(code_bytes, dm_bytes, n_rows):
-        # nibble j -> element j (low) / j+16 (high) within each 32-group
-        q = code_bytes.reshape(n_rows, cols // GROUP_Q41, 16)
-        lo = (q & 0x0F).astype(np.float32)
-        hi = (q >> 4).astype(np.float32)
-        elems = np.concatenate([lo, hi], axis=-1)       # [rows, groups, 32]
-        dm = dm_bytes.reshape(n_rows, cols // GROUP_Q41, 2, 2).copy().view(np.float16)
-        d = dm[..., 0, 0].astype(np.float32)[..., None]
-        m = dm[..., 1, 0].astype(np.float32)[..., None]
-        return (elems * d + m).reshape(n_rows, cols)
-
-    qs_rows = qs.reshape(rows, cols // 2)
-    dm_rows = scales.reshape(rows, cols // GROUP_Q41 * 4)
-    step = max(1, (1 << 25) // cols)
-    for r0 in range(0, rows, step):
-        r1 = min(rows, r0 + step)
-        blk = blocks.reshape(rows, cols // GROUP_Q41, 20)[r0:r1]
-        deq_gguf = _deq(np.ascontiguousarray(blk[..., 4:]),
-                        np.ascontiguousarray(blk[..., :4]), r1 - r0)
-        deq_ours = _deq(np.ascontiguousarray(qs_rows[r0:r1]),
-                        np.ascontiguousarray(dm_rows[r0:r1]), r1 - r0)
-        if not np.array_equal(deq_gguf, deq_ours):
-            raise ValueError(f"{t.name}: Q4_1 round-trip mismatch in rows {r0}:{r1}")
-
-    return qs.tobytes(), scales.tobytes()
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -278,19 +233,12 @@ def main():
     t0 = time.time()
     r = GGUFReader(args.input)
     ternary = any(t.tensor_type.name == "Q2_0" for t in r.tensors)
-    arch = r.fields["general.architecture"].contents()
-    if isinstance(arch, bytes):
-        arch = arch.decode()
-    dspark = arch == "dspark"
-    if dspark and ternary:
-        raise ValueError("dspark pack unexpectedly contains ternary (Q2_0) tensors")
-    binary = not dspark and any(t.tensor_type.name == "Q1_0" for t in r.tensors)
+    binary = any(t.tensor_type.name == "Q1_0" for t in r.tensors)
     if binary and ternary:
         raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
 
     meta = {"q27_version": VERSION,
-            "quant_policy": args.tag or ("dspark-q41-v1" if dspark
-                                         else "bonsai-t2-v1" if ternary
+            "quant_policy": args.tag or ("bonsai-t2-v1" if ternary
                                          else "bonsai-b1-v1" if binary
                                          else "v1.4" if args.q8 else "v1.3"),
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
@@ -298,23 +246,18 @@ def main():
         meta["group_t2"] = GROUP_T2
         meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
         meta["t2_slot_order"] = "seq-lsb-first"
-    if dspark or binary:
+    if binary:
         # Verbatim fork Q1_0 encoding; see the repack_b1 docstring and the
         # binary-tier plan.
         meta["group_b1"] = GROUP_B1
         meta["b1_codes"] = "1=+d,0=-d"
         meta["b1_bit_order"] = "seq-lsb-first"
-    if dspark:
-        # Verbatim mainline Q4_1 encoding; BF16 sources widen exactly to F32.
-        meta["group_q41"] = GROUP_Q41
-        meta["q41_scales"] = "{d,m} fp16 pairs per group"
-        meta["q41_nibble_order"] = "low=elems 0-15, high=elems 16-31"
     if args.q8:
         meta["q8_extra"] = args.q8
     if args.q4_head:
         meta["q4_head"] = True
     for f in r.fields.values():
-        if f.name.startswith(("qwen35.", "dspark.", "general.architecture", "general.name")):
+        if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
             try:
                 v = f.contents()
                 if isinstance(v, bytes):
@@ -343,10 +286,10 @@ def main():
 
     extra = []
     for t in r.tensors:
-        # MTP draft head copy: only for non-quantized-head packs AND only for
-        # pack types that carry MTP (no MTP in ternary/binary/dspark packs).
+        # MTP draft head copy: only for non-quantized-head packs and pack
+        # types that carry MTP (no MTP in ternary/binary packs).
         if t.name == "output.weight" and not args.q4_head \
-                and not ternary and not dspark and not binary:
+                and not ternary and not binary:
             extra.append(("output_q4.weight", t))
     class _Alias:
         def __init__(self, name, t):
@@ -359,10 +302,8 @@ def main():
         verbatim = None  # (dtype, repack_fn) for lossless byte-copy source types
         if t.tensor_type.name == "Q2_0":
             verbatim = (DTYPE_T2, repack_t2)
-        elif (dspark or binary) and t.tensor_type.name == "Q1_0":
+        elif binary and t.tensor_type.name == "Q1_0":
             verbatim = (DTYPE_B1, repack_b1)
-        elif dspark and t.tensor_type.name == "Q4_1":
-            verbatim = (DTYPE_Q41, repack_q41)
         if verbatim is not None:
             vdt, fn = verbatim
             shape = tuple(reversed([int(d) for d in t.shape]))
@@ -389,14 +330,9 @@ def main():
         if binary and t.tensor_type.name != "F32":
             raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in a "
                              f"binary pack (expected Q1_0 or F32 only)")
-        if dspark and t.tensor_type.name not in ("F32", "BF16"):
-            raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in the "
-                             f"dspark pack (expected Q4_1, Q1_0, BF16, or F32 only)")
         w = to_f32(t)
         n_bytes_in += w.nbytes
-        # dspark: everything not byte-copied above widens exactly to F32
-        # (BF16 -> F32 is lossless); the name policy must not requantize.
-        dt = DTYPE_F32 if dspark else policy(t.name)
+        dt = policy(t.name)
         if dt == DTYPE_Q4 and w.shape[-1] % GROUP_Q4 != 0:
             dt = DTYPE_F16  # fallback, shouldn't happen on this model
         if dt == DTYPE_Q8 and w.shape[-1] % GROUP_Q8 != 0:

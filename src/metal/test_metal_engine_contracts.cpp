@@ -57,8 +57,8 @@ bool artifact_requires_per_tensor_upload(const char* path, uint64_t max_buffer_l
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: %s OFFICIAL.q27 BONSAI.q27\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        std::fprintf(stderr, "usage: %s OFFICIAL.q27 [BONSAI.q27]\n", argv[0]);
         return 2;
     }
     try {
@@ -473,7 +473,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cancelled MTP stream changed retry behavior\n");
             return 1;
         }
-        {
+        if (argc == 3) {
             q27::MetalEngine bonsai(argv[2], 8, false);
             if (bonsai.has_mtp())
                 throw std::runtime_error("Bonsai artifact unexpectedly exposed an MTP layer");
@@ -490,10 +490,12 @@ int main(int argc, char** argv) {
             (void)bonsai.ingest_prompt({1, 1, 1}, false, true);
             if (bonsai.position() != 3)
                 throw std::runtime_error("Bonsai serial prefill did not advance");
+            puts("Bonsai engine contracts: OK");
+        } else {
+            puts("Bonsai engine contracts: SKIP (set BONSAI_MODEL to enable)");
         }
 
-
-        puts("Metal q4s and Bonsai engine contracts: OK");
+        puts("Metal q4s engine contracts: OK");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
