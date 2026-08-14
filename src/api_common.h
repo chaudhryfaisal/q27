@@ -241,9 +241,34 @@ inline std::string strip_ctrl(std::string s) {
     return s;
 }
 
+// Per-model dialect default, set once at boot from the artifact's
+// general.name. The 3.8 A/B (BUILDLOG 2026-08-14): instructed in its trained
+// XML dialect the model needed ZERO drift rescues vs 4 under JSON, so 3.8-family
+// checkpoints default to xml; 3.6 demonstrably complies with JSON and keeps it.
+// Matching is normalized (lowercase, alnum-only) because conversion mangles the
+// name -- the real 3.8 artifact says "Qwen38 27b Hf". Q27_TOOL_DIALECT=xml|json
+// overrides in either direction.
+inline bool& tool_dialect_xml_default() {
+    static bool v = false;
+    return v;
+}
+inline void set_tool_dialect_for_model(const std::string& meta_json) {
+    std::string name;
+    try { name = json::parse(meta_json).value("general.name", std::string()); }
+    catch (...) {}
+    std::string norm;
+    for (char c : name)
+        if (isalnum((unsigned char)c)) norm += (char)tolower((unsigned char)c);
+    tool_dialect_xml_default() = norm.find("qwen38") != std::string::npos;
+    fprintf(stderr, "tool dialect: %s (general.name \"%s\"%s)\n",
+            tool_dialect_xml_default() ? "xml (trained-format default)" : "json",
+            name.c_str(),
+            getenv("Q27_TOOL_DIALECT") ? ", Q27_TOOL_DIALECT overrides" : "");
+}
 inline bool tool_dialect_xml() {
     const char* d = getenv("Q27_TOOL_DIALECT");
-    return d && !strcmp(d, "xml");
+    if (d) return !strcmp(d, "xml");
+    return tool_dialect_xml_default();
 }
 // Q27_TOOL_DIALECT=xml swaps the calling instruction for the dialect the
 // checkpoint was trained on (see parse_native_xml_call above). Default stays

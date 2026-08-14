@@ -132,6 +132,30 @@ static void test_mode16_and_15_variants() {
 // parse_tool_call via parse_native_xml_call. Round-trips the template's own
 // example shape, typed values, multi-line values, zero-parameter calls, and
 // refuses a truncated parameter rather than guessing.
+// Per-model dialect default (keyed on general.name, normalized because
+// conversion mangles it -- the real 3.8 artifact says "Qwen38 27b Hf").
+static void test_dialect_default_keying() {
+    unsetenv("Q27_TOOL_DIALECT");
+    auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
+    q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
+    ok(q27::tool_dialect_xml(), "dialect: mangled 3.8 name selects xml");
+    q27::set_tool_dialect_for_model(meta("Qwen3.8-27B"));
+    ok(q27::tool_dialect_xml(), "dialect: clean 3.8 name selects xml");
+    q27::set_tool_dialect_for_model(meta("Qwen3.6-27B"));
+    ok(!q27::tool_dialect_xml(), "dialect: 3.6 stays json");
+    q27::set_tool_dialect_for_model(meta("Qwopus3.6 27B v2"));
+    ok(!q27::tool_dialect_xml(), "dialect: qwopus fine-tune stays json");
+    // env overrides win in BOTH directions
+    setenv("Q27_TOOL_DIALECT", "json", 1);
+    q27::set_tool_dialect_for_model(meta("Qwen3.8-27B"));
+    ok(!q27::tool_dialect_xml(), "dialect: env json overrides a 3.8 model");
+    setenv("Q27_TOOL_DIALECT", "xml", 1);
+    q27::set_tool_dialect_for_model(meta("Qwen3.6-27B"));
+    ok(q27::tool_dialect_xml(), "dialect: env xml overrides a 3.6 model");
+    unsetenv("Q27_TOOL_DIALECT");
+    q27::tool_dialect_xml_default() = false;   // leave global state clean
+}
+
 static void test_native_xml_dialect() {
     q27::ToolCall tc;
     ok(q27::parse_native_xml_call(
@@ -219,6 +243,7 @@ static void test_mode13_truncated_mid_escape() {
 
 int main() {
     test_mode13_truncated_mid_escape();
+    test_dialect_default_keying();
     test_native_xml_dialect();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();

@@ -539,6 +539,7 @@ int main(int argc, char** argv) {
     // will construct N engines from this same pair.)
     q27::Model shared_model = q27::Model::open(model);
     validate_arch(shared_model); // before the upload, not in Engine::init after it
+    q27::set_tool_dialect_for_model(shared_model.meta_json); // per-model tool dialect (BUILDLOG 2026-08-14)
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
     shared_dm.upload_all();
