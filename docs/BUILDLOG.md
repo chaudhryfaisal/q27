@@ -10224,3 +10224,36 @@ batched decode path (one engine, per-request KV, one batched weight sweep),
 which is a redesign of the conductor's engine-per-slot model, plus optionally
 the reopened sm_120a fp4 MMA for the batched sweep. Neither is a small lever.
 Single-stream and 2-slot serving, where q27's numbers stand, are unaffected.
+
+**TOOL-DIALECT A/B (Qwen3.8-27B q5f) -- DONE 2026-08-14: the collision theory
+holds; XML leg needs ZERO rescues.** Same binary (4056496), same model, same
+two thunderdome tasks, one trial per leg (n=1), Q27_TOOL_DIALECT unset (JSON
+control) vs xml:
+
+| | JSON leg | XML leg |
+|---|---|---|
+| drift-mode rescues (server log) | **4** (14x2, 15, 16) | **0** in 15 requests |
+| bench-time-tracker | 9 turns / 8 calls | 9 turns / 8 calls |
+| bench-task-queue | 2 turns / 1 call | **7 turns / 6 calls** |
+| task-queue diff.patch | 8.5 KB | **64.0 KB** |
+| scores | 0.000 | 0.000 |
+
+Instructed in its trained dialect, the model emits it cleanly -- not one
+rescue fired in the XML leg. The JSON leg survives only via the mode 14-16
+safety nets (time-tracker parity is those nets working; task-queue still died
+at turn 2). Work product tells the same story as depth: 7.5x the diff on
+task-queue under XML.
+
+Scores remain 0.000 on both legs: the limiter has MOVED from parsing to task
+quality. Both time-tracker runs ran 9 turns, wrote ~57 KB, self-declared done,
+and failed the hidden tests. 3.6 scored 0.55 on this harness, so either
+3.8's agentic competence is lower here or it wants different serving settings
+-- the obvious suspect being THINKING: q27 serves no-think by default, and 3.8
+is trained with reasoning-effort semantics. Thinking-on agentic A/B is the
+next experiment; dialect default stays the env knob until a second
+corroborating trial, then should flip per-model keyed on general.name.
+
+Process cost, owned: all four raw transcripts were destroyed by running
+`thunderdome rescore` before archiving them (rescore rebuilds workspaces).
+The table above was extracted before the rescore; the XML leg's verbatim
+tool-call bytes are gone. Archive transcripts BEFORE rescoring, always.
