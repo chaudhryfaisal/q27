@@ -10103,3 +10103,88 @@ unbounded control in this single-prompt regression gate. The final boundary-
 hardening tip was not rebenchmarked; these numbers document the immediately
 preceding follow-up tree and remain directional feature evidence, not an exact-
 tip throughput measurement.
+
+**Qwen3.8-27B PORT -- DONE 2026-08-14: repack-only, but the TIER RECIPES DID NOT
+TRANSFER.** Qwen3.8-27B shipped 2026-08-14 (FP8 variant appeared first; the
+release watcher caught it via its org scan while the base repo was still 401).
+`tools/check_checkpoint.py Qwen/Qwen3.8-27B` returned **REPACK JOB**: all
+fourteen compile-time constants match, dense not MoE, MTP head present,
+`architectures: Qwen3_5ForConditionalGeneration`, `model_type: qwen3_5`. No
+engine change was needed and none was made.
+
+Pipeline: official safetensors (55.6 GB, 18 shards) -> `convert_hf_to_gguf.py`
+from `llama.cpp-turboquant` -> BF16 GGUF (54.7 GB, `general.architecture=qwen35`,
+866 tensors, **15 MTP tensors at blk.64**, `nextn_predict_layers=1`) ->
+`tools/repack.py` x7. The shipped `crc32.txt` covers only 8 small files and NONE
+of the 18 safetensors shards, so the weights arrive with no publisher digest;
+three of its eight entries were stale (chat template, generation config,
+tokenizer config), confirmed by matching the live Hub bytes rather than assumed.
+
+**The tokenizer is byte-identical to Qwen3.6's** -- same 248320 vocab, 247587
+merges, bos 248044, eos 248046, same file bytes. So prompt formatting and stop
+handling carry over unchanged, and the pre-tokenized wikitext-2 corpus
+(`wiki.test.qwopus.i32`) is directly reusable.
+
+All seven tiers reproduced at EXACTLY their 3.6 footprints, across all four
+recipe shapes (plain, q4_head, q8_extra, both):
+
+| tier | GB | md5 | canonical |
+|---|--:|---|---|
+| q4s | 15.46 | `85b2a0e08f86a691e24fd91bc8e40a00` | `a710b3a4de0f13da0b008d948c425735` |
+| default | 17.73 | `f9ba646f023e85793bab8792995fc6e5` | `98e7da0df4ae81511566ad1ce31b719a` |
+| q5f | 18.22 | `953ae3a23f1ccdae781b4361612fdbbe` | `10e654eb9c9f2aeb47ea8e003aa77030` |
+| q6 | 20.49 | `1fd9fe41ad69780f52569c92b7c022a5` | `067d81464ed4573b9e52841a503e111e` |
+| q6f | 20.99 | `49c5267df9f2aceea02adbd9808dd4ac` | `d0c05c0c723df6208ae1e080be9c6fe5` |
+| q6k | 23.25 | `00d1afa9cd560a3bf29455fad7e6f685` | `067d81464ed4573b9e52841a503e111e` |
+| q8 | 28.45 | `fd2a6ac2102b3a75ccd4deeb0731648d` | none (OOM) |
+
+Two canonical caveats. **q6 and q6k collide** -- `cmp`-verified byte-identical
+`generated:` lines, not a hash artifact. They differ only in `ffn_gate`
+promotion, which flips no argmax over 128 greedy tokens, so this canonical
+CANNOT distinguish those two tiers on this prompt. **q8 has no canonical on a
+5090**: 28.45 GB of weights plus KV and graphs OOMs at `device_model.cu:28`.
+Its raw digest reads `d41d8cd98f00b204e9800998ecf8427e`, the md5 of empty --
+recorded here because that value has now twice looked like a canonical failure
+when it actually means no output at all.
+
+**THE FINDING: the q4-head error-cancellation family does not transfer, and the
+3.6 tier ordering is gone.** Full wikitext-2 test set, same protocol as the 3.6
+sweep:
+
+| tier | 3.8 PPL | 3.6 PPL |
+|---|--:|--:|
+| q6k | **7.2049** | -- |
+| q6 | 7.2444 | -- |
+| q6f | 7.2636 | 7.9189 |
+| q5f | 7.3039 | **7.9491** |
+| default | 7.3384 | -- |
+| q4s | 7.3917 | measured 0.26% BETTER than default |
+
+On 3.6, q4s beat default and q5f beat everything including q8; the ordering was
+deliberately NON-monotone in bits and that was the whole point of the family. On
+3.8 the ordering is monotone in bits, q6k wins, and **q4s is 0.73% WORSE than
+default (7.3917 vs 7.3384)** -- the cancellation is simply absent. This is the
+qwopus inversion reproduced on a second, independent checkpoint, which promotes
+"recipe families are checkpoint-specific" from a one-off observation to a
+repeatable phenomenon. Identical file sizes prove the recipes APPLIED; they say
+nothing about whether they are still well CHOSEN.
+
+Consequence: the README tier table's quality claims ("q5f: best quality that
+fits a 24GB card", "q4s: PPL measures BETTER than default") are 3.6 claims and
+must not be carried onto 3.8 weights. PPL is one axis and this project has
+documented it ranking KV formats backwards (2026-08-01), so a tier
+recommendation still wants task-level corroboration -- but the direction here is
+unambiguous and measured over the full test set, not a slice.
+
+**Agentic serving is parser-bound again, exactly as 3.6 was.** A thunderdome
+`bench-time-tracker` trial against the q5f repack scored 0.000 while the engine
+itself was healthy: 164-194 t/s decode, 17.4K-token prefix-cache reuse,
+`end=eos`, 9 KB of code written. Cause: Qwen3.8 complies with the
+`<tool_call>{json}</tool_call>` instruction on turn 1 then drifts into dialects
+the parser did not know. Two were captured live and fixed (53ef4cc): **mode 14**
+`<tool_name>NAME</tool_name><parameter=KEY>VALUE</parameter>` with two calls
+concatenated and disagreeing conventions between them, and **mode 15**
+`<name>NAME, "arguments": {...}}`, which is mode 10 wearing an XML hat. Both
+engage only on a declared tool name. Measured effect: 2 turns with 0 tool calls
+-> 3 turns with 2 parsed. The score is still 0.000; this is a catalogue problem
+like 3.6's nine-mode climb from 0.00 to 0.55, not a single-fix problem.
