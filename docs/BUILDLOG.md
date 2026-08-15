@@ -10547,3 +10547,43 @@ Step 3 (running): full 21-task suite under the recipe, same protocol as the
 corrected campaign. Watch item: 24K thinking leaves 8K/response -- check the
 easy tasks for answer-truncation regressions before adopting the budget as a
 serving default.
+
+## 2026-08-15: suite3 under the recovery recipe -- 0.315, the 24K budget is net-negative and comes back out
+
+Full 21-task suite under effort-xhigh + --think-budget 24000: **hidden mean
+0.315** vs the corrected campaign's 0.511 (effort off, 16K default). The
+recipe that recovered three zeros in isolation made the suite WORSE by
+re-rolling every task's trajectory:
+
+- Former 1.000s lost: task-queue 1.000 -> 0 (after 20 min / 1.05M tok of
+  real work), time-tracker 1.000 -> 0 (comp 0.000 -- not even the plausible
+  files; it was hidden=1 in FIVE straight trials this morning at 16K),
+  structural-merge 1.000 -> 0, permission-maze 0.673 -> 0, phantom-invoice
+  0.976 -> 0.707, monorepo 1.000 -> 0.765.
+- Recoveries that did not repeat: ecommerce 1.000 -> 0.074, collab-server
+  1.000 -> 0 (worked 12.5 min), constraint-scheduler 0.789 -> 0.
+- Stable: the five fast tasks held (financial-ledger, ssg-toolkit, both
+  yamls at 1.000; debug-nightmare/fts-search at their exact campaign
+  scores). plugin-marketplace replayed its step-2 trajectory to the byte
+  (14 s / 100,264 tok / 0.262) -- deterministic fast-quit basin.
+
+ATTRIBUTION: the arms changed two variables, but the damage pattern points
+at the BUDGET. Step 1 (effort line alone, 16K) regressed nothing it
+measured. The tasks that fell hardest are exactly the big-write ones --
+24K thinking leaves 8K per response, and the forced-close-plus-answer
+machinery reshapes every long-turn trajectory. The effort line stays: it is
+the trained render (fidelity, not a tweak), it fixed the no-effort quits at
+DEFAULT budget, and nothing implicates it in the regressions.
+
+SERVING RECIPE VERDICT: --think + effort xhigh (37caa07 default) + the 16K
+DEFAULT budget. --think-budget 24000 is a per-request rescue for
+reasoning-bound tasks (constraint-scheduler class), not a default.
+
+PROTOCOL VERDICT, banked for every future 3.8 campaign: single-trial suite
+means on this checkpoint carry roughly +-0.1-0.15 of trajectory-basin noise
+on the volatile half of the tasks. 0.511-vs-0.315 is partly recipe, partly
+re-roll. Campaign comparisons need n=3 on the volatile tasks (the five fast
+tasks are stable and can stay n=1), or a variance-collapsing serving change
+first. The suite mean for the RECOMMENDED recipe (effort + 16K) has NOT
+been measured; it is not 0.511 (that was effort-off) and not 0.315 (that
+was 24K).
