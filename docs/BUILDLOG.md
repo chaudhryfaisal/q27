@@ -10460,3 +10460,34 @@ self-describing. The suite table was cross-checked against live grep'd
 console rows all morning and both read the same wrong column; the check that
 caught it was comparing OTHER orchestrators' means and refusing to believe
 forty different models tie to three decimals.
+
+## 2026-08-15: think-budget recovery arm -- 24K recovers constraint-scheduler (0 -> 0.789), exonerates the budget for the rest
+
+Hypothesis from the campaign correction: the class regression's zeroed tasks
+split into big-think zeros (12-14K think blocks, near the 16K default budget
+= half of CC's 32K max_tokens) and no-effort zeros (25-token think blocks,
+13 s self-declared completion). Arm: --think-budget 24000, v2 default,
+one trial each, four tasks (three big-think zeros + ecommerce-backend as the
+no-effort control). All results verified from orchestrator-scoped run dirs
+(a concurrent orchestrator appeared in results/runs mid-arm and poisoned the
+ls -t extraction -- attribution now globs trials/claude-code-q27-haight).
+
+| task | baseline 16K | 24K budget |
+|---|---|---|
+| constraint-scheduler | 0 (91K tok, 81 s) | 0.789 (895K tok, 636 s) |
+| beam-splitter | 0 (137K, 223 s) | 0 (118K, 234 s) |
+| analytics-dashboard | 0 (212K, 190 s) | 0 (379K, 373 s) |
+| ecommerce-backend (control) | 0 (189K, 13 s) | 0 (189K, 14 s) |
+
+The budget was genuinely binding on constraint-scheduler: 10x the work and a
+0 -> 0.789 flip. It is NOT the class story: beam-splitter and analytics both
+consumed the extra headroom and still zeroed (approach quality, not
+truncation), and the control replayed its no-effort trajectory to the token
+(189,025 both runs -- the content-seeded near-determinism). Context never
+mattered: longest request under 60K against 258K ctx.
+
+Next lever, untested: the reasoning-effort prompt line ("Reasoning effort is
+set to xhigh") -- 3.8's trained mechanism, never injected q27-side, and the
+only candidate that touches the no-effort mode. Serving-default tradeoff if
+24K is adopted: constraint-scheduler went 81 s -> 10.6 min; fine for eval,
+real latency for interactive use.
