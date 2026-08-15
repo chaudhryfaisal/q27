@@ -140,19 +140,42 @@ static void test_mode16_and_15_variants() {
 // <parameter=arguments> wrapping the whole JSON, streamed with NO closers.
 // Fell between mode 14 (wrong opener) and the bare-native rescue (demanded
 // closers) and zeroed the first four suite tasks.
+// Replicates the server.cu response-path consumer walk (cursor ->
+// source_begin/source_end -> substr). A call returned with an unset span
+// (npos defaults) passes name/args checks but throws std::out_of_range in
+// that walk -- the 2026-08-15 mid-suite server abort (drift mode 17, rid=61)
+// -- so every rescue fixture must walk clean here.
+static bool spans_walkable(const std::string& text,
+                           const std::vector<q27::ToolCall>& calls) {
+    size_t cursor = 0;
+    for (const auto& c : calls) {
+        if (c.source_begin == std::string::npos ||
+            c.source_end == std::string::npos ||
+            c.source_begin < cursor || c.source_end < c.source_begin ||
+            c.source_end > text.size())
+            return false;
+        (void)text.substr(cursor, c.source_begin - cursor);
+        cursor = c.source_end;
+    }
+    (void)text.substr(cursor);
+    return true;
+}
+
 static void test_function_arguments_unterminated() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
     std::string pre;
-    auto v = q27::parse_bare_tool_calls(
+    const std::string in_suite =
         "\n\n<function=Bash>\n<parameter=arguments>\n"
         "{\"command\":\"cat /workspace/schema.sql /workspace/TASK.md\","
-        "\"description\":\"Show schema and task\"}",
-        &pre, &tools);
+        "\"description\":\"Show schema and task\"}";
+    auto v = q27::parse_bare_tool_calls(in_suite, &pre, &tools);
     ok(v.size() == 1 && v[0].ok && v[0].name == "Bash" &&
            v[0].arguments.value("command", std::string()).rfind("cat /workspace", 0) == 0 &&
            v[0].arguments.value("description", std::string()) == "Show schema and task" &&
            !v[0].arguments.contains("arguments"),
        "suite-form: unterminated <parameter=arguments> merged, not nested");
+    ok(v.size() == 1 && spans_walkable(in_suite, v),
+       "suite-form: source span set and consumer-walkable");
     // an unterminated NON-final parameter (another <parameter= follows) still refuses
     q27::ToolCall t2;
     ok(!q27::parse_native_xml_call(
@@ -164,25 +187,31 @@ static void test_think_mode_drift() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}])");
     std::string pre;
     // bare <function=NAME>, no <tool_call> wrapper (task-queue stray blocks)
-    auto v1 = q27::parse_bare_tool_calls(
-        "\n<function=Read>\n<parameter=file_path>\n/workspace/tests/phase-06.test.ts\n</parameter>\n</function>\n",
-        &pre, &tools);
+    const std::string in_bare =
+        "\n<function=Read>\n<parameter=file_path>\n/workspace/tests/phase-06.test.ts\n</parameter>\n</function>\n";
+    auto v1 = q27::parse_bare_tool_calls(in_bare, &pre, &tools);
     ok(v1.size() == 1 && v1[0].ok && v1[0].name == "Read" &&
            v1[0].arguments.value("file_path", std::string()) ==
                "/workspace/tests/phase-06.test.ts",
        "bare native dialect without wrapper recovered");
+    ok(v1.size() == 1 && spans_walkable(in_bare, v1) &&
+           v1[0].source_end == in_bare.find("</function>") + 11,
+       "bare native: source span ends at the closer");
     // the chimera, verbatim shape from the archived transcript
-    auto v2 = q27::parse_bare_tool_calls(
+    const std::string in_chim =
         "The test suite is clear. Writing the implementation:\n\n"
         "{\"name\": \"Write\",\n<parameter=file_path>\n/workspace/src/index.ts\n</parameter>\n"
-        "<parameter=content>\nimport { existsSync, mkdirSync } from 'fs';\nconst x = 1;\n</parameter>",
-        &pre, &tools);
+        "<parameter=content>\nimport { existsSync, mkdirSync } from 'fs';\nconst x = 1;\n</parameter>";
+    auto v2 = q27::parse_bare_tool_calls(in_chim, &pre, &tools);
     ok(v2.size() == 1 && v2[0].ok && v2[0].name == "Write" &&
            v2[0].arguments.value("file_path", std::string()) == "/workspace/src/index.ts" &&
            v2[0].arguments.value("content", std::string()).rfind("import { existsSync", 0) == 0,
        "mode17: json-head/xml-params chimera recovered");
     ok(pre.find("Writing the implementation") != std::string::npos,
        "mode17: prose before the chimera preserved as prefix");
+    ok(v2.size() == 1 && spans_walkable(in_chim, v2) &&
+           v2[0].source_begin == in_chim.find("{\"name\""),
+       "mode17: source span starts at the json head (rid=61 abort regression)");
     // an UNDECLARED chimera name stays text
     auto v3 = q27::parse_bare_tool_calls(
         "{\"name\": \"NotATool\",\n<parameter=x>\n1\n</parameter>", &pre, &tools);

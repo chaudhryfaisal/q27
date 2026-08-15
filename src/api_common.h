@@ -3298,6 +3298,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             size_t fe = span.find("</function>");
             if (fe != std::string::npos) span = span.substr(0, fe + 11);
             if (parse_native_xml_call(span, tc) && declared(tc.name)) {
+                tc.source_begin = fb;
+                tc.source_end = fe != std::string::npos ? fb + fe + 11
+                                                        : text_in.size();
                 if (prefix) *prefix = text_in.substr(0, fb);
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] bare native-dialect call recovered: %s\n", tc.name.c_str());
@@ -3323,6 +3326,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         span += "\n</function>";
                         ToolCall tc;
                         if (parse_native_xml_call(span, tc)) {
+                            tc.source_begin = jb;
+                            tc.source_end = text_in.size();
                             if (prefix) *prefix = text_in.substr(0, jb);
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 17: chimera json-head/xml-params %s\n",
