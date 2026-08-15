@@ -10587,3 +10587,70 @@ tasks are stable and can stay n=1), or a variance-collapsing serving change
 first. The suite mean for the RECOMMENDED recipe (effort + 16K) has NOT
 been measured; it is not 0.511 (that was effort-off) and not 0.315 (that
 was 24K).
+
+## 2026-08-15: phase 0 of the ninfer steals -- sm_120a fp4 capability pinned in-tree, and the phase 2 gate is already cleared
+
+The fp4 block-scaled MMA proof lived only in a session scratchpad and prose;
+now it is `tools/microbench_mxf4.cu` + a Makefile target, with the toolchain
+trap documented at the target: the mxf4nvf4 instruction requires
+`-gencode arch=compute_120a,code=sm_120a`, and under the tri-arch NVCCFLAGS
+ptxas rejects it in a way that reads as a hardware limitation. That exact
+omission was the 2026-08 NO-GO.
+
+THE TOOL: A leg is a from-scratch nvfp4 W4A4 GEMM (e2m1 codes, ue4m3 scale
+per 16 elems, m16n8k64 block-scale MMA, 128x128x256 tiles, 8 warps, cp.async
+double buffer, ldmatrix over 16B-segment-swizzled smem) plus a fp32->nvfp4
+activation-quantize kernel; B leg is the LIVE prefill inner path,
+`q27k::gemm_q4_T` on real q4s projection weights (W4A8-int, s8 m16n8k32,
+including the ntx dispatch). Two self-gates: 256 sampled CPU-reference
+checks on the fp4 GEMM (PASS) and quantize reconstruction rel RMS 0.102
+(PASS, e2m1 grid error). Timing: warmup + 50-rep cudaEvent pairs, the
+gemm_ntx_spike pattern.
+
+THE TABLE (5090, driver clocks as-found, both activation quantizes timed):
+
+| shape (N x K) | M | q27 gemm ms / TFLOPS | fp4 gemm ms / TFLOPS | gemm | e2e |
+|---|--:|--:|--:|--:|--:|
+| attn_q+gate 12288x5120 | 1024 | 0.410 / 313.9 | 0.165 / 781.1 | 2.49x | 2.53x |
+| attn_output 5120x6144  | 1024 | 0.209 / 308.3 | 0.082 / 785.8 | 2.55x | 2.60x |
+| ffn_gate 17408x5120    | 1024 | 0.571 / 319.5 | 0.230 / 792.4 | 2.48x | 2.51x |
+| ffn_down 5120x17408    | 1024 | 0.579 / 315.5 | 0.212 / 861.7 | 2.73x | 3.04x |
+
+Full sweep M = 512/1024/2048/8192 in the tool output: ratios 2.13x-2.97x,
+monotone-ish in M, worst case (ffn_gate M=512) still 2.13x. The fp4 kernel
+sits at 780-868 TFLOPS = the card's dense fp4 tensor peak, so phase 2's
+integration headroom is real, not a microbench artifact. The e2e column
+includes each side's activation quantize (q27: quantize_x + quantize_x_g64;
+fp4: k_quant_nvfp4) -- fp4's quantize is CHEAPER (one pass, no g32 leg), so
+e2e ratios are at or above the gemm ratios.
+
+VERDICT: the phase 2 gate (>= 1.3x at M >= 512 on real projection shapes)
+is cleared by 1.6x-2.3x of margin at every point measured. Phase 2 (repack
+leg + activation quantize + prefill GEMM swap behind Q27_PF=fp4) is GO by
+this table; its own bars (canonical unchanged, NLL battery incl. long
+single-pass, wall-clock prefill >= 1.25x on 17K-27K prompts) still apply.
+Corroborating external datum, same day: the club-3090 single-harness A/B
+measured ninfer's nvfp4 profile at 2.9x q27's end-to-end prefill at 10K
+depth (results/ninfer-vs-q27-20260815 in the club-3090 checkout).
+
+M=1024 is the row that matters for serving: prefill runs PF_T=1024 chunks,
+so 512/2048/8192 characterize the kernel, not the deployment. Excluded by
+design: K/V projections (Q8_G128 policy, ~2% of prefill GEMM work) and the
+whole SSM path (the ssm_out cancellation lesson says leave it alone).
+
+REVIEW HARDENING, same day: the consensus review pushed for a stronger
+correctness gate; the added EXHAUSTIVE single-tile check (every output of
+128x128x256) immediately caught a real latent bug -- at k_tiles == 1 the
+prologue committed only one cp.async group, cp_wait<1> returned with it
+still in flight, and the kernel computed on unstaged smem (all-zero
+output). K=1024 sampled testing could never see it; every benched shape is
+multi-tile, so the ratio table stands unchanged (re-measured: 2.14x-2.96x,
+same within noise). Fix: the prologue always commits STAGES groups, empty
+when there is no second tile. Also added: N/K/M tileability guards with
+loud skips (the kernel has no tail handling by design), sm_120 device
+guard, model-path existence check, tightened ref tolerance to 1e-2/0.25
+(e2m1 x ue4m3 products are fp32-exact; slack is accumulation order + bf16
+output rounding), 3-rep warmup, and the synthetic-B scoping note (baseline
+= real q4s weights, fp4 leg = synthetic weights of matching shape;
+throughput is value-independent for both kernels -- the real-weight fp4
+repack is phase 2's deliverable).

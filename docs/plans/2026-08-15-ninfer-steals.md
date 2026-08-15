@@ -10,7 +10,14 @@ Ground rule carried over from the engine roadmap: every phase has a
 pre-declared bar and closes with a measurement, win or lose. No phase starts
 before the one ahead of it reports, except phase 0, which is free.
 
-## Phase 0 (hours): pin the sm_120a capability in-tree
+## Phase 0 (hours): pin the sm_120a capability in-tree -- DONE 2026-08-15
+
+Landed as `tools/microbench_mxf4.cu` + `build/microbench_mxf4` (sm_120a-only
+target, trap documented in the Makefile). Ratio table in the BUILDLOG entry
+of the same date: fp4 W4A4 clears the phase 2 gate at every measured point,
+2.13x-2.97x vs the live W4A8-int path (gate was 1.3x), 2.5x at the PF_T=1024
+production point, fp4 kernel at dense-peak TFLOPS. Phase 2 is GO on this
+table.
 
 The fp4 recon proof -- block-scaled mxf4nvf4 mma.sync executing on haight --
 lives only in a session scratchpad and the BUILDLOG prose. The old NO-GO was

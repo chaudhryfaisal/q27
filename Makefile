@@ -104,6 +104,18 @@ build/gdn_chunk_bench: tools/gdn_chunk_bench.cu | build
 build/attn_fdw_bench: tools/attn_fdw_bench.cu | build
 	$(NVCC) $(NVCCFLAGS) tools/attn_fdw_bench.cu -o $@
 
+# sm_120a-ONLY target. The block-scaled fp4 MMA (mma.sync...kind::mxf4nvf4)
+# exists only behind the arch-SPECIFIC target: with the plain
+# compute_120/sm_120 gencode above, ptxas rejects the instruction and the
+# failure is indistinguishable from a hardware limitation -- that exact
+# omission produced the 2026-08 fp4 NO-GO verdict (falsified 2026-08-14, see
+# docs/plans/2026-08-15-ninfer-steals.md). The tri-arch serving binary stays
+# on NVCCFLAGS until a real kernel needs 120a; only this tool gets the flag.
+MXF4FLAGS = -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a -Xcompiler -Wall
+build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp \
+                       src/prefill.cuh src/kernels.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
+
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
 
