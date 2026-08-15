@@ -10286,3 +10286,53 @@ One-trial legs, greedy-free sampled serving, so treat as a demonstrated
 capability rather than a distribution -- but 0.000 -> 1.000 on both tasks is
 not noise. Serving recipe for 3.8 agentic: --think, dialect auto (xml via
 general.name), modes 14-17 armed.
+
+**QWEN3.8 QUANT SWEEP (phases A-D) -- DONE 2026-08-14: new tier family
+dominates the ported recipes on every instrument, and ssm_out promotion is
+LONG-CONTEXT POISON on this checkpoint.**
+
+Phase A/B, single-axis sensitivity (v1.3-style pure-Q4 base 16.75 GB @ 7.3284,
+full wikitext chunked NLL, artifacts deleted after measurement): ssm_out
+promotion +0.34% PPL (HARMFUL); attn_output -0.22% at +0.24 GB (best
+efficiency, -0.90%/GB); ffn_down -1.23%; ffn_up -0.58% beats ffn_gate -0.48%
+(3.6 chose gate); q4-head demotion +0.86% (no cancellation -- and the q4-head
+config reproduced the ported q4s byte-for-byte, validating the harness).
+Eval noise floor measured incidentally: +-0.0003 PPL run-to-run (same GPU,
+same bytes), so sub-0.001 deltas are ties. Cross-arch (3090) delta ~0.0007:
+coarse checks only, one instrument per table.
+
+Phase C, compositions -- additivity holds within ~0.001-0.008 everywhere:
+
+| candidate | recipe | GB | PPL | ported opponent |
+|---|---|--:|--:|---|
+| c-small | q4-head +attn_output | 15.70 | 7.3765 | q4s 15.46 @ 7.3917 |
+| c-default | +attn_output | 17.00 | 7.3121 | default 17.73 @ 7.3384 |
+| c-quality1 | +attn_output+ffn_down | 19.76 | 7.2233 | q6 20.49 @ 7.2444 |
+| c-quality2 | +ffn_up too | 22.52 | 7.1718 | q6k 23.25 @ 7.2049 |
+
+Every ported tier is dominated: smaller AND better.
+
+Phase D, tails (q6k reference, 24K single-pass -- 64K does not fit beside the
+23.3 GB reference plus the engine's fixed stack; all legs share the window)
+plus HumanEval+: candidates cluster tightly (92-97% shared divergence
+positions), study-definition catastrophic counts 1-10 of 24,575 (c-quality1:
+ONE), HumanEval+ 30/30, 30/30, 28/30, 29/30 -- all >= ported q4s's 27/30.
+
+THE HEADLINE CAME OUT OF THE REFERENCE INVERTING: every candidate beat q6k by
+7-12% dPPL at depth. Isolation (ported default vs c-default, whose recipes
+differ by EXACTLY the ssm_out promotion): **+14.0% dPPL at 24K, 210 positions
+|d|>4, 69 study-catastrophic -- versus +0.26% chunked.** The Q8 ssm_out
+promotion compounds through the GDN recurrence: ~50x amplification at depth,
+invisible to chunked PPL because chunking resets the recurrence every 512
+tokens. Direction matters: MORE precision is WORSE, so 3.8 does have one
+error-cancellation structure -- in the SSM path -- and the 3.6-family recipes
+(default, q6, q6k all carry ssm_out) break it. Those ported tiers are
+quietly degraded in exactly the regime q27 serves.
+
+Generalize, alongside the 2026-08-01 lesson: PPL is blind on the KV axis, and
+CHUNKED anything is blind on the recurrent-path axis. Long-context single-pass
+NLL joins the standard battery for any change touching the SSM path.
+
+Recipes are the durable object (probe artifacts deleted; the four candidates
+are on disk pending the publish decision). Still owed before any publish:
+per-tier canonicals for the new family, needle checks, naming.
