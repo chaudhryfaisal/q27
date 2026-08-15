@@ -10402,3 +10402,11 @@ no-think signature at the score level; only the transcripts separate them.
 Suite mechanics for next time: 21 tasks end-to-end is ~90 min at q27 speeds
 when the server stays up (284K tokens through a cache-hot trajectory in 43 s).
 Transcripts archived per-task before any rescore, per the 08-14 lesson.
+
+## 2026-08-15: v0.7.0 released
+
+Tagged at 5a45daa: the Apple-silicon Metal backend (PRs #17-#22, manthedan),
+Qwen3.8-27B with the v2 tier family, turbo5k + the Ampere default flip, the
+native XML dialect + drift modes 14-17, and the span crash fix. 109 commits
+since v0.6.2. Gates: full CPU+GPU test suite green, vanilla 3.6 canonical
+reproduced (a2982c51). Notes: github.com/signalnine/q27/releases/tag/v0.7.0
