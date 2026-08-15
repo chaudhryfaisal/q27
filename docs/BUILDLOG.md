@@ -10491,3 +10491,31 @@ set to xhigh") -- 3.8's trained mechanism, never injected q27-side, and the
 only candidate that touches the no-effort mode. Serving-default tradeoff if
 24K is adopted: constraint-scheduler went 81 s -> 10.6 min; fine for eval,
 real latency for interactive use.
+
+## 2026-08-15: the missing reasoning-effort line -- a render-fidelity bug, and ecommerce-backend goes 0 -> 1.000 on it alone
+
+Reading 3.8's chat_template.jinja for the recovery campaign turned up
+something worse than an unexploited lever: with thinking enabled the trained
+template injects a reasoning-effort instruction at the HEAD of the system
+block and DEFAULTS to xhigh. q27's render never emitted it, so every
+thinking prompt served to 3.8 has been missing a line the checkpoint was
+trained to expect. 37caa07 injects the byte-exact template strings, keyed on
+the same general.name bit as the tool dialect (3.6 renders untouched),
+Q27_REASONING_EFFORT=xhigh|low|medium|off to override, six render tests.
+
+Step-1 arm, effort line as the ONLY changed variable (16K default budget):
+
+| task | baseline | 24K budget | effort line |
+|---|---|---|---|
+| ecommerce-backend | 0 (13 s) | 0 (14 s, same trajectory) | **1.000** (231 s, 1.1M tok) |
+| beam-splitter | 0 | 0 | 0 |
+| analytics-dashboard | 0 | 0 | 0 |
+
+The no-effort failure mode (25-token think blocks, self-declared completion
+in seconds) was the model correctly reading line-absence as "don't think
+hard": give it the trained xhigh line and the same task gets 231 seconds of
+real work and a clean 0.980 composite. beam-splitter and analytics-dashboard
+are now 0 across three arms each -- capability walls, not recipe gaps.
+
+The serving default changes with 37caa07: 3.8-family thinking prompts now
+carry the xhigh line out of the box.
