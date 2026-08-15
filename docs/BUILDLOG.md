@@ -10410,3 +10410,53 @@ Qwen3.8-27B with the v2 tier family, turbo5k + the Ampere default flip, the
 native XML dialect + drift modes 14-17, and the span crash fix. 109 commits
 since v0.6.2. Gates: full CPU+GPU test suite green, vanilla 3.6 canonical
 reproduced (a2982c51). Notes: github.com/signalnine/q27/releases/tag/v0.7.0
+
+## 2026-08-15 (later): CORRECTION -- the campaign entry above read the wrong score column; true hidden mean is 0.511, and the 08-14 1.000s DID replicate
+
+The thunderdome meta.json schema splits per task class: real-repo tasks carry
+`scores.tests` alone (their one suite), greenfield tasks carry `tests`
+(VISIBLE) and `hidden_tests` (the discriminator) as separate keys. Everything
+in this session -- the suite table, the replication arms, the "fail basin" --
+read `scores.tests` throughout, which on greenfield tasks is the visible
+column. Corrected rule: hidden = `hidden_tests` where present, else `tests`.
+
+What changes:
+
+**Campaign, corrected: hidden 0.511 / composite 0.507** (was reported 0.336).
+Nine tasks at 1.000 hidden, not five -- structural-merge, task-queue, and
+time-tracker passed their hidden suites while failing the visible column.
+
+**The replication verdict REVERSES.** time-tracker scored hidden=1 in ALL
+FIVE trials today (suite, n=3 repro, q5f arm, ab74 arm); task-queue hidden
+1.000 in the suite and 0.907 in the repro trial. The 08-14 A/B replicated
+fine; the "sampled-basin draws" story was an artifact of the column misread.
+Struck. (What stands from that morning: the mode-17 span crash and its fix,
+the ab74 rebuild dying on today's traffic, the per-task health check, and the
+observation that composite tracks artifact plausibility.) One real anomaly
+remains: the q5f-arm task-queue trial scored hidden 0 / composite 0 with 485K
+tokens -- a genuine failed trajectory on the v1 checkpoint, unexplained.
+
+**The correct headline the wrong column was hiding: 3.8 regresses hard
+against 3.6 on this suite, and the regression is a class, not a slope.**
+Same orchestrator, same engine, latest-per-task across history: the 3.6-era
+serving scored 0.908 mean hidden on these 21 tasks; the 3.8 campaign scores
+0.511. Per-task it is bimodal -- nine tasks hold at 1.000 (all bugfix /
+features / real-repo / recovery / marathon work, plus structural-merge) and
+permission-maze IMPROVES +0.42, but every greenfield/complex task and most
+reasoning/hard + algorithmic/hard tasks go to flat ZERO from 3.6's
+0.84-1.000. The zeroed complex builds finish in 13-225 s -- fast, plausible,
+self-declared done. 3.8-with-think retains 3.6's competence on bounded work
+and loses the long-haul build-a-system class entirely. Whether that is
+serving-recipe (think budget? the unexploited reasoning-effort prompt line?)
+or the checkpoint itself is the next campaign.
+
+Context for the ranking: on the same suite, frontier orchestrators land
+0.92-0.98 hidden, the qwopus family 0.77-0.87, and 0.511 sits near the
+bottom of the 95-orchestrator board. README and the v0.7.0 release notes
+are corrected to the true numbers.
+
+Process lesson, banked: a scoring harness's column names are not
+self-describing. The suite table was cross-checked against live grep'd
+console rows all morning and both read the same wrong column; the check that
+caught it was comparing OTHER orchestrators' means and refusing to believe
+forty different models tie to three decimals.
