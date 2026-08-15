@@ -10336,3 +10336,69 @@ NLL joins the standard battery for any change touching the SSM path.
 Recipes are the durable object (probe artifacts deleted; the four candidates
 are on disk pending the publish decision). Still owed before any publish:
 per-tier canonicals for the new family, needle checks, naming.
+
+## 2026-08-15: first FULL thunderdome campaign (21 tasks) -- hidden 0.336, a mid-suite server abort found+fixed, and the 08-14 1.000s die under replication
+
+**THE NUMBER: Qwen3.8-27B v2.0 default, --think, auto-XML dialect, one trial
+per task across all 21 benchmarks: hidden-tests mean 0.336, composite 0.507.**
+Five clean 1.000s (financial-ledger, monorepo-disaster, ssg-toolkit,
+yaml-escapes, yaml-trailing-comma), phantom-invoice 0.976, debug-nightmare
+0.647, fts-search 0.429, and ten flat zeros on hidden tests. No prior model
+has run this suite end-to-end -- the "3.6 scored 0.55" figure that has been
+floating around this log is the OLD T8 single-task n=5 CC composite (0.553)
+and is not comparable to anything here. This table is the baseline now.
+
+**MID-SUITE ABORT, root-caused from the journal in one line.** 20 minutes in,
+the eval server died: `[q27] drift mode 17` immediately followed by
+`std::out_of_range: substr(npos)`. The 74b6a09 rescue paths (bare-native +
+chimera) return ToolCalls with source_begin/source_end left at their npos
+defaults; the response-path consumer walks `cursor=call.source_end;
+source.substr(cursor)` and throws. The 08-14 A/B survived its own chimera
+only because it rode the streaming path, which consumes prefix/remaining_text
+instead of spans -- path-dependent luck, not correctness. Fixed in 6da787e
+(honest spans on both rescue paths) plus a spans_walkable() test that
+replicates the consumer walk, so an unset span now fails in the test binary,
+not in production. Validation came free later in the morning: the rebuilt
+74b6a09 died on today's traffic within 14 seconds of its first chimera; the
+fixed binary shrugged off several across the campaign. Tasks 9-21 had burned
+against the dead server (0-token rows) and were rerun on the fixed binary;
+tasks 1-8 stand -- their transcripts contain zero raw `<function=` bytes, so
+the buggy path never fired there. The rerun script gained a per-task health
+check: a dead server now costs one task, not thirteen.
+
+**THE 08-14 "1.000 on both tasks" DID NOT SURVIVE REPLICATION.** The suite
+trial scored hidden 0 on time-tracker AND task-queue, so the discrepancy got
+the full one-variable treatment:
+
+| arm | binary | checkpoint | time-tracker | task-queue |
+|---|---|---|---|---|
+| 08-14 A/B | 74b6a09 | q5f-v1 | 1.000 | 1.000 |
+| suite + n=3 | 6da787e | v2.0 default | 0 / 0 / 0 / 0 | 0 / 0 |
+| checkpoint swap | 6da787e | q5f-v1 | 0 | 0 (comp 0) |
+| binary rebaseline | 74b6a09 rebuilt | q5f-v1 | 0 (server died mid-run) | -- |
+
+Ruled out by direct evidence: checkpoint (q5f fails today too), KV (journal
+shows kv=fp8 both days), think (think=1 both days, thinking blocks in every
+transcript), dialect (both days log `tool dialect: xml (trained-format
+default)`), task definitions (untouched since March), prompt bytes (90fc97b
+diff is parser-internal only). Trials are near-deterministic -- two
+bit-identical time-tracker runs, a third differing by 15 tokens -- so
+content-seeded sampling makes same-day trials correlated, not independent
+draws. VERDICT: no engine regression; the 08-14 1.000s were favorable
+sampled-basin draws on knife-edge tasks, exactly what that entry's own
+"demonstrated capability, not a distribution" caveat allowed for. Both tasks
+run short trajectories (7-11 assistant messages) where one skipped
+validation step flips every hidden test, and both days' runs emitted the
+SAME mode-17 chimera at the same message position before diverging on
+sampled wording.
+
+Two smaller things the morning surfaced. Composite is mostly artifact
+plausibility: the rebaseline's time-tracker scored composite 0.92 off a run
+whose server had been DEAD since message ~4 -- hidden tests are the only
+column that discriminates. And the fail basin's profile (fast completion,
+self-declared done, plausible files, hidden 0) is indistinguishable from the
+no-think signature at the score level; only the transcripts separate them.
+
+Suite mechanics for next time: 21 tasks end-to-end is ~90 min at q27 speeds
+when the server stays up (284K tokens through a cache-hot trajectory in 43 s).
+Transcripts archived per-task before any rescore, per the 08-14 lesson.

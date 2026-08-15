@@ -132,11 +132,15 @@ checkpoint. Per-tier canonicals are in the HF model card; note they gate
 change, not identity (nearby tiers can share a 128-token greedy walk).
 
 Serving 3.8 for agentic use: run with `--think` -- with thinking off the
-model runs plausible-looking sessions and fails hidden tests it passes with
-thinking on (0.000 -> 1.000 on the thunderdome pair, BUILDLOG 2026-08-14).
-The engine auto-selects 3.8's trained XML tool dialect from the artifact's
-`general.name` and carries drift rescues (modes 14-17) for the forms the
-model falls into under thinking.
+model runs plausible-looking sessions that self-declare done and fail
+hidden tests. Documented capability on the full 21-task thunderdome suite
+(one trial per task, BUILDLOG 2026-08-15): hidden-tests mean 0.336,
+composite 0.507, five tasks at 1.000. Single-trial scores on individual
+tasks swing hard between runs -- an earlier 1.000 pair did not replicate --
+so trust the suite mean, not one-task anecdotes. The engine auto-selects
+3.8's trained XML tool dialect from the artifact's `general.name` and
+carries drift rescues (modes 14-17) for the forms the model falls into
+under thinking.
 
 ```bash
 # 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);
