@@ -1,6 +1,6 @@
 # Quasar
 
-A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
+A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and their fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
 ## Why this is interesting
 
@@ -49,7 +49,9 @@ canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate
 scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
 `CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
 Pre-07-09 historical numbers (see BUILDLOG) were measured on Qwopus
-unless noted.
+unless noted. Qwen3.8 tiers carry their own canonicals (HF model
+card); the benchmark standard remains vanilla 3.6 until a 3.8 bench
+campaign replaces it.
 
 ## Quickstart
 
@@ -104,6 +106,37 @@ they trade decode speed for model quality:
 Task scores measure the same across tiers (q4s: fully validated --
 PPL, suite, agentic NLL, needle, 18-run task dome, no deficit) -- the
 quality tiers buy perplexity margin, not benchmark wins. When in doubt take the default.
+
+### Qwen3.8-27B (v2 recipes)
+
+Qwen3.8-27B (released 2026-08-14) is a repack-only port: every compile-time
+constant matches (`docs/PORTING.md` predicted it from the config alone, and
+the prediction held). The tiers are at
+[signalnine/Qwen3.8-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.8-27B-MTP-q27)
+and were **re-derived from a fresh per-tensor sensitivity sweep** (BUILDLOG
+2026-08-14), NOT ported: the 3.6 recipes measurably do not transfer. The
+q4-head error-cancellation family inverts, and the `ssm_out` Q8 promotion the
+3.6 default/q6/q6k recipes carry is actively harmful at depth on 3.8 (+14%
+dPPL at 24K single-pass vs +0.26% chunked -- it compounds through the GDN
+recurrence, and chunked PPL cannot see it).
+
+| tier | file | GB | wikitext PPL | HumanEval+ | needle |
+|---|---|--:|--:|--:|---|
+| q4s (v2) | `qwen38-27b-mtp-q4s.q27` | 15.70 | 7.3765 | 30/30 | 6/6 @ ~120K |
+| **default (v2)** | `qwen38-27b-mtp.q27` | 17.00 | 7.3121 | 30/30 | 6/6 @ ~120K |
+| q6 (v2) | `qwen38-27b-mtp-q6.q27` | 19.76 | 7.2233 | 28/30 | 6/6 @ ~100K |
+| q6k (v2) | `qwen38-27b-mtp-q6k.q27` | 22.52 | 7.1718 | 29/30 | 6/6 @ ~40K |
+
+All four are smaller AND lower-PPL than 3.6-recipe builds of the same
+checkpoint. Per-tier canonicals are in the HF model card; note they gate
+change, not identity (nearby tiers can share a 128-token greedy walk).
+
+Serving 3.8 for agentic use: run with `--think` -- with thinking off the
+model runs plausible-looking sessions and fails hidden tests it passes with
+thinking on (0.000 -> 1.000 on the thunderdome pair, BUILDLOG 2026-08-14).
+The engine auto-selects 3.8's trained XML tool dialect from the artifact's
+`general.name` and carries drift rescues (modes 14-17) for the forms the
+model falls into under thinking.
 
 ```bash
 # 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);

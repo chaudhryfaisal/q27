@@ -185,6 +185,16 @@ for k in sorted(set(a) | set(b)):
         print(f"{k:<46} {str(a.get(k,'--'))[:27]:<28} {b.get(k,'--')}")
 ```
 
+## Outcome: the checklist verified in anger (2026-08-14)
+
+Qwen3.8-27B shipped and `tools/check_checkpoint.py` returned REPACK JOB; the
+port was exactly that -- no engine change, all seven 3.6 tier recipes applied
+byte-cleanly. What the checklist correctly does NOT promise: that the recipes
+are still well CHOSEN. They were not (see BUILDLOG 2026-08-14: the tier
+quality ordering inverted, and the `ssm_out` promotion is actively harmful at
+depth on 3.8). Constants portability and recipe portability are different
+claims; this file covers only the first.
+
 ## Recon log
 
 ### Qwen3.8 (2026-08-05, pre-release)
