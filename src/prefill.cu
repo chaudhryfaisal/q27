@@ -8,6 +8,7 @@
 #include "prefill.cuh"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
+#include "i8g64.cuh"
 
 namespace q27k {
 
@@ -1440,6 +1441,9 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
                         else if constexpr (KFMT == PF_K_T5)
                             q27turbo::turbo5_stage8_h2(
                                 (const q27turbo::block_turbo5*)kc + rb, d8, kd);
+                        else if constexpr (KFMT == PF_K_I8)
+                            q27turbo::i8g64_stage8_h2(
+                                (const q27turbo::block_i8g64*)kc + rb, d8, kd);
                         else {
                             const __half* kr = (const __half*)kc + off;
                             #pragma unroll
@@ -2275,6 +2279,10 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
                 s_kv[(pp * 2) * HD + d] = q27turbo::turbo5_deq_elem(
                     (const q27turbo::block_turbo5*)kc +
                         ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+            else if constexpr (KFMT == PF_K_I8)
+                s_kv[(pp * 2) * HD + d] = q27turbo::i8g64_deq_elem(
+                    (const q27turbo::block_i8g64*)kc +
+                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
             else
                 s_kv[(pp * 2) * HD + d] = kv2f(((const CT*)kc)[off]);
             if constexpr (VT3)
@@ -2506,6 +2514,10 @@ __global__ void k_kv_store_T_t3(const float* __restrict__ kT, const float* __res
         q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
         return;
     }
+    if (!is_v && kvk == KV_I8G64) {
+        q27turbo::i8g64_quant_group(src[j], (q27turbo::block_i8g64*)kc + blk, j, red);
+        return;
+    }
     q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
                                  xs, red);
 }
@@ -2557,6 +2569,12 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, co
     }
     if (kvk == KV_T5K) {
         attn_prefill_launch<__half, PF_K_T5, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                                   part, base_pos, t0, SB, n_q_heads,
+                                                   n_kv_heads, head_dim, scale, st);
+        return;
+    }
+    if (kvk == KV_I8G64) {
+        attn_prefill_launch<__half, PF_K_I8, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
                                                    part, base_pos, t0, SB, n_q_heads,
                                                    n_kv_heads, head_dim, scale, st);
         return;

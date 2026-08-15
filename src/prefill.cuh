@@ -69,7 +69,7 @@ void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int bas
 // rows -- fp16, fp8, and turbo3v's plain-fp16 K all take that leg -- while
 // PF_K_T3/PF_K_T5 dequant turbo blocks into the tiles. Only the staging
 // differs; every MMA past the tiles is format-agnostic.
-enum PfKFmt : int { PF_K_CT = 0, PF_K_T3 = 1, PF_K_T5 = 2 };
+enum PfKFmt : int { PF_K_CT = 0, PF_K_T3 = 1, PF_K_T5 = 2, PF_K_I8 = 3 };
 // Per-128-group WHT rotate over a flat [T][row_stride] buffer (prefill Q
 // forward after rope; attention output inverse before the sigmoid gate).
 // head_stride = floats between heads within a row (2*head_dim for qgT,

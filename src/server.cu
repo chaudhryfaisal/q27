@@ -577,10 +577,16 @@ int main(int argc, char** argv) {
             const bool t3 = kvv && !strcmp(kvv, "turbo3");
             const bool t3v = kvv && !strcmp(kvv, "turbo3v");
             const bool t5k = kvv && !strcmp(kvv, "turbo5k");
+            const bool i8 = kvv && !strcmp(kvv, "int8g64");
             // K+V bytes per token per layer-pair. turbo3 400+400, turbo3v
-            // 2048(fp16 K)+400, turbo5k 656(82 B x 8 blocks)+400.
-            const double pair =
-                t3 ? 800.0 : t3v ? 2448.0 : t5k ? 1056.0 : fp8 ? 2048.0 : 4096.0;
+            // 2048(fp16 K)+400, turbo5k 656(82 B x 8 blocks)+400, int8g64
+            // 1056(132 B x 8 blocks)+400.
+            const double pair = t3    ? 800.0
+                                : t3v ? 2448.0
+                                : t5k ? 1056.0
+                                : i8  ? 1456.0
+                                : fp8 ? 2048.0
+                                      : 4096.0;
             const double per_tok = 18.0 * pair;
             // calibrated 2026-07-17 (in-process free deltas, q4s tier):
             // sm_120 W12 fp8@131072: non-KV stack 4.49GB => base 0.89;
@@ -691,6 +697,7 @@ int main(int argc, char** argv) {
                         : kve && !strcmp(kve, "turbo3")  ? KV_T3
                         : kve && !strcmp(kve, "turbo3v") ? KV_T3V
                         : kve && !strcmp(kve, "turbo5k") ? KV_T5K
+                        : kve && !strcmp(kve, "int8g64") ? KV_I8G64
                                                          : KV_F16;
         size_t model_bytes = 0;
         { struct stat st; if (::stat(model.c_str(), &st) == 0) model_bytes = (size_t)st.st_size; }

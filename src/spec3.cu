@@ -7,6 +7,7 @@
 #include "spec3.cuh"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
+#include "i8g64.cuh"
 
 namespace q27k {
 
@@ -197,6 +198,10 @@ __global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ 
     }
     if (!is_v && kvk == KV_T5K) {
         q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
+        return;
+    }
+    if (!is_v && kvk == KV_I8G64) {
+        q27turbo::i8g64_quant_group(src[j], (q27turbo::block_i8g64*)kc + blk, j, red);
         return;
     }
     q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
@@ -579,6 +584,10 @@ __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
             q27turbo::turbo5_ld8_lane(
                 (const q27turbo::block_turbo5*)kc + ((size_t)p * n_kv_heads + kvh) * 2, lane,
                 kv);
+        else if constexpr (KVK == KV_I8G64)
+            q27turbo::i8g64_ld8_lane(
+                (const q27turbo::block_i8g64*)kc + ((size_t)p * n_kv_heads + kvh) * 2, lane,
+                kv);
         else
             fd2_ld8((const __half*)kc + ((size_t)p * n_kv_heads + kvh) * head_dim, lane, kv);
         fd2_ld8_t3((const q27turbo::block_turbo3*)vc + ((size_t)p * n_kv_heads + kvh) * 2,
@@ -677,6 +686,10 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
     else if (kvk == KV_T5K)
         k_attn_fd2_t3<KV_T5K, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
                                                              n_kv_heads, gqa, head_dim, scale);
+    else if (kvk == KV_I8G64)
+        k_attn_fd2_t3<KV_I8G64, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch,
+                                                               pos, n_kv_heads, gqa, head_dim,
+                                                               scale);
     else if (kvk == KV_FP8)
         k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
             q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,
@@ -706,7 +719,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // 08-01 (c) when it gained both mma legs -- which is the maintenance rule:
     // add the leg, then take the kind out, rather than widening a condition
     // downstream and leaving the guard stale.
-    if (kvk == KV_T3V) {
+    if (kvk == KV_T3V || kvk == KV_I8G64) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;

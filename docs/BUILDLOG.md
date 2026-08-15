@@ -10654,3 +10654,58 @@ output rounding), 3-rep warmup, and the synthetic-B scoping note (baseline
 = real q4s weights, fp4 leg = synthetic weights of matching shape;
 throughput is value-independent for both kernels -- the real-weight fp4
 repack is phase 2's deliverable).
+
+## 2026-08-15: ninfer steals phase 1 -- int8-g64 K arm is a NO-GO; turbo5k's rotation is worth ~3 bits on the tail
+
+The tail study gets a sixth arm: `Q27_KV=int8g64`, ninfer's KV profile on the
+K side (64-dim groups, fp32 absmax, fp16_rne(absmax/127) scale with the
+reciprocal taken from the ROUNDED scale, RNE, clamp [-127,127], no rotation;
+bit-faithful per the 2026-08-15 recon of their normative contract), V =
+turbo3 like every turbo kind, so the row sits on the K ladder next to
+turbo3v (fp16 K) and turbo5k (5-bit K). 1056 B/token/layer K + 400 V = 25.6
+KB/token. Wiring is the turbo3v pattern -- KvKind appended, branches in the
+shared store kernels / fd2 template / prefill staging, force-routed to fd2
+at the dispatch guard, zero new kernels. Format header src/i8g64.cuh;
+microtest tools/i8g64_test.cu holds every leg to BITWISE oracle equality
+(absmax is order-independent, so no tolerance class needed) -- ALL PASS.
+Two plan errors corrected before the run and recorded in the plan doc: no
+host-side sim path exists in this harness, and the "~18.0 KB/token" claim
+was an arithmetic slip (int8 = fp8 bytes; both-sides int8g64 is ~37 KB/tok).
+
+THE RUN (same harness, corpus, N=65536, CTX=69632, fresh dumps in
+scratchpad/t5_tail_i8g64/, archived 08-01 dumps untouched): SELF-GATE PASS
+-- fp8/turbo3v/turbo3 reproduce the published rows EXACTLY on today's
+binary.
+
+| format | KB/tok | dPPL | mean|d| | p99.9 | |d|>1 | catastrophic |
+|---|--:|--:|--:|--:|--:|--:|
+| fp8 | 36.0 | +0.458% | 0.14612 | 5.4287 | 2718 | 19 |
+| turbo3v | 43.0 | +0.510% | 0.20971 | 7.0938 | 4321 | 52 |
+| turbo5k | 18.6 | +1.132% | 0.21938 | 7.9088 | 4513 | 63 |
+| **int8g64** | **25.6** | +1.041% | 0.21246 | 7.2681 | 4388 | **64** |
+| turbo3 | 14.1 | +0.804% | 0.27673 | 8.7321 | 5816 | 114 |
+
+VERDICT, against the bar re-declared in the plan before the measurement:
+**NO-GO** -- 64 catastrophic at 25.6 KB/tok spends 37% more bytes than
+turbo5k for a statistically identical tail (63 vs 64). No serving port.
+
+THE FINDING, which is why the arm was worth building: ninfer's
+groupwise-int8 K -- the industry-default 8-bit KV recipe -- lands at the
+SAME catastrophic tier as q27's 5-bit WHT-rotated Lloyd-Max K while
+spending 1.6x the K bytes (1056 vs 656 B/row). The rotation+centroid stack
+is worth ~3 bits of tail-equivalent quality on this checkpoint. int8g64 IS
+marginally cleaner in the bulk (every other metric: mean|d| 0.21246 vs
+0.21938, p99.9 7.27 vs 7.91, |d|>1 4388 vs 4513, dPPL +1.041% vs +1.132%)
+but identical where it counts. Steal-list item 1 closes: q27's K ladder is
+already past the int8-groupwise frontier.
+
+DRIFT NOTE: turbo5k reads 63/+1.132% today vs the published 65/+0.983%.
+Its read legs changed since 08-01 (H16 mma leg 938fb66 etc.); fp8/t3v/t3,
+whose paths did not change, reproduce exactly. Same-binary comparisons are
+the valid ones; the drift does not affect the verdict in either direction.
+The arm STAYS IN-TREE as a diagnostic kind (like turbo3v): opt-in, guarded
+at the fd2 dispatch, inert on every default path.
+
+GATES: canonical a2982c5197c627551b27d76a0a94b220 EXACT (fp16 default
+untouched), test_kernels ALL PASS, i8g64_test ALL PASS (bitwise), self-gate
+PASS.

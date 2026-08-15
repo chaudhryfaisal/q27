@@ -30,6 +30,7 @@
 #include "prefix_ram.h"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
+#include "i8g64.cuh"
 #include "vgemm.cuh"
 
 using q27::DevTensor;
@@ -632,6 +633,7 @@ struct Engine {
         if (kv_kind >= KV_T3 && is_v) return t3;      // V is turbo3 in all turbo kinds
         if (kv_kind == KV_T3) return t3;
         if (kv_kind == KV_T5K) return rows * sizeof(q27turbo::block_turbo5);
+        if (kv_kind == KV_I8G64) return rows * sizeof(q27turbo::block_i8g64);
         return (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz();
     }
     std::vector<void*> kcache, vcache;
@@ -671,6 +673,7 @@ struct Engine {
                   : kve && !strcmp(kve, "turbo3")  ? KV_T3
                   : kve && !strcmp(kve, "turbo3v") ? KV_T3V
                   : kve && !strcmp(kve, "turbo5k") ? KV_T5K
+                  : kve && !strcmp(kve, "int8g64") ? KV_I8G64
                                                    : KV_F16;
         if (kv_fp8) fprintf(stderr, "KV cache: fp8 E4M3 (opt-in, 34 KB/token)\n");
         else if (kv_kind == KV_T3)
@@ -679,6 +682,9 @@ struct Engine {
             fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in, diagnostic)\n");
         else if (kv_kind == KV_T5K)
             fprintf(stderr, "KV cache: turbo5 5-bit K + turbo3 V (opt-in, ~18.6 KB/token)\n");
+        else if (kv_kind == KV_I8G64)
+            fprintf(stderr,
+                    "KV cache: int8-g64 K (ninfer profile) + turbo3 V (opt-in, ~25.6 KB/token)\n");
         validate_arch(model);
         const std::string& mj = model.meta_json;
         size_t p = mj.find("\"attn_layers\": [");

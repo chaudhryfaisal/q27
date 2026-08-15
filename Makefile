@@ -142,6 +142,9 @@ build/turbo3_test: tools/turbo3_test.cu src/turbo3.cuh | build
 build/turbo5_test: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/turbo5_test.cu -o $@
 
+build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
+	$(NVCC) $(NVCCFLAGS) tools/i8g64_test.cu -o $@
+
 # 24GB-card (3090-class) server: Q27_W_MAX=8 shrinks the GDN role sets +
 # graph zoo so the fixed stack fits beside the weights (the default W12
 # build OOMs at graph instantiation on 24GB). Same sources, own binary.

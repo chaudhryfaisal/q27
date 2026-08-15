@@ -50,10 +50,12 @@ static constexpr int OUTCOME_INTS = W_PLUMB + 2;
 // across them, which is exactly what Engine::kv_bytes(is_v) is shaped to
 // express. Append new turbo kinds at the END; anything that is NOT a turbo
 // kind must go below KV_T3.
-enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3, KV_T5K = 4 };
+enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3, KV_T5K = 4, KV_I8G64 = 5 };
 
 // Does K carry the WHT rotation (so Q must be forward-rotated to match)?
-// True for every turbo kind except turbo3v, whose K stays plain fp16.
+// True for every turbo kind except turbo3v (plain fp16 K) and int8g64
+// (ninfer's per-64-absmax int8 K, deliberately rotation-free -- the study
+// arm measures that exact error profile; src/i8g64.cuh).
 static inline bool kv_k_rotated(int kvk) { return kvk == KV_T3 || kvk == KV_T5K; }
 
 #ifdef __CUDACC__

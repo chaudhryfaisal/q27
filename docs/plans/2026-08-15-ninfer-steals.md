@@ -34,22 +34,45 @@ anyone adding an fp4 kernel.
 - Bar: none -- this is capability pinning, not a lever. Output is the
   measured GEMM ratio table that phase 2 decides on.
 
-## Phase 1 (days): INT8-G64 KV arm in the tail study
+## Phase 1 (days): INT8-G64 KV arm in the tail study -- DONE 2026-08-15, NO-GO
+
+Measured same day (BUILDLOG entry of the same date): 64 catastrophic at
+25.6 KB/token vs turbo5k's 63 at 18.6 on the same binary -- identical tail
+at 1.37x the bytes. The finding: groupwise-int8 K equals 5-bit WHT+Lloyd-Max
+K on the catastrophic axis at 1.6x the K bytes, i.e. the rotation+centroid
+stack is worth ~3 bits. No serving port; the arm stays in-tree as a
+diagnostic kind. Steal-list item 1 CLOSED.
 
 ninfer serves these checkpoints with INT8 KV in groups of 64. We now know
 PPL is blind on the KV axis and the per-position tail study (`--nll-dump`,
 64K fp16-referenced) is the instrument. turbo5k just shipped through exactly
 this pipeline, so the harness exists end to end.
 
-- Add INT8-G64 as a STUDY-ONLY arm first: host-side quantize/dequantize in
-  the NLL harness (the turbo3v pattern), no CUDA kernels. ~18.0 KB/token,
-  between turbo5k (18.6) and fp8 (34).
-- Bar, pre-declared: catastrophic-position count must beat turbo5k's 65 at
-  comparable bytes, or beat fp8's 19 at meaningfully fewer bytes. Miss both
-  and the arm closes as a NO-GO entry; nothing gets built.
-- Only on a pass: port to a serving format (turbo5.cuh is the template --
-  format struct, fd2 + H16 legs, prefill leg, canonical + needle gates).
-  That is the expensive half; the study arm is the cheap gate in front of it.
+CORRECTED 2026-08-15, before the run -- the paragraph this replaces had two
+factual errors. (1) There is no host-side sim path in the NLL harness; "the
+turbo3v pattern" means a KvKind with zero NEW kernels (branches in the
+shared store kernel, the fd2 template, and the prefill staging, force-routed
+to fd2 by the dispatch guard). (2) "~18.0 KB/token" was an arithmetic slip:
+int8 bytes = fp8 bytes, so both-sides INT8-G64 is ~37 KB/token (ninfer's own
+accounting: 33,792 B over their 16 attn layers) -- MORE than fp8's 36.0, not
+between turbo5k and fp8.
+
+- The arm as built: K = INT8-G64, bit-faithful to ninfer's codec (64-dim
+  groups, fp32 absmax, fp16_rne(absmax/127) scale, reciprocal from the
+  ROUNDED scale, RNE, clamp [-127,127], no rotation); V = turbo3, the
+  turbo3v/turbo5k denominator, keeping the row comparable on the K ladder
+  (fp16 K = 52 catastrophic, 5-bit K = 65). 1056 B/token/layer K + 400 V =
+  25.6 KB/token at the 18-pair accounting. src/i8g64.cuh + Q27_KV=int8g64,
+  microtest tools/i8g64_test.cu (bitwise oracle).
+- Bar, re-declared before the measurement: STRONG PASS = catastrophic <= 19
+  (beats fp8 at 29% fewer bytes -- the original second clause). PASS =
+  catastrophic < 65 (a new Pareto-frontier point: nothing exists between
+  turbo5k 18.6/65 and fp8 36.0/19). NO-GO = catastrophic >= 65 (more bytes
+  than turbo5k without beating its tail); the arm closes as a NO-GO entry
+  and no serving port happens.
+- Only on a pass: serving-grade port (fdmma/H16 legs, canonical + needle
+  gates, throughput ladder). That is the expensive half; the study arm is
+  the cheap gate in front of it.
 
 ## Phase 2 (1-2 weeks, gated on phase 0's table): fp4 W4A4 prefill
 
