@@ -1,5 +1,6 @@
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
+PYTHON    ?= python3
 NVCC      ?= /usr/local/cuda/bin/nvcc
 # sm_120 = RTX 5090, sm_89 = RTX 4090/Ada (needs CUDA 12.4+ for e4m3 MMA),
 # sm_86 = RTX 3090 (fallback device for tests)
@@ -26,8 +27,10 @@ test-inspect: build/inspect build/test_loader_contracts
 	python3 tools/test_inspect.py ./build/inspect
 	./build/test_loader_contracts
 
-test-repack:
-	python3 tools/test_repack_split.py
+test-repack: tools/repack.py tools/test_repack_split.py tools/test_repack_split_e2e.py \
+             tools/requirements-repack-test.txt
+	$(PYTHON) tools/test_repack_split.py
+	$(PYTHON) tools/test_repack_split_e2e.py
 
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
