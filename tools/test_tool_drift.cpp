@@ -240,6 +240,39 @@ static void test_dialect_default_keying() {
     q27::tool_dialect_xml_default() = false;   // leave global state clean
 }
 
+static void test_reasoning_effort_line() {
+    // The trained 3.8 template injects the effort line at the HEAD of the
+    // system block when thinking is on, defaulting to xhigh (2026-08-15).
+    unsetenv("Q27_REASONING_EFFORT");
+    unsetenv("Q27_TOOL_DIALECT");
+    auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
+    std::vector<q27::Msg> msgs = {{"system", "Be terse."}, {"user", "hi"}};
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}])");
+    const std::string XH = "Reasoning effort is set to xhigh.";
+    q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
+    std::string p = q27::chatml_prompt(msgs, tools, /*think=*/true);
+    size_t at = p.find(XH), tools_at = p.find("# Tools");
+    ok(at != std::string::npos && tools_at != std::string::npos && at < tools_at,
+       "effort: 3.8+think injects xhigh line before # Tools");
+    ok(q27::chatml_prompt(msgs, tools, /*think=*/false).find(XH) == std::string::npos,
+       "effort: no-think render carries no effort line");
+    q27::set_tool_dialect_for_model(meta("Qwen3.6-27B"));
+    ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort") == std::string::npos,
+       "effort: 3.6 family renders unchanged");
+    q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
+    setenv("Q27_REASONING_EFFORT", "off", 1);
+    ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort") == std::string::npos,
+       "effort: off restores legacy rendering");
+    setenv("Q27_REASONING_EFFORT", "low", 1);
+    ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort is set to low.") != std::string::npos,
+       "effort: low selects the trained low string");
+    setenv("Q27_REASONING_EFFORT", "medium", 1);
+    ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort") == std::string::npos,
+       "effort: medium emits no line, matching the template");
+    unsetenv("Q27_REASONING_EFFORT");
+    q27::tool_dialect_xml_default() = false;   // leave global state clean
+}
+
 static void test_native_xml_dialect() {
     q27::ToolCall tc;
     ok(q27::parse_native_xml_call(
@@ -331,6 +364,7 @@ int main() {
     test_function_arguments_unterminated();
     test_think_mode_drift();
     test_dialect_default_keying();
+    test_reasoning_effort_line();
     test_native_xml_dialect();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();

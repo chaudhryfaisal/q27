@@ -274,6 +274,29 @@ inline bool tool_dialect_xml() {
 // checkpoint was trained on (see parse_native_xml_call above). Default stays
 // JSON: 3.6 complied with it well, and the A/B that would justify flipping the
 // default is exactly what this knob exists to run.
+
+// Reasoning-effort instruction (Qwen3.8 chat_template.jinja): with thinking
+// enabled the trained template injects this line at the HEAD of the system
+// block and DEFAULTS to xhigh, so a thinking prompt rendered without it is
+// out-of-distribution for the 3.8 checkpoint. Strings are byte-exact from the
+// template. Keyed on the same general.name bit as the tool dialect: 3.6's
+// template has no reasoning_effort, so 3.6-family renders stay untouched.
+// Q27_REASONING_EFFORT: xhigh | low | medium (no line, per the template) |
+// off (legacy pre-2026-08-15 rendering, for A/Bs) -- overrides either way.
+inline std::string reasoning_effort_line() {
+    const char* e = getenv("Q27_REASONING_EFFORT");
+    const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
+    if (v == "xhigh")
+        return "Reasoning effort is set to xhigh. Please think carefully through "
+               "the task, validate key assumptions, consider plausible alternatives, "
+               "and prioritize correctness, consistency, and clarity in the final "
+               "answer.";
+    if (v == "low")
+        return "Reasoning effort is set to low. Keep your thinking brief and "
+               "focused, moving directly to the conclusion without unnecessary "
+               "elaboration.";
+    return ""; // medium (template emits nothing) / off (legacy) / unknown
+}
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-
@@ -341,7 +364,12 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
                                !unavailable_tools->empty();
-    if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty()) {
+    // Template order: reasoning_instructions FIRST, then tools, then the
+    // client system content. Thinking-gated exactly like the template
+    // (enable_thinking undefined-or-true).
+    const std::string effort = think ? reasoning_effort_line() : std::string();
+    if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty() ||
+        !effort.empty()) {
         p += "<|im_start|>system\n";
         bool need_separator=false;
         auto append_system_part=[&](const std::string& part) {
@@ -350,6 +378,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
             p += part;
             need_separator=true;
         };
+        append_system_part(effort);
         if (has_tools) append_system_part(tools_preamble(tools));
         if (has_unavailable)
             append_system_part(unavailable_tools_preamble(*unavailable_tools));
