@@ -10519,3 +10519,31 @@ are now 0 across three arms each -- capability walls, not recipe gaps.
 
 The serving default changes with 37caa07: 3.8-family thinking prompts now
 carry the xhigh line out of the box.
+
+## 2026-08-15: recovery campaign steps 1-2 complete -- 3 of 9 zeros recovered, six capability walls
+
+Step 2 ran the five remaining zeros under the full candidate recipe (effort
+xhigh + --think-budget 24000). Combined recovery table, best arm per task:
+
+| task | baseline | best arm | verdict |
+|---|---|---|---|
+| ecommerce-backend | 0 (13 s) | 1.000 / comp 0.980 (effort alone) | recovered |
+| collab-server | 0 (199 s) | 1.000 / comp 0.924 (effort+24K, 1.6M tok / 28 min) | recovered |
+| constraint-scheduler | 0 (81 s) | 0.789 (24K alone) | recovered |
+| analytics-dashboard | 0 | 0 x3 arms | wall |
+| beam-splitter | 0 | 0 x3 arms | wall |
+| circuit-debugger | 0 | 0 (worked 471 s) | wall (3.6-era: 0.25) |
+| factory-reset | 0 | 0 | wall |
+| plugin-marketplace | 0 | 0 (14 s fast-quit DESPITE the line) | wall |
+| reactive-spreadsheet | 0 | 0 | wall |
+
+Both recovered greenfield/complex tasks became marathons (231 s / 28 min) --
+the class regression was substantially a serving-recipe artifact, not pure
+capability. The walls skew reasoning/hard + algorithmic/hard. One nuance:
+plugin-marketplace reproduced the 14-second fast-quit WITH the effort line
+in the prompt, so the line makes the no-effort mode rare, not impossible.
+
+Step 3 (running): full 21-task suite under the recipe, same protocol as the
+corrected campaign. Watch item: 24K thinking leaves 8K/response -- check the
+easy tasks for answer-truncation regressions before adopting the budget as a
+serving default.
