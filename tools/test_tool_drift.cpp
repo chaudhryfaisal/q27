@@ -136,6 +136,30 @@ static void test_mode16_and_15_variants() {
 // conversion mangles it -- the real 3.8 artifact says "Qwen38 27b Hf").
 // Think-mode drift (2026-08-14): bare native dialect without the wrapper, and
 // the JSON-head/XML-params chimera that killed bench-time-tracker at turn 4.
+// Full-suite capture (2026-08-15): <function=NAME> opener with mode-14-style
+// <parameter=arguments> wrapping the whole JSON, streamed with NO closers.
+// Fell between mode 14 (wrong opener) and the bare-native rescue (demanded
+// closers) and zeroed the first four suite tasks.
+static void test_function_arguments_unterminated() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
+    std::string pre;
+    auto v = q27::parse_bare_tool_calls(
+        "\n\n<function=Bash>\n<parameter=arguments>\n"
+        "{\"command\":\"cat /workspace/schema.sql /workspace/TASK.md\","
+        "\"description\":\"Show schema and task\"}",
+        &pre, &tools);
+    ok(v.size() == 1 && v[0].ok && v[0].name == "Bash" &&
+           v[0].arguments.value("command", std::string()).rfind("cat /workspace", 0) == 0 &&
+           v[0].arguments.value("description", std::string()) == "Show schema and task" &&
+           !v[0].arguments.contains("arguments"),
+       "suite-form: unterminated <parameter=arguments> merged, not nested");
+    // an unterminated NON-final parameter (another <parameter= follows) still refuses
+    q27::ToolCall t2;
+    ok(!q27::parse_native_xml_call(
+           "<function=Bash>\n<parameter=command>\nls\n<parameter=description>\nx\n</parameter>\n</function>", t2),
+       "suite-form: unterminated mid-stream parameter still refused");
+}
+
 static void test_think_mode_drift() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}])");
     std::string pre;
@@ -209,9 +233,10 @@ static void test_native_xml_dialect() {
            t3.ok && t3.arguments.empty(),
        "native-xml: zero-parameter call is legal");
     q27::ToolCall t4;
-    ok(!q27::parse_native_xml_call(
-           "<function=Write>\n<parameter=content>\ntruncated with no closer", t4),
-       "native-xml: truncated parameter is refused, not guessed");
+    ok(q27::parse_native_xml_call(
+           "<function=Write>\n<parameter=content>\ntruncated with no closer", t4) &&
+           t4.arguments.value("content", std::string()) == "truncated with no closer",
+       "native-xml: unterminated FINAL parameter closes at EOF (2026-08-15 leniency)");
     q27::ToolCall t5;
     ok(!q27::parse_native_xml_call("plain text, no dialect", t5),
        "native-xml: non-dialect text is not consumed");
@@ -274,6 +299,7 @@ static void test_mode13_truncated_mid_escape() {
 
 int main() {
     test_mode13_truncated_mid_escape();
+    test_function_arguments_unterminated();
     test_think_mode_drift();
     test_dialect_default_keying();
     test_native_xml_dialect();

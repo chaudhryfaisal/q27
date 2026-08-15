@@ -2108,16 +2108,46 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         size_t vs = ke + 1;
         if (vs < seg.size() && seg[vs] == '\n') vs++;
         size_t ve = seg.find(PC, vs);
-        if (ve == std::string::npos) return false;   // truncated parameter: refuse
+        {
+            // A closer that belongs to a LATER parameter is not ours: an
+            // unterminated mid-stream parameter is genuine mangling, refuse.
+            size_t next_po = seg.find(PO, vs);
+            if (ve != std::string::npos && next_po != std::string::npos && next_po < ve)
+                return false;
+        }
+        bool unterminated = ve == std::string::npos;
+        if (unterminated) {
+            // Final-parameter leniency (2026-08-15, full-suite capture): the
+            // model streams `<function=Bash>\n<parameter=arguments>\n{json}`
+            // and stops -- no closers at all. Mode 14 already tolerated this
+            // shape under <tool_name>; refusing it here was the crack the
+            // first full suite fell through. Close at end-of-span, but only
+            // for the LAST parameter: an unterminated one followed by another
+            // <parameter= would be genuine mangling and still refuses.
+            if (seg.find(PO, vs) != std::string::npos) return false;
+            size_t fe = seg.find("</function>", vs);
+            ve = fe == std::string::npos ? seg.size() : fe;
+        }
         size_t vend = ve;
-        if (vend > vs && seg[vend - 1] == '\n') vend--;
+        while (vend > vs && (seg[vend - 1] == '\n' || seg[vend - 1] == ' ')) vend--;
         std::string val = seg.substr(vs, vend - vs);
         if (key.empty()) return false;
         json parsed;
         bool as_json = false;
         try { parsed = json::parse(val); as_json = !parsed.is_string(); } catch (...) {}
-        if (as_json) tc.arguments[key] = parsed;
+        // Tolerate mode-14's trailing unbalanced brace on a JSON payload.
+        if (!as_json && !val.empty() && val.back() == '}') {
+            std::string t2 = val.substr(0, val.size() - 1);
+            while (!t2.empty() && isspace((unsigned char)t2.back())) t2.pop_back();
+            try { parsed = json::parse(t2); as_json = !parsed.is_string(); } catch (...) {}
+        }
+        if (as_json && key == "arguments" && parsed.is_object()) {
+            // arguments-as-one-parameter: merge, do not nest (mode-14 semantics)
+            for (auto it = parsed.begin(); it != parsed.end(); ++it)
+                tc.arguments[it.key()] = it.value();
+        } else if (as_json) tc.arguments[key] = parsed;
         else tc.arguments[key] = val;
+        if (unterminated) break;
         p = ve + PC.size();
     }
     tc.ok = true;   // zero-parameter calls are legal
