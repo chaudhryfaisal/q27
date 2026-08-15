@@ -133,14 +133,17 @@ change, not identity (nearby tiers can share a 128-token greedy walk).
 
 Serving 3.8 for agentic use: run with `--think` -- with thinking off the
 model runs plausible-looking sessions that self-declare done and fail
-hidden tests. Documented capability on the full 21-task thunderdome suite
-(one trial per task, BUILDLOG 2026-08-15): hidden-tests mean 0.336,
-composite 0.507, five tasks at 1.000. Single-trial scores on individual
-tasks swing hard between runs -- an earlier 1.000 pair did not replicate --
-so trust the suite mean, not one-task anecdotes. The engine auto-selects
-3.8's trained XML tool dialect from the artifact's `general.name` and
-carries drift rescues (modes 14-17) for the forms the model falls into
-under thinking.
+hidden tests. Full 21-task thunderdome suite (one trial per task, BUILDLOG
+2026-08-15 + same-day correction): hidden-tests mean 0.511, composite
+0.507, nine tasks at 1.000. The failures are a class, not a slope: 3.8
+holds 1.000 on bugfix / features / real-repo / recovery work but
+flat-zeros the greenfield/complex and most hard-reasoning tasks that the
+3.6-era serving scored 0.84-1.000 on (3.6-era mean on the same suite:
+0.908). Weigh that against 3.8's throughput and long-context gains before
+picking a default for build-from-scratch workloads. The engine
+auto-selects 3.8's trained XML tool dialect from the artifact's
+`general.name` and carries drift rescues (modes 14-17) for the forms the
+model falls into under thinking.
 
 ```bash
 # 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);
