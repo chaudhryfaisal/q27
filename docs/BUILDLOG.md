@@ -10899,3 +10899,43 @@ mirrors gdn_state_bytes honestly via kEngGdn).
 Also in this pass: the stale "18 K/V pairs" auto-ctx comment corrected to
 the audited 17, and the w8/w16 builds compile with the arena sized off
 W_MAX (rows = W_MAX-1).
+
+## 2026-08-16 (b): M1 ladder rerun -- peak aggregate serving throughput +51%, and the harness finally lives in-repo
+
+The 2026-08-14 protocol, reconstructed as bench/ladder/ladder.py (the
+original rig was never committed -- that mistake is now structural, not
+repeated): vanilla q4s, Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5, --slots 8
+--ctx 16384, C concurrent 8,192-token sampled generations (0.6/0.95),
+distinct salted prompts, aggregate = sum(dec)/union-of-decode-intervals
+from [req] telemetry ([t - dec_ms, t] per request), n=1 per point.
+
+| C | 2026-08-14 (pre-M1) | M1 (f1a1df0+5d0cdc4) | M1 scaling |
+|--:|--:|--:|--:|
+| 1 | 143.0 | 138.3 | -- |
+| 2 | 183.7 (1.28x) | 219.0 | 1.58x |
+| 4 | 185.6 (CLAMPED to 2 slots) | **280.7** | **2.03x** |
+| 8 | UNREACHABLE | 264.2 (8 reqs queued on 4 slots) | 1.91x |
+
+Headline: **peak aggregate 185.6 -> 280.7 t/s (+51%)**, and it comes from
+BOTH halves of M1. The slots half: C=4 runs on four real engines instead
+of two (the admission win). The kernels half: C=2 -- same two-engine
+fused machinery as the 08-14 run -- improved 1.28x -> 1.58x. Plausible
+mechanism, not fully attributed: a fused member's GDN mix dropped from
+2W+1 launches/layer to <= 5 (lane-0 pair + two chunks + record), so the
+captured round replays far fewer nodes, and each member stopped writing
+W x 3.27 MB/layer of role snapshots (~0.5 ms/round of DRAM at width 5)
+-- both compound across members. Caveats kept honest: n=1 sampled points,
+and C=1 read 138.3 vs the baseline's 143.0 (-3%; the greedy CLI A/B
+pinned the engine itself at -0.4%, so the gap is prompt/acceptance-basin
+noise between the two runs' prompts -- the 08-14 prompt was not
+preserved either). Normalizing scalings by each run's own C=1 keeps the
+C=2 jump real (1.28x -> 1.58x).
+
+Per-stream retention: 138 solo -> ~110 at C=2 (79%) -> ~71 at C=4 (51%).
+C=8 oversubscribed on 4 slots nets slightly BELOW C=4 (queue churn +
+serialized prefills + early-EOS streams); the lane math says C=8 wants
+W_PLUMB > 16, exactly as the spec scoped. Distance to ninfer's table:
+their 27B int does 2.88x at C=8 and NVFP4 5.67x on shared-engine batch
+-- q27 at 2.03x/C=4 has banked the memory half of that gap (M1); the
+compute half is M2-M4 (paged KV pool, SeqState extraction, batch-shape
+keys). Raw logs: scratchpad/m1_ladder/.
