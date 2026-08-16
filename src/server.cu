@@ -286,6 +286,7 @@ int main(int argc, char** argv) {
         served_name.resize(served_name.size() - 4);
     int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
     int n_slots = 1, slot1_ctx = 32768;
+    bool slot1_ctx_set = false; // explicit --slot1-ctx wins over --ctx propagation
     int fast_flag = -1;        // tri-state: explicit flag wins over profile
     int think_flag = -1;
     bool kv_fp16 = false;
@@ -309,7 +310,7 @@ int main(int argc, char** argv) {
             ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
         }
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) slot1_ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = atoi(argv[++i]); slot1_ctx_set = true; }
         else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
         else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
         else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
@@ -587,7 +588,11 @@ int main(int argc, char** argv) {
                                 : i8  ? 1456.0
                                 : fp8 ? 2048.0
                                       : 4096.0;
-            const double per_tok = 18.0 * pair;
+            // 17 pairs = 16 attention caches (il < 64; layer 64 is outside
+            // the loop) + the MTP pair -- matches kcache.size()+1 in the
+            // skip loop and the engine's own "34 KB/token" fp8 banner. The
+            // 2026-08-01 BUILDLOG note claiming 18 miscounted (phase-3 audit).
+            const double per_tok = 17.0 * pair;
             // calibrated 2026-07-17 (in-process free deltas, q4s tier):
             // sm_120 W12 fp8@131072: non-KV stack 4.49GB => base 0.89;
             // sm_86 w8 fp16@61440: 4.22GB => base 1.77 (turbo3 measured
@@ -666,6 +671,11 @@ int main(int argc, char** argv) {
             if (n_slots > 1) slot1_ctx = ctx; // auto: every slot gets the same window
         }
     }
+    // Explicit --ctx propagates to slots 1+ unless --slot1-ctx was given.
+    // Before 2026-08-15 an explicit --ctx left slots 1+ at the 32768 default
+    // -- the 08-14 concurrent ladder's "8.2 GB needed" was partly a 32K KV
+    // window nobody asked for (phase-3 audit, batched-decode spec section 0).
+    if (ctx >= 0 && n_slots > 1 && !slot1_ctx_set) slot1_ctx = ctx;
     // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
     // gets --ctx; slots 1+ get --slot1-ctx (subagent/background conversations
     // measured 11-18K in R0). Per-slot GDN snapshot + ckpt ring + KV means an
@@ -735,7 +745,12 @@ int main(int argc, char** argv) {
             // The old need[] used a hardcoded ~1.2 GB that omitted the
             // graph zoo, so a slot could pass here and then OOM building its
             // own zoo (2026-07-18: aligned to ENG_FIXED_BYTES).
-            size_t need = ENG_FIXED_BYTES + kvb + (kvb >> 3) + (256ull << 20);
+            // kEngBase is the per-PROCESS CUDA context + module images --
+            // slot 0 already paid it; charging it per slot skipped slots
+            // that fit (phase-3 audit: measured slot cost ~5.6 GB vs the
+            // 8.2 this printed on 08-14).
+            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + kvb + (kvb >> 3) +
+                          (256ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);
