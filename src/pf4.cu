@@ -262,7 +262,9 @@ bool pf4_on() {
         cudaDeviceProp p{};
         if (cudaGetDevice(&dev) != cudaSuccess) return 0;
         if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
-        return p.major == 12 ? 1 : 0;
+        // The embedded SASS is sm_120a exactly; a hypothetical sm_12x sibling
+        // would fail loudly at first launch, but gate it out here anyway.
+        return (p.major == 12 && p.minor == 0) ? 1 : 0;
     }();
     // Re-read per call (tests flip paths via setenv; a getenv is noise next
     // to a kernel launch -- the prefill.cu convention).
