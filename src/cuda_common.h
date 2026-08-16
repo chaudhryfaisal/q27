@@ -17,7 +17,7 @@
 
 // LANE PLUMBING WIDTH -- the FIXED number of lane slots the round kernels
 // address. Q27_W_MAX (engine.cuh) only caps how many go LIVE and sizes the
-// per-width memory (GDN role sets, captured-graph zoo); W_PLUMB sizes the
+// per-width memory (record-arena rows, captured-graph zoo); W_PLUMB sizes the
 // structs, the outcome layout, and every "list every lane" array. It is 16
 // because the lane-pointer structs (P3/CP3/IP3/XQ3/WIP3) carry p[16] and the
 // fdmma verify kernel asserts 6*W <= 96 rows -- 16 is the hard ceiling of the

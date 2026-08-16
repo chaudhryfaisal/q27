@@ -1958,7 +1958,7 @@ struct Engine {
                     "    --ctx <smaller>            (KV scales with context)\n"
                     "    Q27_MAXD=4                 (drops the depth-5/6 draft graphs)\n"
                     "    Q27_SAMPLED=0              (drops the sampled set, greedy-only)\n"
-                    "    build/q27-server-w8        (24GB-class: narrower role/graph set)\n"
+                    "    build/q27-server-w8        (24GB-class: smaller graph zoo)\n"
                     "  or free co-resident VRAM (other processes on this GPU).\n",
                     what, fb / 1e9);
             exit(1);
@@ -2238,8 +2238,24 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             fold_launches(T_, stm);
             CUDA_CHECK(cudaStreamEndCapture(stm, &gf));
-            inst_or_advise(&fold_graph[T_], gf, "fold");
+            // NOT inst_or_advise (review 2026-08-16): its exit(1) rationale
+            // ("the solo zoo is all-needed") does not hold here -- flush_fold
+            // null-checks and falls back to the eager fold, bitwise-identical
+            // at ~1% single-stream. On an edge-boot OOM (this is the LAST
+            // capture block), degrade instead of dying; later Ts would OOM
+            // too, so stop trying.
+            cudaError_t fe = cudaGraphInstantiate(&fold_graph[T_], gf, nullptr, nullptr, 0);
             CUDA_CHECK(cudaGraphDestroy(gf));
+            if (fe == cudaErrorMemoryAllocation) {
+                (void)cudaGetLastError();
+                fold_graph[T_] = nullptr;
+                fprintf(stderr,
+                        "fold graphs: instantiate OOM at T=%d -- eager fold for "
+                        "T>=%d (bitwise-identical, ~1%% single-stream)\n",
+                        T_, T_);
+                break;
+            }
+            CUDA_CHECK(fe); // non-OOM: loud abort
         }
         reset_gdn_mtp();
         // P12: confidence-gated depth. Q27_PMIN=theta engages the gate (drafter

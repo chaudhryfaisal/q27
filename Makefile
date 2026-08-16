@@ -152,9 +152,11 @@ build/turbo5_test: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
 build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/i8g64_test.cu -o $@
 
-# 24GB-card (3090-class) server: Q27_W_MAX=8 shrinks the GDN role sets +
-# graph zoo so the fixed stack fits beside the weights (the default W12
-# build OOMs at graph instantiation on 24GB). Same sources, own binary.
+# 24GB-card (3090-class) server: Q27_W_MAX=8 shrinks the captured-graph zoo
+# (plus a few M1 record-arena rows) so the fixed stack fits beside the
+# weights (the default W12 build OOMs at graph instantiation on 24GB; the
+# per-width GDN role sets it also used to shed were retired by M1
+# record+fold). Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
