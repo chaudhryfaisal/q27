@@ -11037,3 +11037,38 @@ the full pre-declared M2b gates (admission suite, FIFO exhaustion,
 tier-2 extension proof, canonical/scatter, both-arch test_kernels,
 width_curve, ladder, pfx round-trip under scatter) have not run.
 Default stays per-slot KV until they do.
+
+## 2026-08-16 (e): M2b gate battery GREEN -- M2 complete; pool stays opt-in on throughput honesty
+
+The pre-declared battery, all passed, with two real fixes found BY the
+battery before it ran: (1) STARVATION -- on pool exhaustion the claim
+selector retried the same empty-lineage slot forever while another idle
+slot held the pages; fixed with LRU pool scavenging (idle lineages are
+cache, not entitlement -- reclaim until the reservation fits, never
+touching busy slots). (2) The pooled slot loop bypassed the skip check
+entirely (--slots 8 pooled would hard-OOM mid-build); fixed with a
+fixed-stack-only skip, plus the pool sizing now clamps its projected
+slot count to what fixed stacks fit (8 requested -> 3 on this card,
+1.70 GB pool) instead of going negative and disabling itself.
+
+RESULTS: both-arch test_kernels ALL PASS (3090 -- the M2a owed item);
+canonical EXACT identity AND scatter; fused_smoke fp8 all legs;
+admission suite -- oversized prompt 400s instantly (never FIFO-stuck),
+three sequential 30K-entitlement requests complete in 0.08 s each
+(scavenge fires, no starvation), tier-2 continuation lands on its slot
+with hit=26 and extends in place; width_curve on the paged binary W=8
+2.365 ms/tok / W=12 1.645 (in-family with the July curve); pfx
+round-trip UNDER SCATTER across a server restart (352 MB blob at
+L=5618 persisted through permuted pages, restored on a fresh boot,
+prefix_hit=5618, identical greedy output); pooled ladder C=1 139.6 /
+C=2 214.3 (per-slot parity with M1's 138.3/219.0) / C=4 227.0 on the
+3-slot pool config.
+
+DEFAULT DECISION: the pool stays OPT-IN. At uniform 16K on this card it
+trades the 4th slot for per-request flexibility (C=4 227 vs per-slot
+281) -- the right trade only once M1b's zoo collapse (~1.4 GB/slot)
+makes fixed stacks cheap enough to keep 4+ slots AND the pool. M2 (a+b)
+is otherwise COMPLETE: block-table addressing always-on and
+scatter-proven, entitlement admission built and gated. The remaining
+sizing conservatism (2.2 GB co-residency fudge) is deliberately left
+for the M1b re-calibration, which changes the constants anyway.

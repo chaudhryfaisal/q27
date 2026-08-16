@@ -750,6 +750,21 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
         // fixed stacks: slot 0 pays kEngBase once; slots 1+ the co-resident
         // form (same arithmetic the skip loop uses, minus its KV terms).
+        // Clamp the PROJECTED slot count to what fixed stacks actually fit
+        // (calibration 2026-08-16: sizing for 8 requested slots on a card
+        // that fits 3 stacks went negative and disabled the pool); the
+        // build-loop skip check then agrees by construction.
+        const double per_extra = (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
+                                 (double)(256ull << 20);
+        int fit_slots = 1;
+        if ((double)freeb > (double)ENG_FIXED_BYTES + 0.25e9)
+            fit_slots = 1 + (int)(((double)freeb - (double)ENG_FIXED_BYTES - 0.25e9) /
+                                  per_extra);
+        if (fit_slots < n_slots) {
+            fprintf(stderr, "[pool] clamping projected slots %d -> %d (fixed stacks)\n",
+                    n_slots, fit_slots);
+            n_slots = fit_slots;
+        }
         const double fixed = ENG_FIXED_BYTES +
                              (double)(n_slots - 1) * (ENG_FIXED_BYTES - (size_t)kEngBase) +
                              0.25e9 /* arch slack */ + (double)n_slots * (256ull << 20);
@@ -789,6 +804,20 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
+        if (si > 0 && kv_pool.enabled()) {
+            // M2b pooled slots carry NO per-slot KV, but the fixed stack
+            // (zoo + GDN + scratch) is unchanged -- skip, don't abort, when
+            // it no longer fits (the pool was sized assuming n_slots stacks;
+            // skipped slots just leave more headroom).
+            size_t freeb = 0, totalb = 0;
+            cudaMemGetInfo(&freeb, &totalb);
+            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + (256ull << 20);
+            if (freeb < need) {
+                fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB fixed stack\n",
+                        si, freeb / 1e9, need / 1e9);
+                break;
+            }
+        }
         if (si > 0 && !kv_pool.enabled()) {
             // coarse per-slot floor: GDN recurrent state (exact bytes from
             // slot 0's own allocation -- review 2026-07-09: the old "5 sets
@@ -1125,7 +1154,27 @@ int main(int argc, char** argv) {
                             .n_max +
                         best->eng->ctx_round_reserve() - 1;
                     if (best_tier < 2) best->eng->kv_release_for_takeover();
-                    if (!best->eng->kv_entitle(std::min(rows, best->eng->max_ctx))) {
+                    bool entitled =
+                        best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
+                    // Pool scavenge on exhaustion: idle lineages are CACHE,
+                    // not entitlement -- reclaim them LRU-first until the
+                    // reservation fits. Without this the selector can retry
+                    // an empty-lineage slot forever while another idle slot
+                    // holds the pages (starvation). Busy slots and the chosen
+                    // slot are never touched; releasing clears the victim's
+                    // reuse tiers (the R1 rule), exactly like a takeover.
+                    while (!entitled) {
+                        Slot* victim = nullptr;
+                        for (auto& sv : slots)
+                            if (!sv.busy && &sv != best && sv.eng->kv_rows > 0 &&
+                                (!victim || sv.last_used < victim->last_used))
+                                victim = &sv;
+                        if (!victim) break;
+                        victim->eng->kv_release_for_takeover();
+                        entitled =
+                            best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
+                    }
+                    if (!entitled) {
                         route_cv.wait(lk);
                         continue;
                     }
