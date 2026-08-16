@@ -575,9 +575,13 @@ inline bool union_view_eq(const UnionView& a, const UnionView& b) {
 //     ONE shared read is cw = T(il,"ssm_conv1d.weight").data: a DeviceModel
 //     WEIGHT, read-only at round time (concurrent reads are safe).
 //   attn_mix(il, st): qg_L (RW: wht3 rotates in place, attn reads), kbuf_L/
-//     vbuf_L (R), kcache[ci]/vcache[ci] (W disjoint rows, then R), scratch
-//     (RW, the fd/fdmma partials buffer), attnout_L (W, wht3 inverse in
-//     place), d_pos_L (R) -- all Engine members; NO weight reads at all.
+//     vbuf_L (R), KV rows via kv_ktab(ci)/kv_vtab(ci) (M2a: the store/decode
+//     kernels READ d_kv_tab entries, then W disjoint rows / R through them),
+//     scratch (RW, the fd/fdmma partials buffer), attnout_L (W, wht3 inverse
+//     in place), d_pos_L (R) -- all Engine members; NO weight reads at all.
+//     M2b WARNING: the audit's soundness now also rests on d_kv_tab entries
+//     being 'mutated only at init/commit boundaries, never inside a round' --
+//     admission-time remaps must stay stream-ordered against in-flight rounds.
 //   Host-side reads: vw/kv_kind/kv_fp8/max_ctx/attn_cache_idx --
 //     per-engine members, mutated only at init/commit boundaries, never
 //     inside a round.

@@ -10995,3 +10995,16 @@ NEXT: M2b -- the process-wide K/V pools + claim_slot entitlement
 (reserve+map prompt + n_max + ctx_round_reserve - 1, MTP +1), FIFO wait
 on route_cv, lineage page ownership with the R1 clear-tiers-first rule.
 The kernels no longer care where a page lives; M2b only moves them.
+
+CORRECTIONS to the (c) entry (same-day review, 2 medium + 6 low findings,
+0 refuted): (1) "fd2/v1 stream per-position" -- true only for v1; landed
+fd2 is page-hoisted (the PERF FIGHT paragraph is the accurate one).
+(2) "M2a changes no allocations" overstates: d_kv_tab itself is one new
+~1 MB-class cudaMalloc per engine; no KV layout changes is the true
+claim. (3) d5a44e1's Q27_KV_SCATTER permuted ALL pages -- OOB past the
+alloc end for a full logical page mapped onto the partial tail page when
+max_ctx % 64 != 0 (debug-knob-only exposure; serving ctx is
+4096-aligned). Fixed in the follow-up by pinning the tail page; the
+static_asserts coupling KV_PAGE/KV_PAGE_SHIFT and pinning the
+32-aligned-tile hoist invariant landed with it. Full deviation record in
+the plan doc's AS-LANDED section; stale pfx/B2/PORTING comments fixed.

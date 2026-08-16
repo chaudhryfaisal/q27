@@ -83,8 +83,8 @@ Do not add these to the checklist. They flow through without a code change.
 
 **Which layers are full attention, on the CUDA path.** `tools/repack.py:136-145`
 derives `attn_layers` by inspecting tensor names, writes it into the `.q27`
-metadata, and `engine.cuh:684-691` reads it back into `attn_layer[]`. Every
-consumer asks `is_attn_layer(il)` (`engine.cuh:2453`) rather than computing an
+metadata, and `engine.cuh:710-717` reads it back into `attn_layer[]`. Every
+consumer asks `is_attn_layer(il)` (`engine.cuh:2575`) rather than computing an
 interval. A checkpoint with a different `full_attention_interval`, or an
 irregular layout that no interval describes, needs no CUDA engine edit -- the
 KV allocation and the layer dispatch both loop over the flag.

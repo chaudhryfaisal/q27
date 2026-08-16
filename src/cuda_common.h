@@ -70,6 +70,14 @@ static inline bool kv_k_rotated(int kvk) { return kvk == KV_T3 || kvk == KV_T5K;
 static constexpr int KV_PAGE = 64;         // rows per page
 static constexpr int KV_PAGE_SHIFT = 6;
 static constexpr int KV_PAGE_MASK = KV_PAGE - 1;
+static_assert((1 << KV_PAGE_SHIFT) == KV_PAGE,
+              "KV_PAGE_SHIFT must stay coupled to KV_PAGE -- every kernel indexes "
+              "tab[p >> SHIFT] while the host builds pages of KV_PAGE rows");
+// The MMA-family kernels hoist ONE table lookup per 32-position tile; that is
+// sound only while a 32-aligned tile can never cross a page boundary.
+static_assert(KV_PAGE % 32 == 0 && KV_PAGE >= 32,
+              "per-tile page hoists (fdmma/H16/prefill) assume 32-aligned tiles "
+              "never cross a KV page");
 
 #ifdef __CUDACC__
 // Row/block resolvers -- the ONLY sanctioned way a kernel touches KV memory

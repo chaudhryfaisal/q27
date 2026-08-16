@@ -1024,8 +1024,14 @@ struct Engine {
                 char* vb = (char*)(c < (int)kcache.size() ? vcache[c] : mtp_v);
                 for (int j = 0; j < kv_npages; j++) pmap[j] = j;
                 if (scatter) { // Fisher-Yates with a fixed per-pair LCG seed
+                    // When max_ctx is not 64-divisible the LAST physical page
+                    // is partial -- permuting a full logical page onto it
+                    // would dereference past the alloc. Pin it; permute the
+                    // full pages only. (Serving ctx is 4096-aligned, so this
+                    // only matters for odd explicit --ctx debug runs.)
+                    const int nperm = max_ctx % KV_PAGE ? kv_npages - 1 : kv_npages;
                     unsigned st_ = 0x9E3779B9u ^ (unsigned)(c * 2654435761u);
-                    for (int j = kv_npages - 1; j > 0; j--) {
+                    for (int j = nperm - 1; j > 0; j--) {
                         st_ = st_ * 1664525u + 1013904223u;
                         int r = (int)(st_ % (unsigned)(j + 1));
                         int tmp = pmap[j]; pmap[j] = pmap[r]; pmap[r] = tmp;
@@ -3326,10 +3332,13 @@ struct Engine {
     // What has to travel, and why it is exactly this:
     //   GDN  -- S[il] + conv_ring[il] for every recurrent layer. Same content
     //           ckpt_save copies; sized independently of L.
-    //   ATTN -- kcache/vcache rows [0,L). kv_store_T writes row-major with
-    //           stride N_KV*HEAD_DIM, so a prefix is one CONTIGUOUS chunk at
-    //           the head of each buffer -- no gather, and it reloads into an
-    //           engine with a different max_ctx.
+    //   ATTN -- kcache/vcache rows [0,L). M2a: rows live in 64-row pages
+    //           reached through the block table, so export/import GATHER
+    //           per page (kv_row_host) -- NEVER collapse these walks back to
+    //           one linear copy: it looks identical under identity mapping
+    //           and silently corrupts under Q27_KV_SCATTER or the M2b pool.
+    //           The BLOB stays linear-row-ordered, which is why entries
+    //           remain portable across max_ctx and pool geometries.
     //   MTP  -- mtp_k/mtp_v rows [0,L+1). One row longer than the attention
     //           side on purpose: mtp_warm_T stores at base+1, so prefilling
     //           through L leaves MTP rows [1,L] populated. Copying only [0,L)
