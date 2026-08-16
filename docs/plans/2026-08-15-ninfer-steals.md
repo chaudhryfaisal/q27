@@ -74,7 +74,20 @@ between turbo5k and fp8.
   gates, throughput ladder). That is the expensive half; the study arm is
   the cheap gate in front of it.
 
-## Phase 2 (1-2 weeks, gated on phase 0's table): fp4 W4A4 prefill
+## Phase 2 (1-2 weeks, gated on phase 0's table): fp4 W4A4 prefill -- DONE 2026-08-15, NO-GO
+
+Built end to end (repack --pf4 sidecars, FP4_G16 dtype, Q27_PREFILL=fp4
+routing, sm_120a pf4.cu TU) and measured same day (BUILDLOG entry). NO-GO on
+all three bars independently: quality +3.734% dPPL / 561 catastrophic vs the
+fp8-KV envelope (+0.458% / 19) on the 64K single-pass; wall 1.237x @ 17K and
+1.192x @ 27K vs the 1.25x bar (Amdahl eats the 2.5x GEMM: include set is 77%
+of GEMM flops, attention/GDN untouched); and dual-copy weights peak 31.8 GiB
+at ctx 2048 -- serving cannot hold real context on 32 GB. Bonus lesson:
+chunked wiki PPL IMPROVES under fp4 (activation sparsification regularizing
+smooth text) while the long instrument shows the damage -- chunked PPL alone
+would have shipped it. Code stays in-tree, opt-in, inert by default.
+Salvage forks if ever: W4A8-on-fp4-weights attribution arm; native fp4 tier
+(single copy + fp4 GEMV decode + own canonical), the only VRAM-viable shape.
 
 The falsified NO-GO reopens the biggest single-kernel lever. Prefill is the
 compute-bound half, agentic traffic re-prefills on every cache miss, and

@@ -106,10 +106,19 @@ int DeviceModel::checksum_verify(bool print) const {
     return bad;
 }
 
-void DeviceModel::upload_all() {
+static bool is_pf4_sidecar(const std::string& name) {
+    return name.size() > 4 && name.compare(name.size() - 4, 4, ".pf4") == 0;
+}
+
+void DeviceModel::upload_all(bool with_pf4, bool drop_shadowed_q4) {
     validate_cuda_model(model_);
 
-    for (const auto& t : model_.tensors) upload(t.name);
+    for (const auto& t : model_.tensors) {
+        if (!with_pf4 && is_pf4_sidecar(t.name)) continue;
+        if (drop_shadowed_q4 && !is_pf4_sidecar(t.name) && model_.find(t.name + ".pf4"))
+            continue;
+        upload(t.name);
+    }
 }
 
 const DevTensor& DeviceModel::get(const std::string& name) const {

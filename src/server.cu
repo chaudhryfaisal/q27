@@ -542,7 +542,7 @@ int main(int argc, char** argv) {
     q27::set_tool_dialect_for_model(shared_model.meta_json); // per-model tool dialect (BUILDLOG 2026-08-14)
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
-    shared_dm.upload_all();
+    shared_dm.upload_all(q27k::pf4_on());
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
 

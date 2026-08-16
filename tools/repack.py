@@ -48,16 +48,21 @@ ALIGN = 256
 # dtype 5 is reserved for the parked T3_G128 (never emitted; see FORMAT.md).
 DTYPE_F32, DTYPE_F16, DTYPE_Q8, DTYPE_Q4, DTYPE_T2 = 0, 1, 2, 3, 4
 DTYPE_B1 = 6
+DTYPE_FP4 = 7  # nvfp4 sidecars: e2m1 codes 2/byte + ue4m3 scale per 16 (--pf4)
 DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4: "Q4_G64",
-               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128"}
+               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128", DTYPE_FP4: "FP4_G16"}
 GROUP_Q4, GROUP_Q8, GROUP_T2, GROUP_B1 = 64, 128, 128, 128
+GROUP_FP4 = 16
 
 
 Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
 Q4_HEAD = False  # set from --q4-head (q4s tier: single Q4 lm_head)
+PF4 = False      # set from --pf4 (fp4 prefill sidecars, ninfer-steals phase 2)
 
 
 def policy(name: str) -> int:
+    if name.endswith(".pf4"):
+        return DTYPE_FP4  # --pf4 sidecar aliases; never matched by real GGUF names
     if (name.endswith("_norm.weight") or name.endswith("norm.weight")
             or name.endswith(".ssm_a") or name.endswith(".ssm_dt.bias")
             or "ssm_conv1d" in name):
@@ -108,6 +113,48 @@ def quant_q4(w: np.ndarray):
     deq = ((q.reshape(rows, cols // GROUP_Q4, GROUP_Q4).astype(np.float32) - 8)
            * scale[..., None]).reshape(rows, cols)
     return packed.tobytes(), scale.astype(np.float16).tobytes(), deq
+
+
+# nvfp4 encode tables. e2m1 positive grid; ue4m3 = unsigned e4m3 (bias 7,
+# subnormals, no infinity, 0x7f = NaN excluded from the encode range).
+_E2M1_POS = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
+def _ue4m3_table():
+    v = np.zeros(127, dtype=np.float32)  # byte values 0x00..0x7e
+    for b in range(127):
+        e, m = b >> 3, b & 7
+        v[b] = (m / 8.0) * 2.0 ** -6 if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 7)
+    return v
+_UE4M3 = _ue4m3_table()
+
+def _nearest_even(x: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Index of nearest grid value, ties to EVEN index (= even mantissa LSB,
+    matching cvt.rn semantics on these formats). Saturates at the grid ends."""
+    idx = np.searchsorted(grid, x)                      # first grid[i] >= x
+    idx = np.clip(idx, 1, len(grid) - 1)
+    lo, hi = grid[idx - 1], grid[idx]
+    take_lo = (x - lo < hi - x) | ((x - lo == hi - x) & ((idx - 1) % 2 == 0))
+    return np.where(take_lo, idx - 1, idx).astype(np.int32)
+
+def quant_nvfp4(w: np.ndarray):
+    """nvfp4: 16-elem groups along the contiguous axis, ue4m3 scale =
+    rne(absmax/6), e2m1 codes from the ROUNDED scale's reciprocal (the
+    device-codec convention: see src/i8g64.cuh's sibling note and the ninfer
+    recon), packed 2/byte even=low like Q4."""
+    rows, cols = (1, w.shape[0]) if w.ndim == 1 else (int(np.prod(w.shape[:-1])), w.shape[-1])
+    assert cols % GROUP_FP4 == 0, f"cols {cols} not divisible by {GROUP_FP4}"
+    g = w.reshape(rows, cols // GROUP_FP4, GROUP_FP4).astype(np.float32)
+    amax = np.abs(g).max(axis=2)
+    sb = _nearest_even(np.minimum(amax / 6.0, _UE4M3[-1]), _UE4M3).astype(np.uint8)
+    sw = _UE4M3[sb]
+    inv = np.where(sw > 0, 1.0 / np.where(sw > 0, sw, 1), 0.0).astype(np.float32)
+    scaled = np.abs(g) * inv[..., None]
+    ci = _nearest_even(np.minimum(scaled, 6.0), _E2M1_POS)
+    codes = (ci | np.where((g < 0) & (ci > 0), 8, 0)).astype(np.uint8)
+    q = codes.reshape(rows, cols)
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+    deq = (np.where(codes & 8, -1.0, 1.0) * _E2M1_POS[codes & 7]
+           * sw[..., None]).reshape(rows, cols).astype(np.float32)
+    return packed.tobytes(), sb.tobytes(), deq
 
 
 def quant_q8(w: np.ndarray):
@@ -224,11 +271,17 @@ def main():
     ap.add_argument("--q4-head", action="store_true",
                     help="emit output.weight at Q4_G64 and skip the output_q4.weight copy "
                          "(q4s tier; engine falls back to output.weight for drafts)")
+    ap.add_argument("--pf4", action="store_true",
+                    help="also emit nvfp4 sidecar copies (<name>.pf4, dtype FP4_G16) of the "
+                         "attn+FFN projection weights for the fp4 prefill path "
+                         "(Q27_PREFILL=fp4; ninfer-steals phase 2). ~10.5 GB extra; readers "
+                         "older than DTYPE 7 cannot open the resulting file")
     args = ap.parse_args()
-    global Q8_EXTRA, Q4_HEAD
+    global Q8_EXTRA, Q4_HEAD, PF4
     if args.q8:
         Q8_EXTRA = re.compile(args.q8)
     Q4_HEAD = args.q4_head
+    PF4 = args.pf4
 
     t0 = time.time()
     r = GGUFReader(args.input)
@@ -256,6 +309,10 @@ def main():
         meta["q8_extra"] = args.q8
     if args.q4_head:
         meta["q4_head"] = True
+    if args.pf4:
+        meta["pf4_sidecars"] = True
+        meta["group_fp4"] = GROUP_FP4
+        meta["pf4_encoding"] = "e2m1 even=low, ue4m3 scale per 16"
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
             try:
@@ -291,6 +348,16 @@ def main():
         if t.name == "output.weight" and not args.q4_head \
                 and not ternary and not binary:
             extra.append(("output_q4.weight", t))
+    if PF4:
+        # fp4 prefill sidecars: attn+FFN projections only. attn_q/attn_output
+        # exist only on attention layers; blk.64 (MTP) is outside the prefill
+        # loop; the SSM path (attn_qkv/attn_gate/ssm_*) is deliberately
+        # excluded (ssm_out cancellation lesson, BUILDLOG 2026-08-14).
+        pf4_re = re.compile(r"blk\.(\d+)\.(ffn_gate|ffn_up|ffn_down|attn_q|attn_output)\.weight$")
+        for t in r.tensors:
+            m = pf4_re.match(t.name)
+            if m and int(m.group(1)) < 64:
+                extra.append((t.name + ".pf4", t))
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
@@ -347,6 +414,8 @@ def main():
             deq = w.astype(np.float16).astype(np.float32)
         elif dt == DTYPE_Q8:
             data, scales, deq = quant_q8(w)
+        elif dt == DTYPE_FP4:
+            data, scales, deq = quant_nvfp4(w)
         else:
             data, scales, deq = quant_q4(w)
 

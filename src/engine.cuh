@@ -31,6 +31,7 @@
 #include "turbo3.cuh"
 #include "turbo5.cuh"
 #include "i8g64.cuh"
+#include "pf4.h"
 #include "vgemm.cuh"
 
 using q27::DevTensor;
@@ -365,6 +366,9 @@ struct Engine {
     float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
     float* pf_part; // P4 split-attention partials: [24 heads][PF_T][SPLIT_MAX][258]
     q27k::XQuant xqT;
+    // fp4 prefill activation scratch (Q27_PREFILL=fp4): nvfp4 codes + ue4m3
+    // scales for one padded PF_T chunk at the widest activation (N_FFN).
+    uint8_t *pf4_ac = nullptr, *pf4_as = nullptr;
 
     // ---- prefix cache (M6.5): snapshot of GDN state + conv rings taken right
     // after prefill (perm==0), keyed by the prompt tokens it covers. Attention
@@ -922,6 +926,14 @@ struct Engine {
         xmtpT = fal((size_t)PF_T * N_EMBD);
         pf_part = fal((size_t)N_HEAD * PF_T * q27k::PF_SPLIT_MAX * 258);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN, /*g64=*/true);
+        {
+            // fp4 prefill activation scratch (~10 MB, unconditional so tests
+            // can flip Q27_PREFILL=fp4 in-process). Sized to the padded chunk:
+            // pf4_gemm_T rounds T up to its 128-row tile.
+            const size_t pf_tp = ((size_t)PF_T + 127) & ~(size_t)127;
+            CUDA_CHECK(cudaMalloc((void**)&pf4_ac, pf_tp * N_FFN / 2));
+            CUDA_CHECK(cudaMalloc((void**)&pf4_as, pf_tp * N_FFN / 16));
+        }
         q27k::wy_scratch_reserve(&wy_scratch, PF_T); // fixed cap: no mid-serving regrow
         q27k::splitk_scratch_reserve(&splitk_ws);    // fixed cap: no mid-serving regrow
         for (int il = 0; il < N_LAYER; il++)
@@ -995,9 +1007,16 @@ struct Engine {
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
-            dm.upload_all();
+            dm.upload_all(q27k::pf4_on(), q27k::pf4_instrument());
             dm.checksum_baseline();
             fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
+        }
+        if (q27k::pf4_on()) {
+            if (dm.model_has("blk.0.ffn_gate.weight.pf4"))
+                fprintf(stderr, "prefill: fp4 W4A4 (Q27_PREFILL=fp4, .pf4 sidecar projections)\n");
+            else
+                fprintf(stderr, "prefill: Q27_PREFILL=fp4 requested but this pack has no .pf4 "
+                                "sidecars (repack with --pf4) -- int path stays\n");
         }
     }
 
@@ -2916,6 +2935,28 @@ struct Engine {
         // dispatch choice downstream is safe)
         q27k::quantize_x_g64(x, (int64_t)T * cols, xqT, stm);
     }
+    // fp4 prefill routing (ninfer-steals phase 2): the five include-list
+    // projections call this instead of mmT. With Q27_PREFILL=fp4 on sm_120
+    // and a .pf4 sidecar resident, the GEMM runs the block-scaled W4A4 path
+    // for EVERY T (small chunks pad to the 128-row tile inside pf4_gemm_T --
+    // a T-dependent int/fp4 switch would make prefill numerics depend on
+    // chunk alignment). Everything else -- K/V (Q8), the SSM path, the lm
+    // head -- never gets a sidecar and stays int by construction.
+    void mmT_pf4(int il, const char* leaf, const float* xT, float* yout, int T) {
+        // Sidecar FIRST: under Q27_PF4_INSTRUMENT the base Q4 tensor is not
+        // resident at all, so nothing here may touch it when the fp4 leg
+        // routes. The sidecar carries the same rows/cols.
+        if (q27k::pf4_on()) {
+            char buf[96];
+            snprintf(buf, sizeof buf, "blk.%d.%s.pf4", il, leaf);
+            if (const DevTensor* s = dm.try_get(buf)) {
+                q27k::pf4_gemm_T(s->data, s->scales, xT, pf4_ac, pf4_as, yout, s->rows,
+                                 s->cols, T, stm);
+                return;
+            }
+        }
+        mmT(T2(il, leaf), xT, yout, T); // T2: the int T param shadows T()
+    }
     void mmT(const DevTensor& w, const float* xT, float* yout, int T) {
         switch (w.dtype) {
             case DType::Q4_G64:
@@ -2958,7 +2999,7 @@ struct Engine {
     void attn_block_T(int il, int base, int T, void* kc, void* vc) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
         qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "attn_q.weight"), x1T, qgT, T);
+        mmT_pf4(il, "attn_q.weight", x1T, qgT, T);
         q27k::rmsnorm_heads_T(qgT, (const float*)T2(il, "attn_q_norm.weight").data, qgT, N_HEAD,
                               HEAD_DIM, 2 * HEAD_DIM, QROW, T, EPS, stm);
         mmT(T2(il, "attn_k.weight"), x1T, kT, T);
@@ -2985,16 +3026,16 @@ struct Engine {
             q27k::wht_T(attnT, N_HEAD, HEAD_DIM, HEAD_DIM, N_HEAD * HEAD_DIM, T, true, stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
-        mmT(T2(il, "attn_output.weight"), attnT, yT, T);
+        mmT_pf4(il, "attn_output.weight", attnT, yT, T);
     }
 
     void ffn_T(int il, int T) {
         qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "ffn_gate.weight"), x1T, ffnGT, T);
-        mmT(T2(il, "ffn_up.weight"), x1T, ffnUT, T);
+        mmT_pf4(il, "ffn_gate.weight", x1T, ffnGT, T);
+        mmT_pf4(il, "ffn_up.weight", x1T, ffnUT, T);
         q27k::silu_mul(ffnGT, ffnUT, ffnGT, (int64_t)T * N_FFN, stm);
         qxT(ffnGT, N_FFN, T);
-        mmT(T2(il, "ffn_down.weight"), ffnGT, yT, T);
+        mmT_pf4(il, "ffn_down.weight", ffnGT, yT, T);
     }
 
     // Forward a chunk of T prompt tokens starting at absolute position `base`.

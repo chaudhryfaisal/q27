@@ -96,8 +96,16 @@ int main(int argc, char** argv) {
 
     Engine e(path, ctx);
     e.fast_head = fast;
-    e.build_graph();
-    if (spec) e.build_spec_graphs();
+    if (q27k::pf4_instrument()) {
+        // Prefill-only instrument runs (--nll-long, --pf with NOSERIAL): the
+        // decode-graph warmup reads the Q4 projections that instrument mode
+        // deliberately left off the card. Any mode that decodes will fail on
+        // the missing graph -- by design, not by accident.
+        fprintf(stderr, "pf4 instrument mode: decode graph SKIPPED (prefill-only)\n");
+    } else {
+        e.build_graph();
+        if (spec) e.build_spec_graphs();
+    }
 
     if (!taps_path.empty()) {
         // DFlash P0a tap capture (docs/dflash-block-verify-design.md):

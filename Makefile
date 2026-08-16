@@ -10,8 +10,8 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 .PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
-           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
-	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
+           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
+	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 build:
 	mkdir -p build
@@ -91,9 +91,9 @@ build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | b
 build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
+                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
 clean:
 	rm -rf build
@@ -112,6 +112,13 @@ build/attn_fdw_bench: tools/attn_fdw_bench.cu | build
 # docs/plans/2026-08-15-ninfer-steals.md). The tri-arch serving binary stays
 # on NVCCFLAGS until a real kernel needs 120a; only this tool gets the flag.
 MXF4FLAGS = -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a -Xcompiler -Wall
+# fp4 prefill kernels (Q27_PREFILL=fp4): the ONE engine TU that needs the
+# arch-specific target. Compiled as a standalone object with MXF4FLAGS and
+# linked into every engine binary; its kernels have no SASS for sm_86/89 and
+# are never launched there (q27k::pf4_on() gates on sm_120 at runtime).
+build/pf4.o: src/pf4.cu src/pf4.h | build
+	$(NVCC) $(MXF4FLAGS) -c src/pf4.cu -o $@
+
 build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp \
                        src/prefill.cuh src/kernels.cuh src/device_model.h src/loader.h src/cuda_common.h | build
 	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
@@ -151,9 +158,9 @@ build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
+                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
 # Continuous-batching gates (docs/plans/2026-07-14-continuous-batching.md):
 #   ninv_test      -- N-invariance: per-lane weight-kernel output must be bitwise
@@ -168,17 +175,17 @@ build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@
 
 build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/prefix_cache.h src/prefix_ram.h src/blocks.cu src/prefill.cu \
-                   src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp | build
+                   src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) tools/fused_smoke.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                       src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
-                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h | build
+                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
-	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
 # Native Metal backend primitives. Kept separate from the engine/CLI targets so
 # this dependency cut stays buildable and testable on its own.

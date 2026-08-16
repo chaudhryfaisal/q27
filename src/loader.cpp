@@ -25,6 +25,7 @@ const char* dtype_name(DType t) {
         case DType::T2_G128: return "T2_G128";
         case DType::T3_G128: return "T3_G128";
         case DType::B1_G128: return "B1_G128";
+        case DType::FP4_G16: return "FP4_G16";
     }
     return "?";
 }
@@ -33,6 +34,7 @@ std::string validate_tensor_payload(const Tensor& tensor) {
     const uint64_t rows = tensor.rows(), cols = tensor.cols();
     uint64_t group = 0;
     if (tensor.dtype == DType::Q4_G64) group = 64;
+    else if (tensor.dtype == DType::FP4_G16) group = 16;
     else if (tensor.dtype == DType::Q8_G128 || tensor.dtype == DType::T2_G128 ||
              tensor.dtype == DType::T3_G128 || tensor.dtype == DType::B1_G128)
         group = 128;
@@ -64,6 +66,8 @@ std::string validate_tensor_payload(const Tensor& tensor) {
             checked_product({rows, cols / 128, 2}, want_scales); break;
         case DType::B1_G128: sizes_representable = checked_product({rows, cols / 8}, want_data) &&
             checked_product({rows, cols / 128, 2}, want_scales); break;
+        case DType::FP4_G16: sizes_representable = checked_product({rows, cols / 2}, want_data) &&
+            checked_product({rows, cols / 16}, want_scales); break; // ue4m3: 1 B/scale
         default:
             return "unsupported dtype " +
                    std::to_string(static_cast<unsigned>(tensor.dtype));
@@ -104,6 +108,7 @@ bool cuda_weight_dtype_supported(DType dtype) {
         case DType::F16:
         case DType::Q8_G128:
         case DType::Q4_G64:
+        case DType::FP4_G16: // uploadable bytes; consumed only by the pf4 prefill leg
             return true;
         case DType::T2_G128:
         case DType::T3_G128:

@@ -10709,3 +10709,82 @@ at the fd2 dispatch, inert on every default path.
 GATES: canonical a2982c5197c627551b27d76a0a94b220 EXACT (fp16 default
 untouched), test_kernels ALL PASS, i8g64_test ALL PASS (bitwise), self-gate
 PASS.
+
+## 2026-08-15: ninfer steals phase 2 -- fp4 W4A4 prefill: built end to end, and the measurement says NO-GO three ways
+
+The full stage A + B landed: `tools/repack.py --pf4` emits 224 nvfp4 sidecar
+tensors (e2m1 2/byte + ue4m3 per-16 scales, quantized from the BF16 GGUF,
+reciprocal-from-ROUNDED-scale convention, dtype FP4_G16=7 with exact payload
+validation), opt-in upload (`upload_all(with_pf4)` -- default boots pay
+nothing), and `Q27_PREFILL=fp4` routes the five include-list projections
+(attn_q, attn_output, ffn gate/up/down; K/V, SSM path, lm head structurally
+excluded) through `src/pf4.cu` -- the phase-0 GEMM with fp32 mmT output +
+T-padding, the ONE sm_120a TU, linked as an object into every engine binary.
+Artifact: qwen36-27b-mtp-q4s-pf4.q27 (25.94 GB, fp4 sidecars 10.48 GB, rel
+RMSE 0.123-0.130 -- the e2m1 grid is coarse and that is the format).
+CANONICAL: PASS three ways (q4s vs q4s-pf4 vs q4s-pf4+fp4-env, all
+f64e7c02252ca4c40cea62db662205e0 -- the fp4 mode is inert where it must be).
+
+FINDING 1, VRAM WALL: dual-copy (Q4 for decode + fp4 for prefill) peaks at
+31.8 GiB of 32.6 at ctx 2048. Serving under Q27_PREFILL=fp4 cannot hold real
+context on this card, and the 64K NLL gate cannot host at all. The gates ran
+under a new CLI-only concession, Q27_PF4_INSTRUMENT=1: the Q4 copies of
+sidecar-shadowed tensors stay off the card (16.04 GB resident) and the
+decode graph is never built -- sound because --nll-long/--pf never decode
+(generate() cannot run: even token 1 needs the spec verify pass; measured,
+not assumed). ninfer does not have this wall because their fp4 weights are
+the ONLY copy -- their decode reads them as W4A16 GEMV. For q27 that shape
+is a NATIVE fp4 TIER with its own canonical and an fp4 decode leg -- a
+separate plan if ever, not a patch.
+
+FINDING 2, QUALITY GATE FAIL (the load-bearing one): 64K fp16-referenced...
+same harness as the KV tail study, int-prefill vs fp4-prefill on the same
+pack, teacher-forced, paired:
+
+| leg | dPPL | mean|d| | p99.9 | |d|>1 | study_cat |
+|---|--:|--:|--:|--:|--:|
+| fp4 vs int | +3.734% | 0.56053 | 13.4094 | 9828 | 561 |
+
+The envelope was fp8-KV-class (+0.458% dPPL, 19 catastrophic): fp4 prefill
+is 8x outside on dPPL and 30x on the catastrophic count. Damage concentrates
+where entropy lives (8-16k bucket +0.12 NLL = +12.7% PPL; the echo region
+barely moves) -- format damage shows where prediction is hard.
+
+FINDING 2b, THE CHUNKED ANOMALY, recorded before anyone quotes it as a win:
+chunked wiki PPL IMPROVES under fp4 (7.7678 -> 7.5630 at chunk 1024, 8.0197
+-> 7.5723 at 2048, reproducible, both normal and instrument modes) while
+wiki through the LONG instrument shows the expected damage (+5.7%/+8% per
+bucket). No 4-bit format legitimately beats its own baseline by 5%; the
+working hypothesis is e2m1's 12:1 per-16 dynamic range zeroing small
+activations (everything under ~amax/24 in a group rounds to 0), i.e.
+activation SPARSIFICATION on the SiLU-product path -- a regularizer on
+smooth text, a wrecker on structured content. PPL was already convicted of
+blindness on the KV axis (2026-08-01); this is the same lesson on the
+activation axis, from the other direction. Chunked PPL alone would have
+SHIPPED this format.
+
+FINDING 3, WALL-CLOCK BAR MISS: nll-long wall (prefill + head, head ~5%
+symmetric dilution): 17408 tokens 7.51s -> 6.07s = 1.237x; 27648 tokens
+11.09s -> 9.30s = 1.192x. Bar was >= 1.25x on 17K-27K. The phase-0 GEMM
+ratio (2.5x at M=1024) survives Amdahl as ~1.2x: the include set is 77% of
+prefill GEMM flops (GDN-input projections excluded by the ssm lesson), and
+attention + delta-scan are untouched. ninfer's 3.48x rides fp4 GDN-input
+projections (their gdn_input_proj/nvfp4 kernels) plus batch-width fp4 MMA
+engagement q27's single-stream prefill does not have.
+
+DEFECT, open: one run-to-run wobble observed on the fp4 chunked leg
+(2.023262 vs 2.020509 mean NLL across identical invocations, ~0.0015 PPL);
+two of three runs matched exactly. Somewhere in the pf4 path there is a rare
+race. Three orders of magnitude below the gate deltas; matters only if the
+path is ever promoted, which it is not being.
+
+VERDICT: NO-GO on the pre-declared bars, all three independently
+sufficient. The code stays in-tree, opt-in, inert by default (canonical +
+suite gates prove it). Salvage forks, NOT built, for a future plan entry:
+(a) attribution arm -- W4A8 on fp4 weights would split weight-grid damage
+from activation-sparsification damage and could rescue a W4-only variant;
+(b) the native fp4 tier (single weight copy, fp4 GEMV decode, own
+canonical), the only shape that clears the VRAM wall and the only one worth
+(a)'s answer. Phase 2 closes measured: the 2.5x GEMM is real, and on this
+engine, with this include set, it does not survive contact with Amdahl, the
+quality envelope, or a 32 GB card.

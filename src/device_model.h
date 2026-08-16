@@ -28,10 +28,21 @@ class DeviceModel {
 
     // Upload one tensor (no-op if already resident). Returns the device tensor.
     const DevTensor& upload(const std::string& name);
-    // Upload everything (engine path).
-    void upload_all();
+    // Upload everything (engine path). ".pf4" sidecars (fp4 prefill copies,
+    // ~10.5 GB on a --pf4 pack) are skipped unless with_pf4 -- callers pass
+    // q27k::pf4_on() so default boots pay nothing for them.
+    // drop_shadowed_q4 (Q27_PF4_INSTRUMENT, CLI-only): ALSO skip the base Q4
+    // tensors that have a .pf4 sibling -- prefill-only instrument runs
+    // (--nll-long, --pf) never decode, and both weight copies do not fit a
+    // 32 GB card at instrument depths (measured 31.8/32.6 GiB at ctx 2048).
+    void upload_all(bool with_pf4 = false, bool drop_shadowed_q4 = false);
 
     const DevTensor& get(const std::string& name) const;
+    // Nullable get: for optional sidecars (nullptr when never uploaded).
+    const DevTensor* try_get(const std::string& name) const {
+        auto it = dev_.find(name);
+        return it == dev_.end() ? nullptr : &it->second;
+    }
     bool model_has(const std::string& name) const { return model_.find(name) != nullptr; }
     // The Model behind this DeviceModel. The engine sizes the vgemm workspace by
     // walking the weight list BEFORE upload_all(), so it needs shapes/dtypes when
