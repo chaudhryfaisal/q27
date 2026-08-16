@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "blocks.cuh" // Q27_CONV_OLDEST_FIRST / Q27_GDN_HEAD_TILE (M1 chunk twins)
 #include "cuda_common.h"
 #include "fdmma.cuh"
 #include "spec3.cuh"
@@ -33,6 +34,152 @@ __global__ void k_l2norm3(__grid_constant__ const P3 xp, int head_dim, float eps
 void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st, int ntok) {
     dim3 g(n_heads, ntok);
     k_l2norm3<<<g, 128, 0, st>>>(x, head_dim, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- M1 record+fold GDN verify chunks (batched-decode spec Appendix A) ----
+// MIRROR WARNING (M1): the tap arithmetic below is a body twin of k_conv_step
+// (blocks.cu) -- any arithmetic change there MUST be mirrored here and re-gated
+// with ninv's CHUNK leg (bitwise, both arches). Lane L = blockIdx.y + 1; taps
+// are the raw inputs L-3..L. Absolute input a >= 1 comes from lane a's qkv
+// buffer; a <= 0 comes from the committed ring AFTER lane 0's in-place shift
+// (slot a+2: ring = [x(-2), x(-1), x(0)] oldest-first). No ring writes.
+__global__ void k_gdn_conv_chunk3(const float* __restrict__ ring,
+                                  __grid_constant__ const CP3 qkv,
+                                  const float* __restrict__ w,
+                                  __grid_constant__ const P3 out, int channels) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int L = blockIdx.y + 1;
+    const float* wc = w + (size_t)c * 4; // [channels][4], taps contiguous
+    auto tap = [&](int a) {
+        return a >= 1 ? qkv.p[a][c] : ring[(size_t)(a + 2) * channels + c];
+    };
+    float r0 = tap(L - 3), r1 = tap(L - 2), r2 = tap(L - 1), x = tap(L);
+#if Q27_CONV_OLDEST_FIRST
+    float acc = r0 * wc[0] + r1 * wc[1] + r2 * wc[2] + x * wc[3];
+#else
+    float acc = r0 * wc[3] + r1 * wc[2] + r2 * wc[1] + x * wc[0];
+#endif
+    out.p[L][c] = acc / (1.0f + expf(-acc)); // silu
+}
+
+void gdn_conv_chunk3(const float* ring, CP3 qkv, const float* convw, P3 out, int channels,
+                     int nsp, cudaStream_t st) {
+    dim3 g((channels + 255) / 256, nsp);
+    k_gdn_conv_chunk3<<<g, 256, 0, st>>>(ring, qkv, convw, out, channels);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// MIRROR WARNING (M1): the per-step body below is a smem twin of k_delta_step
+// (blocks.cu) and k_delta_scan_T (prefill.cu) -- same 48x512 launch, same
+// i-tile/j mapping, same part[0..3] reduction order, same decay/pred/d/update
+// sequence. Any arithmetic change there MUST be mirrored here and re-gated
+// with ninv's CHUNK leg. Committed S (post lane-0) is read once into 64KB
+// dynamic smem; each speculative lane's o is written; S is NEVER written --
+// the commit Fold (delta_scan_seq over the recorded rows) advances it.
+__global__ void k_gdn_delta_chunk3(const float* __restrict__ S0,
+                                   __grid_constant__ const CP3 conv3,
+                                   __grid_constant__ const CP3 g3,
+                                   __grid_constant__ const CP3 beta3,
+                                   __grid_constant__ const P3 o3, int nsp) {
+    constexpr int SK = 128;
+    extern __shared__ float S[]; // [128][128] = 64KB
+    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
+    const int h = blockIdx.x;
+    const int j = threadIdx.x & (SK - 1);
+    const int it = threadIdx.x >> 7;
+    const int i0 = it * 32;
+#if Q27_GDN_HEAD_TILE
+    const int qk = h % 16;
+#else
+    const int qk = h / 3;
+#endif
+    const float scale = rsqrtf((float)SK);
+    const float* Sgh = S0 + (size_t)h * SK * SK;
+    for (int i = i0; i < i0 + 32; i++) S[i * SK + j] = Sgh[i * SK + j];
+    __syncthreads();
+    for (int t = 0; t < nsp; t++) {
+        const float* conv = conv3.p[t + 1];
+        if (it == 0) {
+            sq[j] = conv[qk * SK + j] * scale;
+            sk[j] = conv[2048 + qk * SK + j];
+        }
+        __syncthreads();
+        const float decay = expf(g3.p[t + 1][h]);
+        float pred = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] * decay;
+            S[i * SK + j] = s;
+            pred += sk[i] * s;
+        }
+        part[it][j] = pred;
+        __syncthreads();
+        if (it == 0) {
+            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float vj = conv[4096 + h * SK + j];
+            dj[j] = beta3.p[t + 1][h] * (vj - p);
+        }
+        __syncthreads();
+        float d = dj[j];
+        float acc = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] + sk[i] * d;
+            S[i * SK + j] = s;
+            acc += sq[i] * s;
+        }
+        part[it][j] = acc;
+        __syncthreads();
+        if (it == 0)
+            o3.p[t + 1][h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        __syncthreads();
+    }
+}
+
+void gdn_delta_chunk3(const float* S0, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
+                      cudaStream_t st) {
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gdn_delta_chunk3,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        128 * 128 * 4));
+        attr = true;
+    }
+    k_gdn_delta_chunk3<<<48, 512, 128 * 128 * 4, st>>>(S0, conv, g, beta, o, nsp);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Record lanes 1..nsp into the per-layer arena (row L-1): raw qkv + post-norm
+// conv rows (contiguous [row][channels], so the Fold's conv_ring_update /
+// delta_scan_seq consume them with prefill's row stride), g/beta scalars
+// ([row][n_heads]). Pure copies -- launch after l2norm3, before the lane
+// buffers are reused by the next layer.
+__global__ void k_gdn_record3(__grid_constant__ const CP3 qkv,
+                              __grid_constant__ const CP3 conv,
+                              __grid_constant__ const CP3 g,
+                              __grid_constant__ const CP3 beta,
+                              float* __restrict__ rq, float* __restrict__ rc,
+                              float* __restrict__ rg, float* __restrict__ rb,
+                              int channels, int n_heads) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int t = blockIdx.y; // arena row t <- verify lane t+1
+    rq[(size_t)t * channels + c] = qkv.p[t + 1][c];
+    rc[(size_t)t * channels + c] = conv.p[t + 1][c];
+    if (c < n_heads) {
+        rg[(size_t)t * n_heads + c] = g.p[t + 1][c];
+        rb[(size_t)t * n_heads + c] = beta.p[t + 1][c];
+    }
+}
+
+void gdn_record3(CP3 qkv, CP3 conv, CP3 g, CP3 beta, float* rec_qkv, float* rec_conv,
+                 float* rec_g, float* rec_beta, int channels, int n_heads, int nsp,
+                 cudaStream_t st) {
+    dim3 grid((channels + 255) / 256, nsp);
+    k_gdn_record3<<<grid, 256, 0, st>>>(qkv, conv, g, beta, rec_qkv, rec_conv, rec_g,
+                                        rec_beta, channels, n_heads);
     CUDA_CHECK(cudaGetLastError());
 }
 

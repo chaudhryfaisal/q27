@@ -120,4 +120,16 @@ void wy_scratch_reserve(WyScratch* wy, int T_max);
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st, WyScratch* wy);
 
+// M1 commit Fold (batched-decode spec Appendix A): advance committed GDN state
+// by T accepted speculative rows recorded during the verify round.
+// conv_ring_update = k_conv_ring_update_T alone (ring := raw qkv of the last 3
+// accepted rows, shifting in the old ring when T < 3). delta_scan_seq = the
+// BITWISE-exact sequential scan k_delta_scan_T, bypassing delta_scan_T's env
+// dispatch -- the WY path reorders reductions and would be a state-format
+// change (spec section 5: the Fold must be pure state movement). oT is dead
+// output scratch (>= T * 6144 floats).
+void conv_ring_update(float* ring, const float* qkvT, int channels, int T, cudaStream_t st);
+void delta_scan_seq(float* S_global, const float* convT, const float* gT, const float* betaT,
+                    float* oT, int T, cudaStream_t st);
+
 } // namespace q27k

@@ -31,6 +31,36 @@ void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int
 void gated_norm3(CP3 o, const float* w, CP3 z, P3 out, int n_heads, int head_dim, float eps,
                  cudaStream_t st = 0, int ntok = 3);
 
+// M1 record+fold GDN verify chunks (batched-decode spec Appendix A). The
+// speculative lanes 1..nsp of a verify round read COMMITTED state only and
+// write per-lane outputs only -- no role-state writes. Lane 0 (the pending
+// token, always accepted) still commits in place via conv_step/delta_step;
+// the accepted speculative lanes are folded into committed state afterwards
+// (Engine::flush_fold) from the rows gdn_record3 retains.
+//
+// gdn_conv_chunk3: per-lane 4-tap conv + silu for lanes 1..nsp. Taps are the
+// raw qkv rows of absolute inputs L-3..L, read from the committed ring for
+// inputs <= 0 (POST lane-0 shift: launch after lane 0's conv_step) and from
+// the lane qkv buffers for inputs >= 1. Arithmetic mirrors k_conv_step
+// (blocks.cu) -- same tap order, same silu; ONLY the ring writes are gone.
+void gdn_conv_chunk3(const float* ring, CP3 qkv, const float* convw, P3 out, int channels,
+                     int nsp, cudaStream_t st = 0);
+// gdn_delta_chunk3: gated delta rule for lanes 1..nsp with the committed S
+// (POST lane-0: launch after lane 0's delta_step) resident in 64KB dynamic
+// smem; writes each lane's o only. Per-step arithmetic mirrors k_delta_step /
+// k_delta_scan_T (same tile split, same part[0..3] reduction order) -- the
+// smem round-trip is value-preserving fp32, proven bitwise by the seq-prefill
+// gate and tools/gdn_chunk_bench.
+void gdn_delta_chunk3(const float* S0, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
+                      cudaStream_t st = 0);
+// gdn_record3: retain lane L=1..nsp's raw qkv row, POST-l2norm conv row (launch
+// after l2norm3) and g/beta scalars into the per-layer record arena (row L-1),
+// so the commit Fold can replay exactly the bytes the verify consumed after
+// the lane buffers are reused by the next layer.
+void gdn_record3(CP3 qkv, CP3 conv, CP3 g, CP3 beta, float* rec_qkv, float* rec_conv,
+                 float* rec_g, float* rec_beta, int channels, int n_heads, int nsp,
+                 cudaStream_t st = 0);
+
 // attention output sigmoid gate, ntok tokens.
 void sigmoid_gate3(P3 out, CP3 qg, int n_heads, int head_dim, cudaStream_t st = 0, int ntok = 3);
 

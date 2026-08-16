@@ -510,7 +510,7 @@ int main(int argc, char** argv) {
             no_think_srv ? 0 : 1);
 
     // Per-engine non-KV reserve, the single source of truth shared by
-    // auto-ctx (below) and the multi-slot skip loop. roles + graph zoo +
+    // auto-ctx (below) and the multi-slot skip loop. GDN state + graph zoo +
     // scratch, arch/width/gate scaled. Calibrated to the known-good 2x48K
     // fp8 anchor on a 32GB 5090 (~5.8 GB/slot on W12). See the auto-ctx
     // comment for the term-by-term rationale.
@@ -520,11 +520,16 @@ int main(int argc, char** argv) {
     const double kEngMonoSave = cc_arch >= 89 ? 0.08e9 : 0.15e9;
     const double kEngSampSave = cc_arch >= 89 ? 0.34e9 : 0.60e9;
     const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+    // GDN recurrent state, M1 record+fold: committed + snapshot sets
+    // (2 x 0.157 GB) + the record arena ((W_MAX-1) rows x ~3.95 MB across the
+    // 48 GDN layers). MIRRORS Engine gdn_state_bytes -- the 11 spare role
+    // sets of the retired rotation are gone (was (W_MAX+1) x 0.157e9).
+    const double kEngGdn = 2 * 0.157e9 + (Q27_W_MAX - 1) * 3.95e6;
     // per-slot non-KV = single-engine stack + co-residency scratch (the
     // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
     // this + KV so it agrees with what auto-ctx sized for.
     const size_t ENG_FIXED_BYTES =
-        (size_t)(kEngBase + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 + 2.2e9 -
+        (size_t)(kEngBase + kEngGraphs + kEngGdn + 2.2e9 -
                  (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
     // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
@@ -551,15 +556,17 @@ int main(int argc, char** argv) {
     // with the weights already resident, so tier size (q4s/v1.4/q6),
     // upload alignment overhead, and any co-tenant process fall out of the
     // measurement instead of a model. What remains estimated is the non-KV
-    // stack allocated after this point (GDN role sets + spec/sample graph
-    // zoo + workspaces): each width adds one role set (~157MB) and ~one
-    // perm's worth of graphs (~130MB), plus an arch base -- the sm_86
+    // stack allocated after this point (GDN committed/snap state + record
+    // arena + spec/sample graph zoo + workspaces): under M1 record+fold a
+    // width adds only ~4 MB of arena and ~one perm-index's worth of graphs
+    // (~130MB, vestigial until M1b), plus an arch base -- the sm_86
     // fd2/h16 path carries heavier workspaces than sm_120, and the old
     // 1.27GB anchor predates the P1-P3 graph growth (calibrated 2026-07-17
     // from in-process free deltas on both cards; see BUILDLOG).
-    // per-token KV bytes are EXACT: 18 K/V pairs (17 attn + 1 MTP),
-    // per-buffer/token = N_KV*HEAD_DIM*esz (fp16 2048 B, fp8 1024 B) or
-    // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3 / *82 B = 656 B turbo5 K.
+    // per-token KV bytes are EXACT: 17 K/V pairs (16 attn + 1 MTP, the
+    // phase-3 audit count), per-buffer/token = N_KV*HEAD_DIM*esz (fp16
+    // 2048 B, fp8 1024 B) or N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3 /
+    // *82 B = 656 B turbo5 K.
     // MIRROR WARNING: matches Engine::kv_bytes -- update together.
     {
         // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
@@ -605,11 +612,12 @@ int main(int argc, char** argv) {
             // deliberately shares sm_86's fat slope below (under-pick beats
             // a dead boot).
             const double base = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
-            // SINGLE-slot non-KV stack (base + roles + graph zoo - capture
-            // saves), unchanged and calibrated: this is what N==1 uses, and
-            // it must stay exact (drives the 262144/57344/... single-slot
-            // picks). Reuses the hoisted width/arch-scaled terms.
-            const double single_fixed = base + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 -
+            // SINGLE-slot non-KV stack (base + GDN state + graph zoo - capture
+            // saves): this is what N==1 uses, and it must stay exact (drives
+            // the 262144/57344/... single-slot picks). Reuses the hoisted
+            // width/arch-scaled terms; kEngGdn is the M1 record+fold figure
+            // (committed + snap + arena -- the spare role sets are gone).
+            const double single_fixed = base + kEngGraphs + kEngGdn -
                                         (constrain_tools ? 0.0 : kEngMonoSave) -
                                         (sampled_on ? 0.0 : kEngSampSave);
             long budget, c;

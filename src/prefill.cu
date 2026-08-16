@@ -1203,6 +1203,14 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// M1 commit Fold ring half: the ring-update kernel alone (the conv outputs for
+// the accepted rows were recorded post-l2norm during the verify; only the raw
+// ring needs advancing here). Same kernel, same semantics as the prefill tail.
+void conv_ring_update(float* ring, const float* qkvT, int channels, int T, cudaStream_t st) {
+    k_conv_ring_update_T<<<(channels + 255) / 256, 256, 0, st>>>(ring, qkvT, channels, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename CT>
 __global__ void k_kv_store_T(const float* __restrict__ kT, const float* __restrict__ vT,
                              CT* __restrict__ kc, CT* __restrict__ vc, int base_pos,
@@ -3137,6 +3145,23 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
                                        nch);
         CUDA_CHECK(cudaGetLastError());
     }
+}
+
+// M1 commit Fold delta half: the sequential scan DIRECTLY, no env dispatch.
+// k_delta_scan_T's per-token arithmetic is a bitwise twin of k_delta_step (the
+// seq-prefill gate proved it); the Fold rides that identity. NEVER route this
+// through delta_scan_T: the WY default reorders reductions = format change.
+void delta_scan_seq(float* S_global, const float* convT, const float* gT, const float* betaT,
+                    float* oT, int T, cudaStream_t st) {
+    static bool attr_set = false;
+    if (!attr_set) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        128 * 128 * 4));
+        attr_set = true;
+    }
+    k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,

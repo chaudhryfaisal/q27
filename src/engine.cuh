@@ -47,13 +47,15 @@ static constexpr float EPS = 1e-6f;
 static constexpr int GDN_CH = 10240, GDN_V = 6144, GDN_HEADS = 48, GDN_DIM = 128;
 static constexpr int VOCAB = 248320;
 static constexpr int MAX_GEN_TRACK = 65536;
-// width-12 (plan 2026-07-10): max verify width = lane count = GDN role count
-// = perm modulus. The MTP draft ladder stays policy-capped at 4..7
-// (D_MAX_MTP); widths 9..12 are reserved for the suffix drafter (P1).
+// width-12 (plan 2026-07-10): max verify width = lane count. The MTP draft
+// ladder stays policy-capped at 4..7 (D_MAX_MTP); widths 9..12 are reserved
+// for the suffix drafter (P1).
 // Q27_W_MAX build knob (2026-07-11): narrow builds for smaller cards.
-// Each width costs one GDN role set (~157MB/engine) AND one perm's worth
-// of the graph zoo (~1.5x captures from 8->12), so W_MAX=8 reclaims
-// ~1.5-2GB -- the difference between fitting and OOMing a 24GB 3090.
+// M1 record+fold (2026-08-16): the per-width GDN role sets are GONE --
+// speculative lanes read committed state and write outputs only; commit is a
+// Fold from a ~4 MB/width record arena. A width now costs arena rows plus one
+// perm-index's worth of the graph zoo (the zoo's [W_MAX] leading index is
+// vestigial until M1b collapses it -- perm is frozen at 0).
 // Floor 8 keeps the full maxd7 (4..7) ladder; cap 12 = the lane plumbing.
 // Struct arrays stay p[16]; the unused high slots are never dereferenced.
 #ifndef Q27_W_MAX
@@ -271,10 +273,21 @@ struct Engine {
     float* d_vgemm_ws = nullptr;
     int gemm_min = 9;
     int64_t gemm_min_rows = 4096;
-    // GDN role state, spare sets 1..11 (role 0 = S/conv_ring). Roles 8..11
-    // (indices 7..10) exist only when Q27_W_MAX admits them -- nullptr else.
-    // Was 11 pairs of named members + ternary chains (audit 2026-07-12).
-    float *S_sp[W_PLUMB - 1][N_LAYER], *ring_sp[W_PLUMB - 1][N_LAYER];
+    // M1 record+fold (batched-decode spec Appendix A): the per-layer record
+    // arena. Verify rounds retain each speculative lane's raw qkv row,
+    // POST-l2norm conv row and g/beta scalars here (row r = lane r+1, rows
+    // contiguous at prefill strides), so flush_fold can replay the accepted
+    // steps into committed state after the lane buffers are reused by later
+    // layers. One backing alloc (rec_base); per-layer views below are nullptr
+    // on attn layers. Replaces the 11 spare GDN role sets (~1.73 GB) with
+    // ~43 MB at W12.
+    float* rec_base = nullptr;
+    float *rec_qkv[N_LAYER] = {}, *rec_conv[N_LAYER] = {};
+    float *rec_g[N_LAYER] = {}, *rec_beta[N_LAYER] = {};
+    // Accepted speculative rows (n-1) awaiting the commit Fold. Set by the
+    // three commit sites, shrunk by refinish_round, consumed by flush_fold,
+    // cancelled by reset/restore (they replace committed state wholesale).
+    int fold_pending = 0;
     float *h_next2;
     int *d_pos_m2, *d_draft2;
     // depth-3 lane (d): 4th verify column + pass-3 draft chain
@@ -313,15 +326,20 @@ struct Engine {
     int h_mask_id0 = -1, h_cap0 = 0; // tool-grammar cap (0 = none, 1 = one token)
     int h_reason_cap = 0, h_accept_cap = 0; // reasoning cap + persistent async-copy source
     static constexpr int MASK_POOL_CAP = 512;
-    // GDN state as W_MAX=12 physical buffers with a cyclic role permutation
-    // (history: 6 at P12b, 8 at maxd7, 12 at width-12). role r (0=primary,
-    // 1..11 = post-b..post-l) -> physical (r+perm)%12. accept n tokens ->
-    // perm += n-1 (mod 12). One captured graph per perm. Shallower ceilings
-    // use only a role prefix (a bitwise-identical subset -- the modulus only
-    // relabels WHICH physical buffer holds a role; every access goes through
-    // SBuf/RBuf, so values and emitted tokens are modulus-invariant as long
-    // as modulus >= max commit n). Invariant: role 0 = the last-committed
-    // state.
+    // GDN state, M1 record+fold (2026-08-16; history: role rotation over 6
+    // physical sets at P12b, 8 at maxd7, 12 at width-12 -- retired). ONE
+    // committed set: S[il]/conv_ring[il] IS the state after the last accepted
+    // token. In a verify round, lane 0 (the pending token, always accepted:
+    // k_finish_round starts n=1) commits in place exactly as before; lanes
+    // 1..vw-1 run the chunk kernels (spec3.cu) that read committed state and
+    // write per-lane outputs ONLY, while gdn_record3 retains their inputs in
+    // the record arena. Commit = flush_fold: replay the n-1 accepted rows
+    // (conv_ring_update + delta_scan_seq, bitwise twins of the serial chain)
+    // into committed state. Rewind (refinish_round) = fold fewer rows --
+    // state is uncommitted until the Fold runs. perm is FROZEN at 0: the
+    // graph zoo's [W_MAX] perm index and the capture loop are vestigial
+    // (M1b collapses them); every capture now bakes the same committed
+    // pointers, so all perm variants are identical.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
     //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
@@ -378,36 +396,14 @@ struct Engine {
     float* ring_snap[N_LAYER] = {};
     std::vector<int> snap_toks;
     bool have_snap = false;
+    // M1: perm is FROZEN at 0 (no commit advances it; the restore paths still
+    // stamp 0 defensively). It survives only as the graph zoo's vestigial
+    // trailing index -- every launch site reads [perm] == [0] -- until M1b
+    // collapses the arrays. The P3 T2 device role tables + perm scalar +
+    // stage_perm_async are GONE with the rotation: the chunk kernels read the
+    // committed pointers directly, so captures are perm-invariant with no
+    // device indirection at all.
     int perm = 0;
-    // ---- P3 T2 (capture plan 2026-07-16): device-resolved GDN role tables.
-    // d_gdn_tab = ONE flat init-time upload of [2][N_LAYER][W_MAX] float*:
-    // ring half first, S half second; entry [il][ph] = the physical buffer
-    // RBuf/SBuf return when (role+perm)%W_MAX == ph (attn layers stay
-    // nullptr, never indexed). The conv_step_t/delta_step_t twins index
-    // (table + il*W_MAX) with *d_perm_scalar, so a captured fused round no
-    // longer bakes host-resolved role pointers -- the T3 enabler for
-    // cross-round graph exec reuse. Tables are read ONLY when a caller asks
-    // gdn_mix for use_tables: the fused path does from T2 on (mix_all in
-    // conductor.h, eager first per the plan gate; T3 captures the same
-    // launches); the solo path never passes the flag, so its kernels/
-    // pointers are byte-for-byte untouched. h_perm_pin is the PINNED
-    // per-engine staging int the caller cudaMemcpyAsyncs to d_perm_scalar
-    // on cstm before each fused round / graph launch (pinned: no new
-    // pageable-blocking semantics; at most one DISTINCT VALUE in flight per
-    // round -- the guard-trip fallback may enqueue a second byte-identical
-    // copy (perm is constant within a round); the round sync fences the
-    // next rewrite).
-    float** d_gdn_tab = nullptr;   // base == ring half
-    float** d_gdn_S_tab = nullptr; // = d_gdn_tab + N_LAYER*W_MAX
-    int* d_perm_scalar = nullptr;
-    int* h_perm_pin = nullptr;
-    // Stage the CURRENT host perm to the device scalar on st (T3 calls this
-    // per capture-mode round, before the graph launch on the same stream).
-    void stage_perm_async(cudaStream_t st) {
-        *h_perm_pin = perm;
-        CUDA_CHECK(cudaMemcpyAsync(d_perm_scalar, h_perm_pin, sizeof(int),
-                                   cudaMemcpyHostToDevice, st));
-    }
     // ---- GRAPH ZOO (read before any width/depth change: miss one and a decode
     // path silently runs a stale graph). perm is mod-W_MAX=12 (12 GDN state
     // buffers), so every spec/gated set below is [..][perm=0..11]. Two NON-spec
@@ -477,8 +473,10 @@ struct Engine {
     // MTP passes/round and only pays off on high-acceptance (agentic) traffic
     // (+2.6% agentic, -8% docs), so it is opt-in.
     int gate_maxd = 4;
-    // exact bytes of resident GDN recurrent state (all S buffers + conv
-    // rings, every set); accumulated at alloc, read by server slot admission
+    // exact bytes of resident GDN recurrent state (committed + snapshot sets
+    // + the M1 record arena); accumulated at alloc. NOTE: the server's
+    // admission estimator mirrors this arithmetic as a constant
+    // (server.cu kEngGdn) rather than reading it -- keep them in step.
     size_t gdn_state_bytes = 0;
     // Single source for every context guard/clamp (generate() loop, CLI spec
     // loop, server n_max clamps). A width-W verify round launched at P writes
@@ -601,14 +599,8 @@ struct Engine {
     int h_sfx_prop[W_MAX];       // host staging for the H2D draft copies (W_MAX-1 max)
     bool sfx_dbg = false;        // Q27_SUFFIX_DBG: per-round propose trace
     bool tool_split_active = false; // set by set_tool_constraint when constraining
-    float* SBuf(int il, int role) {
-        int ph = (role + perm) % W_MAX;
-        return ph == 0 ? S[il] : S_sp[ph - 1][il];
-    }
-    float* RBuf(int il, int role) {
-        int ph = (role + perm) % W_MAX;
-        return ph == 0 ? conv_ring[il] : ring_sp[ph - 1][il];
-    }
+    // M1: SBuf/RBuf (the host role resolvers) are gone with the rotation --
+    // committed state is always physically S[il]/conv_ring[il].
     q27k::XQuant xq;
     // layer state
     float* conv_ring[N_LAYER];
@@ -957,53 +949,34 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 A((void**)&S[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
                 CUDA_CHECK(cudaMemset(S[il], 0, (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
-                // spare sets 1..7 are allocated at EVERY gate_maxd (review
-                // 2026-07-09, accepted tradeoff ~157MB each): the perm
-                // rotation is uniformly mod-12 ((role+perm)%12), so all 12
-                // sets enter rotation even at shallow ceilings. Roles 8..11
-                // (indices 7..10) exist only when W_MAX admits them (Q27_W_MAX
-                // knob); skipped sets stay nullptr and are never addressed
-                // (SBuf/RBuf index (role+perm)%W_MAX < W_MAX). This is the
-                // narrow-build memory win: each skipped role = ~157MB/engine.
-                for (int r = 0; r < W_PLUMB - 1; r++) {
-                    if (r >= 7 && W_MAX <= r + 1) {
-                        S_sp[r][il] = ring_sp[r][il] = nullptr;
-                        continue;
-                    }
-                    A((void**)&S_sp[r][il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                    A((void**)&ring_sp[r][il], 3 * GDN_CH * 4);
-                }
-                // (W_MAX + 1) S-buffers (main + W_MAX-1 spares + snap) + rings
-                // per GDN layer -- server slot admission sizes its floor from
-                // this (review 2026-07-09: the old hardcoded "5 sets" predated
-                // maxd6/7; the (W_MAX+1) form tracks the Q27_W_MAX knob).
+                // 2 sets (main + snap) per GDN layer; the arena rides below.
                 gdn_state_bytes +=
-                    (size_t)(W_MAX + 1) * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
+                    (size_t)2 * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
         }
-        // P3 T2: upload the device role-pointer tables (ring half + S half,
-        // one flat alloc) and the perm scalar, ONCE, now that every role
-        // buffer above has its final address. Inert unless the conv/delta
-        // table twins run (gdn_mix use_tables; see the member block).
+        // M1 record arena: one backing alloc, per-GDN-layer views. Row r =
+        // speculative lane r+1 of a verify round (W_MAX-1 rows: verify width
+        // caps at W_MAX). Layout per layer: [rows][GDN_CH] raw qkv, then
+        // [rows][GDN_CH] post-l2norm conv, then [rows][GDN_HEADS] g, then
+        // [rows][GDN_HEADS] beta -- contiguous rows so the Fold reuses the
+        // prefill kernels' row strides verbatim.
         {
-            const size_t half = (size_t)N_LAYER * W_MAX;
-            std::vector<float*> tab(2 * half, nullptr);
+            const size_t rows = W_MAX - 1;
+            const size_t per_layer = rows * (2 * (size_t)GDN_CH + 2 * GDN_HEADS);
+            size_t gdn_layers = 0;
+            for (int il = 0; il < N_LAYER; il++)
+                if (!attn_layer[il]) gdn_layers++;
+            A((void**)&rec_base, gdn_layers * per_layer * 4);
+            gdn_state_bytes += gdn_layers * per_layer * 4;
+            float* p = rec_base;
             for (int il = 0; il < N_LAYER; il++) {
                 if (attn_layer[il]) continue;
-                for (int ph = 0; ph < W_MAX; ph++) {
-                    tab[(size_t)il * W_MAX + ph] = ph == 0 ? conv_ring[il] : ring_sp[ph - 1][il];
-                    tab[half + (size_t)il * W_MAX + ph] = ph == 0 ? S[il] : S_sp[ph - 1][il];
-                }
+                rec_qkv[il] = p;                      p += rows * GDN_CH;
+                rec_conv[il] = p;                     p += rows * GDN_CH;
+                rec_g[il] = p;                        p += rows * GDN_HEADS;
+                rec_beta[il] = p;                     p += rows * GDN_HEADS;
             }
-            CUDA_CHECK(cudaMalloc((void**)&d_gdn_tab, 2 * half * sizeof(float*)));
-            CUDA_CHECK(cudaMemcpy(d_gdn_tab, tab.data(), 2 * half * sizeof(float*),
-                                  cudaMemcpyHostToDevice));
-            d_gdn_S_tab = d_gdn_tab + half;
-            CUDA_CHECK(cudaMalloc((void**)&d_perm_scalar, sizeof(int)));
-            CUDA_CHECK(cudaMemset(d_perm_scalar, 0, sizeof(int)));
-            CUDA_CHECK(cudaMallocHost((void**)&h_perm_pin, sizeof(int)));
-            *h_perm_pin = 0;
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
@@ -1629,44 +1602,63 @@ struct Engine {
     // value, same launch sequence). Width stays MEMBER vw: each engine's mix
     // walks its OWN granted lanes 0..vw-1, never the union width (the
     // conductor sets vw per round via set_round_width before the fused round).
-    // P3 T2: use_tables=false (every existing call site) keeps the shipped
-    // conv_step/delta_step launches with host-resolved RBuf/SBuf pointers --
-    // the solo path is untouched by construction. use_tables=true swaps in
-    // the TABLE TWINS (identical math, device-resolved role pointers via
-    // d_gdn_tab + *d_perm_scalar); the FUSED path passes it (mix_all,
-    // conductor.h -- eager from T2 on, captured in T3), after the caller's
-    // stage_perm_async has landed the round's perm in the scalar.
-    void gdn_mix(int il, cudaStream_t st, bool use_tables = false) {
+    // M1 record+fold: ONE launch sequence for solo AND fused (the P3 T2
+    // use_tables fork is gone with the rotation). Lane 0 (the pending token,
+    // always accepted) commits in place, byte-for-byte the pre-M1 launches;
+    // lanes 1..vw-1 run the chunk kernels, which read COMMITTED state (post
+    // lane 0, stream-ordered) and write per-lane convout/o only -- no role
+    // writes, so every pointer here is init-fixed and captures are
+    // perm-invariant. gdn_record3 retains the speculative lanes' inputs for
+    // the commit Fold (flush_fold) AFTER l2norm3 normalized q||k in place --
+    // the Fold replays exactly the bytes delta consumed.
+    void gdn_mix(int il, cudaStream_t st) {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
-        // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
-        // earlier this round) and writes role k. Only lanes < vw are live; a
-        // width-vw graph skips the rest, leaving their (never-read) role buffers
-        // untouched. Lane a (role 0, the pending token) always runs.
-        if (use_tables) {
-            float* const* rt = d_gdn_tab + (size_t)il * W_MAX;
-            float* const* stab = d_gdn_S_tab + (size_t)il * W_MAX;
-            q27k::conv_step_t(rt, d_perm_scalar, 0, 0, W_MAX, qkv, cw, convout, GDN_CH, st);
-            for (int L = 1; L < vw; L++)
-                q27k::conv_step_t(rt, d_perm_scalar, L - 1, L, W_MAX, qkv_L[L], cw,
-                                  convout_L[L], GDN_CH, st);
-            q27k::l2norm3(LANESW(convout), 32,
-                          GDN_DIM, eps, st, vw);
-            q27k::delta_step_t(stab, d_perm_scalar, 0, 0, W_MAX, convout, g, beta, o, st);
-            for (int L = 1; L < vw; L++)
-                q27k::delta_step_t(stab, d_perm_scalar, L - 1, L, W_MAX, convout_L[L], g_L[L],
-                                   beta_L[L], o_L[L], st);
-            return;
-        }
-        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, st); // lane 0
-        for (int L = 1; L < vw; L++)
-            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, st);
+        q27k::conv_step(conv_ring[il], conv_ring[il], qkv, cw, convout, GDN_CH, st); // lane 0
+        if (vw > 1)
+            q27k::gdn_conv_chunk3(conv_ring[il], LANESW(qkv), cw, LANESW(convout), GDN_CH,
+                                  vw - 1, st);
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
         q27k::l2norm3(LANESW(convout), 32,
                       GDN_DIM, eps, st, vw);
-        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, st); // lane 0
-        for (int L = 1; L < vw; L++)
-            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], st);
+        if (vw > 1)
+            q27k::gdn_record3(LANESW(qkv), LANESW(convout), LANESW(g), LANESW(beta),
+                              rec_qkv[il], rec_conv[il], rec_g[il], rec_beta[il], GDN_CH,
+                              GDN_HEADS, vw - 1, st);
+        q27k::delta_step(S[il], S[il], convout, g, beta, o, st); // lane 0
+        if (vw > 1)
+            q27k::gdn_delta_chunk3(S[il], LANESW(convout), LANESW(g), LANESW(beta),
+                                   LANESW(o), vw - 1, st);
+    }
+    // M1 commit Fold: advance committed GDN state by the accepted speculative
+    // rows (fold_pending = n-1, set at commit, shrunk by refinish_round).
+    // Ring: raw qkv of the last 3 accepted inputs (conv_ring_update shifts in
+    // the post-lane-0 ring when T < 3). S: T bitwise-exact delta steps over
+    // the recorded post-norm conv rows (delta_scan_seq == k_delta_step per
+    // step; NEVER the WY scan -- reduction reorder = format change). oT is
+    // dead prefill scratch (idle during decode: prefill is FIFO-serialized
+    // against this engine's own rounds; T*GDN_V floats << PF_T*GDN_V).
+    void fold_launches(int T_, cudaStream_t st) {
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                q27k::conv_ring_update(conv_ring[il], rec_qkv[il], GDN_CH, T_, st);
+                q27k::delta_scan_seq(S[il], rec_conv[il], rec_g[il], rec_beta[il], oT, T_,
+                                     st);
+            }
+    }
+    // Per-T fold graphs (captured in build_spec_graphs: every pointer above
+    // is init-fixed, T is the shape) collapse the 96-launch eager fold to one
+    // graph launch -- the eager form costs ~0.26 ms/round of submit overhead
+    // (measured -1.4% single-stream on the A/B). Eager fallback pre-capture.
+    // Idempotent -- callers may flush defensively. Runs OUTSIDE any capture
+    // (T varies with the accepted n).
+    cudaGraphExec_t fold_graph[W_MAX] = {}; // [T 1..W_MAX-1]; 0 unused
+    void flush_fold(cudaStream_t st) {
+        const int T_ = fold_pending;
+        if (T_ <= 0) return;
+        fold_pending = 0;
+        if (fold_graph[T_]) CUDA_CHECK(cudaGraphLaunch(fold_graph[T_], st));
+        else fold_launches(T_, st);
     }
     // -- split point: back to the weight sweep (per-lane elementwise + o-proj
     //    on the view); mix wrote o_L in place, the view aliases it --
@@ -2081,11 +2073,6 @@ struct Engine {
                     size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
                     CUDA_CHECK(cudaMemset(S[il], 0, sb));
                     CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
-                    for (int r = 0; r < W_PLUMB - 1; r++)
-                        if (S_sp[r][il]) {
-                            CUDA_CHECK(cudaMemset(S_sp[r][il], 0, sb));
-                            CUDA_CHECK(cudaMemset(ring_sp[r][il], 0, 3 * GDN_CH * 4));
-                        }
                 }
             CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
             CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
@@ -2239,6 +2226,22 @@ struct Engine {
         }
         perm = 0;
         } // sampled_graphs
+        // M1: per-T commit-Fold graphs. Warm the fold kernels once (the junk
+        // fold below mutates S/ring exactly like the spec warm above -- the
+        // reset_gdn_mtp after this block restores clean state), then capture
+        // T=1..W_MAX-1. Every pointer (committed state, record arena, oT) is
+        // init-fixed, so the captures are replayable for the engine lifetime.
+        fold_launches(1, stm);
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        for (int T_ = 1; T_ < W_MAX; T_++) {
+            cudaGraph_t gf;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            fold_launches(T_, stm);
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gf));
+            inst_or_advise(&fold_graph[T_], gf, "fold");
+            CUDA_CHECK(cudaGraphDestroy(gf));
+        }
+        reset_gdn_mtp();
         // P12: confidence-gated depth. Q27_PMIN=theta engages the gate (drafter
         // top1-top2 margin >= theta extends the verify one lane deeper). <=0 or
         // unset = off (always full width 5 = the canonical depth-4 round).
@@ -2279,6 +2282,11 @@ struct Engine {
     // one speculative round; returns tokens emitted (1..gate_maxd+1).
     // All position math + acceptance runs on device; host reads 36 bytes.
     int spec_round(int* emit) {
+        // M1 belt: decode_step/post_round folds every round, but direct-call
+        // rigs (CLI spec loop, smoke harnesses) drive spec_round without
+        // post_round -- fold the previous round's commit before this round's
+        // verify reads committed state. No-op when already folded.
+        flush_fold(stm);
         int md_used = -1;  // P13: draft-depth ceiling actually used this round
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
         bool sfx_round = false; // suffix-drafted round (own stats class)
@@ -2453,7 +2461,7 @@ struct Engine {
             for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
             fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1], sfx_round ? 1 : 0);
         }
-        perm = (perm + (n - 1)) % W_MAX;
+        fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
         return n;
     }
 
@@ -2520,19 +2528,10 @@ struct Engine {
     // a recycled Engine* address must never hit a differently-configured
     // engine's cached exec.
     int kv_cache_kind() const { return kv_kind; }
-    // why: the T3 ALWAYS-ON hit guard re-derives the device state a cached
-    // exec's table twins consume -- the GDN role-table base, the perm
-    // scalar the twins dereference, and the pinned staging int
-    // stage_perm_async copies from -- and compares each against the
-    // capture-stored snapshot (B8 discipline) before any replay.
-    float* const* gdn_role_tab() const { return d_gdn_tab; }
-    const int* perm_scalar_dev() const { return d_perm_scalar; }
-    const int* perm_pin_host() const { return h_perm_pin; }
-    // why: the guard's staging-expectation check -- stage_perm_async(cstm)
-    // must already have run this round, so the pinned int must carry the
-    // CURRENT perm; a stale value means the copy the twins depend on was
-    // never staged and a replay would consume last round's rotation.
-    int cur_perm() const { return perm; }
+    // M1: the T3 role-table/perm-scalar guard accessors are gone with the
+    // rotation -- a fused round's GDN launches carry only init-fixed
+    // committed/arena pointers, so there is no per-round device state for
+    // the exec-cache guard to re-derive.
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
@@ -2699,7 +2698,7 @@ struct Engine {
                         sfx_round ? 1 : 0);
             }
         }
-        perm = (perm + (n - 1)) % W_MAX;
+        fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
         return n;
     }
 
@@ -2732,6 +2731,7 @@ struct Engine {
     // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
     // h_next is the prefill hidden. Tools are off under sampling, so no split path.
     int spec_sample_round(int* emit) {
+        flush_fold(stm); // M1 belt: see spec_round
         // First token from the retained prefill logits (kind 0, no forward) --
         // BEFORE any spec round, on both the gated and ungated branches, so the
         // gated/ungated first token is identical at a given seed.
@@ -2795,7 +2795,7 @@ struct Engine {
         int n = oc[0];
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[6];
-        perm = (perm + (n - 1)) % W_MAX;
+        fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
         return n;
     }
     int last_pending = -1;
@@ -2898,19 +2898,22 @@ struct Engine {
         upload_accept_cap();
     }
     // Rewind the JUST-FINISHED speculative round from n accepted tokens to m
-    // (1 <= m <= n). Everything needed is still resident: per-lane GDN states /
-    // conv rings sit in the rotating role buffers (the round "commits" by
-    // advancing perm, never by copying -- state-after-lane-(m-1) is old role
-    // m-1), lane hiddens in x1_L, and lane logits in logits2. KV/MTP rows past
-    // the kept position are rewritten by the next round. Greedy tool engagement
-    // uses the freshly staged slot-0 mask for the replacement pending token.
-    // Sampled budget truncation immediately overwrites that provisional argmax
-    // with the queued forced close, preserving the accepted sampled prefix
-    // without needing a second random draw. Must be called BETWEEN rounds.
+    // (1 <= m <= n). M1: the round's GDN commit is UNFOLDED at this point
+    // (fold_pending = n-1, consumed only after on_round resolves), so the
+    // rewind is just folding fewer rows -- committed state still holds
+    // state-after-lane-0, and the record arena holds every speculative lane's
+    // inputs. Lane hiddens are still in x1_L and lane logits in logits2.
+    // KV/MTP rows past the kept position are rewritten by the next round.
+    // Greedy tool engagement uses the freshly staged slot-0 mask for the
+    // replacement pending token. Sampled budget truncation immediately
+    // overwrites that provisional argmax with the queued forced close,
+    // preserving the accepted sampled prefix without needing a second random
+    // draw. Must be called BETWEEN rounds, before the fold flushes.
     // Returns the provisional pending token. The CLI/canonical path never sets
     // on_round, so this code is unreachable there.
     int refinish_round(int m, int n, int P_target) {
-        perm = (perm + (m - n) + W_MAX) % W_MAX;
+        (void)n;
+        fold_pending = m - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P_target, 4, cudaMemcpyHostToDevice, stm));
         // W16: this was a hand-written 12-entry brace list into a W_PLUMB array
         // -- at W_PLUMB=16 it left lanes[12..15] = nullptr, and a wide suffix
@@ -3174,6 +3177,7 @@ struct Engine {
                 h += 3 * GDN_CH;
             }
         perm = 0;
+        fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
 
@@ -3224,6 +3228,7 @@ struct Engine {
                                            cudaMemcpyDeviceToDevice, stm));
             }
         perm = 0;
+        fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
 
@@ -3387,6 +3392,7 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(mtp_v, p, (size_t)(L + 1) * rv, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         perm = 0;
+        fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
     // Shared write policy for both entry kinds (P16a stable, P16b system).
@@ -3444,20 +3450,12 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
         perm = 0;
-        // width-12 fix-in-passing: this memset used to stop at spare 5 (a
-        // stale P12b-era list -- benign only because every role is written
-        // before it is read within a round). All 11 spare sets now reset,
-        // matching build_spec_graphs' reset_gdn_mtp.
+        fold_pending = 0; // M1: committed state is being replaced wholesale
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
                 CUDA_CHECK(cudaMemset(S[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
-                for (int r = 0; r < W_PLUMB - 1; r++)
-                    if (S_sp[r][il]) {
-                        CUDA_CHECK(cudaMemset(S_sp[r][il], 0, sb));
-                        CUDA_CHECK(cudaMemset(ring_sp[r][il], 0, 3 * GDN_CH * 4));
-                    }
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
         CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
@@ -3822,6 +3820,14 @@ struct Engine {
                 n = m;
             }
         }
+        // M1: fold the round's accepted speculative rows into committed GDN
+        // state, now that on_round/refinish fixed the final n. After this
+        // point the round boundary is state-coherent again -- ckpt/snapshot/
+        // preemption/pfx paths need no fold awareness. (Fused members reach
+        // here after the conductor's one host sync, so the cstm-side arena
+        // writes have landed; the fold on stm is ordered before the next
+        // round's draft on stm, and cstm waits on draft_done.)
+        flush_fold(stm);
         // suffix index tracks the committed stream (post-truncation n);
         // the pending token rides along virtually in propose_with.
         if (suffix_on)

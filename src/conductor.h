@@ -568,17 +568,17 @@ inline bool union_view_eq(const UnionView& a, const UnionView& b) {
 // B2 ISOLATION AUDIT (2026-07-15 at a01c110, blocking precondition -- every
 // device buffer a mix touches is Engine-owned; nothing DeviceModel-shared is
 // written):
-//   gdn_mix(il, st):  RBuf -> conv_ring[il] / ring_sp[role-1][il] (RW, the
-//     per-lane recurrent conv chain), SBuf -> S[il] / S_sp[role-1][il] (RW,
-//     delta state), qkv/qkv_L (R), convout/convout_L (W then R, l2norm3 in
-//     place), g_L/beta_L (R), o_L (W) -- all Engine members. The ONE shared
-//     read is cw = T(il,"ssm_conv1d.weight").data: a DeviceModel WEIGHT,
-//     read-only at round time (concurrent reads are safe).
+//   gdn_mix(il, st):  conv_ring[il] (lane 0 RW in place; chunk R),
+//     S[il] (lane 0 RW in place; chunk R), qkv/qkv_L (R), convout/convout_L
+//     (W then R, l2norm3 in place), g_L/beta_L (R), o_L (W), rec_qkv/rec_conv/
+//     rec_g/rec_beta[il] (W, the M1 record arena) -- all Engine members. The
+//     ONE shared read is cw = T(il,"ssm_conv1d.weight").data: a DeviceModel
+//     WEIGHT, read-only at round time (concurrent reads are safe).
 //   attn_mix(il, st): qg_L (RW: wht3 rotates in place, attn reads), kbuf_L/
 //     vbuf_L (R), kcache[ci]/vcache[ci] (W disjoint rows, then R), scratch
 //     (RW, the fd/fdmma partials buffer), attnout_L (W, wht3 inverse in
 //     place), d_pos_L (R) -- all Engine members; NO weight reads at all.
-//   Host-side reads: vw/perm/kv_kind/kv_fp8/max_ctx/attn_cache_idx --
+//   Host-side reads: vw/kv_kind/kv_fp8/max_ctx/attn_cache_idx --
 //     per-engine members, mutated only at init/commit boundaries, never
 //     inside a round.
 //   (a) NO cudaGraphExec launches inside either mix -- plain kernel wrappers
@@ -628,22 +628,21 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     // one host sync stays in the caller. The stream argument is the ONLY
     // delta vs the serial path: same kernels, same launch params, same
     // per-engine buffers, so per-lane bytes must be identical (B1 gate).
-    // P3 T2: GDN mixers in the FUSED path run the TABLE TWINS
-    // (use_tables=true -- conv_step_t/delta_step_t, engine.cuh gdn_mix):
-    // identical math, but the role pointers resolve ON DEVICE as
-    // tab[(role + *d_perm_scalar) % W_MAX], so the launch sequence carries no
-    // host-resolved per-perm pointers and one captured graph exec can serve
-    // every perm rotation (T3). CALLER CONTRACT: every member's
-    // stage_perm_async(cstm) must have been enqueued on cstm before this
-    // round (Conductor::fused_round does; fused_smoke leg B does) -- in T3
-    // that copy stays OUTSIDE the captured graph, it is the round's mutable
-    // input. The solo path (gdn_pair and the engines' captured graphs) never
-    // sets the flag and keeps the direct kernels bit-for-bit untouched.
+    // M1 record+fold: the fused GDN mix runs the SAME launch sequence as the
+    // solo path (the P3 T2 table twins retired with the rotation) -- lane 0
+    // in place on committed state, chunk kernels for the speculative lanes,
+    // record arena writes. Every pointer is init-fixed, so captured execs are
+    // perm-invariant with no per-round device staging at all. CALLER
+    // CONTRACT: every member's flush_fold(cstm) must have been enqueued on
+    // cstm before this round (Conductor::fused_round does; fused_smoke leg B
+    // does) so the verify reads FOLDED committed state; the flush stays
+    // OUTSIDE any captured graph (its launch count varies with the accepted
+    // n).
     auto mix_all = [&](int il, bool attn) {
         if (!mf) { // serial P1 path (smoke leg B / embedders without a pool)
             for (int m = 0; m < k; m++) {
                 if (attn) es[m]->attn_mix(il, cstm);
-                else      es[m]->gdn_mix(il, cstm, /*use_tables=*/true);
+                else      es[m]->gdn_mix(il, cstm);
             }
             return;
         }
@@ -651,7 +650,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
         for (int m = 0; m < k; m++) {
             CUDA_CHECK(cudaStreamWaitEvent(mf->side[m], mf->fork, 0));
             if (attn) es[m]->attn_mix(il, mf->side[m]);
-            else      es[m]->gdn_mix(il, mf->side[m], /*use_tables=*/true);
+            else      es[m]->gdn_mix(il, mf->side[m]);
             CUDA_CHECK(cudaEventRecord(mf->mix[m], mf->side[m]));
         }
         for (int m = 0; m < k; m++)
@@ -1412,16 +1411,14 @@ private:
             evs[i] = ms[i]->draft_done;
             CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stream()));
         }
-        // P3 T2: land each member's CURRENT perm in its device scalar --
-        // pinned staging + cudaMemcpyAsync on cstm (plan T2's exact recipe:
-        // pinned so no new pageable-blocking semantics enter the round).
-        // fused_verify_round's gdn table twins resolve roles from
-        // *d_perm_scalar, so this must be stream-ordered before the verify
-        // body. In T3 this call stays OUTSIDE the captured graph (the perm
-        // is the round's mutable input; everything else the graph bakes is
-        // init-fixed). The ONE host sync below fences the pinned rewrite --
-        // at most one copy per engine is ever in flight.
-        for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
+        // M1: fold each member's previous-round commit into committed GDN
+        // state before this round's verify reads it. Replaces P3 T2's
+        // stage_perm_async at the same program point -- stream-ordered on
+        // cstm before the verify body, OUTSIDE any captured graph (the fold's
+        // launch count varies with the accepted n; everything the graph bakes
+        // is init-fixed). Normally a no-op: post_round already folded on the
+        // member stream; this covers hand-driven callers (fused_smoke leg B).
+        for (int i = 0; i < k; i++) es[i]->flush_fold(cstm);
         // P2 Task 1: coarse per-round phase walls, bracketed by timing
         // events on cstm (records on an in-order stream do not reorder or
         // synchronize any work -- they only timestamp):
@@ -1538,9 +1535,9 @@ private:
     // sampled Philox state, tool masks d_mask_ids/d_accept_cap) is DEVICE-
     // resident and staged outside the capture: the same invariance the solo
     // graph zoo has always replayed on. The ONE host-resolved per-round
-    // value was the GDN role-pointer set, removed by the T2 table twins
-    // (device resolve via d_gdn_tab + *d_perm_scalar); stage_perm_async is
-    // the round's mutable input and stays OUTSIDE the graph.
+    // value was the GDN role-pointer set -- gone entirely under M1
+    // record+fold (committed/arena pointers are init-fixed); the pre-round
+    // flush_fold is the round's mutable input and stays OUTSIDE the graph.
     //
     // KEY COMPONENTS (== the T1 census key: 28 keys/KV live alphabet,
     // top-32 = 100%, so the cap-32 LRU holds the whole zoo):
@@ -1584,22 +1581,17 @@ private:
                 return false;
         return true;
     }
-    struct RoleSnap { // per-engine device state the captured twins consume
-        const float* const* tab;
-        const int* dperm;
-        const int* hpin;
-    };
     struct GCacheEnt {
         GraphKey key;
         cudaGraph_t graph = nullptr; // kept alive so teardown owns both halves
         cudaGraphExec_t exec = nullptr;
         // ALWAYS-ON hit-guard reference (B8 discipline): the capture-time
-        // union-view pointer table + per-engine role-table/perm-staging
-        // addresses. A hit re-derives both from live host state and
-        // compares; any mismatch means the exec would replay STALE baked
-        // pointers and must never launch.
+        // union-view pointer table. A hit re-derives it from live host state
+        // and compares; any mismatch means the exec would replay STALE baked
+        // pointers and must never launch. (M1: the per-engine role-table/
+        // perm-staging snapshot is gone with the rotation -- GDN launches
+        // carry only init-fixed pointers, all covered by the union view.)
         UnionView uv;
-        RoleSnap role[GK_MAX] = {};
         long tick = 0;    // LRU stamp
         size_t nodes = 0; // telemetry ([gcache] miss lines)
     };
@@ -1614,26 +1606,17 @@ private:
     }
     // The ALWAYS-ON hit guard (B8: re-derive, never trust): rebuild the
     // union view from live host state (build_union_view is launch-free
-    // pure host work) and re-read each engine's role-table/perm-scalar/
-    // pinned-staging addresses; memcmp-equal against the capture-stored
-    // copy or the hit is refused. The perm VALUE is deliberately NOT part
-    // of the pointer compare -- perm-invariance is the twins' whole point
-    // -- but the staging EXPECTATION is: fused_round enqueued
-    // stage_perm_async(cstm) before this guard runs, so the pinned int
-    // must already carry THIS round's perm; a stale value means the copy
-    // the graph's twins depend on was never staged this round.
+    // pure host work); memcmp-equal against the capture-stored copy or the
+    // hit is refused. M1: the role-table/perm checks are gone with the
+    // rotation -- every GDN pointer a captured round consumes (committed
+    // state, record arena, lane buffers) is an init-fixed engine member,
+    // and the fold-staging expectation is enforced host-side (fused_round
+    // enqueues flush_fold(cstm) before this guard runs, which zeroes
+    // fold_pending).
     bool gc_guard_ok(const GCacheEnt& e, Engine** es, const int* granted, int k,
                      const bool* sfx) const {
         UnionView now = build_union_view(es, granted, k, cstm, sfx);
-        if (!union_view_eq(e.uv, now)) return false;
-        for (int i = 0; i < k; i++) {
-            if (e.role[i].tab != es[i]->gdn_role_tab() ||
-                e.role[i].dperm != es[i]->perm_scalar_dev() ||
-                e.role[i].hpin != es[i]->perm_pin_host())
-                return false;
-            if (*es[i]->perm_pin_host() != es[i]->cur_perm()) return false;
-        }
-        return true;
+        return union_view_eq(e.uv, now);
     }
     static void gc_gwstr(char* buf, size_t n, const int* granted, const bool* sfx,
                          const bool* sampled, int k) {
@@ -1648,14 +1631,15 @@ private:
     //     hard boundary -- the 07-14 GPU-side-depth NO-GO stands); the
     //     draft_done waits (a cudaStreamWaitEvent on an event recorded
     //     outside the capture is capture-illegal -- hoisted here);
-    //     stage_perm_async (already enqueued by fused_round: the round's
-    //     mutable input -- the twins make the graph perm-invariant); the
-    //     ev_round_start/ev_draft_end timing records (replay must never
-    //     re-record them; fused_round's GenStats note).
+    //     flush_fold (already enqueued by fused_round: the round's mutable
+    //     input -- its launch count varies with the accepted n, so it can
+    //     never live inside a capture); the ev_round_start/ev_draft_end
+    //     timing records (replay must never re-record them; fused_round's
+    //     GenStats note).
     //   INSIDE: the whole fused_verify_round body, incl. the P2b mixer
     //     fork/join side-stream choreography (T0/T1-proven topology) and
-    //     the T2 table-twin GDN launches, under Relaxed capture mode (the
-    //     T0-proven mode).
+    //     the M1 chunk-kernel GDN launches (init-fixed pointers only),
+    //     under Relaxed capture mode (the T0-proven mode).
     //   OUTSIDE, AFTER: outcome D2Hs + ev_verify_end + the round's ONE
     //     host sync (the pageable-gating caveat: host gating rides on
     //     those blocking D2H semantics -- never capture or move them).
@@ -1699,22 +1683,18 @@ private:
             // guard trip: NEVER launch a stale exec. Loud regardless of dbg.
             gc_guard_trips_++;
             fprintf(stderr,
-                    "[gcache] GUARD TRIP r=%ld k=%d gw=%s -- capture-stored pointer/"
-                    "role/perm state != re-derived host state; evicting key, eager "
+                    "[gcache] GUARD TRIP r=%ld k=%d gw=%s -- capture-stored union-view "
+                    "pointers != re-derived host state; evicting key, eager "
                     "fallback this round (h=%ld m=%ld ev=%ld gt=%ld)\n",
                     gc_rounds_, k, gws, gc_hits_, gc_misses_, gc_evictions_,
                     gc_guard_trips_);
             gc_destroy(gcache_[hit]);
             gcache_.erase(gcache_.begin() + hit);
-            // M1 (P3 exit review): the eager fallback runs the TABLE TWINS,
-            // which read the same d_perm_scalar a broken staging path would
-            // have left stale -- falling back without re-staging would
-            // "recover" into the same corruption the guard detected. Re-issue
-            // the staging for every member before the eager round (idempotent
-            // k pinned 4-byte copies; unreachable today since fused_round
-            // stages unconditionally, but the guard exists for the refactor
-            // that breaks that).
-            for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
+            // Defensive re-flush before the eager fallback (idempotent:
+            // fused_round already flushed; a broken caller path that skipped
+            // it would otherwise "recover" into a verify over unfolded
+            // state).
+            for (int i = 0; i < k; i++) es[i]->flush_fold(cstm);
             fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx,
                                sampled, /*ev_draft_end=*/nullptr, mf);
             return;
@@ -1776,9 +1756,9 @@ private:
                     "the rest of this run, eager fused rounds (h=%ld m=%ld ev=%ld)\n",
                     gc_hits_, gc_misses_, gc_evictions_);
             graphs_on_ = false;
-            // M1 posture: re-stage perms before the eager round (idempotent;
-            // the captured staging copies above were recorded, not executed).
-            for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
+            // Defensive re-flush before the eager round (idempotent; the
+            // capture above recorded launches without executing them).
+            for (int i = 0; i < k; i++) es[i]->flush_fold(cstm);
             fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx,
                                sampled, /*ev_draft_end=*/nullptr, mf);
             return;
@@ -1790,9 +1770,6 @@ private:
         ent.graph = g;
         ent.exec = x;
         ent.uv = build_union_view(es, granted, k, cstm, sfx); // guard reference
-        for (int i = 0; i < k; i++)
-            ent.role[i] = {es[i]->gdn_role_tab(), es[i]->perm_scalar_dev(),
-                           es[i]->perm_pin_host()};
         ent.tick = ++gc_tick_;
         CUDA_CHECK(cudaGraphGetNodes(g, nullptr, &ent.nodes));
         gcache_.push_back(ent);

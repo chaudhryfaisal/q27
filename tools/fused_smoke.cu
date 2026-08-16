@@ -247,10 +247,10 @@ int main(int argc, char** argv) {
         }
         for (int m = 0; m < k; m++) es[m]->set_round_width(want[m]);
         for (int m = 0; m < k; m++) CUDA_CHECK(cudaEventRecord(ev[m], es[m]->stm));
-        // P3 T2 caller contract (see mix_all in conductor.h): the fused GDN
-        // mixers run the table twins, which read *d_perm_scalar -- each
-        // member's perm must land on cstm before the verify body.
-        for (int m = 0; m < k; m++) es[m]->stage_perm_async(cstm);
+        // M1 caller contract (see mix_all in conductor.h): fold each member's
+        // previous-round commit before the verify body reads committed GDN
+        // state (this hand-driven loop never runs post_round's flush).
+        for (int m = 0; m < k; m++) es[m]->flush_fold(cstm);
         q27::fused_verify_round(es, want, k, cstm, ev, sfx);
         int oc[2][OUTCOME_INTS];
         for (int m = 0; m < k; m++)

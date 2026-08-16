@@ -10835,3 +10835,67 @@ about -1.5 GB/slot, which fits a third slot into today's post-weight
 budget before any redesign lands. It is the load-bearing stage and the
 gate for everything after it. M0 (config bug + estimator honesty) ships in
 hours, independently.
+
+## 2026-08-16: M1 record-then-Fold SHIPPED -- the GDN role rotation is gone, and a fourth slot fell out
+
+The load-bearing stage of the batched-decode spec (Appendix A), landed in
+one pass with every pre-declared gate green on the first run.
+
+THE SHAPE. Verify rounds no longer write speculative GDN state anywhere.
+Lane 0 (the pending token, always accepted -- k_finish_round starts n=1)
+still commits in place, byte-for-byte the old launches. Lanes 1..vw-1 run
+two new chunk kernels (spec3.cu): gdn_conv_chunk3 taps the committed ring
++ lane qkv buffers, gdn_delta_chunk3 holds committed S in 64KB smem and
+walks the lanes with k_delta_step's exact per-step arithmetic, writing
+per-lane convout/o ONLY. gdn_record3 retains each speculative lane's raw
+qkv row, POST-l2norm conv row and g/beta into a per-layer record arena
+(43.5 MB at W12 -- rows contiguous at prefill strides). Commit = flush_fold:
+conv_ring_update (k_conv_ring_update_T alone) + delta_scan_seq (the
+Q27_DS_MODE=seq kernel k_delta_scan_T called DIRECTLY, never the WY
+dispatch) replay the accepted rows into committed state. The fold is LAZY:
+commit sites just set fold_pending = n-1; post_round folds AFTER the
+on_round callback resolves, so refinish_round's rewind became
+`fold_pending = m-1` -- fold fewer rows, nothing to un-rotate -- and every
+round boundary stays state-coherent (ckpt/snap/pfx/preemption paths needed
+ZERO changes; restores cancel the pending fold). Per-T fold graphs
+(captured at init, all pointers init-fixed) collapse the 96-launch eager
+fold to one graph launch -- eager cost -1.4% single-stream, graphed -0.4%.
+
+WHAT DIED: the 11 spare role sets (1.73 GB/engine), SBuf/RBuf, the three
+perm-advance commit sites, the perm rewind, the P3 T2 table twins
+conv_step_t/delta_step_t + d_gdn_tab + d_perm_scalar + stage_perm_async,
+and the conductor's RoleSnap guard fields. perm is frozen at 0 -- the graph
+zoo's [W_MAX] trailing index and the 12x capture loop are now vestigial
+(all captures identical; M1b collapses them for ~1.4 GB more). The fold
+key insight that made this a week's stage into a day's: the Fold's delta
+kernel ALREADY EXISTED -- k_delta_scan_T is bitwise k_delta_step per step
+(the seq-prefill gate proved it in July), and recording POST-l2norm conv
+rows means the Fold replays exactly the bytes the verify's delta consumed,
+so no recompute path (conv or l2norm) had to be re-proven at all.
+
+GATES, all first-try green:
+- ninv CHUNK+FOLD leg (replaces the retired TWIN leg): chunk outputs ==
+  serial chain AND Fold == chain role m-1, W in {2,5,12} x m in 1..W x 3
+  layers, ZERO tolerance -- ALL PASS on sm_120 AND sm_86.
+- canonical EXACT a2982c5197c627551b27d76a0a94b220, twice (eager fold and
+  graph fold); identical 2.67 tok/round over 192 rounds vs pre-M1.
+- fused_smoke all 4 legs x {fp16, fp8, turbo3} PASS (the graph leg proves
+  perm-invariant captures + the pre-round flush under capture/replay).
+- ptxas: 0 spills on all three new kernels (18/40/18 regs).
+- single-stream A/B vs pre-M1 binary (canonical prompt, -n 512, 3 reps):
+  146.2 -> 145.6 t/s mean (-0.4%, one rep +1.0%) -- inside the <=3% bar.
+
+THE MEASUREMENT (M0 rig, --slots 8 --ctx 16384, fp8, vanilla q4s):
+admission need dropped 6.6 -> 4.9 GB/slot (the spec predicted ~5.1; the
+record arena came in at 43 MB against the spec's 0.31 GB placeholder).
+Post-weights 15.76 GB now admits **FOUR slots** at 16K -- the gate asked
+for a third; the 2026-08-14 ladder fit two. The default (v1.4) tier admits
+three. C=4's memory precondition is met on admission before M2-M4 exist;
+actual C=4 throughput still needs the ladder rerun once a client harness
+reproduces the 08-14 protocol (aggregate numbers deferred to the M2+
+sessions -- admission was M1's pre-declared gate, and the estimator now
+mirrors gdn_state_bytes honestly via kEngGdn).
+
+Also in this pass: the stale "18 K/V pairs" auto-ctx comment corrected to
+the audited 17, and the w8/w16 builds compile with the arena sized off
+W_MAX (rows = W_MAX-1).
