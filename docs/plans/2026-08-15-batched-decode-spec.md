@@ -213,3 +213,60 @@ record-then-Fold plus an in-tree indirection precedent (the `_t` twins).
 The implementation is NOT greenlit as one unit: M1 must clear its bitwise
 gates and show its -1.5 GB/slot before M2+ proceeds, per the ground rule
 that every stage closes with a measurement.
+
+## Appendix A: M1 implementation notes (recon 2026-08-15, post-M0)
+
+Corrections to §1: spares are W_MAX-1 = 11 sets (engine.cuh:969-972 skips
+r>=7 when W_MAX<=r+1), 1.726 GB not 1.646; total resident GDN = 13 sets =
+2.040 GB, matching the estimator's (W_MAX+1)*0.157e9 exactly. And "2 sets
+per lane" in §3(a) must be read per-SEQUENCE: recording full S per lane
+(16 x 2 sets = 5.0 GB) is a non-starter.
+
+THE MECHANISM TODAY: commit = `perm = (perm + n-1) % W_MAX` (engine.cuh:
+2456/2702/2798) -- a pure relabel; role k after a round = state after
+lanes 0..k; lane 0 overwrites committed state IN PLACE; rewind
+(refinish_round) works only because every role buffer stays resident.
+Snapshot/ckpt/prefill/solo all touch PHYSICAL S[il]/conv_ring[il] and are
+correct only because every restore forces perm=0 -- a latent coupling M1
+removes. MTP drafts never touch GDN (blk.64 is attention).
+
+THE M1 DESIGN, concretely:
+- Record: per lane per layer, qkv row (40,960 B) + g + beta (384 B) --
+  1.98 MB/lane x W. These are EXISTING lane buffers (qkv_L/g_L/beta_L,
+  engine.cuh:744-748), currently reused per layer; the arena just retains
+  them across the 48 layers: ~24 MB at W=12, ~32 at 16 lanes.
+- Verify chain: replace gdn_mix's per-lane conv_step/delta_step chains
+  (3 x W x 48 tiny dependent launches, STATE-WRITE-bound: W x 48 x 3.1 MB
+  of global writes per round) with one conv-chunk + one delta-chunk per
+  layer, S and ring resident in smem, writing per-lane convout/o ONLY.
+  The prototype is tools/gdn_chunk_bench.cu k_delta_chunk/k_conv_chunk:
+  per-step arithmetic identical to k_delta_step (same tile split, same
+  part[0..3] reduction order), bench-verified BITWISE on every leg. The
+  2026-07-10 gdn-chunk plan shelved it pending exactly this contract
+  ("write final state only + n-step fixup on partial accept").
+- Commit: Fold = an n-step chunk from committed S using the records,
+  writing final S+ring once per layer (~48 launches, ~1 ms class --
+  against ~1.2 ms/round of eliminated state-write traffic; the bench
+  measured chunked FASTER per step than serial even WITH snapshot writes).
+- Rewind: don't fold. State is uncommitted until the Fold runs -- strictly
+  simpler than today's perm-rewind.
+- In-place aliasing is already bitwise-safe in both kernels (reads
+  complete into registers before writes; verified in the recon), so the
+  committed/working split cannot move a bit.
+- DO NOT use delta_scan_T (the WY prefill scan) as the Fold: different
+  reduction order = format change, not state movement.
+
+GATES: (1) new chunk-vs-serial bitwise equivalence leg in ninv_test
+(replaces the TWIN role legs' role coverage: verify-chunk outputs ==
+serial chain, Fold == n serial steps, over W x n x layer sweeps, ZERO
+tolerance); (2) canonical EXACT (the greedy --spec walk runs gdn_mix);
+(3) fused_smoke all legs; (4) the -1.5 GB/slot admission delta measured
+on the M0 rig (expected: third slot fits at --slots 8 --ctx 16384, need
+drops ~6.6 -> ~5.1 vs 5.2 free).
+
+THE SECOND PRIZE (M1b, do not bundle): perm is the leading index of the
+ENTIRE solo graph zoo (every set at engine.cuh:458-566 is [...][W_MAX]).
+With roles gone, committed state is permanently S[il], the capture loop
+collapses 12x (~1.4 GB more, on top of M1's 1.54), and refinish/restore
+lose their perm=0 coupling. Bigger blast radius (graph arrays, capture
+loop, ckpt/snap paths) -- its own gate cycle after M1 lands.
