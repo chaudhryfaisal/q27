@@ -290,23 +290,23 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
 
 template <typename CT>
 __global__ void k_kv_store3(__grid_constant__ const CP3 kp, __grid_constant__ const CP3 vp,
-                            CT* __restrict__ kc, CT* __restrict__ vc,
+                            void* const* __restrict__ ktab, void* const* __restrict__ vtab,
                             __grid_constant__ const IP3 pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
-    size_t off = (size_t)(*pos.p[t]) * rowlen + i;
-    kv_set(kc[off], kp.p[t][i]);
-    kv_set(vc[off], vp.p[t][i]);
+    // M2a: row via the pair's block table (addressing-only; same bytes).
+    const int p = *pos.p[t];
+    kv_set(kv_row<CT>(ktab, p, rowlen)[i], kp.p[t][i]);
+    kv_set(kv_row<CT>(vtab, p, rowlen)[i], vp.p[t][i]);
 }
-void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st,
-               int ntok, bool fp8) {
+void kv_store3(CP3 k, CP3 v, void* const* ktab, void* const* vtab, IP3 pos, int rowlen,
+               cudaStream_t st, int ntok, bool fp8) {
     dim3 g((rowlen + 255) / 256, ntok);
     if (fp8)
-        k_kv_store3<<<g, 256, 0, st>>>(k, v, (__nv_fp8_e4m3*)kc, (__nv_fp8_e4m3*)vc, pos,
-                                       rowlen);
+        k_kv_store3<__nv_fp8_e4m3><<<g, 256, 0, st>>>(k, v, ktab, vtab, pos, rowlen);
     else
-        k_kv_store3<<<g, 256, 0, st>>>(k, v, (__half*)kc, (__half*)vc, pos, rowlen);
+        k_kv_store3<__half><<<g, 256, 0, st>>>(k, v, ktab, vtab, pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -328,7 +328,7 @@ void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream
 //   KV_T5K  -- K turbo5 (5-bit blocks, src/turbo5.cuh)
 // Assumes head_dim == 256 (two groups/head), like the whole fd2 family.
 __global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ const CP3 vp,
-                              void* __restrict__ kc, void* __restrict__ vc,
+                              void* const* __restrict__ ktab, void* const* __restrict__ vtab,
                               __grid_constant__ const IP3 pos, int n_kv_heads, int head_dim,
                               int kvk) {
     const int t = blockIdx.z, j = threadIdx.x;
@@ -336,29 +336,33 @@ __global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ 
     const int h = blockIdx.x >> 1, g = blockIdx.x & 1;
     const int p = *pos.p[t];
     const float* src = (is_v ? vp.p[t] : kp.p[t]) + (size_t)h * head_dim + g * 128;
-    const size_t blk = (size_t)p * n_kv_heads * 2 + h * 2 + g;
+    // M2a: in-page block/row index via the pair's table (addressing-only).
+    const int bpr = n_kv_heads * 2; // blocks per row (head_dim 256 = 2 groups/head)
+    const size_t blk = (size_t)h * 2 + g;
     __shared__ float xs[128], red[128];
     if (!is_v && kvk == KV_T3V) {
-        ((__half*)kc)[(size_t)p * n_kv_heads * head_dim + (size_t)h * head_dim + g * 128 + j] =
+        kv_row<__half>(ktab, p, n_kv_heads * head_dim)[(size_t)h * head_dim + g * 128 + j] =
             __float2half_rn(src[j]);
         return;
     }
     if (!is_v && kvk == KV_T5K) {
-        q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
+        q27turbo::turbo5_quant_group(src[j], kv_blk<q27turbo::block_turbo5>(ktab, p, bpr) + blk,
+                                     j, xs, red);
         return;
     }
     if (!is_v && kvk == KV_I8G64) {
-        q27turbo::i8g64_quant_group(src[j], (q27turbo::block_i8g64*)kc + blk, j, red);
+        q27turbo::i8g64_quant_group(src[j], kv_blk<q27turbo::block_i8g64>(ktab, p, bpr) + blk,
+                                    j, red);
         return;
     }
-    q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
-                                 xs, red);
+    q27turbo::turbo3_quant_group(
+        src[j], kv_blk<q27turbo::block_turbo3>(is_v ? vtab : ktab, p, bpr) + blk, j, xs, red);
 }
 
-void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,
-                 cudaStream_t st, int ntok, int kvk) {
+void kv_store_t3(CP3 k, CP3 v, void* const* ktab, void* const* vtab, IP3 pos, int n_kv_heads,
+                 int head_dim, cudaStream_t st, int ntok, int kvk) {
     dim3 g(n_kv_heads * (head_dim >> 7), 2, ntok); // x: (head, group); y: K,V
-    k_kv_store_t3<<<g, 128, 0, st>>>(k, v, kc, vc, pos, n_kv_heads, head_dim, kvk);
+    k_kv_store_t3<<<g, 128, 0, st>>>(k, v, ktab, vtab, pos, n_kv_heads, head_dim, kvk);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -395,9 +399,10 @@ static inline P3 out2p(float* o) { return P3{{o, o, o, o}}; }
 // softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
 // combine kernel merges splits. Works for 1..4 tokens via gridDim.z.
 template <typename CT>
-__global__ void k_attn_fd(__grid_constant__ const CP3 qp, int q_stride, const CT* __restrict__ kc,
-                          const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
-                          int n_kv_heads, int gqa, int head_dim, float scale) {
+__global__ void k_attn_fd(__grid_constant__ const CP3 qp, int q_stride,
+                          const void* const* __restrict__ ktab,
+                          const void* const* __restrict__ vtab, float* __restrict__ part,
+                          IP3 pos, int n_kv_heads, int gqa, int head_dim, float scale) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int seq = *pos.p[t] + 1;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -422,8 +427,10 @@ __global__ void k_attn_fd(__grid_constant__ const CP3 qp, int q_stride, const CT
     float* accw = s_acc + warp * 6 * 256;
 
     for (int p = p_lo + warp; p < p_hi; p += NW) {
-        const CT* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        const CT* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        // M2a: token-row via the pair's block table, then the head offset
+        // (addressing-only; the streamed bytes and fp order are unchanged).
+        const CT* kp = kv_row_c<CT>(ktab, p, n_kv_heads * head_dim) + (size_t)kvh * head_dim;
+        const CT* vp = kv_row_c<CT>(vtab, p, n_kv_heads * head_dim) + (size_t)kvh * head_dim;
         float kv[8], vv[8];
 #pragma unroll
         for (int u = 0; u < 8; u++) {
@@ -575,9 +582,9 @@ __device__ __forceinline__ void fd2_ld8_t3(const q27turbo::block_turbo3* __restr
 
 template <typename CT, int NW>
 __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
-                           const CT* __restrict__ kc,
-                           const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
-                           int n_kv_heads, int gqa, int head_dim, float scale) {
+                           const void* const* __restrict__ ktab,
+                           const void* const* __restrict__ vtab, float* __restrict__ part,
+                           IP3 pos, int n_kv_heads, int gqa, int head_dim, float scale) {
     // P14: lane (token) is the FASTEST-varying grid axis so the vw same-split
     // blocks for a given (head, split) co-schedule and share the ~1MB KV chunk
     // in L2 instead of each lane re-streaming it from DRAM (Task 1 R~=4.25).
@@ -615,9 +622,22 @@ __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
         for (int i = 0; i < 8; i++) acc[j][i] = 0.f;
     }
 
-    for (int p = p_lo + warp; p < p_hi; p += NW) {
-        const CT* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        const CT* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+    // M2a: page-hoisted streaming -- each warp walks its p-sequence unchanged
+    // (same positions, same fp order = bitwise), but the table load happens
+    // once per 64-row page instead of per iteration (the naive per-iteration
+    // form measured +5-6% on the fd2 wall at 61K; fd2 is DRAM-saturated and
+    // the dependent load sat in the chain).
+    for (int p = p_lo + warp; p < p_hi;) {
+        const int pg = p >> KV_PAGE_SHIFT;
+        const int pend = min(p_hi, (pg + 1) << KV_PAGE_SHIFT);
+        // linear induction within the page (the original loop's strength
+        // reduction, which the naive (p & 63) recompute was defeating)
+        const size_t rowe = (size_t)n_kv_heads * head_dim;
+        const CT* kp = (const CT*)ktab[pg] + (size_t)(p & KV_PAGE_MASK) * rowe +
+                       (size_t)kvh * head_dim;
+        const CT* vp = (const CT*)vtab[pg] + (size_t)(p & KV_PAGE_MASK) * rowe +
+                       (size_t)kvh * head_dim;
+        for (; p < pend; p += NW, kp += NW * rowe, vp += NW * rowe) {
         float kv[8], vv[8];
         fd2_ld8(kp, lane, kv);
         fd2_ld8(vp, lane, vv);
@@ -635,6 +655,7 @@ __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
             m[j] = mn;
 #pragma unroll
             for (int i = 0; i < 8; i++) acc[j][i] = acc[j][i] * so + w * vv[i];
+        }
         }
     }
 
@@ -692,7 +713,8 @@ __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
 // inverse-WHT un-rotates the pooled output (linearity).
 template <int KVK, int NW>
 __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
-                              const void* __restrict__ kc, const void* __restrict__ vc,
+                              const void* const* __restrict__ ktab,
+                              const void* const* __restrict__ vtab,
                               float* __restrict__ part, IP3 pos, int n_kv_heads, int gqa,
                               int head_dim, float scale) {
     const int t = blockIdx.x, sp = blockIdx.y, kvh = blockIdx.z;
@@ -722,23 +744,28 @@ __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
         for (int i = 0; i < 8; i++) acc[j][i] = 0.f;
     }
 
-    for (int p = p_lo + warp; p < p_hi; p += NW) {
+    // M2a: page-hoisted streaming (see the scalar fd2 leg's rationale).
+    for (int p = p_lo + warp; p < p_hi;) {
+        const int pg = p >> KV_PAGE_SHIFT;
+        const void* kpage = ktab[pg];
+        const void* vpage = vtab[pg];
+        const int pend = min(p_hi, (pg + 1) << KV_PAGE_SHIFT);
+        const int bpr = n_kv_heads * 2; // blocks per token-row
+        // linear induction within the page (block index and fp16-row offset)
+        size_t ib = (size_t)(p & KV_PAGE_MASK) * bpr + (size_t)kvh * 2;
+        size_t rowoff = ((size_t)(p & KV_PAGE_MASK) * n_kv_heads + kvh) * (size_t)head_dim;
+        for (; p < pend;
+             p += NW, ib += (size_t)NW * bpr, rowoff += (size_t)NW * n_kv_heads * head_dim) {
         float kv[8], vv[8];
         if constexpr (KVK == KV_T3)
-            fd2_ld8_t3((const q27turbo::block_turbo3*)kc + ((size_t)p * n_kv_heads + kvh) * 2,
-                       lane, kv);
+            fd2_ld8_t3((const q27turbo::block_turbo3*)kpage + ib, lane, kv);
         else if constexpr (KVK == KV_T5K)
-            q27turbo::turbo5_ld8_lane(
-                (const q27turbo::block_turbo5*)kc + ((size_t)p * n_kv_heads + kvh) * 2, lane,
-                kv);
+            q27turbo::turbo5_ld8_lane((const q27turbo::block_turbo5*)kpage + ib, lane, kv);
         else if constexpr (KVK == KV_I8G64)
-            q27turbo::i8g64_ld8_lane(
-                (const q27turbo::block_i8g64*)kc + ((size_t)p * n_kv_heads + kvh) * 2, lane,
-                kv);
+            q27turbo::i8g64_ld8_lane((const q27turbo::block_i8g64*)kpage + ib, lane, kv);
         else
-            fd2_ld8((const __half*)kc + ((size_t)p * n_kv_heads + kvh) * head_dim, lane, kv);
-        fd2_ld8_t3((const q27turbo::block_turbo3*)vc + ((size_t)p * n_kv_heads + kvh) * 2,
-                   lane, vv);
+            fd2_ld8((const __half*)kpage + rowoff, lane, kv);
+        fd2_ld8_t3((const q27turbo::block_turbo3*)vpage + ib, lane, vv);
 #pragma unroll
         for (int j = 0; j < 6; j++) {
             const float4 qa = reinterpret_cast<const float4*>(s_q + j * 256)[lane];
@@ -753,6 +780,7 @@ __global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
             m[j] = mn;
 #pragma unroll
             for (int i = 0; i < 8; i++) acc[j][i] = acc[j][i] * so + w * vv[i];
+        }
         }
     }
 
@@ -805,18 +833,19 @@ static void fd_setattr(size_t sm) {
 }
 
 template <typename CT>
-static void fd_launch(CP3 q, int q_stride, const void* kc, const void* vc, float* scratch,
-                      IP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, size_t sm,
-                      int ntok, cudaStream_t st) {
+static void fd_launch(CP3 q, int q_stride, const void* const* ktab, const void* const* vtab,
+                      float* scratch, IP3 pos, int n_kv_heads, int gqa, int head_dim,
+                      float scale, size_t sm, int ntok, cudaStream_t st) {
     fd_setattr<CT>(sm);
     dim3 g1(n_kv_heads, FD_NS, ntok);
-    k_attn_fd<CT><<<g1, 256, sm, st>>>(q, q_stride, (const CT*)kc, (const CT*)vc, scratch, pos,
-                                       n_kv_heads, gqa, head_dim, scale);
+    k_attn_fd<CT><<<g1, 256, sm, st>>>(q, q_stride, ktab, vtab, scratch, pos, n_kv_heads, gqa,
+                                       head_dim, scale);
 }
 
-void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
-                      float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
-                      int head_dim, float scale, cudaStream_t st, int ntok, int kvk) {
+void attn_decode3_fd2(CP3 q, int q_stride, const void* const* ktab, const void* const* vtab,
+                      P3 out, float* scratch, IP3 pos, int max_ctx, int n_q_heads,
+                      int n_kv_heads, int head_dim, float scale, cudaStream_t st, int ntok,
+                      int kvk) {
     (void)max_ctx;
     int gqa = n_q_heads / n_kv_heads;
     // NW=4 (128 threads): probe-favored -- more blocks/SM for latency hiding.
@@ -825,34 +854,33 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
     size_t sm = (size_t)(2 * 6) * 256 * sizeof(float);
     dim3 g1(ntok, FD2_NS, n_kv_heads);  // P14: lane (x) fastest -> cross-lane KV L2 reuse
     if (kvk == KV_T3)
-        k_attn_fd2_t3<KV_T3, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+        k_attn_fd2_t3<KV_T3, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, ktab, vtab, scratch, pos,
                                                             n_kv_heads, gqa, head_dim, scale);
     else if (kvk == KV_T3V)
-        k_attn_fd2_t3<KV_T3V, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+        k_attn_fd2_t3<KV_T3V, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, ktab, vtab, scratch, pos,
                                                              n_kv_heads, gqa, head_dim, scale);
     else if (kvk == KV_T5K)
-        k_attn_fd2_t3<KV_T5K, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+        k_attn_fd2_t3<KV_T5K, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, ktab, vtab, scratch, pos,
                                                              n_kv_heads, gqa, head_dim, scale);
     else if (kvk == KV_I8G64)
-        k_attn_fd2_t3<KV_I8G64, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch,
-                                                               pos, n_kv_heads, gqa, head_dim,
-                                                               scale);
+        k_attn_fd2_t3<KV_I8G64, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, ktab, vtab,
+                                                               scratch, pos, n_kv_heads, gqa,
+                                                               head_dim, scale);
     else if (kvk == KV_FP8)
         k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
-            q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,
-            n_kv_heads, gqa, head_dim, scale);
+            q, q_stride, ktab, vtab, scratch, pos, n_kv_heads, gqa, head_dim, scale);
     else
-        k_attn_fd2<__half, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, (const __half*)kc,
-                                                          (const __half*)vc, scratch, pos,
-                                                          n_kv_heads, gqa, head_dim, scale);
+        k_attn_fd2<__half, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, ktab, vtab, scratch,
+                                                          pos, n_kv_heads, gqa, head_dim,
+                                                          scale);
     dim3 g2(n_q_heads, ntok);
     k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD2_NS, pos);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
-                  IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st, int ntok, int kvk) {
+void attn_decode3(CP3 q, int q_stride, const void* const* ktab, const void* const* vtab,
+                  P3 out, float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
+                  int head_dim, float scale, cudaStream_t st, int ntok, int kvk) {
     // turbo3v (diagnostic) has exactly one read path (fd2). turbo3 and
     // turbo5k both have fdmma + H16 legs; Q27_FD=v1 still falls to fd2 for
     // every turbo kind.
@@ -867,7 +895,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // add the leg, then take the kind out, rather than widening a condition
     // downstream and leaving the guard stale.
     if (kvk == KV_T3V || kvk == KV_I8G64) {
-        attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
+        attn_decode3_fd2(q, q_stride, ktab, vtab, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
     }
@@ -975,7 +1003,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             int fdmma_ns = (smc * (two_cta ? 2 : 1)) / n_kv_heads;
             fdmma_ns = fdmma_ns < 16 ? 16 : fdmma_ns > FD_MAXNS ? FD_MAXNS : fdmma_ns;
             if (ns_pin) fdmma_ns = ns_pin;
-            if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
+            if (fdmma::launch_fdmma(mq, q_stride, ktab, vtab, scratch, mp, n_kv_heads,
                                     n_q_heads / n_kv_heads, head_dim, scale, fdmma_ns, ntok, st,
                                     fdmma_stages, /*t3=*/kvk == KV_T3)) {
                 dim3 g2(n_q_heads, ntok);
@@ -1007,7 +1035,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
                             : kvk == KV_T5K ? 3
                             : kvk == KV_FP8 ? 1
                                             : 0;
-            if (fdmma::launch_fdmma_h16(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
+            if (fdmma::launch_fdmma_h16(mq, q_stride, ktab, vtab, scratch, mp, n_kv_heads,
                                         n_q_heads / n_kv_heads, head_dim, scale, h16_ns,
                                         ntok, fmt, st)) {
                 dim3 g2(n_q_heads, ntok);
@@ -1020,7 +1048,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     }
     if (!fd || strcmp(fd, "v1") != 0 || kvk >= KV_T3) {
         // no turbo kind ever runs the v1 kernel (no block leg there)
-        attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
+        attn_decode3_fd2(q, q_stride, ktab, vtab, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
     }
@@ -1028,23 +1056,24 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     int gqa = n_q_heads / n_kv_heads;
     size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
     if (fp8)
-        fd_launch<__nv_fp8_e4m3>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa, head_dim,
-                                 scale, sm, ntok, st);
+        fd_launch<__nv_fp8_e4m3>(q, q_stride, ktab, vtab, scratch, pos, n_kv_heads, gqa,
+                                 head_dim, scale, sm, ntok, st);
     else
-        fd_launch<__half>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa, head_dim, scale,
-                          sm, ntok, st);
+        fd_launch<__half>(q, q_stride, ktab, vtab, scratch, pos, n_kv_heads, gqa, head_dim,
+                          scale, sm, ntok, st);
     dim3 g2(n_q_heads, ntok);
     k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD_NS, pos);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // single-token plain-path attention through the same flash-decode kernels
-void attn_decode(const float* q, int q_stride, const void* kcache, const void* vcache,
-                 float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
-                 int n_kv_heads, int head_dim, float scale, cudaStream_t st, int kvk) {
+void attn_decode(const float* q, int q_stride, const void* const* ktab,
+                 const void* const* vtab, float* out, float* scratch, const int* d_pos,
+                 int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
+                 cudaStream_t st, int kvk) {
     CP3 qp{{q, q, q}};
     IP3 pp{{d_pos, d_pos, d_pos}};
-    attn_decode3(qp, q_stride, kcache, vcache, out2p(out), scratch, pp, max_ctx, n_q_heads,
+    attn_decode3(qp, q_stride, ktab, vtab, out2p(out), scratch, pp, max_ctx, n_q_heads,
                  n_kv_heads, head_dim, scale, st, 1, kvk);
 }
 

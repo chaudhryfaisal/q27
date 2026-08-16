@@ -55,15 +55,18 @@ void gated_norm_gdn_T(const float* o, const float* w, const float* z, float* out
                       int head_dim, int T, float eps, cudaStream_t st);
 void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT, int channels,
                     int T, cudaStream_t st);
-void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                int rowlen, int T, cudaStream_t st, bool fp8 = false);
+// M2a: KV rows are reached through per-pair 64-row block tables (ktab/vtab =
+// the pair's table slice; entries = page bases). Addressing-only.
+void kv_store_T(const float* kT, const float* vT, void* const* ktab, void* const* vtab,
+                int base_pos, int rowlen, int T, cudaStream_t st, bool fp8 = false);
 // turbo prefill store: cooperative per-128-group quantize of T tokens' rope'd
 // K + raw V into block caches at rows base_pos..base_pos+T-1 (same pipeline as
 // the decode store -- shared turbo3_quant_group / turbo5_quant_group). V is
 // turbo3 for every kind; kvk picks the K leg (KV_T3 turbo3, KV_T3V plain fp16
 // rows, KV_T5K turbo5).
-void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                   int n_kv_heads, int head_dim, int T, cudaStream_t st, int kvk = KV_T3);
+void kv_store_T_t3(const float* kT, const float* vT, void* const* ktab, void* const* vtab,
+                   int base_pos, int n_kv_heads, int head_dim, int T, cudaStream_t st,
+                   int kvk = KV_T3);
 
 // K tile source for the prefill attention kernels. PF_K_CT reads scalar CT
 // rows -- fp16, fp8, and turbo3v's plain-fp16 K all take that leg -- while
@@ -89,10 +92,10 @@ constexpr int PF_SPLIT_MAX = 8;
 // sides, KV_T3V reads plain fp16 K rows with a turbo3 V, KV_T5K dequants a
 // 5-bit K with a turbo3 V. The fp8 cp.async prefetch is CT-rows-only and
 // stays off for all of them.
-void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, float* part, int base_pos, int t0, int SB,
-                    int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
-                    int kvk = KV_F16);
+void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* const* ktab,
+                    const void* const* vtab, float* outT, int out_row, float* part,
+                    int base_pos, int t0, int SB, int n_q_heads, int n_kv_heads, int head_dim,
+                    float scale, cudaStream_t st, int kvk = KV_F16);
 // Sequential gated delta rule over T tokens, S resident in shared memory.
 // P6: the 128 S-columns per head are independent, so the launcher slices them
 // across delta_scan_nsplit() blocks per head (48 blocks alone starve 170 SMs).

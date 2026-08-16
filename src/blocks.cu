@@ -77,24 +77,23 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 
 template <typename CT>
 __global__ void k_kv_store(const float* __restrict__ kbuf, const float* __restrict__ vbuf,
-                           CT* __restrict__ kc, CT* __restrict__ vc,
+                           void* const* __restrict__ ktab, void* const* __restrict__ vtab,
                            const int* __restrict__ d_pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
-    size_t off = (size_t)(*d_pos) * rowlen + i;
-    kv_set(kc[off], kbuf[i]);
-    kv_set(vc[off], vbuf[i]);
+    // M2a: row via the pair's block table (addressing-only; same bytes).
+    const int p = *d_pos;
+    kv_set(kv_row<CT>(ktab, p, rowlen)[i], kbuf[i]);
+    kv_set(kv_row<CT>(vtab, p, rowlen)[i], vbuf[i]);
 }
 
-void kv_store(const float* kbuf, const float* vbuf, void* kcache, void* vcache,
+void kv_store(const float* kbuf, const float* vbuf, void* const* ktab, void* const* vtab,
               const int* d_pos, int rowlen, cudaStream_t st, bool fp8) {
     dim3 g((rowlen + 255) / 256);
     if (fp8)
-        k_kv_store<<<g, 256, 0, st>>>(kbuf, vbuf, (__nv_fp8_e4m3*)kcache,
-                                      (__nv_fp8_e4m3*)vcache, d_pos, rowlen);
+        k_kv_store<__nv_fp8_e4m3><<<g, 256, 0, st>>>(kbuf, vbuf, ktab, vtab, d_pos, rowlen);
     else
-        k_kv_store<<<g, 256, 0, st>>>(kbuf, vbuf, (__half*)kcache, (__half*)vcache, d_pos,
-                                      rowlen);
+        k_kv_store<__half><<<g, 256, 0, st>>>(kbuf, vbuf, ktab, vtab, d_pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 

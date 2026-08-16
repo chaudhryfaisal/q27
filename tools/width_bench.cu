@@ -28,6 +28,20 @@
         }                                                                      \
     } while (0)
 
+// M2a shim: device identity block-table over a contiguous test buffer.
+// Deliberately LEAKED (short-lived bench process; entries are 8B each) so call
+// sites can wrap buffers inline without lifetime hazards vs async launches.
+static void* const* mk_tab(const void* base, size_t row_bytes, int rows) {
+    int np = (rows + KV_PAGE - 1) / KV_PAGE;
+    std::vector<void*> h(np);
+    for (int j = 0; j < np; j++)
+        h[j] = (char*)const_cast<void*>(base) + (size_t)j * KV_PAGE * row_bytes;
+    void** d = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d, np * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(d, h.data(), np * sizeof(void*), cudaMemcpyHostToDevice));
+    return d;
+}
+
 static std::vector<float> rand_vec(size_t n, unsigned seed) {
     std::vector<float> v(n);
     unsigned s = seed;
@@ -118,6 +132,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_v8, v8.size()));
     CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    void* const* k8tab = mk_tab(d_k8, (size_t)ROW, SEQMAX);
+    void* const* v8tab = mk_tab(d_v8, (size_t)ROW, SEQMAX);
     const int QROW = NH * 2 * HD;
     float* d_q[8];
     float* d_o[8];
@@ -146,7 +162,7 @@ int main(int argc, char** argv) {
             }
             double ms = timeit(
                 [&] {
-                    q27k::attn_decode3_fd2(q, 2 * HD, d_k8, d_v8, o, d_scr, P, SEQMAX, NH,
+                    q27k::attn_decode3_fd2(q, 2 * HD, k8tab, v8tab, o, d_scr, P, SEQMAX, NH,
                                            NKV, HD, scale, 0, ntok, true);
                 },
                 50);

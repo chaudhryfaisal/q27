@@ -36,6 +36,20 @@
 static constexpr int N_KV = 4, GQA = 6, HD = 256, NQH = N_KV * GQA;
 static constexpr int WMAXT = 16; // W16: the kernel ceiling (6*16 = 96 rows)
 static constexpr int NS = 128, ST = 258;
+
+// M2a shim: device identity block-table over a contiguous test buffer.
+// Deliberately LEAKED (short-lived test process; entries are 8B each) so call
+// sites can wrap buffers inline without lifetime hazards vs async launches.
+static void* const* mk_tab(const void* base, size_t row_bytes, int rows) {
+    int np = (rows + KV_PAGE - 1) / KV_PAGE;
+    std::vector<void*> h(np);
+    for (int j = 0; j < np; j++)
+        h[j] = (char*)const_cast<void*>(base) + (size_t)j * KV_PAGE * row_bytes;
+    void** d = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d, np * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(d, h.data(), np * sizeof(void*), cudaMemcpyHostToDevice));
+    return d;
+}
 static int fails = 0;
 #define CHECK(cond, ...)                                                       \
     do {                                                                       \
@@ -95,6 +109,8 @@ int main() {
     CUDA_CHECK(cudaMalloc(&vc, kvn));
     CUDA_CHECK(cudaMemcpy(kc, hk.data(), kvn, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(vc, hv.data(), kvn, cudaMemcpyHostToDevice));
+    void* const* ktab = mk_tab(kc, (size_t)N_KV * HD, MAXSEQ);
+    void* const* vtab = mk_tab(vc, (size_t)N_KV * HD, MAXSEQ);
 
     const int QSTRIDE = 2 * HD; // engine q_stride
     std::vector<float> hq(WMAXT * (size_t)NQH * QSTRIDE); // W16: WMAXT lanes
@@ -147,7 +163,7 @@ int main() {
                 std::vector<float> poison(partn, qnan);
                 CUDA_CHECK(cudaMemcpy(part, poison.data(), partn * 4, cudaMemcpyHostToDevice));
             }
-            bool ok = fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale,
+            bool ok = fdmma::launch_fdmma(qp, QSTRIDE, ktab, vtab, part, pp, N_KV, GQA, HD, scale,
                                           nsv, W, 0, stages);
             CHECK(ok, "launch W=%d", W);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -172,7 +188,7 @@ int main() {
             }
             // T3: bitwise repeat-run
             std::vector<float> hpart2(partn);
-            fdmma::launch_fdmma(qp, QSTRIDE, kc, vc, part, pp, N_KV, GQA, HD, scale, nsv, W, 0, stages);
+            fdmma::launch_fdmma(qp, QSTRIDE, ktab, vtab, part, pp, N_KV, GQA, HD, scale, nsv, W, 0, stages);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(hpart2.data(), part, partn * 4, cudaMemcpyDeviceToHost));
             // compare only written slots (unwritten hold stale NaN pattern both runs)

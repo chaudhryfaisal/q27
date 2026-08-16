@@ -644,8 +644,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "kvstats prefill: %d tokens in %.2fs (%.1f t/s)\n", N, pf_s, N / pf_s);
         size_t n = (size_t)N * N_KV * HEAD_DIM;
         std::vector<__half> hb(n);
-        auto scan = [&](const char* tag, int layer, const __half* dev) {
-            CUDA_CHECK(cudaMemcpy(hb.data(), dev, n * 2, cudaMemcpyDeviceToHost));
+        // M2a: rows live in 64-row pages -- gather through the block table
+        // (identity today, but correct under Q27_KV_SCATTER too).
+        auto gather = [&](bool is_v, int pair) {
+            const size_t rb = (size_t)N_KV * HEAD_DIM * 2; // fp16-only rig
+            for (int r0 = 0; r0 < N; r0 += KV_PAGE) {
+                const int nr = N - r0 < KV_PAGE ? N - r0 : KV_PAGE;
+                CUDA_CHECK(cudaMemcpy((char*)hb.data() + (size_t)r0 * rb,
+                                      e.kv_row_host(is_v, pair, r0), (size_t)nr * rb,
+                                      cudaMemcpyDeviceToHost));
+            }
+        };
+        auto scan = [&](const char* tag, int layer, bool is_v, int pair) {
+            gather(is_v, pair);
             double amax = 0, asum = 0;
             long sat = 0, sub = 0; // |x| > 448 (E4M3 sat) / 0 < |x| < 2^-10 (flush to 0)
             for (size_t i = 0; i < n; i++) {
@@ -663,11 +674,11 @@ int main(int argc, char** argv) {
             int layer = -1;
             for (int il = 0; il < N_LAYER; il++)
                 if (e.attn_cache_idx[il] == (int)s) layer = il;
-            scan("K", layer, (const __half*)e.kcache[s]);
-            scan("V", layer, (const __half*)e.vcache[s]);
+            scan("K", layer, false, (int)s);
+            scan("V", layer, true, (int)s);
         }
-        scan("K", 64, (const __half*)e.mtp_k);
-        scan("V", 64, (const __half*)e.mtp_v);
+        scan("K", 64, false, e.kv_mtp_pair());
+        scan("V", 64, true, e.kv_mtp_pair());
         return 0;
     }
 
@@ -1002,15 +1013,22 @@ int main(int argc, char** argv) {
         auto s_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
         auto s_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto s_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
-        auto grabh = [&](const __half* dev, size_t n) {
-            std::vector<__half> tmp(n);
-            CUDA_CHECK(cudaMemcpy(tmp.data(), dev, n * 2, cudaMemcpyDeviceToHost));
-            std::vector<float> out(n);
-            for (size_t i = 0; i < n; i++) out[i] = __half2float(tmp[i]);
+        // M2a: gather KV rows through the block table (page-aware).
+        auto grabh = [&](bool is_v, int pair, int rows) {
+            const size_t rl = (size_t)N_KV * HEAD_DIM;
+            std::vector<__half> tmp((size_t)rows * rl);
+            for (int r0 = 0; r0 < rows; r0 += KV_PAGE) {
+                const int nr = rows - r0 < KV_PAGE ? rows - r0 : KV_PAGE;
+                CUDA_CHECK(cudaMemcpy(tmp.data() + (size_t)r0 * rl,
+                                      e.kv_row_host(is_v, pair, r0), (size_t)nr * rl * 2,
+                                      cudaMemcpyDeviceToHost));
+            }
+            std::vector<float> out(tmp.size());
+            for (size_t i = 0; i < tmp.size(); i++) out[i] = __half2float(tmp[i]);
             return out;
         };
-        auto s_kc = grabh((const __half*)e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
-        auto s_mk = grabh((const __half*)e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
+        auto s_kc = grabh(false, 0, T);
+        auto s_mk = grabh(false, e.kv_mtp_pair(), T);
         // pass 2: batched (chunked prefill only, no final serial token)
         e.reset();
         if (e.d_prompt_cap < N) {
@@ -1032,8 +1050,8 @@ int main(int argc, char** argv) {
         auto b_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
         auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
-        auto b_kc = grabh((const __half*)e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
-        auto b_mk = grabh((const __half*)e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
+        auto b_kc = grabh(false, 0, T);
+        auto b_mk = grabh(false, e.kv_mtp_pair(), T);
         printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
         printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
         printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");

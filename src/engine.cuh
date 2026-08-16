@@ -601,6 +601,30 @@ struct Engine {
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     // M1: SBuf/RBuf (the host role resolvers) are gone with the rotation --
     // committed state is always physically S[il]/conv_ring[il].
+    // ---- M2a paged-KV block tables (plan docs/plans/2026-08-16-m2-paged-kv.md).
+    // ONE device array [2][kv_pairs][kv_npages] (K half then V half); entry
+    // [pair][j] = base of the 64-row page backing rows [64j, 64j+64) of that
+    // pair. The table POINTER is init-fixed (baked into every captured graph,
+    // the mask-pool discipline); ENTRIES are rewritable between rounds -- M2a
+    // maps them identity over the per-layer allocs (or a fixed permutation
+    // under Q27_KV_SCATTER=1, the addressing proof knob); the M2b pool remaps
+    // them per admission. h_kv_tab is the host mirror the pfx walks and debug
+    // rigs read rows through. Pair kv_pairs-1 is the MTP pair.
+    void** d_kv_tab = nullptr;
+    std::vector<void*> h_kv_tab;
+    int kv_pairs = 0, kv_npages = 0;
+    void* const* kv_ktab(int pair) const { return d_kv_tab + (size_t)pair * kv_npages; }
+    void* const* kv_vtab(int pair) const {
+        return d_kv_tab + ((size_t)kv_pairs + pair) * kv_npages;
+    }
+    int kv_mtp_pair() const { return kv_pairs - 1; }
+    // Host-side row base (pfx export/import + CLI rigs): row r of pair/side.
+    char* kv_row_host(bool is_v, int pair, int r) const {
+        const size_t rb = kv_bytes(is_v) / max_ctx; // exact per-row bytes (divides evenly)
+        const void* pg = h_kv_tab[((is_v ? kv_pairs : 0) + (size_t)pair) * kv_npages +
+                                  (r >> KV_PAGE_SHIFT)];
+        return (char*)const_cast<void*>(pg) + (size_t)(r & KV_PAGE_MASK) * rb;
+    }
     q27k::XQuant xq;
     // layer state
     float* conv_ring[N_LAYER];
@@ -978,6 +1002,47 @@ struct Engine {
                 rec_beta[il] = p;                     p += rows * GDN_HEADS;
             }
         }
+        // M2a: build the KV block tables over the per-layer allocs. Identity
+        // mapping (page j -> rows 64j..) reproduces today's layout byte-for-
+        // byte; Q27_KV_SCATTER=1 applies a fixed per-pair LCG permutation of
+        // the pages instead -- rows land physically scattered inside the same
+        // allocs, and every gate must STILL pass (the proof the tables are
+        // load-bearing). All row/page arithmetic is exact: kv_bytes(is_v) is
+        // max_ctx * per-row bytes for every format.
+        {
+            kv_pairs = (int)kcache.size() + 1; // + the MTP pair (last)
+            kv_npages = (max_ctx + KV_PAGE - 1) / KV_PAGE;
+            h_kv_tab.assign((size_t)2 * kv_pairs * kv_npages, nullptr);
+            const size_t krow = kv_bytes(false) / max_ctx, vrow = kv_bytes(true) / max_ctx;
+            const bool scatter = [] {
+                const char* e = getenv("Q27_KV_SCATTER");
+                return e && atoi(e) != 0;
+            }();
+            std::vector<int> pmap(kv_npages);
+            for (int c = 0; c < kv_pairs; c++) {
+                char* kb = (char*)(c < (int)kcache.size() ? kcache[c] : mtp_k);
+                char* vb = (char*)(c < (int)kcache.size() ? vcache[c] : mtp_v);
+                for (int j = 0; j < kv_npages; j++) pmap[j] = j;
+                if (scatter) { // Fisher-Yates with a fixed per-pair LCG seed
+                    unsigned st_ = 0x9E3779B9u ^ (unsigned)(c * 2654435761u);
+                    for (int j = kv_npages - 1; j > 0; j--) {
+                        st_ = st_ * 1664525u + 1013904223u;
+                        int r = (int)(st_ % (unsigned)(j + 1));
+                        int tmp = pmap[j]; pmap[j] = pmap[r]; pmap[r] = tmp;
+                    }
+                }
+                for (int j = 0; j < kv_npages; j++) {
+                    h_kv_tab[(size_t)c * kv_npages + j] =
+                        kb + (size_t)pmap[j] * KV_PAGE * krow;
+                    h_kv_tab[((size_t)kv_pairs + c) * kv_npages + j] =
+                        vb + (size_t)pmap[j] * KV_PAGE * vrow;
+                }
+            }
+            if (scatter) fprintf(stderr, "M2a: Q27_KV_SCATTER=1 -- KV pages PERMUTED\n");
+            CUDA_CHECK(cudaMalloc((void**)&d_kv_tab, h_kv_tab.size() * sizeof(void*)));
+            CUDA_CHECK(cudaMemcpy(d_kv_tab, h_kv_tab.data(), h_kv_tab.size() * sizeof(void*),
+                                  cudaMemcpyHostToDevice));
+        }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
             dm.upload_all(q27k::pf4_on(), q27k::pf4_instrument());
@@ -1047,20 +1112,22 @@ struct Engine {
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
-    void attn_block(int il, const float* xin, float* yout, void* kc = nullptr,
-                    void* vc = nullptr, const int* pos_src = nullptr) {
-        attn_block(il, xin, yout, kc, vc, pos_src, stm);
+    void attn_block(int il, const float* xin, float* yout, void* const* kt = nullptr,
+                    void* const* vt = nullptr, const int* pos_src = nullptr) {
+        attn_block(il, xin, yout, kt, vt, pos_src, stm);
     }
     // P2c: explicit-stream form, same contract as gdn_mix/attn_mix's stream
     // param -- mtp_attn runs the MTP attention on the conductor stream in the
     // fused draft step; every other caller comes through the defaulted form
     // above with member stm (same value, same launch sequence).
-    void attn_block(int il, const float* xin, float* yout, void* kc, void* vc,
+    // M2a: kt/vt are the pair's block-table slices (nullptr = resolve this
+    // layer's pair; mtp_attn passes the MTP pair's).
+    void attn_block(int il, const float* xin, float* yout, void* const* kt, void* const* vt,
                     const int* pos_src, cudaStream_t st) {
-        if (!kc) {
+        if (!kt) {
             int ci = attn_cache_idx[il];
-            kc = kcache[ci];
-            vc = vcache[ci];
+            kt = kv_ktab(ci);
+            vt = kv_vtab(ci);
         }
         if (!pos_src) pos_src = d_pos;
         qx(xin, N_EMBD, st);
@@ -1084,11 +1151,11 @@ struct Engine {
             q27k::CP3 kw{{kbuf}};
             q27k::CP3 vw3{{vbuf}};
             q27k::IP3 pw{{pos_src}};
-            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, st, 1, kv_kind);
+            q27k::kv_store_t3(kw, vw3, kt, vt, pw, N_KV, HEAD_DIM, st, 1, kv_kind);
         } else {
-            q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, st, kv_fp8);
+            q27k::kv_store(kbuf, vbuf, kt, vt, pos_src, N_KV * HEAD_DIM, st, kv_fp8);
         }
-        q27k::attn_decode(qg, 2 * HEAD_DIM, kc, vc, attnout, scratch, pos_src,
+        q27k::attn_decode(qg, 2 * HEAD_DIM, kt, vt, attnout, scratch, pos_src,
                           max_ctx, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), st,
                           kv_kind);
         // turbo3 V accumulates in the rotated basis: one inverse-WHT on the
@@ -1324,7 +1391,7 @@ struct Engine {
     void mtp_attn(const int* pos_src, cudaStream_t st) {
         const int il = 64;
         q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, st);
-        attn_block(il, x1, y, mtp_k, mtp_v, pos_src, st);
+        attn_block(il, x1, y, kv_ktab(kv_mtp_pair()), kv_vtab(kv_mtp_pair()), pos_src, st);
     }
     void mtp_post(const MtpLaneView& v) {
         const int il = 64;
@@ -1712,14 +1779,14 @@ struct Engine {
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
             q27k::kv_store_t3(LANESW(kbuf),
-                              LANESW(vbuf), kcache[ci], vcache[ci],
+                              LANESW(vbuf), kv_ktab(ci), kv_vtab(ci),
                               P, N_KV, HEAD_DIM, st, vw, kv_kind);
         else
             q27k::kv_store3(LANESW(kbuf),
-                            LANESW(vbuf), kcache[ci], vcache[ci],
+                            LANESW(vbuf), kv_ktab(ci), kv_vtab(ci),
                             P, N_KV * HEAD_DIM, st, vw, kv_fp8);
-        q27k::attn_decode3(LANESW(qg), 2 * HEAD_DIM, kcache[ci],
-                           vcache[ci],
+        q27k::attn_decode3(LANESW(qg), 2 * HEAD_DIM, kv_ktab(ci),
+                           kv_vtab(ci),
                            LANESW(attnout),
                            scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, st, vw, kv_kind);
         // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
@@ -3015,7 +3082,7 @@ struct Engine {
         mmT(T2(il, "ssm_out.weight"), ogT, yT, T);
     }
 
-    void attn_block_T(int il, int base, int T, void* kc, void* vc) {
+    void attn_block_T(int il, int base, int T, void* const* kt, void* const* vt) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "attn_q.weight", x1T, qgT, T);
@@ -3035,10 +3102,10 @@ struct Engine {
         if (kv_k_rotated(kv_kind))
             q27k::wht_T(qgT, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, QROW, T, false, stm);
         if (kv_kind >= KV_T3)
-            q27k::kv_store_T_t3(kT, vT, kc, vc, base, N_KV, HEAD_DIM, T, stm, kv_kind);
+            q27k::kv_store_T_t3(kT, vT, kt, vt, base, N_KV, HEAD_DIM, T, stm, kv_kind);
         else
-            q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
-        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, pf_part,
+            q27k::kv_store_T(kT, vT, kt, vt, base, KVROW, T, stm, kv_fp8);
+        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kt, vt, attnT, N_HEAD * HEAD_DIM, pf_part,
                              base, 0, T, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM),
                              stm, kv_kind);
         if (kv_kind >= KV_T3)
@@ -3069,7 +3136,7 @@ struct Engine {
                             EPS, stm);
             if (attn_layer[il]) {
                 int ci = attn_cache_idx[il];
-                attn_block_T(il, base, T, kcache[ci], vcache[ci]);
+                attn_block_T(il, base, T, kv_ktab(ci), kv_vtab(ci));
             } else {
                 gdn_block_T(il, T);
             }
@@ -3107,10 +3174,12 @@ struct Engine {
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base + 1, T, FREQ_BASE,
                           stm);
         if (kv_kind >= KV_T3)
-            q27k::kv_store_T_t3(kT, vT, mtp_k, mtp_v, base + 1, N_KV, HEAD_DIM, T, stm,
+            q27k::kv_store_T_t3(kT, vT, kv_ktab(kv_mtp_pair()), kv_vtab(kv_mtp_pair()),
+                                base + 1, N_KV, HEAD_DIM, T, stm,
                                 kv_kind);
         else
-            q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
+            q27k::kv_store_T(kT, vT, kv_ktab(kv_mtp_pair()), kv_vtab(kv_mtp_pair()), base + 1,
+                             KVROW, T, stm, kv_fp8);
     }
 
     // ---- P9: same-session GDN checkpoint ring (host pinned RAM) ----
@@ -3369,17 +3438,32 @@ struct Engine {
                 CUDA_CHECK(cudaMemcpyAsync(p, conv_ring[il], cb, cudaMemcpyDeviceToHost, stm));
                 p += cb;
             }
+        // M2a: rows live in 64-row pages reached through the block table --
+        // walk pages (ceil(L/64) copies per buffer instead of 1) but keep the
+        // BLOB linear-row-ordered, so the on-disk format and compat hash are
+        // unchanged and entries stay portable across pool geometries.
         const size_t rk = kv_bytes(false) / (size_t)max_ctx;
         const size_t rv = kv_bytes(true) / (size_t)max_ctx;
+        auto kv_copy = [&](bool is_v, int pair, int rows, char*& q, bool to_host) {
+            const size_t rb = is_v ? rv : rk;
+            for (int r0 = 0; r0 < rows; r0 += KV_PAGE) {
+                const int nr = rows - r0 < KV_PAGE ? rows - r0 : KV_PAGE;
+                char* dev = kv_row_host(is_v, pair, r0);
+                if (to_host)
+                    CUDA_CHECK(cudaMemcpyAsync(q, dev, (size_t)nr * rb,
+                                               cudaMemcpyDeviceToHost, stm));
+                else
+                    CUDA_CHECK(cudaMemcpyAsync(dev, q, (size_t)nr * rb,
+                                               cudaMemcpyHostToDevice, stm));
+                q += (size_t)nr * rb;
+            }
+        };
         for (size_t i = 0; i < kcache.size(); i++) {
-            CUDA_CHECK(cudaMemcpyAsync(p, kcache[i], (size_t)L * rk, cudaMemcpyDeviceToHost, stm));
-            p += (size_t)L * rk;
-            CUDA_CHECK(cudaMemcpyAsync(p, vcache[i], (size_t)L * rv, cudaMemcpyDeviceToHost, stm));
-            p += (size_t)L * rv;
+            kv_copy(false, (int)i, L, p, true);
+            kv_copy(true, (int)i, L, p, true);
         }
-        CUDA_CHECK(cudaMemcpyAsync(p, mtp_k, (size_t)(L + 1) * rk, cudaMemcpyDeviceToHost, stm));
-        p += (size_t)(L + 1) * rk;
-        CUDA_CHECK(cudaMemcpyAsync(p, mtp_v, (size_t)(L + 1) * rv, cudaMemcpyDeviceToHost, stm));
+        kv_copy(false, kv_mtp_pair(), L + 1, p, true);
+        kv_copy(true, kv_mtp_pair(), L + 1, p, true);
         CUDA_CHECK(cudaStreamSynchronize(stm));
     }
     // Host -> device, byte-for-byte the inverse of pfx_export. Caller has
@@ -3395,17 +3479,24 @@ struct Engine {
                 CUDA_CHECK(cudaMemcpyAsync(conv_ring[il], p, cb, cudaMemcpyHostToDevice, stm));
                 p += cb;
             }
+        // M2a: per-page inverse of pfx_export's walk (same linear blob).
         const size_t rk = kv_bytes(false) / (size_t)max_ctx;
         const size_t rv = kv_bytes(true) / (size_t)max_ctx;
+        auto kv_copy = [&](bool is_v, int pair, int rows, const char*& q) {
+            const size_t rb = is_v ? rv : rk;
+            for (int r0 = 0; r0 < rows; r0 += KV_PAGE) {
+                const int nr = rows - r0 < KV_PAGE ? rows - r0 : KV_PAGE;
+                CUDA_CHECK(cudaMemcpyAsync(kv_row_host(is_v, pair, r0), q, (size_t)nr * rb,
+                                           cudaMemcpyHostToDevice, stm));
+                q += (size_t)nr * rb;
+            }
+        };
         for (size_t i = 0; i < kcache.size(); i++) {
-            CUDA_CHECK(cudaMemcpyAsync(kcache[i], p, (size_t)L * rk, cudaMemcpyHostToDevice, stm));
-            p += (size_t)L * rk;
-            CUDA_CHECK(cudaMemcpyAsync(vcache[i], p, (size_t)L * rv, cudaMemcpyHostToDevice, stm));
-            p += (size_t)L * rv;
+            kv_copy(false, (int)i, L, p);
+            kv_copy(true, (int)i, L, p);
         }
-        CUDA_CHECK(cudaMemcpyAsync(mtp_k, p, (size_t)(L + 1) * rk, cudaMemcpyHostToDevice, stm));
-        p += (size_t)(L + 1) * rk;
-        CUDA_CHECK(cudaMemcpyAsync(mtp_v, p, (size_t)(L + 1) * rv, cudaMemcpyHostToDevice, stm));
+        kv_copy(false, kv_mtp_pair(), L + 1, p);
+        kv_copy(true, kv_mtp_pair(), L + 1, p);
         CUDA_CHECK(cudaStreamSynchronize(stm));
         perm = 0;
         fold_pending = 0; // M1: restored state replaces any unfolded commit

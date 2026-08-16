@@ -58,6 +58,45 @@ enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3, KV_T5K = 4, K
 // arm measures that exact error profile; src/i8g64.cuh).
 static inline bool kv_k_rotated(int kvk) { return kvk == KV_T3 || kvk == KV_T5K; }
 
+// ---- M2a paged KV addressing (plan docs/plans/2026-08-16-m2-paged-kv.md) --
+// KV rows live in 64-row pages reached through a per-pair block table: entry
+// j = base pointer of the page backing rows [64j, 64j+64). The table POINTER
+// is init-fixed (baked into captured graphs, the mask-pool discipline); the
+// ENTRIES are rewritable between rounds (identity mapping in M2a; the M2b
+// pool remaps them). Kernels receive the pair's table slice (void* const*)
+// instead of a raw base pointer; every access stays single-row arithmetic:
+//   row base  = (char*)tab[p >> 6] + (size_t)(p & 63) * row_bytes
+//   block idx = (Block*)tab[p >> 6] + (p & 63) * n_kv_heads * 2 + h*2 + g
+static constexpr int KV_PAGE = 64;         // rows per page
+static constexpr int KV_PAGE_SHIFT = 6;
+static constexpr int KV_PAGE_MASK = KV_PAGE - 1;
+
+#ifdef __CUDACC__
+// Row/block resolvers -- the ONLY sanctioned way a kernel touches KV memory
+// under M2a. Addressing-only by construction: same bytes, same fp order.
+template <typename T>
+__device__ __forceinline__ T* kv_row(void* const* __restrict__ tab, int p,
+                                     int row_elems) {
+    return (T*)tab[p >> KV_PAGE_SHIFT] + (size_t)(p & KV_PAGE_MASK) * row_elems;
+}
+template <typename T>
+__device__ __forceinline__ const T* kv_row_c(const void* const* __restrict__ tab, int p,
+                                             int row_elems) {
+    return (const T*)tab[p >> KV_PAGE_SHIFT] + (size_t)(p & KV_PAGE_MASK) * row_elems;
+}
+// Block-addressed kinds (turbo3/turbo5/i8g64): row = n_kv_heads*2 blocks.
+template <typename B>
+__device__ __forceinline__ B* kv_blk(void* const* __restrict__ tab, int p,
+                                     int blocks_per_row) {
+    return (B*)tab[p >> KV_PAGE_SHIFT] + (size_t)(p & KV_PAGE_MASK) * blocks_per_row;
+}
+template <typename B>
+__device__ __forceinline__ const B* kv_blk_c(const void* const* __restrict__ tab, int p,
+                                             int blocks_per_row) {
+    return (const B*)tab[p >> KV_PAGE_SHIFT] + (size_t)(p & KV_PAGE_MASK) * blocks_per_row;
+}
+#endif
+
 #ifdef __CUDACC__
 #include <cuda_fp8.h>
 // KV-cache element conversions (P2): fp16 default, fp8 E4M3 opt-in (Q27_KV=fp8).

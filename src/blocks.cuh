@@ -31,17 +31,17 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
                        const int* d_pos, float freq_base, cudaStream_t st = 0);
 
 // Causal decode attention for one new token; seq_len = *d_pos + 1 read on device.
-// Q strided (interleaved qg), caches contiguous [pos][n_kv][head_dim], fp16 or
-// fp8 E4M3 elements. kvk = KvKind (cuda_common.h; widened from `bool fp8`,
-// 0/1 keep the old meaning; KV_T3/KV_T3V = turbo3 block cache, fd2-only).
+// Q strided (interleaved qg). M2a: caches are reached through per-pair 64-row
+// block tables (ktab/vtab = the pair's table slice; entries = page bases,
+// identity-mapped over the per-layer allocs until the M2b pool). kvk = KvKind.
 // scratch: [n_q_heads][FD_NS][FD_ST] floats (flash-decode partials, spec3.cuh).
-void attn_decode(const float* q, int q_stride, const void* kcache, const void* vcache,
-                 float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
-                 int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0,
-                 int kvk = KV_F16);
+void attn_decode(const float* q, int q_stride, const void* const* ktab,
+                 const void* const* vtab, float* out, float* scratch, const int* d_pos,
+                 int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
+                 cudaStream_t st = 0, int kvk = KV_F16);
 
-// Store this token's K/V rows into the caches at position *d_pos.
-void kv_store(const float* kbuf, const float* vbuf, void* kcache, void* vcache,
+// Store this token's K/V rows (via the pair's block tables) at position *d_pos.
+void kv_store(const float* kbuf, const float* vbuf, void* const* ktab, void* const* vtab,
               const int* d_pos, int rowlen, cudaStream_t st = 0, bool fp8 = false);
 
 // End-of-token bookkeeping (device-chained decode): d_gen[*d_step] = *d_token;

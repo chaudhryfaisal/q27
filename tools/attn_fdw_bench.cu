@@ -39,7 +39,23 @@ struct CP3 { const float* p[16]; }; // width-12 tuning
 struct P3 { float* p[16]; };
 struct IP3 { const int* p[16]; };
 
+// M2a shim: device identity block-table over a contiguous test buffer.
+// Deliberately LEAKED (short-lived bench process; entries are 8B each) so call
+// sites can wrap buffers inline without lifetime hazards vs async launches.
+static void* const* mk_tab(const void* base, size_t row_bytes, int rows) {
+    int np = (rows + KV_PAGE - 1) / KV_PAGE;
+    std::vector<void*> h(np);
+    for (int j = 0; j < np; j++)
+        h[j] = (char*)const_cast<void*>(base) + (size_t)j * KV_PAGE * row_bytes;
+    void** d = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d, np * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(d, h.data(), np * sizeof(void*), cudaMemcpyHostToDevice));
+    return d;
+}
+
 // ---- fd2 + combine, forked verbatim from src/spec3.cu ----
+// (M2a: the forked kernels below keep raw KV pointers ON PURPOSE -- they are
+// the pre-M2a baseline leg; only the real fdmma:: entry points take tables.)
 template <typename CT>
 __device__ __forceinline__ void fd2_ld8(const CT* __restrict__ row, int lane, float* o) {
     if constexpr (sizeof(CT) == 1) {
@@ -740,6 +756,9 @@ int main() {
             CUDA_CHECK(cudaMemcpy(kc, h.data(), kvn, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(vc, h2.data(), kvn, cudaMemcpyHostToDevice));
         }
+        // M2a tables for the real fdmma:: legs (fork kernels keep raw kc/vc)
+        void* const* ktab = mk_tab(kc, (size_t)N_KV * HD, CTX + MAXW);
+        void* const* vtab = mk_tab(vc, (size_t)N_KV * HD, CTX + MAXW);
         float* q[12];
         float* o2[12];
         float* ow[12];
@@ -840,7 +859,7 @@ int main() {
             fdmma::FIP3 mpp{};
             for (int t = 0; t < W; t++) { mqp.p[t] = qp.p[t]; mpp.p[t] = pp.p[t]; }
             auto fdmma_leg = [&] {
-                fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                fdmma::launch_fdmma(mqp, HD, ktab, vtab, part, mpp, N_KV, GQA, HD, scale,
                                     FD2_NS, W, 0);
                 dim3 g2(NQH, W);
                 k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, FD2_NS, pp);
@@ -849,7 +868,7 @@ int main() {
             // 2026-07-10). Shared arithmetic -> outputs must be BITWISE
             // identical to stages=2.
             auto fdmma1_leg = [&] {
-                fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                fdmma::launch_fdmma(mqp, HD, ktab, vtab, part, mpp, N_KV, GQA, HD, scale,
                                     FD2_NS, W, 0, /*stages=*/1);
                 dim3 g2(NQH, W);
                 k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, FD2_NS, pp);
@@ -975,7 +994,7 @@ int main() {
             if (W >= 8) {
                 const int nsx = 85;
                 auto s1_85 = [&] {
-                    fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                    fdmma::launch_fdmma(mqp, HD, ktab, vtab, part, mpp, N_KV, GQA, HD, scale,
                                         nsx, W, 0, /*stages=*/1);
                     dim3 g2(NQH, W);
                     k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, nsx, pp);
@@ -1018,7 +1037,7 @@ int main() {
                 printf("    ns-sweep (SMs=%d, slots=%d):", smc, smc * 2);
                 for (int ns : {64, 85, 96, 128, 170}) {
                     auto leg = [&] {
-                        fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                        fdmma::launch_fdmma(mqp, HD, ktab, vtab, part, mpp, N_KV, GQA, HD, scale,
                                             ns, W, 0, /*stages=*/1);
                         dim3 g2(NQH, W);
                         k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, ns, pp);

@@ -10939,3 +10939,59 @@ their 27B int does 2.88x at C=8 and NVFP4 5.67x on shared-engine batch
 -- q27 at 2.03x/C=4 has banked the memory half of that gap (M1); the
 compute half is M2-M4 (paged KV pool, SeqState extraction, batch-shape
 keys). Raw logs: scratchpad/m1_ladder/.
+
+## 2026-08-16 (c): M2a SHIPPED -- every KV access now goes through 64-row block tables, proven load-bearing by a scattered-page canonical
+
+The addressing half of M2 (plan docs/plans/2026-08-16-m2-paged-kv.md),
+landed same-day on the recon's central simplification: max_ctx was already
+DEAD in every decode kernel (lengths ride the device pos pointers), so the
+conversion is purely additive -- kernels swap raw kc/vc bases for the
+pair's table slice, nothing semantic moves.
+
+THE SHAPE. Per engine, ONE device array [2][17 pairs][npages] (K half, V
+half; MTP = pair 16); entry j = base of the page backing rows [64j,
+64j+64). The table POINTER is init-fixed (baked into every captured
+graph -- the mask-pool discipline); ENTRIES are rewritable between
+rounds: identity-mapped over the existing per-layer allocs in M2a, the
+M2b pool remaps them at admission. Converted end to end: kv_store /
+kv_store3 / kv_store_t3 / kv_store_T / kv_store_T_t3, fd2 (scalar +
+turbo), v1, fdmma e4m3 + H16, all four prefill attention kernels
+(f16-MMA, fp8q, pv8, lite), attn_block/attn_mix/mtp paths, pfx
+export/import (per-page walks, BLOB LAYOUT UNCHANGED -- entries stay
+portable, compat hash untouched), --kvstats/--pfdbg gathers, and the
+four test/bench tools via identity-table shims. MMA legs take ONE
+lookup per 32-aligned tile (tiles never cross a page); fd2/v1 stream
+per-position.
+
+THE PROOF THE TABLES ARE REAL: Q27_KV_SCATTER=1 permutes every pair's
+page mapping with a per-pair Fisher-Yates at init -- rows land physically
+scattered inside the same allocs -- and canonical EXACT still reads
+a2982c5197c627551b27d76a0a94b220, byte-identical, plus fused_smoke all
+legs PASS under scatter+fp8 including the captured-graph leg. An
+identity-only gate would have proven nothing about the addressing.
+
+THE PERF FIGHT (the spec's named risk, materialized and closed): the
+naive per-iteration table load cost +5-6% on the fd2 wall at 61K
+(fd2 is DRAM-saturated; the dependent load sat in the chain). Two-level
+page-hoisted loops (page base loaded once per 64 rows, per-warp position
+sequence UNCHANGED = bitwise) recovered to +2-4%; restoring the
+original loop's pointer INDUCTION inside the page (the naive (p & 63)
+recompute had defeated strength reduction) closed it: 61K W=8 paged
+0.8052/0.8056 ms vs contiguous 0.8029/0.8115 -- within noise. Same
+class of fix on the fdmma T3 staging (un-hoist there: the cached page
+pointers pushed 7 widths into spills; final ptxas spill set is
+byte-identical to pre-M2a).
+
+GATES, all green: ninv ALL PASS; canonical EXACT identity AND scatter;
+fused_smoke 4 legs x {fp16, fp8, turbo3, fp8+scatter}; test_kernels ALL
+PASS (fd2/fdmma/turbo legs on tables); zero new ptxas spills;
+single-stream A/B vs pre-M2a -0.1% median (identical 2.67 tok/round);
+admission boot byte-identical to M1 (4 slots @16K q4s -- M2a changes no
+allocations, by design). OWED: a 3090 test_kernels pass (the H16 leg
+conversion is arch-independent and h16 legs ran on the 5090, but the
+both-arches habit says run it with the next Ampere session).
+
+NEXT: M2b -- the process-wide K/V pools + claim_slot entitlement
+(reserve+map prompt + n_max + ctx_round_reserve - 1, MTP +1), FIFO wait
+on route_cv, lineage page ownership with the R1 clear-tiers-first rule.
+The kernels no longer care where a page lives; M2b only moves them.

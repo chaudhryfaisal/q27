@@ -218,8 +218,8 @@ static __device__ __forceinline__ void fdmma_tile_compute(
 template <int W, int STAGES = 2, bool T3 = false>
 __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     k_attn_fdmma(__grid_constant__ const FCP3 qp, int q_stride,
-                 const __nv_fp8_e4m3* __restrict__ kc,
-                 const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ part,
+                 const void* const* __restrict__ ktab,
+                 const void* const* __restrict__ vtab, float* __restrict__ part,
                  __grid_constant__ const FIP3 pos,
                  int n_kv_heads, int gqa, int head_dim, float scale) {
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
@@ -309,12 +309,17 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     // leans on the SECOND resident CTA for overlap)
     int cur = 0;
     if (STAGES == 2) {
+        // M2a: PP=32-aligned tiles never cross a 64-row page -- one table
+        // lookup per tile, then in-page row addressing (addressing-only).
+        const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p_beg >> KV_PAGE_SHIFT];
+        const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p_beg >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
             const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
             const int gpos = p_beg + pp;
-            const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-            cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
-            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+            const size_t off =
+                ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * LDK + d16, &kpg[off], gpos < p_end ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_end ? 16 : 0);
         }
         cpasync_commit();
     }
@@ -326,15 +331,21 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
             if constexpr (T3) {
                 // expand turbo3 blocks -> e4m3 into the tiles (no cp.async
                 // on this leg; the wait below has nothing pending)
+                // page lookup NOT hoisted on this leg: the cached page
+                // pointers pushed the T3 variants into spills at 7 widths
+                // (ptxas audit); the in-loop table load is L1-resident and
+                // keeps spill=0 like the pre-M2a kernel.
                 for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += 192) {
                     const int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
                     const int gpos = p0 + pp;
                     if (gpos < p_end) {
-                        const size_t rb = ((size_t)gpos * n_kv_heads + kvh) * 2;
+                        const size_t rb = ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * 2;
                         q27turbo::turbo3_stage8_e4m3(
-                            (const q27turbo::block_turbo3*)kc + rb, d8, kbuf + pp * LDK + d8);
+                            (const q27turbo::block_turbo3*)ktab[p0 >> KV_PAGE_SHIFT] + rb, d8,
+                            kbuf + pp * LDK + d8);
                         q27turbo::turbo3_stage8_e4m3(
-                            (const q27turbo::block_turbo3*)vc + rb, d8, vbuf + pp * HD + d8);
+                            (const q27turbo::block_turbo3*)vtab[p0 >> KV_PAGE_SHIFT] + rb, d8,
+                            vbuf + pp * HD + d8);
                     } else {
                         *(uint2*)(kbuf + pp * LDK + d8) = make_uint2(0u, 0u);
                         *(uint2*)(vbuf + pp * HD + d8) = make_uint2(0u, 0u);
@@ -343,12 +354,15 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
             } else {
                 // fetch THIS tile (prior iteration's trailing barrier proved
                 // every warp is done reading the single buffer)
+                const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p0 >> KV_PAGE_SHIFT];
+                const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p0 >> KV_PAGE_SHIFT];
                 for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
                     const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
                     const int gpos = p0 + pp;
-                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                    cpasync16(kbuf + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
-                    cpasync16(vbuf + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+                    const size_t off =
+                        ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(kbuf + pp * LDK + d16, &kpg[off], gpos < p_end ? 16 : 0);
+                    cpasync16(vbuf + pp * HD + d16, &vpg[off], gpos < p_end ? 16 : 0);
                 }
                 cpasync_commit();
             }
@@ -362,12 +376,17 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
         if (STAGES == 2 && p0 + PP < p_end) {
             __nv_fp8_e4m3* knext = s_kraw + (1 - cur) * PP * LDK;
             __nv_fp8_e4m3* vnext = s_vraw + (1 - cur) * PP * HD;
+            const __nv_fp8_e4m3* kpg =
+                (const __nv_fp8_e4m3*)ktab[(p0 + PP) >> KV_PAGE_SHIFT];
+            const __nv_fp8_e4m3* vpg =
+                (const __nv_fp8_e4m3*)vtab[(p0 + PP) >> KV_PAGE_SHIFT];
             for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
                 const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
                 const int gpos = p0 + PP + pp;
-                const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                cpasync16(knext + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
-                cpasync16(vnext + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+                const size_t off =
+                    ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+                cpasync16(knext + pp * LDK + d16, &kpg[off], gpos < p_end ? 16 : 0);
+                cpasync16(vnext + pp * HD + d16, &vpg[off], gpos < p_end ? 16 : 0);
             }
             cpasync_commit();
         }
@@ -417,7 +436,8 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
 // launcher: grid (ns, n_kv_heads); ns MUST equal the ns passed to
 // k_attn_fd_combine (128 = FD2_NS in the engine). One-shot smem attr raise.
 template <int W, int STAGES = 2, bool T3 = false>
-inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
+inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* const* ktab,
+                           const void* const* vtab, float* part,
                            FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
                            cudaStream_t st) {
     static bool attr = false;
@@ -428,9 +448,8 @@ inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* kc, const void* vc
         attr = true;
     }
     dim3 g((unsigned)ns, (unsigned)n_kv_heads);
-    k_attn_fdmma<W, STAGES, T3><<<g, 192, sm, st>>>(
-        qp, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, part, pos,
-        n_kv_heads, gqa, head_dim, scale);
+    k_attn_fdmma<W, STAGES, T3><<<g, 192, sm, st>>>(qp, q_stride, ktab, vtab, part, pos,
+                                                    n_kv_heads, gqa, head_dim, scale);
 }
 
 // stages: 2 = shipped double-buffered 1-CTA kernel; 1 = single-buffered
@@ -438,19 +457,20 @@ inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* kc, const void* vc
 // change). Arithmetic is shared (fdmma_tile_compute) -- staging only.
 // t3: turbo3 block caches -- always the single-buffered kernel (stages
 // forced to 1; Q27_FDMMA_STAGES=2 has no turbo3 leg).
-inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
+inline bool launch_fdmma(FCP3 qp, int q_stride, const void* const* ktab,
+                         const void* const* vtab, float* part,
                          FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
                          int ntok, cudaStream_t st, int stages = 2, bool t3 = false) {
 #define FDMMA_CASE(N)                                                                        \
     case N:                                                                                  \
         if (t3)                                                                              \
-            launch_fdmma_w<N, 1, true>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,     \
+            launch_fdmma_w<N, 1, true>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa,     \
                                        head_dim, scale, ns, st);                             \
         else if (stages == 1)                                                                \
-            launch_fdmma_w<N, 1>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, \
+            launch_fdmma_w<N, 1>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa, head_dim, \
                                  scale, ns, st);                                             \
         else                                                                                 \
-            launch_fdmma_w<N, 2>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, \
+            launch_fdmma_w<N, 2>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa, head_dim, \
                                  scale, ns, st);                                             \
         return true
     switch (ntok) {
@@ -527,7 +547,7 @@ static __device__ __forceinline__ void h16_ldm_x2_trans(uint32_t& r0, uint32_t& 
 template <int W, int FMT>
 __global__ void __launch_bounds__(192, 1)
     k_attn_fdmma_h16(__grid_constant__ const FCP3 qp, int q_stride,
-                     const void* __restrict__ kc, const void* __restrict__ vc,
+                     const void* const* __restrict__ ktab, const void* const* __restrict__ vtab,
                      float* __restrict__ part, __grid_constant__ const FIP3 pos,
                      int n_kv_heads, int gqa, int head_dim, float scale) {
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDH = FDMMA_LDH16;
@@ -600,36 +620,41 @@ __global__ void __launch_bounds__(192, 1)
 
     for (int p0 = p_beg; p0 < p_end; p0 += PP) {
         __syncthreads(); // prior tile's fragment readers are done
+        // M2a: PP=32-aligned tiles never cross a 64-row page -- one table
+        // lookup per tile, then in-page row addressing (addressing-only).
+        const void* kpg = ktab[p0 >> KV_PAGE_SHIFT];
+        const void* vpg = vtab[p0 >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += 192) {
             const int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
             const int gpos = p0 + pp;
+            const int gp = gpos & KV_PAGE_MASK;
             __half2* kd = (__half2*)(s_k + (size_t)pp * LDH + d8);
             __half2* vd = (__half2*)(s_v + (size_t)pp * LDH + d8);
             if (gpos < p_end) {
                 if constexpr (FMT == 2 || FMT == 3) {
-                    const size_t rb = ((size_t)gpos * n_kv_heads + kvh) * 2;
+                    const size_t rb = ((size_t)gp * n_kv_heads + kvh) * 2;
                     if constexpr (FMT == 3)
-                        q27turbo::turbo5_stage8_h2((const q27turbo::block_turbo5*)kc + rb, d8,
+                        q27turbo::turbo5_stage8_h2((const q27turbo::block_turbo5*)kpg + rb, d8,
                                                    kd);
                     else
-                        q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)kc + rb, d8,
+                        q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)kpg + rb, d8,
                                                    kd);
-                    q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)vc + rb, d8, vd);
+                    q27turbo::turbo3_stage8_h2((const q27turbo::block_turbo3*)vpg + rb, d8, vd);
                 } else if constexpr (FMT == 1) {
-                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d8;
-                    const __nv_fp8_e4m3* kr = (const __nv_fp8_e4m3*)kc + off;
-                    const __nv_fp8_e4m3* vr = (const __nv_fp8_e4m3*)vc + off;
+                    const size_t off = ((size_t)gp * n_kv_heads + kvh) * head_dim + d8;
+                    const __nv_fp8_e4m3* kr = (const __nv_fp8_e4m3*)kpg + off;
+                    const __nv_fp8_e4m3* vr = (const __nv_fp8_e4m3*)vpg + off;
 #pragma unroll
                     for (int j = 0; j < 4; j++) {
                         kd[j] = __halves2half2(kv2h(kr[2 * j]), kv2h(kr[2 * j + 1]));
                         vd[j] = __halves2half2(kv2h(vr[2 * j]), kv2h(vr[2 * j + 1]));
                     }
                 } else {
-                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d8;
+                    const size_t off = ((size_t)gp * n_kv_heads + kvh) * head_dim + d8;
                     // 8 halves = 16 bytes = one uint4 (uint2 was the bug:
                     // 4 halves copied, 4 left uninitialized -> NaN)
-                    const uint4 kw = *(const uint4*)((const __half*)kc + off);
-                    const uint4 vw = *(const uint4*)((const __half*)vc + off);
+                    const uint4 kw = *(const uint4*)((const __half*)kpg + off);
+                    const uint4 vw = *(const uint4*)((const __half*)vpg + off);
                     *(uint4*)kd = kw;
                     *(uint4*)vd = vw;
                 }
@@ -764,7 +789,7 @@ __global__ void __launch_bounds__(192, 1)
 }
 
 template <int W, int FMT>
-inline void launch_fdmma_h16_w(FCP3 qp, int q_stride, const void* kc, const void* vc,
+inline void launch_fdmma_h16_w(FCP3 qp, int q_stride, const void* const* ktab, const void* const* vtab,
                                float* part, FIP3 pos, int n_kv_heads, int gqa, int head_dim,
                                float scale, int ns, cudaStream_t st) {
     static bool attr = false;
@@ -775,27 +800,27 @@ inline void launch_fdmma_h16_w(FCP3 qp, int q_stride, const void* kc, const void
         attr = true;
     }
     dim3 g((unsigned)ns, (unsigned)n_kv_heads);
-    k_attn_fdmma_h16<W, FMT><<<g, 192, sm, st>>>(qp, q_stride, kc, vc, part, pos, n_kv_heads,
-                                                 gqa, head_dim, scale);
+    k_attn_fdmma_h16<W, FMT><<<g, 192, sm, st>>>(qp, q_stride, ktab, vtab, part, pos,
+                                                 n_kv_heads, gqa, head_dim, scale);
 }
 
 // H16 dispatch: W 4..8 only (smem); fmt 0=fp16 1=fp8 2=turbo3 3=turbo5k.
-inline bool launch_fdmma_h16(FCP3 qp, int q_stride, const void* kc, const void* vc,
+inline bool launch_fdmma_h16(FCP3 qp, int q_stride, const void* const* ktab, const void* const* vtab,
                              float* part, FIP3 pos, int n_kv_heads, int gqa, int head_dim,
                              float scale, int ns, int ntok, int fmt, cudaStream_t st) {
 #define FDMMA_H16_CASE(N)                                                                     \
     case N:                                                                                   \
         if (fmt == 3)                                                                         \
-            launch_fdmma_h16_w<N, 3>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+            launch_fdmma_h16_w<N, 3>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa,        \
                                      head_dim, scale, ns, st);                                \
         else if (fmt == 2)                                                                    \
-            launch_fdmma_h16_w<N, 2>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+            launch_fdmma_h16_w<N, 2>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa,        \
                                      head_dim, scale, ns, st);                                \
         else if (fmt == 1)                                                                    \
-            launch_fdmma_h16_w<N, 1>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+            launch_fdmma_h16_w<N, 1>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa,        \
                                      head_dim, scale, ns, st);                                \
         else                                                                                  \
-            launch_fdmma_h16_w<N, 0>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,        \
+            launch_fdmma_h16_w<N, 0>(qp, q_stride, ktab, vtab, part, pos, n_kv_heads, gqa,        \
                                      head_dim, scale, ns, st);                                \
         return true
     switch (ntok) {

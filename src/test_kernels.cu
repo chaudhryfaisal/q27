@@ -21,6 +21,20 @@
 
 using q27::DType;
 
+// M2a shim: device identity block-table over a contiguous test buffer.
+// Deliberately LEAKED (short-lived test process; entries are 8B each) so call
+// sites can wrap buffers inline without lifetime hazards vs async launches.
+static void* const* mk_tab(const void* base, size_t row_bytes, int rows) {
+    int np = (rows + KV_PAGE - 1) / KV_PAGE;
+    std::vector<void*> h(np);
+    for (int j = 0; j < np; j++)
+        h[j] = (char*)const_cast<void*>(base) + (size_t)j * KV_PAGE * row_bytes;
+    void** d = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d, np * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(d, h.data(), np * sizeof(void*), cudaMemcpyHostToDevice));
+    return d;
+}
+
 static int g_fail = 0;
 
 static void check(const char* name, double err, double tol) {
@@ -400,10 +414,12 @@ static void test_attn_mma() {
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, kvhalf.data() + (size_t)SEQ * NKV * HD,
                           (size_t)SEQ * NKV * HD * 2, cudaMemcpyHostToDevice));
+    void* const* ktab = mk_tab(d_k, (size_t)NKV * HD * 2, SEQ);
+    void* const* vtab = mk_tab(d_v, (size_t)NKV * HD * 2, SEQ);
 
     auto run = [&](const char* mode, float* out) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, nullptr, BASE, 0, T,
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, ktab, vtab, out, OROW, nullptr, BASE, 0, T,
                              NKV * GQA, NKV, HD, 1.0f / sqrtf((float)HD), 0);
         CUDA_CHECK(cudaDeviceSynchronize());
     };
@@ -442,7 +458,9 @@ static void test_kv_fp8_store() {
     CUDA_CHECK(cudaMalloc(&d_vc, (size_t)T * ROW));
     CUDA_CHECK(cudaMemcpy(d_k, kf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, vf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
-    q27k::kv_store_T(d_k, d_v, d_kc, d_vc, 0, ROW, T, 0, true);
+    void* const* ktab = mk_tab(d_kc, ROW, T);
+    void* const* vtab = mk_tab(d_vc, ROW, T);
+    q27k::kv_store_T(d_k, d_v, ktab, vtab, 0, ROW, T, 0, true);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<uint8_t> kc((size_t)T * ROW), vc((size_t)T * ROW);
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size(), cudaMemcpyDeviceToHost));
@@ -458,7 +476,7 @@ static void test_kv_fp8_store() {
     int* d_pos;
     CUDA_CHECK(cudaMalloc(&d_pos, 4));
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
-    q27k::kv_store(d_k, d_v, d_kc, d_vc, d_pos, ROW, 0, true);
+    q27k::kv_store(d_k, d_v, ktab, vtab, d_pos, ROW, 0, true);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size(), cudaMemcpyDeviceToHost));
     bad = 0;
@@ -749,6 +767,10 @@ static void test_attn_fp8() {
     CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_kh, kh.data(), kh.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vh, vh.data(), vh.size() * 2, cudaMemcpyHostToDevice));
+    void* const* k8tab = mk_tab(d_k8, ROW, SEQ);
+    void* const* v8tab = mk_tab(d_v8, ROW, SEQ);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, SEQ);
+    void* const* vhtab = mk_tab(d_vh, (size_t)ROW * 2, SEQ);
 
     std::vector<float> oa((size_t)T * OROW), ob((size_t)T * OROW);
     auto maxd = [&]() {
@@ -767,9 +789,9 @@ static void test_attn_fp8() {
     setenv("Q27_PF_FP8MMA", "0", 1);
     for (const char* mode : {"lite", "mma"}) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, k8tab, v8tab, d_oa, OROW, nullptr, BASE, 0, T,
                              NKV * GQA, NKV, HD, scale, 0, true);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, khtab, vhtab, d_ob, OROW, nullptr, BASE, 0, T,
                              NKV * GQA, NKV, HD, scale, 0, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         char label[80];
@@ -782,9 +804,9 @@ static void test_attn_fp8() {
     // bug produces O(1)+ garbage, so 0.1 separates cleanly).
     setenv("Q27_PF_FP8MMA", "1", 1);
     setenv("Q27_ATTN_PF", "mma", 1);
-    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, k8tab, v8tab, d_oa, OROW, nullptr, BASE, 0, T,
                          NKV * GQA, NKV, HD, scale, 0, true);
-    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, khtab, vhtab, d_ob, OROW, nullptr, BASE, 0, T,
                          NKV * GQA, NKV, HD, scale, 0, false);
     CUDA_CHECK(cudaDeviceSynchronize());
     check("fp8q attn prefill vs fp16(deq) (tol)", maxd(), 1e-1);
@@ -797,9 +819,9 @@ static void test_attn_fp8() {
     CUDA_CHECK(cudaMalloc(&d_pos, 4));
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&d_scr, (size_t)NKV * GQA * q27k::FD_MAXNS * q27k::FD_ST * 4));
-    q27k::attn_decode(d_q, 2 * HD, d_k8, d_v8, d_oa, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
+    q27k::attn_decode(d_q, 2 * HD, k8tab, v8tab, d_oa, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
                       scale, 0, true);
-    q27k::attn_decode(d_q, 2 * HD, d_kh, d_vh, d_ob, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
+    q27k::attn_decode(d_q, 2 * HD, khtab, vhtab, d_ob, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
                       scale, 0, false);
     CUDA_CHECK(cudaDeviceSynchronize());
     oa.resize(OROW); ob.resize(OROW);
@@ -844,6 +866,10 @@ static void test_attn_fd2() {
     CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_kh, kh.data(), kh.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vh, vh.data(), vh.size() * 2, cudaMemcpyHostToDevice));
+    void* const* k8tab = mk_tab(d_k8, ROW, SEQMAX);
+    void* const* v8tab = mk_tab(d_v8, ROW, SEQMAX);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, SEQMAX);
+    void* const* vhtab = mk_tab(d_vh, (size_t)ROW * 2, SEQMAX);
     for (int t = 0; t < 5; t++) {
         CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)QROW * 4));
         CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
@@ -902,8 +928,8 @@ static void test_attn_fd2() {
     };
     const float scale = 1.0f / sqrtf((float)HD);
     for (bool fp8 : {true, false}) {
-        const void* kc = fp8 ? (void*)d_k8 : (void*)d_kh;
-        const void* vc = fp8 ? (void*)d_v8 : (void*)d_vh;
+        const void* const* kc = fp8 ? k8tab : khtab;
+        const void* const* vc = fp8 ? v8tab : vhtab;
         for (int seq : {1, 47, 1024, 16384, SEQMAX}) {
             for (int ntok : {1, 5}) {
                 q27k::CP3 q{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}};
@@ -993,11 +1019,11 @@ static void test_attn_fd2() {
             auto run = [&] {
                 if (v1) {
                     setenv("Q27_FD", "v1", 1);
-                    q27k::attn_decode3(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX, NH,
+                    q27k::attn_decode3(q, 2 * HD, k8tab, v8tab, va, d_scr, P, SEQMAX, NH,
                                        NKV, HD, scale, 0, 1, true);
                     unsetenv("Q27_FD");
                 } else {
-                    q27k::attn_decode3_fd2(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX,
+                    q27k::attn_decode3_fd2(q, 2 * HD, k8tab, v8tab, va, d_scr, P, SEQMAX,
                                            NH, NKV, HD, scale, 0, 1, true);
                 }
             };
@@ -1149,7 +1175,9 @@ static void test_kv_turbo3_store() {
     CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
-    q27k::kv_store_t3(kp, vp, d_kc, d_vc, pp, NKV, HD, 0, T, KV_T3);
+    void* const* kctab = mk_tab(d_kc, (size_t)BPR * sizeof(block_turbo3), CAP);
+    void* const* vctab = mk_tab(d_vc, (size_t)BPR * sizeof(block_turbo3), CAP);
+    q27k::kv_store_t3(kp, vp, kctab, vctab, pp, NKV, HD, 0, T, KV_T3);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
@@ -1195,7 +1223,8 @@ static void test_kv_turbo3_store() {
     __half* d_kh;
     CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
     CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
-    q27k::kv_store_t3(kp, vp, d_kh, d_vc, pp, NKV, HD, 0, T, KV_T3V);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, CAP);
+    q27k::kv_store_t3(kp, vp, khtab, vctab, pp, NKV, HD, 0, T, KV_T3V);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<__half> kh((size_t)CAP * ROW);
     CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
@@ -1218,7 +1247,8 @@ static void test_kv_turbo3_store() {
     block_turbo5* d_k5;
     CUDA_CHECK(cudaMalloc(&d_k5, (size_t)CAP * BPR * sizeof(block_turbo5)));
     CUDA_CHECK(cudaMemset(d_k5, 0, (size_t)CAP * BPR * sizeof(block_turbo5)));
-    q27k::kv_store_t3(kp, vp, d_k5, d_vc, pp, NKV, HD, 0, T, KV_T5K);
+    void* const* k5tab = mk_tab(d_k5, (size_t)BPR * sizeof(block_turbo5), CAP);
+    q27k::kv_store_t3(kp, vp, k5tab, vctab, pp, NKV, HD, 0, T, KV_T5K);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo5> k5((size_t)CAP * BPR);
     std::vector<block_turbo3> vc3(CAP * BPR);
@@ -1371,6 +1401,11 @@ static void test_attn_fd2_turbo3() {
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_kh, khalf.data(), khalf.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vh, vhalf.data(), vhalf.size() * 2, cudaMemcpyHostToDevice));
+    void* const* kbtab = mk_tab(d_kb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* vbtab = mk_tab(d_vb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* k5tab = mk_tab(d_k5, (size_t)BPR * sizeof(block_turbo5), SEQMAX);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, SEQMAX);
+    void* const* vhtab = mk_tab(d_vh, (size_t)ROW * 2, SEQMAX);
     for (int t = 0; t < 5; t++) {
         CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)QROW * 4));
         CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
@@ -1440,9 +1475,9 @@ static void test_attn_fd2_turbo3() {
     std::vector<float> ref(OROW), got(OROW), gfp(OROW);
     char label[96];
     for (int kvk : {KV_T3, KV_T3V, KV_T5K}) {
-        const void* kc = kvk == KV_T3    ? (const void*)d_kb
-                         : kvk == KV_T5K ? (const void*)d_k5
-                                         : (const void*)d_kh;
+        const void* const* kc = kvk == KV_T3    ? kbtab
+                                : kvk == KV_T5K ? k5tab
+                                                : khtab;
         const char* kvn = kvk == KV_T3 ? "t3 " : kvk == KV_T5K ? "t5k" : "t3v";
         for (int seq : {1, 47, 1024, SEQMAX}) {
             for (int ntok : {1, 5}) {
@@ -1458,7 +1493,7 @@ static void test_attn_fd2_turbo3() {
                                           cudaMemcpyDeviceToDevice));
                 }
                 if (kv_k_rotated(kvk)) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
-                q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
+                q27k::attn_decode3_fd2(qr, 2 * HD, kc, vbtab, va, d_scr, P, SEQMAX, NH, NKV,
                                        HD, scale, 0, ntok, kvk);
                 q27k::wht3(va, NH, HD, HD, true, 0, ntok);
                 CUDA_CHECK(cudaDeviceSynchronize());
@@ -1487,7 +1522,7 @@ static void test_attn_fd2_turbo3() {
                 }
                 // quality floor vs fp16-cache attention on the same raw K/V
                 q27k::attn_decode3_fd2(
-                    q27k::CP3{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}}, 2 * HD, d_kh, d_vh,
+                    q27k::CP3{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}}, 2 * HD, khtab, vhtab,
                     vb2, d_scr, P, SEQMAX, NH, NKV, HD, scale, 0, ntok, KV_F16);
                 CUDA_CHECK(cudaDeviceSynchronize());
                 double cmin = 1.0;
@@ -1517,7 +1552,7 @@ static void test_attn_fd2_turbo3() {
                     CUDA_CHECK(cudaMemcpy(d_qr[t], d_q[t], (size_t)QROW * 4,
                                           cudaMemcpyDeviceToDevice));
                 if (kv_k_rotated(kvk)) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
-                q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV,
+                q27k::attn_decode3_fd2(qr, 2 * HD, kc, vbtab, vb2, d_scr, P, SEQMAX, NH, NKV,
                                        HD, scale, 0, ntok, kvk);
                 q27k::wht3(vb2, NH, HD, HD, true, 0, ntok);
                 CUDA_CHECK(cudaDeviceSynchronize());
@@ -1605,6 +1640,11 @@ static void test_attn_fdmma_turbo3() {
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vb, vb.data(), vb.size() * sizeof(block_turbo3),
                           cudaMemcpyHostToDevice));
+    void* const* kbtab = mk_tab(d_kb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* vbtab = mk_tab(d_vb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* k5tab = mk_tab(d_k5, (size_t)BPR * sizeof(block_turbo5), SEQMAX);
+    void* const* k8tab = mk_tab(d_k8, ROW, SEQMAX);
+    void* const* v8tab = mk_tab(d_v8, ROW, SEQMAX);
     for (int t = 0; t < NT; t++) {
         CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
         CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
@@ -1619,7 +1659,7 @@ static void test_attn_fdmma_turbo3() {
     // see attn_decode3). turbo5k's mma path is H16, covered by
     // test_attn_fdmma_h16; its ntok>8 fallthrough is gated at the end here.
     for (int tk : {KV_T3}) {
-      const void* kc = (const void*)d_kb;
+      const void* const* kc = kbtab;
       const char* tn = "t3 ";
       const double floor_mult = 2.5;
       for (int ntok : {5, 12}) {
@@ -1643,11 +1683,11 @@ static void test_attn_fdmma_turbo3() {
             // A: fd2-t3 reference (post-attention inverse-WHT skipped on both
             // legs -- comparing pre-rotation outputs is equivalent and avoids
             // touching the buffers twice)
-            q27k::attn_decode3_fd2(q, 2 * HD, kc, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
+            q27k::attn_decode3_fd2(q, 2 * HD, kc, vbtab, va, d_scr, P, SEQMAX, NH, NKV,
                                    HD, scale, 0, ntok, tk);
             // control: no Q27_FD -> dispatch must fall through to fd2 BITWISE
             unsetenv("Q27_FD");
-            q27k::attn_decode3(q, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+            q27k::attn_decode3(q, 2 * HD, kc, vbtab, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
                                scale, 0, ntok, tk);
             CUDA_CHECK(cudaDeviceSynchronize());
             double ctrl = 0;
@@ -1666,7 +1706,7 @@ static void test_attn_fdmma_turbo3() {
             check(label, ctrl, 1e-30);
             // B: Q27_FD=mma -> the turbo3 fdmma leg
             setenv("Q27_FD", "mma", 1);
-            q27k::attn_decode3(q, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+            q27k::attn_decode3(q, 2 * HD, kc, vbtab, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
                                scale, 0, ntok, tk);
             CUDA_CHECK(cudaDeviceSynchronize());
             unsetenv("Q27_FD");
@@ -1695,10 +1735,10 @@ static void test_attn_fdmma_turbo3() {
             for (int t = 0; t < ntok; t++)
                 CUDA_CHECK(cudaMemcpy(d_qr[t], qh.data() + (size_t)t * QROW,
                                       (size_t)QROW * 4, cudaMemcpyHostToDevice));
-            q27k::attn_decode3_fd2(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX, NH, NKV,
+            q27k::attn_decode3_fd2(q, 2 * HD, k8tab, v8tab, va, d_scr, P, SEQMAX, NH, NKV,
                                    HD, scale, 0, ntok, KV_FP8);
             setenv("Q27_FD", "mma", 1);
-            q27k::attn_decode3(q, 2 * HD, d_k8, d_v8, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+            q27k::attn_decode3(q, 2 * HD, k8tab, v8tab, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
                                scale, 0, ntok, KV_FP8);
             CUDA_CHECK(cudaDeviceSynchronize());
             unsetenv("Q27_FD");
@@ -1742,10 +1782,10 @@ static void test_attn_fdmma_turbo3() {
             va.p[t] = d_oa[t]; vb2.p[t] = d_ob[t]; P.p[t] = d_pos[t];
         }
         q27k::wht3(qw, NH, HD, 2 * HD, false, 0, ntok);
-        q27k::attn_decode3_fd2(q, 2 * HD, d_k5, d_vb, va, d_scr, P, SEQMAX, NH, NKV, HD,
+        q27k::attn_decode3_fd2(q, 2 * HD, k5tab, vbtab, va, d_scr, P, SEQMAX, NH, NKV, HD,
                                scale, 0, ntok, KV_T5K);
         setenv("Q27_FD", "mma", 1);
-        q27k::attn_decode3(q, 2 * HD, d_k5, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD, scale,
+        q27k::attn_decode3(q, 2 * HD, k5tab, vbtab, vb2, d_scr, P, SEQMAX, NH, NKV, HD, scale,
                            0, ntok, KV_T5K);
         CUDA_CHECK(cudaDeviceSynchronize());
         unsetenv("Q27_FD");
@@ -1827,6 +1867,13 @@ static void test_attn_fdmma_h16() {
     CUDA_CHECK(cudaMalloc(&d_k5, k5b.size() * sizeof(block_turbo5)));
     CUDA_CHECK(cudaMemcpy(d_k5, k5b.data(), k5b.size() * sizeof(block_turbo5),
                           cudaMemcpyHostToDevice));
+    void* const* kbtab = mk_tab(d_kb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* vbtab = mk_tab(d_vb, (size_t)BPR * sizeof(block_turbo3), SEQMAX);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, SEQMAX);
+    void* const* vhtab = mk_tab(d_vh, (size_t)ROW * 2, SEQMAX);
+    void* const* k8tab = mk_tab(d_k8, ROW, SEQMAX);
+    void* const* v8tab = mk_tab(d_v8, ROW, SEQMAX);
+    void* const* k5tab = mk_tab(d_k5, (size_t)BPR * sizeof(block_turbo5), SEQMAX);
     for (int t = 0; t < NT; t++) {
         CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
         CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
@@ -1842,11 +1889,11 @@ static void test_attn_fdmma_h16() {
     CUDA_CHECK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
     const int arch = mj * 10 + mn;
-    struct Leg { const char* name; int kvk; const void *kc, *vc; bool rot; };
-    Leg legs[4] = {{"f16", KV_F16, d_kh, d_vh, false},
-                   {"fp8", KV_FP8, d_k8, d_v8, false},
-                   {"t3 ", KV_T3, d_kb, d_vb, true},
-                   {"t5k", KV_T5K, d_k5, d_vb, true}};
+    struct Leg { const char* name; int kvk; const void* const* kc; const void* const* vc; bool rot; };
+    Leg legs[4] = {{"f16", KV_F16, khtab, vhtab, false},
+                   {"fp8", KV_FP8, k8tab, v8tab, false},
+                   {"t3 ", KV_T3, kbtab, vbtab, true},
+                   {"t5k", KV_T5K, k5tab, vbtab, true}};
     for (const Leg& L : legs) {
         // on sm_89+ fp8/turbo3/turbo5k route to the e4m3 kernel (already gated
         // elsewhere) -- only the fp16 leg exercises H16 there. On sm_80..88 --
@@ -1931,7 +1978,9 @@ static void test_kv_turbo3_store_T() {
     CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
     CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
-    q27k::kv_store_T_t3(d_kT, d_vT, d_kc, d_vc, BASE, NKV, HD, T, 0, KV_T3);
+    void* const* kctab = mk_tab(d_kc, (size_t)BPR * sizeof(block_turbo3), CAP);
+    void* const* vctab = mk_tab(d_vc, (size_t)BPR * sizeof(block_turbo3), CAP);
+    q27k::kv_store_T_t3(d_kT, d_vT, kctab, vctab, BASE, NKV, HD, T, 0, KV_T3);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
     CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
@@ -1966,7 +2015,8 @@ static void test_kv_turbo3_store_T() {
     __half* d_kh;
     CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
     CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
-    q27k::kv_store_T_t3(d_kT, d_vT, d_kh, d_vc, BASE, NKV, HD, T, 0, KV_T3V);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, CAP);
+    q27k::kv_store_T_t3(d_kT, d_vT, khtab, vctab, BASE, NKV, HD, T, 0, KV_T3V);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<__half> kh((size_t)CAP * ROW);
     CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
@@ -1983,7 +2033,8 @@ static void test_kv_turbo3_store_T() {
     block_turbo5* d_k5T;
     CUDA_CHECK(cudaMalloc(&d_k5T, (size_t)CAP * BPR * sizeof(block_turbo5)));
     CUDA_CHECK(cudaMemset(d_k5T, 0, (size_t)CAP * BPR * sizeof(block_turbo5)));
-    q27k::kv_store_T_t3(d_kT, d_vT, d_k5T, d_vc, BASE, NKV, HD, T, 0, KV_T5K);
+    void* const* k5Ttab = mk_tab(d_k5T, (size_t)BPR * sizeof(block_turbo5), CAP);
+    q27k::kv_store_T_t3(d_kT, d_vT, k5Ttab, vctab, BASE, NKV, HD, T, 0, KV_T5K);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<block_turbo5> k5T((size_t)CAP * BPR);
     CUDA_CHECK(cudaMemcpy(k5T.data(), d_k5T, k5T.size() * sizeof(block_turbo5),
@@ -2053,6 +2104,10 @@ static void test_attn_prefill_turbo3() {
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_kh, khalf.data(), khalf.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
+    void* const* kbtab = mk_tab(d_kb, (size_t)BPR * sizeof(block_turbo3), CAP);
+    void* const* vbtab = mk_tab(d_vb, (size_t)BPR * sizeof(block_turbo3), CAP);
+    void* const* k5tab = mk_tab(d_k5, (size_t)BPR * sizeof(block_turbo5), CAP);
+    void* const* khtab = mk_tab(d_kh, (size_t)ROW * 2, CAP);
     const float scale = 1.0f / sqrtf((float)HD);
     std::vector<float> ref(OROW), got((size_t)T * OROW);
     auto href = [&](int t, int rk, std::vector<float>& out) {
@@ -2115,10 +2170,10 @@ static void test_attn_prefill_turbo3() {
         if (L.lite) setenv("Q27_ATTN_PF", "lite", 1);
         CUDA_CHECK(cudaMemcpy(d_qr, d_q, (size_t)T * QROW * 4, cudaMemcpyDeviceToDevice));
         if (kv_k_rotated(L.kvk)) q27k::wht_T(d_qr, NH, HD, 2 * HD, QROW, T, false, 0);
-        const void* kc = L.kvk == KV_T3    ? (const void*)d_kb
-                         : L.kvk == KV_T5K ? (const void*)d_k5
-                                           : (const void*)d_kh;
-        q27k::attn_prefill_T(d_qr, 2 * HD, QROW, kc, d_vb, d_out, OROW, nullptr, BASE, 0, T,
+        const void* const* kc = L.kvk == KV_T3    ? kbtab
+                                : L.kvk == KV_T5K ? k5tab
+                                                  : khtab;
+        q27k::attn_prefill_T(d_qr, 2 * HD, QROW, kc, vbtab, d_out, OROW, nullptr, BASE, 0, T,
                              NH, NKV, HD, scale, 0, L.kvk);
         q27k::wht_T(d_out, NH, HD, HD, OROW, T, true, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -2170,13 +2225,15 @@ static void test_attn_split() {
     CUDA_CHECK(cudaMemcpy(d_k, kvhalf.data(), (size_t)SEQ * ROW * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, kvhalf.data() + (size_t)SEQ * ROW, (size_t)SEQ * ROW * 2,
                           cudaMemcpyHostToDevice));
+    void* const* ktab = mk_tab(d_k, (size_t)ROW * 2, SEQ);
+    void* const* vtab = mk_tab(d_v, (size_t)ROW * 2, SEQ);
     const float scale = 1.0f / sqrtf((float)HD);
     // forced 5-way split (odd count exercises empty tail slices) vs no split
     setenv("Q27_PF_SPLIT", "5", 1);
-    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, d_oa, OROW, d_part, BASE, 0, T,
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, ktab, vtab, d_oa, OROW, d_part, BASE, 0, T,
                          NKV * GQA, NKV, HD, scale, 0);
     setenv("Q27_PF_SPLIT", "1", 1);
-    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, d_ob, OROW, d_part, BASE, 0, T,
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, ktab, vtab, d_ob, OROW, d_part, BASE, 0, T,
                          NKV * GQA, NKV, HD, scale, 0);
     unsetenv("Q27_PF_SPLIT");
     CUDA_CHECK(cudaDeviceSynchronize());

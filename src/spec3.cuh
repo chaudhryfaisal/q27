@@ -69,8 +69,12 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
            cudaStream_t st = 0, int ntok = 3);
 
 // KV store for ntok tokens (disjoint slots). fp8: E4M3 cache elements (P2).
-void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st = 0,
-               int ntok = 3, bool fp8 = false);
+// M2a: caches are reached through per-pair 64-row block tables (ktab/vtab =
+// the pair's table slice, entries = page bases; identity-mapped over the
+// per-layer allocs until the M2b pool). Addressing-only vs the raw-pointer
+// form -- same bytes, same fp order.
+void kv_store3(CP3 k, CP3 v, void* const* ktab, void* const* vtab, IP3 pos, int rowlen,
+               cudaStream_t st = 0, int ntok = 3, bool fp8 = false);
 
 // turbo KV store (Q27_KV=turbo3|turbo3v|turbo5k; formats src/turbo3.cuh and
 // src/turbo5.cuh, port spec docs/plans/2026-07-11-turbo3-kv-port-spec.md,
@@ -80,8 +84,8 @@ void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream
 // V is turbo3 (50 B/block) for every kind; kvk picks the K leg -- KV_T3
 // turbo3, KV_T3V plain fp16 rows, KV_T5K turbo5 (82 B/block). K must already
 // be rope'd.
-void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,
-                 cudaStream_t st = 0, int ntok = 3, int kvk = KV_T3);
+void kv_store_t3(CP3 k, CP3 v, void* const* ktab, void* const* vtab, IP3 pos, int n_kv_heads,
+                 int head_dim, cudaStream_t st = 0, int ntok = 3, int kvk = KV_T3);
 
 // Per-128-group Walsh-Hadamard rotate, in place, ntok tokens: forward on Q
 // after rope (inv=false), inverse on attention output after the combine
@@ -114,14 +118,15 @@ static constexpr int FD_ST = 258;   // per-partial stride: m, l, acc[256]
 // Only KV_T3 has an mma leg; KV_T3V and KV_T5K are returned to fd2 by an
 // explicit guard at the top of attn_decode3, because the mma/H16/v1 tails
 // would otherwise read them at the WRONG format rather than erroring.
-void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
-                  IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st = 0, int ntok = 3, int kvk = KV_F16);
+void attn_decode3(CP3 q, int q_stride, const void* const* ktab, const void* const* vtab,
+                  P3 out, float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
+                  int head_dim, float scale, cudaStream_t st = 0, int ntok = 3,
+                  int kvk = KV_F16);
 // explicit fd2 entry point (unit gate compares this against Q27_FD=v1)
-void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
-                      float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
-                      int head_dim, float scale, cudaStream_t st = 0, int ntok = 3,
-                      int kvk = KV_F16);
+void attn_decode3_fd2(CP3 q, int q_stride, const void* const* ktab, const void* const* vtab,
+                      P3 out, float* scratch, IP3 pos, int max_ctx, int n_q_heads,
+                      int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0,
+                      int ntok = 3, int kvk = KV_F16);
 
 // embedding row lookup for ntok device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,

@@ -1213,24 +1213,25 @@ void conv_ring_update(float* ring, const float* qkvT, int channels, int T, cudaS
 
 template <typename CT>
 __global__ void k_kv_store_T(const float* __restrict__ kT, const float* __restrict__ vT,
-                             CT* __restrict__ kc, CT* __restrict__ vc, int base_pos,
-                             int rowlen) {
+                             void* const* __restrict__ ktab, void* const* __restrict__ vtab,
+                             int base_pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
-    size_t off = (size_t)(base_pos + t) * rowlen + i;
-    kv_set(kc[off], kT[(size_t)t * rowlen + i]);
-    kv_set(vc[off], vT[(size_t)t * rowlen + i]);
+    // M2a: row via the pair's block table (addressing-only; same bytes).
+    const int p = base_pos + t;
+    kv_set(kv_row<CT>(ktab, p, rowlen)[i], kT[(size_t)t * rowlen + i]);
+    kv_set(kv_row<CT>(vtab, p, rowlen)[i], vT[(size_t)t * rowlen + i]);
 }
 
-void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                int rowlen, int T, cudaStream_t st, bool fp8) {
+void kv_store_T(const float* kT, const float* vT, void* const* ktab, void* const* vtab,
+                int base_pos, int rowlen, int T, cudaStream_t st, bool fp8) {
     dim3 grid((rowlen + 255) / 256, T);
     if (fp8)
-        k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, (__nv_fp8_e4m3*)kc, (__nv_fp8_e4m3*)vc,
-                                           base_pos, rowlen);
+        k_kv_store_T<__nv_fp8_e4m3><<<grid, 256, 0, st>>>(kT, vT, ktab, vtab, base_pos,
+                                                          rowlen);
     else
-        k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, (__half*)kc, (__half*)vc, base_pos, rowlen);
+        k_kv_store_T<__half><<<grid, 256, 0, st>>>(kT, vT, ktab, vtab, base_pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1321,7 +1322,8 @@ constexpr int PF_PART_STRIDE = 258; // m, l, O[256]
 template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
-                   const CT* __restrict__ kc, const CT* __restrict__ vc,
+                   const void* const* __restrict__ ktab,
+                   const void* const* __restrict__ vtab,
                    float* __restrict__ outT, int out_row, float* __restrict__ part,
                    int base_pos, int tile_t0, int T, int n_kv_heads, int head_dim,
                    float scale, int cp_async) {
@@ -1388,12 +1390,16 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
     // zero-fills tail positions past p_hi (fp8 0x00 -> kv2h -> 0.0, matching the
     // blocking path's explicit zero).
     if (cpa) {
+        // M2a: PP=32-aligned tiles never cross a 64-row page -- one table
+        // lookup per tile, then in-page row addressing (addressing-only).
+        const CT* kpg = (const CT*)ktab[p_lo >> KV_PAGE_SHIFT];
+        const CT* vpg = (const CT*)vtab[p_lo >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
             int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
             int gpos = p_lo + pp;
-            size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-            cpasync16(s_kraw + pp * HD + d16, &kc[off], gpos < p_hi ? 16 : 0);
-            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+            size_t off = ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * HD + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
         }
         cpasync_commit();
     }
@@ -1421,50 +1427,59 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
             // prefetch the NEXT tile -- overlaps the QK^T/PV MMAs below (hides
             // the K/V load latency that dominates the deep-context stall)
             if (p0 + PP < p_hi) {
+                const CT* kpg = (const CT*)ktab[(p0 + PP) >> KV_PAGE_SHIFT];
+                const CT* vpg = (const CT*)vtab[(p0 + PP) >> KV_PAGE_SHIFT];
                 for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
                     int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
                     int gpos = p0 + PP + pp;
-                    size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                    cpasync16(s_kraw + pp * HD + d16, &kc[off], gpos < p_hi ? 16 : 0);
-                    cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+                    size_t off =
+                        ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(s_kraw + pp * HD + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+                    cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
                 }
                 cpasync_commit();
             }
         } else {
             __syncthreads();
             // vectorized staging: 8 KV elements per load (uint2 for fp8, uint4
-            // for fp16), same converted bits as the old elementwise path
+            // for fp16), same converted bits as the old elementwise path.
+            // M2a: one page lookup per PP-aligned tile (addressing-only).
+            const void* kpg = ktab[p0 >> KV_PAGE_SHIFT];
+            const void* vpg = vtab[p0 >> KV_PAGE_SHIFT];
             for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
                 int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
                 bool ok = pp < np;
-                size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+                const int gp = (p0 + pp) & KV_PAGE_MASK;
+                size_t off = ((size_t)gp * n_kv_heads + kvh) * head_dim + d8;
                 __half2* kd = (__half2*)(s_k + pp * LDH + d8);
                 __half2* vd = (__half2*)(s_v + pp * LDH + d8);
                 if (ok) {
                     if constexpr (KFMT != PF_K_CT || VT3) {
-                        size_t rb = ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2;
+                        size_t rb = ((size_t)gp * n_kv_heads + kvh) * 2;
                         if constexpr (KFMT == PF_K_T3)
                             q27turbo::turbo3_stage8_h2(
-                                (const q27turbo::block_turbo3*)kc + rb, d8, kd);
+                                (const q27turbo::block_turbo3*)kpg + rb, d8, kd);
                         else if constexpr (KFMT == PF_K_T5)
                             q27turbo::turbo5_stage8_h2(
-                                (const q27turbo::block_turbo5*)kc + rb, d8, kd);
+                                (const q27turbo::block_turbo5*)kpg + rb, d8, kd);
                         else if constexpr (KFMT == PF_K_I8)
                             q27turbo::i8g64_stage8_h2(
-                                (const q27turbo::block_i8g64*)kc + rb, d8, kd);
+                                (const q27turbo::block_i8g64*)kpg + rb, d8, kd);
                         else {
-                            const __half* kr = (const __half*)kc + off;
+                            const __half* kr = (const __half*)kpg + off;
                             #pragma unroll
                             for (int j = 0; j < 4; j++)
                                 kd[j] = __halves2half2(kr[2 * j], kr[2 * j + 1]);
                         }
                         if constexpr (VT3)
                             q27turbo::turbo3_stage8_h2(
-                                (const q27turbo::block_turbo3*)vc + rb, d8, vd);
+                                (const q27turbo::block_turbo3*)vpg + rb, d8, vd);
                     } else {
+                        const CT* kcp = (const CT*)kpg;
+                        const CT* vcp = (const CT*)vpg;
                         CT kraw[8], vraw[8];
                         #pragma unroll
-                        for (int j = 0; j < 8; j++) { kraw[j] = kc[off + j]; vraw[j] = vc[off + j]; }
+                        for (int j = 0; j < 8; j++) { kraw[j] = kcp[off + j]; vraw[j] = vcp[off + j]; }
                         #pragma unroll
                         for (int j = 0; j < 4; j++) {
                             kd[j] = __halves2half2(kv2h(kraw[2 * j]), kv2h(kraw[2 * j + 1]));
@@ -1633,8 +1648,8 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
 // change (Q-cast + fp8 accumulate), tolerance-gated. fp8 KV only. ~66KB smem.
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
-                        const __nv_fp8_e4m3* __restrict__ kc,
-                        const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ outT,
+                        const void* const* __restrict__ ktab,
+                        const void* const* __restrict__ vtab, float* __restrict__ outT,
                         int out_row, float* __restrict__ part, int base_pos, int tile_t0, int T,
                         int n_kv_heads, int head_dim, float scale, int cp_async) {
     // LDQ/LDK pad s_q/s_kraw so the fp8 QK^T uint32 reads don't 8-way bank-conflict
@@ -1697,13 +1712,16 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
 
     int cur = 0;
     if (cpa) {
-        // prologue: prefetch tile p_lo K into s_kraw[0], V into s_vraw
+        // prologue: prefetch tile p_lo K into s_kraw[0], V into s_vraw.
+        // M2a: one page lookup per PP-aligned tile (addressing-only).
+        const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p_lo >> KV_PAGE_SHIFT];
+        const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p_lo >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
             int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
             int gpos = p_lo + pp;
-            size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-            cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
-            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+            size_t off = ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * LDK + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
         }
         cpasync_commit();
     }
@@ -1736,30 +1754,40 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
             // overlaps the QK^T/PV MMAs; kbuf (s_kraw[cur]) is untouched
             if (p0 + PP < p_hi) {
                 __nv_fp8_e4m3* knext = s_kraw + (1 - cur) * PP * LDK;
+                const __nv_fp8_e4m3* kpg =
+                    (const __nv_fp8_e4m3*)ktab[(p0 + PP) >> KV_PAGE_SHIFT];
+                const __nv_fp8_e4m3* vpg =
+                    (const __nv_fp8_e4m3*)vtab[(p0 + PP) >> KV_PAGE_SHIFT];
                 for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
                     int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
                     int gpos = p0 + PP + pp;
-                    size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                    cpasync16(knext + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
-                    cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+                    size_t off =
+                        ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(knext + pp * LDK + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+                    cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
                 }
                 cpasync_commit();
             }
         } else {
             __syncthreads();
-            // blocking: load K raw into kbuf (=s_kraw[0]); convert V -> s_v
+            // blocking: load K raw into kbuf (=s_kraw[0]); convert V -> s_v.
+            // M2a: one page lookup per PP-aligned tile (addressing-only).
+            const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p0 >> KV_PAGE_SHIFT];
+            const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p0 >> KV_PAGE_SHIFT];
             for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
                 int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
                 bool ok = pp < np;
-                size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+                size_t off =
+                    ((size_t)((p0 + pp) & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d8;
                 __half2* vd = (__half2*)(s_v + pp * LDH + d8);
                 __nv_fp8_e4m3* kd = kbuf + pp * LDK + d8;
                 if (ok) {
                     #pragma unroll
-                    for (int j = 0; j < 8; j++) kd[j] = kc[off + j];
+                    for (int j = 0; j < 8; j++) kd[j] = kpg[off + j];
                     #pragma unroll
                     for (int j = 0; j < 4; j++)
-                        vd[j] = __halves2half2(kv2h(vc[off + 2 * j]), kv2h(vc[off + 2 * j + 1]));
+                        vd[j] = __halves2half2(kv2h(vpg[off + 2 * j]),
+                                               kv2h(vpg[off + 2 * j + 1]));
                 } else {
                     #pragma unroll
                     for (int j = 0; j < 8; j++) kd[j] = __nv_fp8_e4m3(0.f);
@@ -1935,8 +1963,8 @@ k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
 // through s_P into A-frag layout (tools/pv8_mma_test.cu validated bitwise).
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
-                        const __nv_fp8_e4m3* __restrict__ kc,
-                        const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ outT,
+                        const void* const* __restrict__ ktab,
+                        const void* const* __restrict__ vtab, float* __restrict__ outT,
                         int out_row, float* __restrict__ part, int base_pos, int tile_t0, int T,
                         int n_kv_heads, int head_dim, float scale, int cp_async) {
     // LDQ/LDK pad s_q/s_kraw so the fp8 QK^T uint32 reads don't 8-way bank-conflict
@@ -2000,13 +2028,16 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
 
     int cur = 0;
     if (cpa) {
-        // prologue: prefetch tile p_lo K into s_kraw[0], V into s_vraw
+        // prologue: prefetch tile p_lo K into s_kraw[0], V into s_vraw.
+        // M2a: one page lookup per PP-aligned tile (addressing-only).
+        const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p_lo >> KV_PAGE_SHIFT];
+        const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p_lo >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
             int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
             int gpos = p_lo + pp;
-            size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-            cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
-            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+            size_t off = ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * LDK + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
         }
         cpasync_commit();
     }
@@ -2029,28 +2060,37 @@ k_attn_prefill_mma_pv8(const float* __restrict__ qT, int q_stride, int q_row,
             if (p0 + PP < p_hi) {
                 __nv_fp8_e4m3* knext = s_kraw + (1 - cur) * PP * LDK;
                 __nv_fp8_e4m3* vnext = s_vraw + (1 - cur) * PP * HD;
+                const __nv_fp8_e4m3* kpg =
+                    (const __nv_fp8_e4m3*)ktab[(p0 + PP) >> KV_PAGE_SHIFT];
+                const __nv_fp8_e4m3* vpg =
+                    (const __nv_fp8_e4m3*)vtab[(p0 + PP) >> KV_PAGE_SHIFT];
                 for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
                     int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
                     int gpos = p0 + PP + pp;
-                    size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                    cpasync16(knext + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
-                    cpasync16(vnext + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+                    size_t off =
+                        ((size_t)(gpos & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(knext + pp * LDK + d16, &kpg[off], gpos < p_hi ? 16 : 0);
+                    cpasync16(vnext + pp * HD + d16, &vpg[off], gpos < p_hi ? 16 : 0);
                 }
                 cpasync_commit();
             }
         } else {
             __syncthreads();
-            // blocking: load K raw into kbuf (=s_kraw[0]); convert V -> s_v
+            // blocking: load K raw into kbuf (=s_kraw[0]); convert V -> s_v.
+            // M2a: one page lookup per PP-aligned tile (addressing-only).
+            const __nv_fp8_e4m3* kpg = (const __nv_fp8_e4m3*)ktab[p0 >> KV_PAGE_SHIFT];
+            const __nv_fp8_e4m3* vpg = (const __nv_fp8_e4m3*)vtab[p0 >> KV_PAGE_SHIFT];
             for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
                 int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
                 bool ok = pp < np;
-                size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+                size_t off =
+                    ((size_t)((p0 + pp) & KV_PAGE_MASK) * n_kv_heads + kvh) * head_dim + d8;
                 __nv_fp8_e4m3* vd = vbuf + pp * HD + d8;
                 __nv_fp8_e4m3* kd = kbuf + pp * LDK + d8;
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    kd[j] = ok ? kc[off + j] : __nv_fp8_e4m3(0.f);
-                    vd[j] = ok ? vc[off + j] : __nv_fp8_e4m3(0.f);
+                    kd[j] = ok ? kpg[off + j] : __nv_fp8_e4m3(0.f);
+                    vd[j] = ok ? vpg[off + j] : __nv_fp8_e4m3(0.f);
                 }
             }
             __syncthreads();
@@ -2245,7 +2285,8 @@ __global__ void k_attn_pf_combine(const float* __restrict__ part, float* __restr
 // on identical continuations.
 template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
 __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int q_row,
-                                 const CT* __restrict__ kc, const CT* __restrict__ vc,
+                                 const void* const* __restrict__ ktab,
+                                 const void* const* __restrict__ vtab,
                                  float* __restrict__ outT, int out_row, int base_pos,
                                  int tile_t0, int T, int n_kv_heads, int gqa, int head_dim,
                                  float scale) {
@@ -2276,29 +2317,33 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
     for (int p0 = 0; p0 < tile_max; p0 += PP) {
         __syncthreads();
         const int np = min(PP, tile_max - p0);
+        // M2a: one page lookup per PP-aligned tile (addressing-only).
+        const void* kpg = ktab[p0 >> KV_PAGE_SHIFT];
+        const void* vpg = vtab[p0 >> KV_PAGE_SHIFT];
         for (int idx = threadIdx.x; idx < np * HD; idx += blockDim.x) {
             int pp = idx / HD, d = idx % HD;
-            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
+            const int gp = (p0 + pp) & KV_PAGE_MASK;
+            size_t off = ((size_t)gp * n_kv_heads + kvh) * head_dim + d;
             if constexpr (KFMT == PF_K_T3)
                 s_kv[(pp * 2) * HD + d] = q27turbo::turbo3_deq_elem(
-                    (const q27turbo::block_turbo3*)kc +
-                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+                    (const q27turbo::block_turbo3*)kpg + ((size_t)gp * n_kv_heads + kvh) * 2,
+                    d);
             else if constexpr (KFMT == PF_K_T5)
                 s_kv[(pp * 2) * HD + d] = q27turbo::turbo5_deq_elem(
-                    (const q27turbo::block_turbo5*)kc +
-                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+                    (const q27turbo::block_turbo5*)kpg + ((size_t)gp * n_kv_heads + kvh) * 2,
+                    d);
             else if constexpr (KFMT == PF_K_I8)
                 s_kv[(pp * 2) * HD + d] = q27turbo::i8g64_deq_elem(
-                    (const q27turbo::block_i8g64*)kc +
-                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+                    (const q27turbo::block_i8g64*)kpg + ((size_t)gp * n_kv_heads + kvh) * 2,
+                    d);
             else
-                s_kv[(pp * 2) * HD + d] = kv2f(((const CT*)kc)[off]);
+                s_kv[(pp * 2) * HD + d] = kv2f(((const CT*)kpg)[off]);
             if constexpr (VT3)
                 s_kv[(pp * 2 + 1) * HD + d] = q27turbo::turbo3_deq_elem(
-                    (const q27turbo::block_turbo3*)vc +
-                        ((size_t)(p0 + pp) * n_kv_heads + kvh) * 2, d);
+                    (const q27turbo::block_turbo3*)vpg + ((size_t)gp * n_kv_heads + kvh) * 2,
+                    d);
             else
-                s_kv[(pp * 2 + 1) * HD + d] = kv2f(((const CT*)vc)[off]);
+                s_kv[(pp * 2 + 1) * HD + d] = kv2f(((const CT*)vpg)[off]);
         }
         __syncthreads();
         if (!live) continue;
@@ -2336,8 +2381,9 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
 }
 
 template <typename CT, int KFMT = PF_K_CT, bool VT3 = false>
-static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const void* kc,
-                                const void* vc, float* outT, int out_row, float* part,
+static void attn_prefill_launch(const float* qT, int q_stride, int q_row,
+                                const void* const* ktab, const void* const* vtab,
+                                float* outT, int out_row, float* part,
                                 int base_pos, int t0, int SB, int n_q_heads, int n_kv_heads,
                                 int head_dim, float scale, cudaStream_t st) {
     const char* e = getenv("Q27_ATTN_PF");
@@ -2431,14 +2477,12 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
                         attrp = true;
                     }
                     k_attn_prefill_mma_pv8<<<grid, 192, SMP, st>>>(
-                        qT, q_stride, q_row, (const __nv_fp8_e4m3*)kc,
-                        (const __nv_fp8_e4m3*)vc, outT, out_row, part, base_pos, t0, t0 + SB,
-                        n_kv_heads, head_dim, scale, cpa_env);
+                        qT, q_stride, q_row, ktab, vtab, outT, out_row, part, base_pos, t0,
+                        t0 + SB, n_kv_heads, head_dim, scale, cpa_env);
                 } else {
                     k_attn_prefill_mma_fp8q<<<grid, 192, SM8, st>>>(
-                        qT, q_stride, q_row, (const __nv_fp8_e4m3*)kc,
-                        (const __nv_fp8_e4m3*)vc, outT, out_row, part, base_pos, t0, t0 + SB,
-                        n_kv_heads, head_dim, scale, cpa_env);
+                        qT, q_stride, q_row, ktab, vtab, outT, out_row, part, base_pos, t0,
+                        t0 + SB, n_kv_heads, head_dim, scale, cpa_env);
                 }
                 CUDA_CHECK(cudaGetLastError());
                 if (nsplit > 1) {
@@ -2471,7 +2515,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         const int tiles = (SB + TT - 1) / TT;
         dim3 grid(n_kv_heads, tiles, nsplit);
         k_attn_prefill_mma<CT, KFMT, VT3><<<grid, 192, SM, st>>>(
-            qT, q_stride, q_row, (const CT*)kc, (const CT*)vc, outT, out_row, part,
+            qT, q_stride, q_row, ktab, vtab, outT, out_row, part,
             base_pos, t0, t0 + SB, n_kv_heads, head_dim, scale, cpa_env);
         CUDA_CHECK(cudaGetLastError());
         if (nsplit > 1) {
@@ -2493,7 +2537,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
     int gqa = n_q_heads / n_kv_heads;
     dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
     k_attn_prefill_T<CT, KFMT, VT3><<<grid, 256, SM, st>>>(
-        qT, q_stride, q_row, (const CT*)kc, (const CT*)vc, outT, out_row, base_pos, t0,
+        qT, q_stride, q_row, ktab, vtab, outT, out_row, base_pos, t0,
         t0 + SB, n_kv_heads, gqa, head_dim, scale);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -2503,37 +2547,44 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
 // the two writers cannot drift; rotate shares turbo3_butterfly128 with k_wht3.
 // kvk picks the K leg exactly as in the decode store -- see kv_store_t3.
 __global__ void k_kv_store_T_t3(const float* __restrict__ kT, const float* __restrict__ vT,
-                                void* __restrict__ kc, void* __restrict__ vc, int base_pos,
+                                void* const* __restrict__ ktab,
+                                void* const* __restrict__ vtab, int base_pos,
                                 int n_kv_heads, int head_dim, int kvk) {
     const int t = blockIdx.z, j = threadIdx.x;
     const bool is_v = blockIdx.y == 1;
     const int h = blockIdx.x >> 1, g = blockIdx.x & 1; // head_dim==256: 2 groups/head
     const int rowlen = n_kv_heads * head_dim;
     const float* src = (is_v ? vT : kT) + (size_t)t * rowlen + (size_t)h * head_dim + g * 128;
+    // M2a: in-page block/row index via the pair's table (addressing-only).
     const int p = base_pos + t;
-    const size_t blk = (size_t)p * n_kv_heads * 2 + h * 2 + g;
+    const int bpr = n_kv_heads * 2;
+    const size_t blk = (size_t)h * 2 + g;
     __shared__ float xs[128], red[128];
     if (!is_v && kvk == KV_T3V) {
-        ((__half*)kc)[(size_t)p * rowlen + (size_t)h * head_dim + g * 128 + j] =
+        kv_row<__half>(ktab, p, rowlen)[(size_t)h * head_dim + g * 128 + j] =
             __float2half_rn(src[j]);
         return;
     }
     if (!is_v && kvk == KV_T5K) {
-        q27turbo::turbo5_quant_group(src[j], (q27turbo::block_turbo5*)kc + blk, j, xs, red);
+        q27turbo::turbo5_quant_group(src[j], kv_blk<q27turbo::block_turbo5>(ktab, p, bpr) + blk,
+                                     j, xs, red);
         return;
     }
     if (!is_v && kvk == KV_I8G64) {
-        q27turbo::i8g64_quant_group(src[j], (q27turbo::block_i8g64*)kc + blk, j, red);
+        q27turbo::i8g64_quant_group(src[j], kv_blk<q27turbo::block_i8g64>(ktab, p, bpr) + blk,
+                                    j, red);
         return;
     }
-    q27turbo::turbo3_quant_group(src[j], (q27turbo::block_turbo3*)(is_v ? vc : kc) + blk, j,
-                                 xs, red);
+    q27turbo::turbo3_quant_group(
+        src[j], kv_blk<q27turbo::block_turbo3>(is_v ? vtab : ktab, p, bpr) + blk, j, xs, red);
 }
 
-void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
-                   int n_kv_heads, int head_dim, int T, cudaStream_t st, int kvk) {
+void kv_store_T_t3(const float* kT, const float* vT, void* const* ktab, void* const* vtab,
+                   int base_pos, int n_kv_heads, int head_dim, int T, cudaStream_t st,
+                   int kvk) {
     dim3 g(n_kv_heads * (head_dim >> 7), 2, T);
-    k_kv_store_T_t3<<<g, 128, 0, st>>>(kT, vT, kc, vc, base_pos, n_kv_heads, head_dim, kvk);
+    k_kv_store_T_t3<<<g, 128, 0, st>>>(kT, vT, ktab, vtab, base_pos, n_kv_heads, head_dim,
+                                       kvk);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2559,40 +2610,40 @@ void wht_T(float* x, int n_heads, int head_dim, int head_stride, int row_stride,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, float* part, int base_pos, int t0, int SB,
-                    int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
-                    int kvk) {
+void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* const* ktab,
+                    const void* const* vtab, float* outT, int out_row, float* part,
+                    int base_pos, int t0, int SB, int n_q_heads, int n_kv_heads, int head_dim,
+                    float scale, cudaStream_t st, int kvk) {
     if (kvk == KV_T3) {
-        attn_prefill_launch<__half, PF_K_T3, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+        attn_prefill_launch<__half, PF_K_T3, true>(qT, q_stride, q_row, ktab, vtab, outT, out_row,
                                                    part, base_pos, t0, SB, n_q_heads,
                                                    n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_T3V) {
-        attn_prefill_launch<__half, PF_K_CT, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+        attn_prefill_launch<__half, PF_K_CT, true>(qT, q_stride, q_row, ktab, vtab, outT, out_row,
                                                    part, base_pos, t0, SB, n_q_heads,
                                                    n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_T5K) {
-        attn_prefill_launch<__half, PF_K_T5, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+        attn_prefill_launch<__half, PF_K_T5, true>(qT, q_stride, q_row, ktab, vtab, outT, out_row,
                                                    part, base_pos, t0, SB, n_q_heads,
                                                    n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_I8G64) {
-        attn_prefill_launch<__half, PF_K_I8, true>(qT, q_stride, q_row, kc, vc, outT, out_row,
+        attn_prefill_launch<__half, PF_K_I8, true>(qT, q_stride, q_row, ktab, vtab, outT, out_row,
                                                    part, base_pos, t0, SB, n_q_heads,
                                                    n_kv_heads, head_dim, scale, st);
         return;
     }
     if (kvk == KV_FP8)
-        attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, kc, vc, outT, out_row, part,
+        attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, ktab, vtab, outT, out_row, part,
                                            base_pos, t0, SB, n_q_heads, n_kv_heads, head_dim,
                                            scale, st);
     else
-        attn_prefill_launch<__half>(qT, q_stride, q_row, kc, vc, outT, out_row, part, base_pos,
+        attn_prefill_launch<__half>(qT, q_stride, q_row, ktab, vtab, outT, out_row, part, base_pos,
                                     t0, SB, n_q_heads, n_kv_heads, head_dim, scale, st);
 }
 
