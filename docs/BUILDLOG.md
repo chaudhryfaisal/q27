@@ -11008,3 +11008,32 @@ max_ctx % 64 != 0 (debug-knob-only exposure; serving ctx is
 static_asserts coupling KV_PAGE/KV_PAGE_SHIFT and pinning the
 32-aligned-tile hoist invariant landed with it. Full deviation record in
 the plan doc's AS-LANDED section; stale pfx/B2/PORTING comments fixed.
+
+## 2026-08-16 (d): M2b BRING-UP -- the process-wide KV pool serves, opt-in behind Q27_KV_POOL=1
+
+The policy half of M2, first working checkpoint (design pinned in the
+plan's M2b section). src/kv_pool.h: two device allocations carved into
+64-row pages, per-side LIFO free lists, all mutation under the server's
+route_m. Engines built with a pool allocate NO per-slot KV: boot maps 2
+warm pages per pair-side (graph warm runs touch rows < 64; entries 2+
+alias entry 0 for dead-lane address formation), and claim_slot reserves
+the request's entitlement -- prompt + n_max + ctx_round_reserve() - 1
+rows (MTP +1) -- releasing a taken-over lineage's pages first (tiers
+cleared per the R1 rule), extending in place on tier-2 continuation,
+waiting on route_cv on exhaustion, and reserving NOTHING for doomed
+prompts. The entitlement formula covers the worst-case write by
+construction (last round launches at Ph <= prompt+n_max-1 and writes
+<= reserve-1 ahead), so no engine-side guard changed. The no-pool path
+(CLI, every tool, default serving) is the M2a identity path bit-for-bit.
+
+Verified live on the q4s/fp8 rig: Q27_KV_POOL=1 --slots 3 --ctx 32768
+boots 3 slots at a 32K CAP (the M2a per-slot form fits 2 at that ctx)
+plus a 1.70 GB pool; greedy request exact, 3 concurrent sampled
+requests all served through pool-backed pages. KNOWN ROUGH EDGES, owed
+to the gate battery before any default flip: pool sizing is conservative
+(7.1 GB idle at ready -- the fixed-stack projection still carries the
+2.2 GB co-residency fudge), auto-ctx + pool interaction unrefined, and
+the full pre-declared M2b gates (admission suite, FIFO exhaustion,
+tier-2 extension proof, canonical/scatter, both-arch test_kernels,
+width_curve, ladder, pfx round-trip under scatter) have not run.
+Default stays per-slot KV until they do.

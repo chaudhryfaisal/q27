@@ -732,10 +732,64 @@ int main(int argc, char** argv) {
     // n_slots already clamped to [1,8] above (before auto-ctx divided the
     // budget by it); the conductor's MAX_K/2 fusion ceiling is 8.
     n_slots = std::max(1, std::min(8, n_slots));
+    // M2b: the process-wide paged KV pool (Q27_KV_POOL=1 opt-in during
+    // bring-up; plan docs/plans/2026-08-16-m2-paged-kv.md M2b section).
+    // Sized from measured free VRAM after the per-slot FIXED stacks: what
+    // the M2a path would have carved as n_slots contiguous per-slot KV
+    // allocations becomes one shared pool; per-request entitlements are
+    // reserved at claim_slot. K:V split follows the boot format's row-byte
+    // ratio. Allocated HERE -- before any Engine/capture -- per the
+    // Global-capture allocation rule.
+    q27::KvPool kv_pool;
+    const bool want_pool = [] {
+        const char* e = getenv("Q27_KV_POOL");
+        return e && atoi(e) != 0;
+    }();
+    if (want_pool && n_slots >= 1) {
+        size_t freeb = 0, totalb = 0;
+        CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
+        // fixed stacks: slot 0 pays kEngBase once; slots 1+ the co-resident
+        // form (same arithmetic the skip loop uses, minus its KV terms).
+        const double fixed = ENG_FIXED_BYTES +
+                             (double)(n_slots - 1) * (ENG_FIXED_BYTES - (size_t)kEngBase) +
+                             0.25e9 /* arch slack */ + (double)n_slots * (256ull << 20);
+        double pool_b = (double)freeb - fixed;
+        // per-token K/V row bytes for the boot format (mirror of kv_bytes;
+        // the engine is not constructed yet). 8 blocks/token block kinds.
+        const char* kvv = getenv("Q27_KV");
+        auto kind = [&]() -> int {
+            if (!kvv) return KV_F16;
+            if (!strcmp(kvv, "fp8")) return KV_FP8;
+            if (!strcmp(kvv, "turbo3")) return KV_T3;
+            if (!strcmp(kvv, "turbo3v")) return KV_T3V;
+            if (!strcmp(kvv, "turbo5k")) return KV_T5K;
+            if (!strcmp(kvv, "int8g64")) return KV_I8G64;
+            return KV_F16;
+        }();
+        const size_t k_row = kind == KV_T3      ? 400
+                             : kind == KV_T5K   ? 656
+                             : kind == KV_I8G64 ? 1056
+                             : kind == KV_FP8   ? 1024
+                                                : 2048; // fp16 + turbo3v K
+        const size_t v_row = kind >= KV_T3 ? 400 : (kind == KV_FP8 ? 1024 : 2048);
+        // 17 pairs share the pool; split K:V by row-byte ratio.
+        if (pool_b > 0) {
+            const double kfrac = (double)k_row / (double)(k_row + v_row);
+            if (kv_pool.init((size_t)(pool_b * kfrac), (size_t)(pool_b * (1.0 - kfrac)),
+                             k_row, v_row))
+                fprintf(stderr,
+                        "[pool] paged KV: %.2f GB (K %d pages x %zu B, V %d pages x "
+                        "%zu B)\n",
+                        pool_b / 1e9, kv_pool.npages[0], kv_pool.page_bytes[0],
+                        kv_pool.npages[1], kv_pool.page_bytes[1]);
+        }
+        if (!kv_pool.enabled())
+            fprintf(stderr, "[pool] Q27_KV_POOL=1 but sizing failed -- per-slot KV\n");
+    }
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
-        if (si > 0) {
+        if (si > 0 && !kv_pool.enabled()) {
             // coarse per-slot floor: GDN recurrent state (exact bytes from
             // slot 0's own allocation -- review 2026-07-09: the old "5 sets
             // ~3GB" constant predated the maxd6/7 widenings) + prefill/attn
@@ -767,7 +821,8 @@ int main(int argc, char** argv) {
         }
         Slot s;
         s.id = si;
-        s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
+        s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx,
+                                         kv_pool.enabled() ? &kv_pool : nullptr);
         s.eng->fast_head = fast;
         if (pfx_cache.enabled()) {
             s.eng->pcache = &pfx_cache;  // P16 disk tier
@@ -1051,6 +1106,30 @@ int main(int argc, char** argv) {
                 if (better) { best = &s; best_tier = tier; best_key = rl; }
             }
             if (best) {
+                // M2b pooled-KV entitlement (no-op on the self-provisioned
+                // path). Doomed prompts reserve NOTHING -- generate() refuses
+                // before any KV row is touched. Tier 0/1 = lineage takeover:
+                // release the old lineage's pages FIRST (kv_release clears
+                // the reuse tiers, the R1 rule), then map the new
+                // entitlement; tier 2 EXTENDS in place, keeping rows
+                // [0, base) byte-stable. On pool exhaustion, fall to the
+                // same route_cv wait as slot scarcity and retry the whole
+                // selection (a takeover elsewhere may free pages).
+                if (fits_any) {
+                    const int rows =
+                        (int)prompt.size() +
+                        q27::resolve_think_decode_limits(
+                            requested, best->eng->max_ctx, (int)prompt.size(),
+                            best->eng->ctx_round_reserve(), limit_close, thinking,
+                            limit_cfg, limit_flag)
+                            .n_max +
+                        best->eng->ctx_round_reserve() - 1;
+                    if (best_tier < 2) best->eng->kv_release_for_takeover();
+                    if (!best->eng->kv_entitle(std::min(rows, best->eng->max_ctx))) {
+                        route_cv.wait(lk);
+                        continue;
+                    }
+                }
                 best->busy = true;
                 // LRU is stamped at FREE, not here: eviction preference must
                 // track completion recency (a slot claimed early but finishing

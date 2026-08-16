@@ -27,6 +27,7 @@
 #include "kernels.cuh"
 #include "loader.h"
 #include "prefix_cache.h"
+#include "kv_pool.h"
 #include "prefix_ram.h"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
@@ -613,11 +614,92 @@ struct Engine {
     void** d_kv_tab = nullptr;
     std::vector<void*> h_kv_tab;
     int kv_pairs = 0, kv_npages = 0;
+    // ---- M2b: pooled KV (kvpool != nullptr). kv_pages[side][pair] = the
+    // page indices this slot LINEAGE owns, logical order (page j backs rows
+    // [64j, 64j+64)). kv_rows = the mapped attention entitlement in rows
+    // (MTP pair carries +1). All mutation runs under the server's route_m
+    // (claim path) with table uploads on THIS engine's stm -- the engine is
+    // claimed and idle at remap time, so entries never change under an
+    // in-flight round (the B2/M2b audit rule).
+    q27::KvPool* kvpool = nullptr;
+    std::vector<std::vector<int>> kv_pages[2];
+    int kv_rows = 0;
     void* const* kv_ktab(int pair) const { return d_kv_tab + (size_t)pair * kv_npages; }
     void* const* kv_vtab(int pair) const {
         return d_kv_tab + ((size_t)kv_pairs + pair) * kv_npages;
     }
     int kv_mtp_pair() const { return kv_pairs - 1; }
+    // ---- M2b pooled-KV lineage ops. THREAD CONTRACT: all three run under
+    // the server's route_m with this engine CLAIMED and IDLE (no in-flight
+    // rounds), so table-entry rewrites can never race a captured replay --
+    // the B2/M2b audit rule. No-ops / trivially-true on the self-provisioned
+    // (CLI/tool) path.
+    //
+    // Map the lineage's entitlement to `rows` attention rows (the MTP pair
+    // carries rows+1). EXTEND-only: existing pages keep their logical slots
+    // (tier-2 continuations keep rows [0, base) byte-stable). Entries past
+    // the entitlement alias page 0 (valid addresses for dead-lane cp.async
+    // formation; the NP/ctx_round_reserve guards keep them undereferenced).
+    // Returns false (state unchanged) when the pool lacks pages -- the
+    // caller waits on route_cv and retries.
+    bool kv_entitle(int rows) {
+        if (!(kvpool && kvpool->enabled())) return true;
+        if (rows > max_ctx) return false; // callers clamp first; belt only
+        const int P = (rows + KV_PAGE - 1) / KV_PAGE;
+        const int Pm = (rows + 1 + KV_PAGE - 1) / KV_PAGE;
+        int need[2] = {0, 0};
+        for (int s_ = 0; s_ < 2; s_++)
+            for (int c = 0; c < kv_pairs; c++) {
+                const int want = c == kv_mtp_pair() ? Pm : P;
+                const int have = (int)kv_pages[s_][c].size();
+                if (want > have) need[s_] += want - have;
+            }
+        if (kvpool->free_pages(0) < need[0] || kvpool->free_pages(1) < need[1]) return false;
+        for (int s_ = 0; s_ < 2; s_++)
+            for (int c = 0; c < kv_pairs; c++) {
+                const int want = c == kv_mtp_pair() ? Pm : P;
+                while ((int)kv_pages[s_][c].size() < want)
+                    kvpool->reserve(s_, 1, kv_pages[s_][c]);
+                for (int j = 0; j < kv_npages; j++) {
+                    const int have = (int)kv_pages[s_][c].size();
+                    h_kv_tab[((size_t)(s_ ? kv_pairs : 0) + c) * kv_npages + j] =
+                        kvpool->page_ptr(s_, kv_pages[s_][c][j < have ? j : 0]);
+                }
+            }
+        if (rows > kv_rows) kv_rows = rows;
+        CUDA_CHECK(cudaMemcpyAsync(d_kv_tab, h_kv_tab.data(),
+                                   h_kv_tab.size() * sizeof(void*),
+                                   cudaMemcpyHostToDevice, stm));
+        return true;
+    }
+    // Lineage takeover: clear the reuse tiers FIRST (the R1 rule -- a stale
+    // snapshot/ckpt would restore GDN state over pages that no longer hold
+    // this conversation), then return every page. The caller immediately
+    // kv_entitle()s the new request; entries are stale-but-unread until then.
+    void kv_release_for_takeover() {
+        if (!(kvpool && kvpool->enabled())) return;
+        have_snap = false;
+        snap_toks.clear();
+        ckpt_clear();
+        for (int s_ = 0; s_ < 2; s_++)
+            for (auto& pg : kv_pages[s_]) kvpool->release(s_, pg);
+        kv_rows = 0;
+    }
+    // MTP KV zeroing, page-aware: the pooled path walks the MTP pair's
+    // mapped pages; the self-provisioned path keeps the whole-buffer memsets.
+    void kv_memset_mtp() {
+        if (!(kvpool && kvpool->enabled())) {
+            CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
+            CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
+            return;
+        }
+        // init calls this once BEFORE the boot warm mapping (kv_pairs still
+        // 0 there; harmless -- the warm pages are zeroed right after grant).
+        if (kv_pairs == 0 || (int)kv_pages[0].size() < kv_pairs) return;
+        for (int s_ = 0; s_ < 2; s_++)
+            for (int idx : kv_pages[s_][kv_mtp_pair()])
+                CUDA_CHECK(cudaMemset(kvpool->page_ptr(s_, idx), 0, kvpool->page_bytes[s_]));
+    }
     // Host-side row base (pfx export/import + CLI rigs): row r of pair/side.
     char* kv_row_host(bool is_v, int pair, int r) const {
         const size_t rb = kv_bytes(is_v) / max_ctx; // exact per-row bytes (divides evenly)
@@ -668,8 +750,13 @@ struct Engine {
     }
     // Borrowing: shares a caller-owned Model+DeviceModel (weights already
     // uploaded by the caller). Multi-slot serving builds N of these.
-    Engine(q27::Model& m, q27::DeviceModel& d, int ctx)
-        : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
+    // M2b: pool != nullptr opts into the process-wide paged KV pool -- the
+    // engine allocates NO per-slot KV; pages arrive per admission
+    // (kv_entitle) and belong to the slot lineage. pool == nullptr (every
+    // CLI/tool site) keeps the M2a self-provisioned identity path
+    // bit-for-bit.
+    Engine(q27::Model& m, q27::DeviceModel& d, int ctx, q27::KvPool* pool = nullptr)
+        : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx), kvpool(pool) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/false);
     }
     // P16 only: a detached prefix-cache writer would outlive its pinned
@@ -750,8 +837,10 @@ struct Engine {
         A((void**)&d_am_blk2, 128 * 4);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
-        A(&mtp_k, kv_bytes(false));
-        A(&mtp_v, kv_bytes(true));
+        if (!(kvpool && kvpool->enabled())) {
+            A(&mtp_k, kv_bytes(false));
+            A(&mtp_v, kv_bytes(true));
+        }
         A((void**)&d_pos_m, 4); A((void**)&d_draft, 4);
         A((void**)&h_L[1], N_EMBD * 4); A((void**)&x1_L[1], N_EMBD * 4); A((void**)&y_L[1], N_EMBD * 4);
         A((void**)&qg_L[1], 2 * N_HEAD * HEAD_DIM * 4);
@@ -921,8 +1010,7 @@ struct Engine {
         d_draft_L[6] = d_draft7;
         A((void**)&d_P, 4);
         A((void**)&d_outcome, OUTCOME_INTS * 4); // {n, t1, dr1..dr(W_PLUMB-1), pending}
-        CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
+        kv_memset_mtp();
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
@@ -960,12 +1048,22 @@ struct Engine {
             }
 
         int cache_slot = 0;
+        const bool pooled = kvpool && kvpool->enabled();
         for (int il = 0; il < N_LAYER; il++) {
             if (attn_layer[il]) {
-                void *k, *v;
-                A(&k, kv_bytes(false));
-                A(&v, kv_bytes(true));
-                kcache.push_back(k); vcache.push_back(v);
+                if (pooled) {
+                    // M2b: no per-slot KV allocation -- pages come from the
+                    // pool at admission. Placeholders keep kcache.size() (the
+                    // pair count every consumer derives from) intact; nothing
+                    // dereferences these since M2a routed all access through
+                    // the block tables.
+                    kcache.push_back(nullptr); vcache.push_back(nullptr);
+                } else {
+                    void *k, *v;
+                    A(&k, kv_bytes(false));
+                    A(&v, kv_bytes(true));
+                    kcache.push_back(k); vcache.push_back(v);
+                }
                 attn_cache_idx.push_back(cache_slot++);
                 conv_ring[il] = nullptr; S[il] = nullptr;
             } else {
@@ -1013,6 +1111,28 @@ struct Engine {
             kv_pairs = (int)kcache.size() + 1; // + the MTP pair (last)
             kv_npages = (max_ctx + KV_PAGE - 1) / KV_PAGE;
             h_kv_tab.assign((size_t)2 * kv_pairs * kv_npages, nullptr);
+            if (pooled) {
+                // M2b boot: 2 WARM pages per pair-side so build_graph /
+                // build_spec_graphs warm runs (positions < 64) have real
+                // rows to write; entries 2+ alias entry 0 -- valid addresses
+                // for dead-lane cp.async formation, never dereferenced past
+                // the entitlement guards. kv_entitle() rewrites everything
+                // at admission.
+                for (int s_ = 0; s_ < 2; s_++) {
+                    kv_pages[s_].assign(kv_pairs, {});
+                    for (int c = 0; c < kv_pairs; c++) {
+                        if (!kvpool->reserve(s_, 2, kv_pages[s_][c])) {
+                            fprintf(stderr, "q27: KV pool too small for boot warm pages\n");
+                            exit(1);
+                        }
+                        for (int j = 0; j < kv_npages; j++)
+                            h_kv_tab[((size_t)(s_ ? kv_pairs : 0) + c) * kv_npages + j] =
+                                kvpool->page_ptr(s_, kv_pages[s_][c][j < 2 ? j : 0]);
+                    }
+                }
+                kv_rows = 2 * KV_PAGE;
+                kv_memset_mtp(); // the warm MTP pages start zeroed like the alloc did
+            } else {
             const size_t krow = kv_bytes(false) / max_ctx, vrow = kv_bytes(true) / max_ctx;
             const bool scatter = [] {
                 const char* e = getenv("Q27_KV_SCATTER");
@@ -1045,6 +1165,7 @@ struct Engine {
                 }
             }
             if (scatter) fprintf(stderr, "M2a: Q27_KV_SCATTER=1 -- KV pages PERMUTED\n");
+            }
             CUDA_CHECK(cudaMalloc((void**)&d_kv_tab, h_kv_tab.size() * sizeof(void*)));
             CUDA_CHECK(cudaMemcpy(d_kv_tab, h_kv_tab.data(), h_kv_tab.size() * sizeof(void*),
                                   cudaMemcpyHostToDevice));
@@ -2147,8 +2268,7 @@ struct Engine {
                     CUDA_CHECK(cudaMemset(S[il], 0, sb));
                     CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 }
-            CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
-            CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
+            kv_memset_mtp();
         };
         // P12b: warm the WIDEST kernels (distinct gemv<N>/ntok instantiations)
         // so graph capture never triggers a lazy module load. Output is
@@ -3573,8 +3693,7 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
             }
-        CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
+        kv_memset_mtp();
         CUDA_CHECK(cudaStreamSynchronize(stm));
     }
 
