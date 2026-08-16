@@ -11072,3 +11072,42 @@ is otherwise COMPLETE: block-table addressing always-on and
 scatter-proven, entitlement admission built and gated. The remaining
 sizing conservatism (2.2 GB co-residency fudge) is deliberately left
 for the M1b re-calibration, which changes the constants anyway.
+
+## 2026-08-16 (f): M1b SHIPPED -- the perm dimension dies, six slots per-slot / seven pooled, and the pool goes DEFAULT
+
+The second prize, collected. `perm` is deleted: every graph family holds
+ONE exec (the [perm=0..11] trailing dimension and both capture loops are
+gone -- all 12 variants had captured identical pointers since M1 froze
+the rotation), the restore stamps died with the variable, and ~1.4 GB of
+duplicate exec memory per slot came back. The capture loops became plain
+scopes so the diff stays brace-stable.
+
+THE ESTIMATOR TRUTH THE COLLAPSE EXPOSED: the 2.2 GB "co-residency
+fudge" had been silently covering the 12x zoo the estimator
+under-modeled. Post-M1b boots measured the REAL marginal slot cost at
+~1.4 GB (6-slot and 5-slot free-deltas), so kEngGraphs is now one
+arch-scaled set (0.13/0.43 GB) and the fudge recalibrated to 1.0 GB
+(prefill scratch + slack). A first pooled boot also exposed a sizing
+policy hole: the slot clamp alone maximized slots and left a 0.24 GB
+pool that could not hold ONE 8K entitlement (every request FIFO-starved,
+found by the ladder hanging) -- fixed with a pool FLOOR: trade slots for
+pool until each projected slot can hold a half-ctx entitlement.
+
+GATES: canonical EXACT identity AND scatter; fused_smoke all legs x
+{fp16, fp8, turbo3}; admission per-slot 2 -> 4 -> SIX slots @16K across
+the M-arc (need 8.2 -> 4.9 -> 3.5 GB/slot); pooled boot SEVEN slots +
+2.89 GB pool; prod-shaped boot (single slot, auto-ctx 262144) serves
+with an 11.42 GB pool covering the full-window entitlement.
+
+LADDER (q4s fp8 16K, 8192-tok sampled, union-of-intervals):
+| C | per-slot | pooled |
+|--:|--:|--:|
+| 4 | 271.2 | 270.0 |
+| 6 | 307.7 | 309.8 |
+| 7 | -- | 293.7 (lane-bound rolloff begins, as the spec priced) |
+
+Peak aggregate across the whole arc: 185.6 (pre-M1) -> 280.7 (M1) ->
+**309.8 t/s (+67%)**. THE FLIP: the recorded criterion (pooled >=
+per-slot at matched C) is met -- Q27_KV_POOL now DEFAULTS ON
+(Q27_KV_POOL=0 restores per-slot). Production restarted on the pooled
+default after the prod-shaped boot sanity.

@@ -511,12 +511,16 @@ int main(int argc, char** argv) {
 
     // Per-engine non-KV reserve, the single source of truth shared by
     // auto-ctx (below) and the multi-slot skip loop. GDN state + graph zoo +
-    // scratch, arch/width/gate scaled. Calibrated to the known-good 2x48K
-    // fp8 anchor on a 32GB 5090 (~5.8 GB/slot on W12). See the auto-ctx
-    // comment for the term-by-term rationale.
-    const double kEngGw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
-    const double kEngGwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
-    const double kEngGraphs = kEngGw8 * 0.13e9 + (Q27_W_MAX - kEngGw8) * kEngGwx;
+    // scratch, arch/width/gate scaled. RECALIBRATED 2026-08-16 post-M1b:
+    // the 2.2 GB co-residency fudge was mostly covering the 12x perm zoo the
+    // estimator under-modeled; with the zoo collapsed, measured marginal
+    // slot cost is ~1.4 GB (6-slot and 5-slot boots, free-delta), so the
+    // fudge drops to 1.0 GB (prefill scratch ~0.84 + slack) and the
+    // ENG_FIXED marginal lands at ~1.41 GB. See the auto-ctx comment.
+    // M1b: ONE graph set per engine (the 12x perm variants are gone) --
+    // ~0.13 GB on cc>=89, ~0.43 GB on sm_86 (the old per-perm slopes are now
+    // the whole zoo).
+    const double kEngGraphs = cc_arch >= 89 ? 0.13e9 : 0.43e9;
     const double kEngMonoSave = cc_arch >= 89 ? 0.08e9 : 0.15e9;
     const double kEngSampSave = cc_arch >= 89 ? 0.34e9 : 0.60e9;
     const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
@@ -529,7 +533,7 @@ int main(int argc, char** argv) {
     // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
     // this + KV so it agrees with what auto-ctx sized for.
     const size_t ENG_FIXED_BYTES =
-        (size_t)(kEngBase + kEngGraphs + kEngGdn + 2.2e9 -
+        (size_t)(kEngBase + kEngGraphs + kEngGdn + 1.0e9 -
                  (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
     // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
@@ -557,9 +561,8 @@ int main(int argc, char** argv) {
     // upload alignment overhead, and any co-tenant process fall out of the
     // measurement instead of a model. What remains estimated is the non-KV
     // stack allocated after this point (GDN committed/snap state + record
-    // arena + spec/sample graph zoo + workspaces): under M1 record+fold a
-    // width adds only ~4 MB of arena and ~one perm-index's worth of graphs
-    // (~130MB, vestigial until M1b), plus an arch base -- the sm_86
+    // arena + ONE spec/sample graph set (M1b) + workspaces): a width adds
+    // ~4 MB of arena + its per-width verify graphs, plus an arch base -- the sm_86
     // fd2/h16 path carries heavier workspaces than sm_120, and the old
     // 1.27GB anchor predates the P1-P3 graph growth (calibrated 2026-07-17
     // from in-process free deltas on both cards; see BUILDLOG).
@@ -639,7 +642,7 @@ int main(int argc, char** argv) {
                 // anchor on a 32GB 5090 == ~6.6 GB/slot on W12). Reduce the
                 // slot count first so the picked ctx and the log are HONEST
                 // (the build-loop skip is then a pure safety net), then split.
-                const double per_slot = single_fixed + 2.2e9;
+                const double per_slot = single_fixed + 1.0e9;
                 int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
                 if (fit < 1) fit = 1;
                 if (fit < n_slots) {
@@ -741,9 +744,12 @@ int main(int argc, char** argv) {
     // ratio. Allocated HERE -- before any Engine/capture -- per the
     // Global-capture allocation rule.
     q27::KvPool kv_pool;
+    // DEFAULT ON since 2026-08-16 (M1b flip criterion met: pooled C=4/C=6
+    // at parity with per-slot -- 270.0/309.8 vs 271.2/307.7 -- while buying
+    // a 7th slot and per-request ctx). Q27_KV_POOL=0 restores per-slot KV.
     const bool want_pool = [] {
         const char* e = getenv("Q27_KV_POOL");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;
     }();
     if (want_pool && n_slots >= 1) {
         size_t freeb = 0, totalb = 0;
@@ -765,10 +771,7 @@ int main(int argc, char** argv) {
                     n_slots, fit_slots);
             n_slots = fit_slots;
         }
-        const double fixed = ENG_FIXED_BYTES +
-                             (double)(n_slots - 1) * (ENG_FIXED_BYTES - (size_t)kEngBase) +
-                             0.25e9 /* arch slack */ + (double)n_slots * (256ull << 20);
-        double pool_b = (double)freeb - fixed;
+
         // per-token K/V row bytes for the boot format (mirror of kv_bytes;
         // the engine is not constructed yet). 8 blocks/token block kinds.
         const char* kvv = getenv("Q27_KV");
@@ -787,6 +790,25 @@ int main(int argc, char** argv) {
                              : kind == KV_FP8   ? 1024
                                                 : 2048; // fp16 + turbo3v K
         const size_t v_row = kind >= KV_T3 ? 400 : (kind == KV_FP8 ? 1024 : 2048);
+        // Pool floor (calibration 2026-08-16: the slot clamp alone left a
+        // 0.24 GB pool that could not hold ONE 8K entitlement -- every
+        // request FIFO-starved). Trade slots for pool until each projected
+        // slot can hold a HALF-ctx entitlement concurrently.
+        auto fixed_for = [&](int ns) {
+            return (double)ENG_FIXED_BYTES +
+                   (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
+                   0.25e9 + (double)ns * (double)(256ull << 20);
+        };
+        const int half_rows = std::max(4096, slot1_ctx / 2);
+        const double ent_bytes =
+            (double)(17 * (size_t)((half_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
+        double pool_b = (double)freeb - fixed_for(n_slots);
+        while (n_slots > 1 && pool_b < (double)n_slots * ent_bytes) {
+            n_slots--;
+            pool_b = (double)freeb - fixed_for(n_slots);
+        }
+        fprintf(stderr, "[pool] %d slots, floor %.2f GB (half-ctx x slots), pool %.2f GB\n",
+                n_slots, n_slots * ent_bytes / 1e9, pool_b / 1e9);
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
             const double kfrac = (double)k_row / (double)(k_row + v_row);

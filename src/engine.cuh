@@ -54,9 +54,9 @@ static constexpr int MAX_GEN_TRACK = 65536;
 // Q27_W_MAX build knob (2026-07-11): narrow builds for smaller cards.
 // M1 record+fold (2026-08-16): the per-width GDN role sets are GONE --
 // speculative lanes read committed state and write outputs only; commit is a
-// Fold from a ~4 MB/width record arena. A width now costs arena rows plus one
-// perm-index's worth of the graph zoo (the zoo's [W_MAX] leading index is
-// vestigial until M1b collapses it -- perm is frozen at 0).
+// Fold from a ~4 MB/width record arena. M1b: the zoo's perm dimension is
+// GONE (one exec per family); a width now costs arena rows plus its
+// per-width verify graphs only.
 // Floor 8 keeps the full maxd7 (4..7) ladder; cap 12 = the lane plumbing.
 // Struct arrays stay p[16]; the unused high slots are never dereferenced.
 #ifndef Q27_W_MAX
@@ -194,7 +194,7 @@ static inline std::unique_ptr<q27::Model> open_validated(const std::string& path
 // LANE PLUMBING is FIXED at W_PLUMB (16, cuda_common.h), independent of W_MAX.
 // The per-lane verify buffers, the p[16] kernel structs, and the finish-kernel
 // outcome layout ({n, t1, dr1..dr15, pending} = 18 ints) are always W_PLUMB
-// wide; W_MAX only caps how many lanes go LIVE (verify width) + the role/perm/
+// wide; W_MAX only caps how many lanes go LIVE (verify width) + the per-width/
 // graph count that scales memory. Arrays that LIST all lane pointers or read
 // the fixed outcome use W_PLUMB; arrays sized by live width use W_MAX.
 // W_PLUMB-wide lane-pointer aggregate from one array member (audit refactor):
@@ -337,10 +337,8 @@ struct Engine {
     // the record arena. Commit = flush_fold: replay the n-1 accepted rows
     // (conv_ring_update + delta_scan_seq, bitwise twins of the serial chain)
     // into committed state. Rewind (refinish_round) = fold fewer rows --
-    // state is uncommitted until the Fold runs. perm is FROZEN at 0: the
-    // graph zoo's [W_MAX] perm index and the capture loop are vestigial
-    // (M1b collapses them); every capture now bakes the same committed
-    // pointers, so all perm variants are identical.
+    // state is uncommitted until the Fold runs. M1b: perm is GONE -- one
+    // exec per graph family, every capture bakes the committed pointers.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
     //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
@@ -397,51 +395,47 @@ struct Engine {
     float* ring_snap[N_LAYER] = {};
     std::vector<int> snap_toks;
     bool have_snap = false;
-    // M1: perm is FROZEN at 0 (no commit advances it; the restore paths still
-    // stamp 0 defensively). It survives only as the graph zoo's vestigial
-    // trailing index -- every launch site reads [perm] == [0] -- until M1b
-    // collapses the arrays. The P3 T2 device role tables + perm scalar +
-    // stage_perm_async are GONE with the rotation: the chunk kernels read the
-    // committed pointers directly, so captures are perm-invariant with no
-    // device indirection at all.
-    int perm = 0;
+    // M1b: `perm` is GONE. M1 froze it at 0; every graph variant it once
+    // selected was byte-identical, so the zoo collapsed to one exec per
+    // family and the variable, its restore stamps, and the capture loop all
+    // retired together.
     // ---- GRAPH ZOO (read before any width/depth change: miss one and a decode
-    // path silently runs a stale graph). perm is mod-W_MAX=12 (12 GDN state
-    // buffers), so every spec/gated set below is [..][perm=0..11]. Two NON-spec
+    // path silently runs a stale graph). M1b: ONE exec per family -- the
+    // perm trailing dimension died with the role rotation. Two NON-spec
     // single-token graphs live at the top of the struct: `graph_exec` (plain
     // greedy forward, step_free fallback) and `sample_graph` (plain temp>0
-    // forward+sample, the non-spec sampled loop). The perm-indexed spec/gated
+    // forward+sample, the non-spec sampled loop). The spec/gated
     // sets and their callers:
     //
-    //   spec_graph[12]             monolithic UNGATED GREEDY round (draft to
+    //   spec_graph                 monolithic UNGATED GREEDY round (draft to
     //                              gate_maxd + width-5 verify, one graph).
     //                              -> spec_round, ungated branch (Q27_PMIN unset,
     //                                 unconstrained). The default greedy path.
-    //   spec_sample_graph[12]      monolithic UNGATED SAMPLED round.
+    //   spec_sample_graph          monolithic UNGATED SAMPLED round.
     //                              -> spec_sample_round, ungated branch. Default
     //                                 sampled path.
-    //   verify_graph_w[13][12]     per-width GREEDY verify, [W=1..12][perm].
+    //   verify_graph_w[13]         per-width GREEDY verify, [W=1..12].
     //                              -> gated greedy round (spec_round), both
     //                                 Q27_DEXIT on and off. Widths 9..12 are
     //                                 suffix-only (captured in P1).
-    //   verify_sample_graph_w[6][12] per-width SAMPLED verify, [W=2..5][perm].
+    //   verify_sample_graph_w[6]   per-width SAMPLED verify, [W=2..5].
     //                              -> gated sampled round (spec_sample_round),
     //                                 both Q27_DEXIT on and off.
-    //   draft_step_graph[7][12]    per-draft-STEP graphs, [step=0..gate_maxd-1].
+    //   draft_step_graph[7]        per-draft-STEP graphs, [step=0..gate_maxd-1].
     //                              -> the early-exit loop in BOTH gated rounds
     //                                 (default when Q27_DEXIT on). Launched one
     //                                 step at a time; concatenated back-to-back
     //                                 they reproduce the monolithic draft exactly.
-    //   draft_graph[12]            monolithic depth-gate_maxd draft (P11 split).
+    //   draft_graph                monolithic depth-gate_maxd draft (P11 split).
     //                              -> P11 constrained-tool path; AND the
     //                                 Q27_DEXIT=0 monolithic-draft A/B fallback
     //                                 (greedy + sampled).
-    //   draft_graph_lo[12]         monolithic DEPTH-4 draft; captured only when
+    //   draft_graph_lo             monolithic DEPTH-4 draft; captured only when
     //                              gate_maxd==5 (auto or fixed Q27_MAXD=5).
     //                              -> constrained-tool path under auto; the
     //                                 Q27_DEXIT=0 depth-4 fallback (greedy auto
     //                                 md_used==4; sampled gate_maxd==5).
-    //   verify_graph[12]           monolithic WIDTH-5 verify (P11 split).
+    //   verify_graph               monolithic WIDTH-5 verify (P11 split).
     //                              -> ONLY the P11 constrained-tool path.
     //
     // REDUNDANT-BUT-KEPT after P14: with Q27_DEXIT default-ON, the gated
@@ -452,16 +446,16 @@ struct Engine {
     // unique callers are constrained-tool-under-auto + the DEXIT=0 auto/sampled
     // fallback); flagged a removable-candidate in the P14 capstone BUILDLOG
     // entry, deliberately NOT removed here.
-    cudaGraphExec_t spec_graph[W_MAX] = {}; // width-12: perm is mod-12 (12 GDN state buffers)
+    cudaGraphExec_t spec_graph = nullptr; // M1b: ONE exec (perm retired)
     // P11: split draft/verify graphs for the constrained tool path
-    cudaGraphExec_t draft_graph[W_MAX] = {};
-    cudaGraphExec_t verify_graph[W_MAX] = {};
-    // P12 confidence-gated depth: one verify graph per width W (index [W][perm],
+    cudaGraphExec_t draft_graph = nullptr;
+    cudaGraphExec_t verify_graph = nullptr;
+    // P12 confidence-gated depth: one verify graph per width W (index [W],
     // W in 1..5). spec_round drafts width-5, reads the 4 draft margins, computes
     // cap = leading run of margin >= pmin_theta, launches verify_graph_w[cap+1].
     // Greedy tokens are width-invariant (lanes are independent grid indices), so
     // this changes only round count + verify width, never the emitted sequence.
-    cudaGraphExec_t verify_graph_w[W_MAX + 1][W_MAX] = {}; // [W=1..12][perm=0..11]
+    cudaGraphExec_t verify_graph_w[W_MAX + 1] = {}; // [W=1..12] (M1b: perm dim gone)
     float* d_draft_margin = nullptr; // [7] drafter top1-top2 margins (device)
     float h_draft_margin[7] = {};
     // P14: block-partial scratch for the fused draft argmax+margin (k_argmax_top2
@@ -503,7 +497,7 @@ struct Engine {
     // The ceiling changes round grouping / draft depth / verify width only -- never
     // the emitted sequence (greedy is width-invariant), so decode stays bitwise.
     bool maxd_auto = false;
-    cudaGraphExec_t draft_graph_lo[W_MAX] = {}; // depth-4 draft (auto mode only)
+    cudaGraphExec_t draft_graph_lo = nullptr; // depth-4 draft (auto mode only)
     DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
                    // CPU tests (tools/test_depthctl.cpp). Lifetime =
                    // conversation lineage (review 2026-07-09 + follow-up):
@@ -549,20 +543,20 @@ struct Engine {
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
     // cannot reconstruct (docs/acceptance-gate-design.md).
     long gate_lane_fired[W_MAX] = {}, gate_lane_acc[W_MAX] = {}; // [j 1..W_MAX-1]; 0 unused
-    // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
+    // Phase 2 (sampling): the sampled set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
-    cudaGraphExec_t spec_sample_graph[W_MAX] = {};
+    cudaGraphExec_t spec_sample_graph = nullptr;
     // P14: per-width sampled verify graphs (sampled analog of verify_graph_w).
-    // [W=2..5][perm=0..5]; the sampled+gated round drafts depth-4, reads the 4
+    // [W=2..5]; the sampled+gated round drafts depth-4, reads the 4
     // draft margins, caps the accept walk at W-1, and launches this at width W.
-    cudaGraphExec_t verify_sample_graph_w[6][W_MAX] = {}; // [W<=5][perm 0..11] (sampled ceiling stays 4)
+    cudaGraphExec_t verify_sample_graph_w[6] = {}; // [W<=5] (sampled ceiling stays 4)
     // P14 draft early-exit: one graph per draft STEP (k=0..gate_maxd-1), so the
     // gated rounds can stop drafting at the first sub-theta margin (llama's
     // p_min stops DRAFTING; the P12 gate only narrowed verify). Steps 0..k
     // launched back-to-back on stm reproduce the monolithic draft graph's
     // kernel sequence exactly (see spec_draft_step_launches). Q27_DEXIT=0
     // restores the monolithic draft (A/B lever); default ON when gated.
-    cudaGraphExec_t draft_step_graph[D_MAX_MTP][W_MAX] = {}; // [step 0..6][perm 0..11]
+    cudaGraphExec_t draft_step_graph[D_MAX_MTP] = {}; // [step 0..6]
     bool dexit_on = true; // Q27_DEXIT (only reached when pmin_theta > 0)
     // Q27_PHASE_STATS=1: per-round draft/verify wall split (Saguaro draft-
     // fraction measurement, survey 2026-07-09). Host steady_clock stamps at
@@ -589,7 +583,7 @@ struct Engine {
     int sfx_L = 12;              // Q27_SUFFIX_L: min match length to fire
     // Q27_SUFFIX_W (width-12 P1): decouple the SUFFIX verify width from the
     // MTP gated width. 0/unset or <= gate_maxd+1 = legacy (suffix rides the
-    // gated width); 9..12 = wide suffix rounds (one extra per-perm graph at
+    // gated width); 9..12 = wide suffix rounds (one extra graph at
     // exactly that width -- suffix rounds always launch full width). The
     // MTP ladder stays 4..gate_maxd regardless.
     int sfx_w = 0;
@@ -2152,7 +2146,7 @@ struct Engine {
                     "    --ctx <smaller>            (KV scales with context)\n"
                     "    Q27_MAXD=4                 (drops the depth-5/6 draft graphs)\n"
                     "    Q27_SAMPLED=0              (drops the sampled set, greedy-only)\n"
-                    "    build/q27-server-w8        (24GB-class: smaller graph zoo)\n"
+                    "    build/q27-server-w8        (24GB-class: fewer per-width graphs)\n"
                     "  or free co-resident VRAM (other processes on this GPU).\n",
                     what, fb / 1e9);
             exit(1);
@@ -2228,7 +2222,7 @@ struct Engine {
         if (const char* e = getenv("Q27_MAXD_FLO6")) dctl.flo6 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
         // width-12 P1: suffix envs parsed BEFORE the warm/capture section --
-        // Q27_SUFFIX_W shapes the warm width and adds one per-perm verify
+        // Q27_SUFFIX_W shapes the warm width and adds one verify
         // graph at exactly that width. <= gate_maxd+1 (or unset) = legacy.
         // value-aware since the CC-defaults flip: Q27_SUFFIX=0 disables
         // (was presence-only -- =0 used to ENABLE).
@@ -2274,21 +2268,23 @@ struct Engine {
         // so graph capture never triggers a lazy module load. Output is
         // discarded and reset below. width-12 P1: the suffix width (when
         // wider than the gated width) is the widest thing captured.
-        perm = 0; dmax = gate_maxd; vw = sfx_width();
+        dmax = gate_maxd; vw = sfx_width();
         seed_positions();
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         reset_gdn_mtp();
-        // capture all 12 cyclic permutations (capture records; does not execute)
-        for (int p = 0; p < W_MAX; p++) {
-            perm = p;
+        // M1b: ONE capture per family. The 12 cyclic-permutation variants
+        // were byte-identical since M1 froze perm at 0 (no launch carries a
+        // role pointer anymore); the loop and the ~1.4 GB of duplicate execs
+        // are gone.
+        {
             // monolithic ungated round: depth-4 draft + width-5 verify.
             dmax = 4; vw = 5;
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            inst_or_advise(&spec_graph[p], gr, "greedy round");
+            inst_or_advise(&spec_graph, gr, "greedy round");
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P12b: the gated draft graph produces gate_maxd drafts + margins.
             dmax = gate_maxd;
@@ -2306,12 +2302,12 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_draft_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
-            inst_or_advise(&draft_graph[p], gd, "mono draft");
+            inst_or_advise(&draft_graph, gd, "mono draft");
             CUDA_CHECK(cudaGraphDestroy(gd));
             }
             // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
             // so spec_round can pick draft depth per round. gate_maxd is forced to
-            // 5 under auto, so draft_graph[p] above is the depth-5 (hi) graph.
+            // 5 under auto, so draft_graph above is the depth-5 (hi) graph.
             // P14: capture it whenever gate_maxd==5 (auto OR fixed Q27_MAXD=5), not
             // just auto -- the sampled+gated path is always a depth-4 draft and
             // needs the depth-4 graph even under fixed depth-5. One extra graph per
@@ -2323,7 +2319,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_launches();
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gdl));
-                inst_or_advise(&draft_graph_lo[p], gdl, "mono draft-lo");
+                inst_or_advise(&draft_graph_lo, gdl, "mono draft-lo");
                 CUDA_CHECK(cudaGraphDestroy(gdl));
                 dmax = gate_maxd;
             }
@@ -2336,7 +2332,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_step_launches(k);
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs));
-                inst_or_advise(&draft_step_graph[k][p], gs, "draft step");
+                inst_or_advise(&draft_step_graph[k], gs, "draft step");
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
             // verify_graph's only consumer is the P11 constrained-tool path
@@ -2345,7 +2341,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
-            inst_or_advise(&verify_graph[p], gv, "mono verify");
+            inst_or_advise(&verify_graph, gv, "mono verify");
             CUDA_CHECK(cudaGraphDestroy(gv));
             }
             // P12/P12b: per-width verify graphs (W = cap+1 lanes, 2..6). Same
@@ -2359,7 +2355,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                inst_or_advise(&verify_graph_w[W][p], gw, "per-width verify");
+                inst_or_advise(&verify_graph_w[W], gw, "per-width verify");
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             // width-12 P1: the suffix drafter's wide verify. Suffix rounds
@@ -2371,7 +2367,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
-                inst_or_advise(&verify_graph_w[sfx_w][p], gs_, "suffix verify");
+                inst_or_advise(&verify_graph_w[sfx_w], gs_, "suffix verify");
                 CUDA_CHECK(cudaGraphDestroy(gs_));
             }
             vw = 5;
@@ -2384,7 +2380,6 @@ struct Engine {
         // generate() refuses as the belt. Skipping the warm block too is safe:
         // captures do not execute, so post-phase state equals post-phase-1.
         if (!sampled_graphs) {
-            perm = 0;
             fprintf(stderr, "sampled spec graphs SKIPPED (Q27_SAMPLED=0, greedy-only)\n");
         } else {
         q27k::SampleParams warm{1.f, 1.f, 0ull};
@@ -2394,13 +2389,12 @@ struct Engine {
         spec_sample_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         reset_gdn_mtp();
-        for (int p = 0; p < W_MAX; p++) {
-            perm = p;
+        { // M1b: one sampled capture (see the greedy set's note)
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_sample_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            inst_or_advise(&spec_sample_graph[p], gr, "sampled round");
+            inst_or_advise(&spec_sample_graph, gr, "sampled round");
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
             // verify_graph_w loop. The sampled tail is always depth-4, so the
@@ -2412,12 +2406,11 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches_sampled(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                inst_or_advise(&verify_sample_graph_w[W][p], gw, "sampled per-width verify");
+                inst_or_advise(&verify_sample_graph_w[W], gw, "sampled per-width verify");
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             vw = 5;
         }
-        perm = 0;
         } // sampled_graphs
         // M1: per-T commit-Fold graphs. Warm the fold kernels once (the junk
         // fold below mutates S/ring exactly like the spec warm above -- the
@@ -2466,10 +2459,9 @@ struct Engine {
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
                     sfx_L, sfx_width());
         fprintf(stderr,
-                "spec graphs captured (%d perms, depth-4%s; +per-width verify "
+                "spec graphs captured (ONE set, M1b; depth-4%s; +per-width verify "
                 "2..%d%s%s; +per-step draft 0..%d); "
                 "Q27_PMIN=%.3f (%s), gate_maxd=%d%s, dexit=%d\n",
-                W_MAX, // was the literal "12" -- the capture loop is over W_MAX
                 capture_constrained
                     ? "; +split D/V"
                     : (dexit_on ? "; mono D/V SKIPPED (dexit on, no --constrain-tools)"
@@ -2506,10 +2498,10 @@ struct Engine {
             // P11 constrained path: run drafts, read them back, let the host
             // stage per-lane grammar masks (uncapped), then verify. Full spec
             // acceptance survives inside tool-call bodies (vs the cap=1 hack).
-            // P13: under auto, draft_graph[perm] is depth-5; the constrained
+            // P13: under auto, draft_graph is depth-5; the constrained
             // verify is width-5 (reads 4 drafts), so draft the depth-4 graph.
             CUDA_CHECK(
-                cudaGraphLaunch(maxd_auto ? draft_graph_lo[perm] : draft_graph[perm], stm));
+                cudaGraphLaunch(maxd_auto ? draft_graph_lo : draft_graph, stm));
             int dr[4];
             CUDA_CHECK(cudaMemcpyAsync(&dr[0], d_draft, 4, cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaMemcpyAsync(&dr[1], d_draft2, 4, cudaMemcpyDeviceToHost, stm));
@@ -2517,7 +2509,7 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(&dr[3], d_draft4, 4, cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaStreamSynchronize(stm));
             on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
-            CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(verify_graph, stm));
         } else if (suffix_on && sfx_valid && pmin_theta > 0.f && h_mask_id0 < 0 &&
                    sfx.propose_with(last_pending, sfx_width() - 1, h_sfx_prop) >= sfx_L) {
             // Suffix round: the committed stream's suffix recurs -- fill the
@@ -2536,7 +2528,7 @@ struct Engine {
             for (int k = 0; k < sw - 1; k++)
                 CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], &h_sfx_prop[k], 4,
                                            cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[sw][perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[sw], stm));
         } else if (pmin_theta > 0.f && h_mask_id0 < 0) {
             // P12/P12b confidence-gated depth (unconstrained decode only): draft to
             // the ceiling + per-draft margins, cap depth at the leading run with
@@ -2557,7 +2549,7 @@ struct Engine {
                 // are unchanged: leading run of margin >= theta.
                 int cap = 0, launched = 0;
                 for (int k = 0; k < md_used; k++) {
-                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
                     launched++;
                     CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
                                                cudaMemcpyDeviceToHost, stm));
@@ -2580,14 +2572,14 @@ struct Engine {
                 // too. Its inputs (d_draft, x1 after step 0) are final at this
                 // point, so it writes exactly what monolithic step 1 writes.
                 for (int k = launched; k < W && k < md_used; k++)
-                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
-                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W], stm));
                 ph_W = W;
                 gate_cap = cap;
             } else {
                 // Q27_DEXIT=0: monolithic gated draft (the pre-P14 A/B baseline).
                 cudaGraphExec_t dg =
-                    (maxd_auto && md_used == 4) ? draft_graph_lo[perm] : draft_graph[perm];
+                    (maxd_auto && md_used == 4) ? draft_graph_lo : draft_graph;
                 CUDA_CHECK(cudaGraphLaunch(dg, stm));
                 CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, 7 * 4,
                                            cudaMemcpyDeviceToHost, stm));
@@ -2602,12 +2594,12 @@ struct Engine {
                 int cap = 0;
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
-                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W][perm], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_graph_w[W], stm));
                 ph_W = W;
                 gate_cap = cap;
             }
         } else {
-            CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(spec_graph, stm));
         }
         // outcome: [0]=n, [1..W_PLUMB]=the emitted tokens, [OUTCOME_INTS-1]=new pending.
         int oc[OUTCOME_INTS];
@@ -2774,7 +2766,7 @@ struct Engine {
     // syncing any of them -- graph launch + margin D2H only, deliberately NO
     // sync (that is the whole overlap).
     void draft_step_launch(int k) {
-        CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
         CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
                                    cudaMemcpyDeviceToHost, stm));
     }
@@ -2794,7 +2786,7 @@ struct Engine {
     // (launched == cap+1 >= W otherwise -- see draft_and_gate).
     void draft_floor_topup(int launched, int W, int md_used) {
         for (int k = launched; k < W && k < md_used; k++)
-            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
     }
     // Draft phase of one GATED round on THIS engine's stm: the P14 dexit
     // margin loop of spec_round verbatim (per-step draft graphs, D2H margin,
@@ -2855,7 +2847,7 @@ struct Engine {
     }
     // Post-verify host commit for one fused round: EXACTLY what the solo
     // round does after its outcome sync. Greedy (spec_round): em[]
-    // extraction, last_pending from oc[OUTCOME_INTS-1], suffix arming, perm
+    // extraction, last_pending from oc[OUTCOME_INTS-1], suffix arming, fold
     // advance, PLUS the telemetry/adaptive-depth block -- suffix counters,
     // gate_cap/gate_n/lane histograms, and the dctl ladder update (Task 9:
     // Q27_MAXD=auto members MUST feed dctl exactly like spec_round or the
@@ -2951,8 +2943,8 @@ struct Engine {
         if (pmin_theta > 0.f) {
             // P14 confidence-gated sampled round -- mirror spec_round's gated
             // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
-            // depth-4: draft_graph[perm] is depth-4 when gate_maxd==4; under
-            // gate_maxd==5 (auto or fixed) draft_graph_lo[perm] is the depth-4
+            // depth-4: draft_graph is depth-4 when gate_maxd==4; under
+            // gate_maxd==5 (auto or fixed) draft_graph_lo is the depth-4
             // draft (captured whenever gate_maxd==5). Cap the accept walk at 4.
             // Tools are off under sampling, so no split path.
             const int md_used = 4; // sampled ceiling is 4; cap <= 4 by construction
@@ -2964,7 +2956,7 @@ struct Engine {
                 // emitted bytes and round counts match Q27_DEXIT=0 exactly.
                 int cap = 0, launched = 0;
                 for (int k = 0; k < md_used; k++) {
-                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
                     launched++;
                     CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
                                                cudaMemcpyDeviceToHost, stm));
@@ -2978,11 +2970,11 @@ struct Engine {
                 // walks max_draft=W-1 drafts, so W draft rows must exist. Only
                 // fires at cap==0.
                 for (int k = launched; k < W && k < md_used; k++)
-                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
-                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+                    CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
             } else {
                 // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
-                cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo[perm] : draft_graph[perm];
+                cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo : draft_graph;
                 CUDA_CHECK(cudaGraphLaunch(dg, stm));
                 CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
                                            cudaMemcpyDeviceToHost, stm));
@@ -2991,12 +2983,12 @@ struct Engine {
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
                 assert(cap <= 4);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
-                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+                CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
             }
             // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
             // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
         } else {
-            CUDA_CHECK(cudaGraphLaunch(spec_sample_graph[perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(spec_sample_graph, stm));
         }
         int oc[7];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
@@ -3387,7 +3379,6 @@ struct Engine {
                                            cudaMemcpyHostToDevice, stm));
                 h += 3 * GDN_CH;
             }
-        perm = 0;
         fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
@@ -3438,7 +3429,6 @@ struct Engine {
                 CUDA_CHECK(cudaMemcpyAsync(conv_ring[il], ring_snap[il], 3 * GDN_CH * 4,
                                            cudaMemcpyDeviceToDevice, stm));
             }
-        perm = 0;
         fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
@@ -3627,7 +3617,6 @@ struct Engine {
         kv_copy(false, kv_mtp_pair(), L + 1, p);
         kv_copy(true, kv_mtp_pair(), L + 1, p);
         CUDA_CHECK(cudaStreamSynchronize(stm));
-        perm = 0;
         fold_pending = 0; // M1: restored state replaces any unfolded commit
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
@@ -3685,7 +3674,6 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
-        perm = 0;
         fold_pending = 0; // M1: committed state is being replaced wholesale
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
