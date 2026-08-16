@@ -66,8 +66,8 @@ static constexpr int N_GEN = 32;
 
 // Serial short-prompt prefill, mirroring generate()'s NP<32 branch verbatim
 // (reset + step_with walk + MTP warm interleave + h_next/d_P epilogue). Leg B
-// re-runs this between legs: reset() restores perm/GDN/MTP-KV to the same
-// state a fresh engine has, and stale attention-KV rows past the prompt are
+// re-runs this between legs: reset() restores GDN/MTP-KV (and cancels any
+// pending fold) to fresh-engine state, and stale attention-KV rows past the prompt are
 // rewritten before any read (the same argument the prefix cache rests on).
 static void prefill_serial(Engine& e, const std::vector<int>& prompt) {
     e.reset();

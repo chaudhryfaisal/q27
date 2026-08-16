@@ -342,7 +342,7 @@ struct Engine {
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
     //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
-    //   sample_graph + spec_sample_graph[12] + verify_sample_graph_w[4][12]
+    //   sample_graph + spec_sample_graph + verify_sample_graph_w[2..5]
     //   -- serves ONLY temperature>0 requests. =0 skips capture; the server
     //   refuses temp>0 with a 400 and generate() refuses as the belt.
     //   capture_constrained (default true; the server clears it when booted
@@ -2310,8 +2310,8 @@ struct Engine {
             // 5 under auto, so draft_graph above is the depth-5 (hi) graph.
             // P14: capture it whenever gate_maxd==5 (auto OR fixed Q27_MAXD=5), not
             // just auto -- the sampled+gated path is always a depth-4 draft and
-            // needs the depth-4 graph even under fixed depth-5. One extra graph per
-            // perm, no new buffers; greedy still selects draft_graph_lo only under
+            // needs the depth-4 graph even under fixed depth-5. One extra graph, no
+            // new buffers; greedy still selects draft_graph_lo only under
             // maxd_auto (spec_round unchanged), so its behavior is untouched.
             if (need_mono_draft && gate_maxd >= 5) {
                 dmax = 4;
@@ -2360,7 +2360,7 @@ struct Engine {
             }
             // width-12 P1: the suffix drafter's wide verify. Suffix rounds
             // always launch full width, so only sfx_w itself is captured
-            // (not every width 9..sfx_w) -- 12 extra graphs total.
+            // (not every width 9..sfx_w) -- one extra graph total (M1b).
             if (sfx_w > gate_maxd + 1) {
                 vw = sfx_w;
                 cudaGraph_t gs_;
@@ -2375,7 +2375,7 @@ struct Engine {
         // Phase 2: sampled graph set -- identical draft half, rejection-sampling
         // verify tail. Warm with dummy params (the greedy graphs above are
         // already instantiated and independent of the device state churned here).
-        // Q27_SAMPLED=0 skips the whole phase (~60 graphs): greedy-only boots
+        // Q27_SAMPLED=0 skips the whole phase (~5 graphs post-M1b): greedy-only boots
         // reclaim the VRAM; the server 400s temperature>0 requests and
         // generate() refuses as the belt. Skipping the warm block too is safe:
         // captures do not execute, so post-phase state equals post-phase-1.

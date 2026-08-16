@@ -11111,3 +11111,24 @@ Peak aggregate across the whole arc: 185.6 (pre-M1) -> 280.7 (M1) ->
 per-slot at matched C) is met -- Q27_KV_POOL now DEFAULTS ON
 (Q27_KV_POOL=0 restores per-slot). Production restarted on the pooled
 default after the prod-shaped boot sanity.
+
+CORRECTIONS + FOLLOW-UPS to the (f) entry (adversarial review: 16 agents,
+12 confirmed / 1 refuted-empirically). THE HIGH: nothing reconciled the
+admission ceiling (max_ctx) with pool capacity -- an admissible
+full-window request could FIFO-wait FOREVER on shapes where the window
+outruns the pool (single-slot has no scavenge victim; no refusal, no
+log). Production was masked only because fp8's 262144 cap binds under an
+11.4 GB pool. FIX: after pool init the advertised window(s) clamp to the
+largest pool-entitlable row count, so every existing guard agrees and
+beyond-window requests 400; a <4096-row pool disables itself to per-slot.
+Verified: --slots 3 --ctx 262144 boots 2x262K slots + 11.13 GB pool with
+the full window genuinely entitlable (84,880 pages vs 69,633 needed).
+ALSO: kEngSampSave/MonoSave were still 12x-zoo values (Q27_SAMPLED=0
+drove the modeled graph term NEGATIVE, ~0.3-0.55 GB overcommit) --
+rescaled to the 5-graph reality; the pool's fixed_for slack is now
+arch-scaled (1.0 GB on sm_86/89 per issue #6 -- the pool allocates
+before capture and was eating the transient margin); the pool-floor
+gains nothing at n_slots==1 by design (the window clamp is the
+single-slot guarantee); stale texts fixed (per_slot rationale, perm in
+the conductor mirror list, "12 extra graphs", "~60 graphs", fused_smoke
+reset comment, default-aware pool-failure message).

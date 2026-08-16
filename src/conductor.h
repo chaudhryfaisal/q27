@@ -687,7 +687,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     e0.mm5(v, e0.shared_dm().get(vhead), v.lg);
     // per-engine tails: own lane pointers (solo view), granted width,
     // conductor stream -- argmax/accept + finish land in each engine's own
-    // d_v/d_outcome/h_next, and perm-role commit semantics are untouched.
+    // d_v/d_outcome/h_next, and the fold commit semantics are untouched.
     for (int m = 0; m < k; m++) {
         Engine::LaneView tv = es[m]->solo_view(); // vw already = granted[m]
         tv.stm = cstm;
@@ -1391,7 +1391,7 @@ private:
     // (a fused verify runs ONE union width; binning it per member width
     // would misprice the curve), sfx_ms/sfx_rounds, and [sfxdbg]'s propose
     // trace lines. Everything else spec_round mutates (last_pending,
-    // sfx_valid/sfx.append, perm, dctl, gate_cap/n/lane hists, sfx_fired/
+    // sfx_valid/sfx.append, fold_pending, dctl, gate_cap/n/lane hists, sfx_fired/
     // sfx_tok, gs.dec/rounds/cb_ms/end) is mirrored via commit_outcome +
     // post_round.
     void fused_round(Member** ms, const int* granted, const bool* sfx, int k,

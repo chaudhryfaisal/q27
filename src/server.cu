@@ -521,8 +521,13 @@ int main(int argc, char** argv) {
     // ~0.13 GB on cc>=89, ~0.43 GB on sm_86 (the old per-perm slopes are now
     // the whole zoo).
     const double kEngGraphs = cc_arch >= 89 ? 0.13e9 : 0.43e9;
-    const double kEngMonoSave = cc_arch >= 89 ? 0.08e9 : 0.15e9;
-    const double kEngSampSave = cc_arch >= 89 ? 0.34e9 : 0.60e9;
+    // M1b review: the capture-skip credits were still calibrated to the
+    // 12x zoo (skipping ~60 sampled graphs); post-collapse the sampled set
+    // is 5 graphs and the mono pair 2-3 -- roughly 1/12 the VRAM. Leaving
+    // the old values drove the modeled graph term NEGATIVE under
+    // Q27_SAMPLED=0 and overcommitted ~0.3-0.55 GB.
+    const double kEngMonoSave = cc_arch >= 89 ? 0.01e9 : 0.015e9;
+    const double kEngSampSave = cc_arch >= 89 ? 0.03e9 : 0.05e9;
     const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
     // GDN recurrent state, M1 record+fold: committed + snapshot sets
     // (2 x 0.157 GB) + the record arena ((W_MAX-1) rows x ~3.95 MB across the
@@ -637,9 +642,9 @@ int main(int argc, char** argv) {
                 c = budget > 0 ? (long)(budget / per_tok) : 0;
             } else {
                 // MULTI-slot: every slot is a full co-resident engine.
-                // PER_SLOT = single_fixed + ~2.2 GB fragmentation/scratch that
-                // co-residency adds (calibrated to the shipped 2x48K fp8
-                // anchor on a 32GB 5090 == ~6.6 GB/slot on W12). Reduce the
+                // PER_SLOT = single_fixed + 1.0 GB scratch/slack (recalibrated
+                // 2026-08-16 post-M1b against measured ~1.4 GB/slot marginals;
+                // the old 2.2 GB was covering the unmodeled 12x zoo). Reduce the
                 // slot count first so the picked ctx and the log are HONEST
                 // (the build-loop skip is then a pure safety net), then split.
                 const double per_slot = single_fixed + 1.0e9;
@@ -794,10 +799,14 @@ int main(int argc, char** argv) {
         // 0.24 GB pool that could not hold ONE 8K entitlement -- every
         // request FIFO-starved). Trade slots for pool until each projected
         // slot can hold a HALF-ctx entitlement concurrently.
+        // Arch-scaled slack (M1b review): sm_86/89 need the 1.0 GB margin
+        // issue #6 established for the ctx-scaled instantiate transient --
+        // the pool is allocated BEFORE any capture and would otherwise eat it.
+        const double pool_slack = cc_arch >= 120 ? 0.25e9 : 1.0e9;
         auto fixed_for = [&](int ns) {
             return (double)ENG_FIXED_BYTES +
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
-                   0.25e9 + (double)ns * (double)(256ull << 20);
+                   pool_slack + (double)ns * (double)(256ull << 20);
         };
         const int half_rows = std::max(4096, slot1_ctx / 2);
         const double ent_bytes =
@@ -820,8 +829,43 @@ int main(int argc, char** argv) {
                         pool_b / 1e9, kv_pool.npages[0], kv_pool.page_bytes[0],
                         kv_pool.npages[1], kv_pool.page_bytes[1]);
         }
+        // M1b review (HIGH): reconcile the ADMISSION ceiling with POOL
+        // capacity. can_fit/the 400 preflight check max_ctx; if the pool
+        // cannot entitle a full window, an admissible full-window request
+        // would FIFO-wait forever (no victim to scavenge on a single slot).
+        // Clamp the window(s) to the largest entitlable row count BEFORE the
+        // engines are built, so every guard agrees and beyond-window
+        // requests 400 like any oversized prompt. A max-window request may
+        // monopolize the pool; others wait FINITELY behind it.
+        if (kv_pool.enabled()) {
+            auto pages_for = [](int rows) { // per side: 16 attn pairs + MTP(+1 row)
+                return 16 * ((rows + 63) / 64) + ((rows + 1 + 63) / 64);
+            };
+            int r_max = 4096;
+            const int np = std::min(kv_pool.npages[0], kv_pool.npages[1]);
+            while (pages_for(r_max + 4096) <= np) r_max += 4096;
+            if (pages_for(r_max) > np) r_max = 0;
+            if (r_max < 4096) {
+                fprintf(stderr, "[pool] cannot entitle even 4096 rows -- per-slot KV\n");
+                for (int s_ = 0; s_ < 2; s_++)
+                    if (kv_pool.base[s_]) { cudaFree(kv_pool.base[s_]); kv_pool.base[s_] = nullptr; }
+            } else {
+                if (ctx > r_max) {
+                    fprintf(stderr, "[pool] ctx %d -> %d (pool-entitlable window)\n", ctx,
+                            r_max);
+                    ctx = r_max;
+                }
+                if (slot1_ctx > r_max) {
+                    fprintf(stderr, "[pool] slot1-ctx %d -> %d (pool-entitlable window)\n",
+                            slot1_ctx, r_max);
+                    slot1_ctx = r_max;
+                }
+            }
+        }
         if (!kv_pool.enabled())
-            fprintf(stderr, "[pool] Q27_KV_POOL=1 but sizing failed -- per-slot KV\n");
+            fprintf(stderr,
+                    "[pool] sizing failed -- per-slot KV (paged pool is the default; "
+                    "Q27_KV_POOL=0 selects per-slot explicitly)\n");
     }
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
