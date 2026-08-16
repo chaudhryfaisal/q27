@@ -10788,3 +10788,50 @@ canonical), the only shape that clears the VRAM wall and the only one worth
 (a)'s answer. Phase 2 closes measured: the 2.5x GEMM is real, and on this
 engine, with this include set, it does not survive contact with Amdahl, the
 quality envelope, or a 32 GB card.
+
+## 2026-08-15: ninfer steals phase 3 -- the batched-decode spec, and the 8.2 GB number comes apart under audit
+
+Phase 3's deliverable was a spec, not code: docs/plans/2026-08-15-batched-
+decode-spec.md. Verdict: **GO with margin** -- but staged, M1-gated.
+
+THE HEADLINE CORRECTIONS. (1) "Each slot costs ~8.2 GB of fixed stack" was
+the ADMISSION ESTIMATOR, not a measurement: 6.611 GB of constants (0.89
+per-PROCESS context double-charged per slot + 1.56 graph zoo + 2.04 GDN
+role sets + 2.2 fudge) plus KV for a 32K window the ladder never requested
+-- CONFIG BUG: explicit `--ctx` does not propagate to slots 1+, which stay
+at slot1_ctx=32768 (server.cu:288 vs :666). Measured reality from the
+ladder's own free-VRAM deltas: **~5.6 GB/slot**. (2) The engine allocates
+17 KV pairs + MTP; the sizer charges 18 pairs -- a 6% conservative bias.
+(3) The batched weight sweep phase 3 was going to design ALREADY SHIPS:
+fused_verify_round runs one sweep at M = sum(widths) across members via
+union LaneViews, drafts fuse (P2c), rounds are graph-captured under shape
+keys (P3). vgemm/gemv_n/every *3 kernel is batch-clean pointer-array work.
+
+THE DECOMPOSITION (per slot, ctx 16K, W12): irreducible per-sequence floor
+is **0.88 GB INCLUDING KV** (0.60 KV + 0.157 committed GDN + 0.15
+snapshot). The rest: 1.65 GB of GDN spare-role ring -- SPECULATION-WIDTH
+state, not sequence state -- plus 0.84 prefill scratch + ~1.6 graph zoo
+(254 execs) of pure engine-per-slot duplication.
+
+THE DESIGN (spec §3): one engine + N SeqStates. Four moves in dependency
+order: (a) GDN record-then-Fold (ninfer's shape: verify records rows into
+a batch-row arena, one Fold commits the accepted prefix; kills the 13-set
+rotation ring -> ~2 sets/lane; byte moves, bitwise-gateable via the ninv
+twins); (b) paged KV (page 64, block tables, reserved/mapped/valid
+extents, per-row lengths in attn_decode3/kv_store3); (c) seq-indexed union
+views + unified tails (the sampled tail still bypasses the view); (d)
+batch-shape graph keys (drop Engine* from the key -- possible only after
+a+b remove baked pointers). Attention stays per-sequence by the standing
+2026-07-14 ruling (zero shared reads).
+
+THE BAR: marginal ~0.67 GB + KV per sequence vs "< 2 GB + KV" -- met 3x.
+C=4 @16K ~= 25 GB total on a 32 GB card; C=4 @32K also fits. C=8 is
+memory-feasible (~30 GB) but LANE-bound: W_PLUMB=16 gives 8 members floor
+width 2 -- the honest ladder target is C=4, and C=8 needs the fdmma tile
+redesign nobody is signing up for here.
+
+THE SLEEPER: M1 (record-then-Fold) pays under the CURRENT architecture --
+about -1.5 GB/slot, which fits a third slot into today's post-weight
+budget before any redesign lands. It is the load-bearing stage and the
+gate for everything after it. M0 (config bug + estimator honesty) ships in
+hours, independently.

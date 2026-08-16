@@ -109,7 +109,17 @@ ninfer demonstrates fp4 MMA carrying real serving on this exact card.
   wall-clock prefill >= 1.25x on the 17K-27K prompts real agentic traffic
   shows. Any miss = NO-GO entry with the numbers.
 
-## Phase 3 (redesign-scale, separate spec): single-engine batched decode
+## Phase 3 (redesign-scale, separate spec): single-engine batched decode -- SPEC DELIVERED 2026-08-15, GO
+
+docs/plans/2026-08-15-batched-decode-spec.md. Bar met 3x: per-sequence
+marginal ~0.67 GB + KV (bar: < 2 GB + KV), C=4 @16K ~= 25 GB on 32 GB. Key
+audit findings: "8.2 GB/slot" was an estimator artifact (config bug: --ctx
+not propagating past slot 0; per-process context double-charged; 18-vs-17
+pair KV bias) -- measured cost ~5.6 GB/slot; the batched weight sweep
+already ships (P0-P3 union views); the true redesign is memory ownership,
+staged M0-M5 with the GDN record-then-Fold (M1) as the gate -- it pays
+~-1.5 GB/slot under the CURRENT architecture before any redesign lands.
+C=8 is lane-bound (W_PLUMB=16), not memory-bound: ladder target is C=4.
 
 The concurrent ladder proved the C=8 gap is architectural: each q27 slot
 carries ~8.2 GB of fixed engine stack, so a 32 GB card fits two engines,
