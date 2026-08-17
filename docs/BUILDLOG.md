@@ -11425,3 +11425,48 @@ batching, for two by-design reasons (the fd2/fdmma width switch and the
 k>=3 vgemm union family), and believing it is what produced the two false
 bug reports corrected in entry (i). Both paragraphs now carry a loud
 amendment naming what to gate on instead.
+
+## 2026-08-17: prefill performance plan -- the M-batching idea dies to a measurement before it was built
+
+Plan doc: docs/plans/2026-08-17-prefill-performance.md. Written after
+re-reading the ninfer A/B raw logs rather than the summary of them.
+
+THE A/B'S OWN CONTROL, which the "2.9x" headline had been quoted without:
+same harness, our silicon, qwen3.6-27b both sides, cache-busted --
+q27 q4s 3,537 PP tok/s @10K and 2,643 @90K; ninfer **nvfp4** 10,418 (2.94x)
+and 5,177 (1.96x); ninfer **int** 3,051 (**0.86x**) and 2,367 (**0.90x**).
+ninfer on an integer format is SLOWER than q27 at both depths. The gap is
+the FORMAT, not the engine -- and it halves with depth because O(N^2)
+attention grows and no weight format touches it.
+
+NEW MEASUREMENT, and it kills a plausible plan item before any code:
+`build/microbench_mxf4` on real q4s projection weights sweeps M and
+`q27k::gemm_q4_T` is FLAT -- attn_q+gate 280.3/313.3/314.9/322.0 TFLOPS at
+M=512/1024/2048/8192, ffn_gate 319.5/319.7/319.6/318.4. A 16x increase in M
+moves throughput ~2%. So the post-M3a idea of BATCHING PREFILL ACROSS
+SEQUENCES (8 slots now exist, concurrent prefills are gate-serialized, and
+the P2a decode physics says one weight read should serve all slots) buys
+nothing on the GEMM: PF_T=1024 is already past the efficiency knee. Filed as
+an explicit dead end so it is not re-proposed.
+
+DECOMPOSITION (derived, not profiled): phase 2's fp4 leg gave 2.5x on its
+include set for a 1.237x wall at 17K, so the included GEMMs are ~32% of the
+prefill wall; the include set is 77% of GEMM flops, so ALL projection GEMM
+is ~42% and ~58% sits in attention + delta-scan + staging at 17K -- rising
+with N (attention alone measured 54% at 128K). A free, perfect GEMM caps at
+~1.7x. That is why the format alone was never going to reproduce 2.9x here.
+
+THE THREE LEVERS, ranked: (1) prefill-attention occupancy -- 12.5%, dual-
+limited by 248 regs AND 84.48 KB smem, 90% of issue slots empty, DRAM 1.98%;
+biggest block, format-independent, zero quality price, needs the smem-layout
+rewrite that blocked fp8-MMA in 07. (2) int GEMM headroom -- 310 vs the fp4
+kernel's 785-868 on the same shapes; fp4's dense peak is 2x fp8/int8 on
+Blackwell, so ~2x of the 2.5x is SILICON and only ~25% is kernel; P0 is a
+spec lookup to confirm percent-of-peak before touching anything. (3) native
+fp4 tier (single copy, fp4 GEMV decode, own canonical), gated on a W4A8
+attribution arm to split weight-grid from activation-sparsification damage.
+
+ROI note kept in the plan, not buried: the P16 prefix cache makes the common
+agentic case a 1.20 s restore vs an 8.15 s re-prefill, so this work's value
+scales with cache MISS RATE, not prefill share. Measure the miss rate on real
+traffic before spending P1's week; "not worth it yet" is a legitimate outcome.
