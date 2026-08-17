@@ -393,14 +393,43 @@ struct UnionView {
 //                 class). trim_widths evicts suffix lanes first, so mixed
 //                 unions are rare and the fork is bounded to opportunistic
 //                 re-emission bets, never depthctl-earned gated lanes.
-// Q27_BATCH_GEMM=1 overrides to always-vgemm (threshold 2) -- the
-// tolerance-class PERF leg for the Task 11 A/B (vgemm is ~flat in width, so
-// wide unions want it even where solo took the GEMV).
+// k >= 3 DEFAULT OVERRIDE (2026-08-16 C-sweep, BUILDLOG (g)): at three or
+// more members the all-gated/mixed union goes vgemm (threshold 2) anyway.
+// The bitwise-preserving GEMV family register-cliffs in union width (q4
+// ffn/call 0.055 ms @N=12 -> 0.113 @N=16) and cost the whole C=7 rolloff;
+// on vgemm the ladder is monotone (C=3..7: +16..37%, peak 309.8 -> 400.0
+// t/s). Price: gated fused lanes at k >= 3 surrender bitwise-vs-solo for
+// the documented rel~1e-6 vgemm class. Determinism, stated precisely: each
+// kernel is run-to-run deterministic, but the family now flips with k at
+// the 2/3 boundary and k changes mid-request as members join/leave -- so at
+// C >= 3 a request's emitted tokens depend on the per-round k SEQUENCE,
+// which is arrival-timing-dependent. Solo replay of a fused greedy request
+// is not expected to match, and multi-slot token-identity A/Bs at 3+ slots
+// require Q27_BATCH_GEMM=0. k <= 2 keeps the GEMV and the full bitwise
+// contract -- also the regime where the GEMV measured faster (07-15 k=2
+// A/B: vgemm -1.5%). The policy keys on member count k, not union width:
+// k=2 can reach vw=12 (trim cap) on the GEMV, which the k=2 A/B covered;
+// keying on vw would surrender the measured-winning bitwise regime.
+// GRAPH SAFETY: gemm_min is part of the view identity (union_view_eq
+// compares it), so a per-round family change can never replay a stale exec;
+// it captures a fresh variant instead.
+// Q27_BATCH_GEMM overrides the default: =1 forces always-vgemm (threshold
+// 2) at ANY k; =0 restores the pre-C-sweep default (gated/mixed on GEMV at
+// any k -- all-suffix unions STILL take vgemm, their solo family; this is
+// not a vgemm kill switch); unset or empty = the k >= 3 auto above.
 inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t cstm,
                                   const bool* is_suffix) {
-    static const bool force_vgemm = [] {
+    static const int batch_gemm = [] { // -1 = auto (vgemm at k >= 3), 0 = never, 1 = always
         const char* e = getenv("Q27_BATCH_GEMM");
-        return e && atoi(e) != 0;
+        if (!e || !*e) return -1;
+        char* end = nullptr;
+        long v = strtol(e, &end, 10);
+        if (end == e) { // non-numeric ("auto", "on", ...): loud, then auto --
+            fprintf(stderr, // silently pinning 0 here would re-enter the C=7 rolloff regime
+                    "Q27_BATCH_GEMM='%s' not numeric; using auto (vgemm at k >= 3)\n", e);
+            return -1;
+        }
+        return v != 0 ? 1 : 0;
     }();
     assert(k >= 1 && k <= W_PLUMB);
     // CRITICAL union-sweep precondition: every engine's lanes 0..w[m]-1 are
@@ -447,10 +476,13 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
     uv.view.vgemm_ws = es[0]->vgemm_ws();
     // union-class GEMM family (policy block in the header comment above):
     // all-suffix -> vgemm (2); all-gated OR mixed -> GEMV (99, gated lanes
-    // keep the bitwise contract; mixed unions' suffix lanes tolerance-fork).
+    // keep the bitwise contract; mixed unions' suffix lanes tolerance-fork)
+    // at k <= 2, vgemm (2) at k >= 3 per the C-sweep default override.
     bool all_sfx = true; // k >= 1 asserted above, so this is never vacuous
     for (int m = 0; m < k; m++) all_sfx &= is_suffix[m];
-    uv.view.gemm_min = (force_vgemm || all_sfx) ? 2 : 99;
+    const bool want_vgemm = all_sfx || batch_gemm == 1 ||
+                            (batch_gemm == -1 && k >= 3);
+    uv.view.gemm_min = want_vgemm ? 2 : 99;
     return uv;
 }
 
@@ -525,14 +557,15 @@ inline bool union_view_eq(const UnionView& a, const UnionView& b) {
 // the view + shared weights (dm/T(il)/EPS), so calling them on es[0] with the
 // union view sweeps every engine's lanes in one pass -- that is the whole
 // point: one weight read serves all slots.
-// NOTE mm5 dispatch: RESOLVED by the union GEMM-family policy (Task 9) --
-// mm5 now compares the union view's vw against view.gemm_min, which
-// build_union_view sets per union class (is_suffix[0..k)) so every lane
-// stays on the numeric family its solo round took; Q27_BATCH_GEMM=1 is the
-// always-vgemm tolerance-class perf override. The old hazard (union >= 9
-// silently taking k_vgemm where solo widths <= 8 took the dp4a GEMV) can no
-// longer occur; Q27_GEMM_MIN=99 pins in older gates are redundant-but-
-// harmless.
+// NOTE mm5 dispatch: mm5 compares the union view's vw against
+// view.gemm_min, which build_union_view sets per union class AND member
+// count (policy block above build_union_view): k <= 2 gated/mixed keep the
+// solo family (GEMV, bitwise); all-suffix, or k >= 3, or Q27_BATCH_GEMM=1
+// go vgemm (tolerance class -- the 2026-08-16 C-sweep default);
+// Q27_BATCH_GEMM=0 restores always-GEMV for gated/mixed. The once-"can no
+// longer occur" hazard (union taking k_vgemm where solo took the dp4a GEMV)
+// is now the DELIBERATE default at k >= 3. Q27_GEMM_MIN=99 pins in older
+// gates pin the SOLO threshold only, not the union family.
 // sampled[m] (Task 9, nullable = all-greedy) picks member m's verify tail:
 // spec_verify_tail_sampled (nucleus + rejection accept + finish_sampled)
 // instead of the greedy argmax tail. The FORWARD is shared by design (both
@@ -1552,12 +1585,15 @@ private:
     //   gw[k]   exact granted-width vector -- per-lane grids, the union vw,
     //           each member's mix lane walk and tail width are baked from
     //           it (the solo analog: verify_graph_w is per-width).
-    //   sfx[k]  suffix class per member -- sets the union's gemm_min family
-    //           (all-suffix -> vgemm(2), else GEMV(99); build_union_view
-    //           policy), i.e. WHICH mm5 branch the capture recorded. Keyed
-    //           as the exact vector (finer than the derived class, so the
-    //           key stays the census key). Q27_BATCH_GEMM is a process
-    //           latch, constant for a server lifetime -- not keyed.
+    //   sfx[k]  suffix class per member -- with k and the Q27_BATCH_GEMM
+    //           latch it determines the union's gemm_min family (gemm_min =
+    //           f(sfx vector, k, latch): all-suffix / k >= 3 / latch=1 ->
+    //           vgemm(2), else GEMV(99)), i.e. WHICH mm5 branch the capture
+    //           recorded. sfx and k are BOTH key components; the latch is
+    //           process-constant -- family is fully determined by the key.
+    //           Any future policy input must itself be a keyed component
+    //           (vw, e.g., is NOT keyed -- it is derived from gw[]), or
+    //           union_view_eq becomes the only line of defense.
     //   smp[k]  sampled mask -- per-member tail kernel choice
     //           (spec_verify_tail vs _sampled), baked at capture.
     //   kvk[k]  per-engine kv_kind -- attn_mix's kv_store/attn_decode

@@ -11208,3 +11208,53 @@ planned (more slots per GB is now worth more than any width work);
 (3) optional later: want-aware trim so depthctl stops pinning (evidence
 fix, not a throughput claim). Bench rig torn down; qwen38 prod + s2s
 restored on the pooled default binary.
+
+## 2026-08-16 (h): the union family goes AUTO -- vgemm at k >= 3 is the batch-mode default
+
+Product call (Gabe, same day as (g)): the +16-37% at C>=3 is worth the
+bitwise-vs-solo contract for gated fused lanes. Landed as a tri-state in
+build_union_view: unset/empty = AUTO (all-gated/mixed unions take vgemm
+at k >= 3 members, keep GEMV at k <= 2); Q27_BATCH_GEMM=1 = always-vgemm
+(the old override, unchanged); =0 = the pre-C-sweep always-GEMV policy
+(NOT a vgemm kill switch -- all-suffix unions keep their solo family).
+Non-numeric values warn loudly and fall to auto (a silent "auto"->0
+parse would have re-entered the C=7 rolloff regime). The boot banner now
+prints batch-gemm=<mode>.
+
+WHY k, NOT UNION WIDTH: the k=2 A/B (07-15, vgemm -1.5%) covered GEMV up
+to the trim cap vw=12, so keying on vw would surrender the bitwise
+contract exactly in the regime it was measured to win. Documented at the
+policy block.
+
+GRAPH SAFETY: gemm_min is compared by union_view_eq and (sfx[], k) are
+both GraphKey components with the env a process latch, so the family is
+fully determined by the key -- a family flip can never replay a stale
+exec; it captures a fresh variant. The census comment now warns that any
+FUTURE policy input must itself be keyed (vw is not -- it is derived).
+
+DETERMINISM, STATED HONESTLY (review MEDIUM, wording adopted): each
+kernel stays run-to-run deterministic, but k changes mid-request as
+members join/leave, so at C >= 3 a greedy request's tokens depend on the
+per-round k sequence = arrival timing. Token-identity A/Bs at 3+ slots
+need Q27_BATCH_GEMM=0. README (P16 "bitwise-identical continuations")
+and docs/multislot-throughput.md now carry the k <= 2 qualifier.
+
+REVIEW (3 lenses, 0 HIGH / 4 MEDIUM / rest LOW-NIT, all addressed or
+declined with reasons): stale mm5-dispatch NOTE + GraphKey census +
+vgemm.cuh "ladder never reaches this kernel" comments rewritten;
+fused_smoke now PINS Q27_BATCH_GEMM=0 (ambient =1 would have failed its
+k=2 byte-identity legs for a policy reason -- the smoke is a plumbing
+test); empty-string env now means auto, not "never". DECLINED: vw-based
+keying (above); a batch_ab.sh 3-slot leg is noted as the missing
+determinism-envelope rig (follow-up, not built).
+
+GATES: canonical EXACT f64e7c02 (q4s CLI) post-review-fixes; fused_smoke
+all legs x {fp16, fp8} PASS (k=2 byte-identity preserved by
+construction); ladder spot-checks on the NEW DEFAULT, no env: C=2 214.0
+(dead match with stock pooled 214.3 -- GEMV/bitwise regime intact), C=6
+366.6 / C=7 385.4 (auto-vgemm engaged; (g)'s flag-forced numbers were
+360.7/400.0 -- within run variance). One rig note for the ledger: the
+first post-build canonical run returned the EMPTY-output md5 because the
+spot-check bench server was still resident (the documented co-residency
+trap) -- killed it, clean rerun. Prod (qwen38, port 8080) + s2s restored
+on the new binary; banner confirms batch-gemm=auto(k>=3).

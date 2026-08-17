@@ -34,7 +34,9 @@
 // isum term to a __vsub4 at the smem unpack -- algebraically the same. ONLY the
 // fp32 accumulation ORDER differs. Measured rel: Q4 1.05e-6, Q8 2.80e-6.
 // => tolerance-class, run-to-run deterministic. Suffix-round output may re-roll
-// an argmax near-tie; the ladder never reaches this kernel (see gemm_min).
+// an argmax near-tie; the solo ladder never reaches this kernel (see gemm_min).
+// Gated union lanes at k >= 3 members DO reach it, by policy (the 2026-08-16
+// C-sweep default in build_union_view) -- same re-roll class applies there.
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

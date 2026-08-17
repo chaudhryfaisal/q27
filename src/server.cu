@@ -500,14 +500,15 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
-            "think=%d\n",
+            "think=%d batch-gemm=%s\n",
             ref_profile ? "ref" : "cc", cc_arch, getenv("Q27_KV") ? getenv("Q27_KV") : "fp16",
             getenv("Q27_FD") ? getenv("Q27_FD") : "fd2",
             getenv("Q27_PMIN") ? getenv("Q27_PMIN") : "off",
             getenv("Q27_MAXD") ? getenv("Q27_MAXD") : "4",
             getenv("Q27_SUFFIX") ? getenv("Q27_SUFFIX") : "0",
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
-            no_think_srv ? 0 : 1);
+            no_think_srv ? 0 : 1,
+            getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)");
 
     // Per-engine non-KV reserve, the single source of truth shared by
     // auto-ctx (below) and the multi-slot skip loop. GDN state + graph zoo +

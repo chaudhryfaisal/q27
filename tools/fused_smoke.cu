@@ -27,10 +27,14 @@
 //                       that), so an unpinned run would fork the numeric path
 //                       and fail byte-identity for a reason that has nothing
 //                       to do with the fused plumbing. Task 9 landed exactly
-//                       that policy call in build_union_view (all-gated
-//                       unions force the GEMV family), so this pin is now
+//                       that policy call in build_union_view (gated unions
+//                       at k <= 2 take the GEMV family -- this smoke builds
+//                       only k <= 2 unions, es[2]), so this pin is now
 //                       REDUNDANT-BUT-HARMLESS; kept so the smoke stays a
 //                       plumbing test, independent of the policy code.
+//                       Q27_BATCH_GEMM is pinned to 0 below for the same
+//                       reason: an ambient =1 would flip the k=2 unions to
+//                       vgemm and fail byte-identity for a policy reason.
 //
 // Build (mirrors the Makefile q27 rule's file list, engine main() swapped
 // for this driver; no Makefile edit per the plan's sensitive-file rule).
@@ -150,6 +154,7 @@ int main(int argc, char** argv) {
     setenv("Q27_PMIN", "0.5", 1);
     setenv("Q27_MAXD", "4", 1);
     setenv("Q27_GEMM_MIN", "99", 1);
+    setenv("Q27_BATCH_GEMM", "0", 1); // union family: keep gated GEMV (header)
     unsetenv("Q27_SUFFIX");   // suffix rounds are a different (non-gated) branch
     unsetenv("Q27_SUFFIX_W");
     unsetenv("Q27_DEXIT");    // default ON = the per-step draft loop we mirror

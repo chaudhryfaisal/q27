@@ -64,7 +64,11 @@ shape-keyed LRU cache can replay whole verify rounds as CUDA graphs
 (~28-44 live shapes, 86-100% hits). The bitwise gates the 07-11 doc
 worried about HELD: batched output is byte-identical to the pre-batching
 references at every phase (master-gate refs, canonical, sampled-seed),
-and solo serving is untouched by construction. What the 07-11 estimate
+and solo serving is untouched by construction. [2026-08-16 amendment:
+byte-identity now holds at k <= 2 members; k >= 3 unions default to the
+vgemm tolerance class (rel ~1e-6) after the C-sweep found the GEMV family
+caused the C=7 rolloff -- BUILDLOG (g)/(h), Q27_BATCH_GEMM=0 restores the
+old policy.] What the 07-11 estimate
 got right: ~1.9x was the no-graphs ceiling estimate at k=2; eager fusion
 measured 1.21-1.31x and graph replay carried it to 1.41x. What it got
 wrong: nothing material -- it priced the work as expensive (it was: P0-P3,

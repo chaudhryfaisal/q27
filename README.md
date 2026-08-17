@@ -241,7 +241,9 @@ workstation Blackwell has no fp4 MMA in PTX, so int8 is the ceiling.
 Two serving-side additions since: **P16 persistent prefix cache** (opt-in,
 `--prefix-cache DIR`) survives a restart or a fresh conversation by writing the
 P8 stable prefix to disk -- restart TTFT **8.15 s -> 1.20 s** on a 26,700-token
-prompt, bitwise-identical continuations, with an optional pinned host-RAM tier
+prompt, bitwise-identical continuations at up to 2 concurrent decode streams
+(3+ streams default to the vgemm tolerance class, rel ~1e-6; `Q27_BATCH_GEMM=0`
+restores bitwise at any concurrency), with an optional pinned host-RAM tier
 above it (`--prefix-cache-ram-gb`). And a **reasoning-token budget**, ON by
 default when the rendered prompt begins inside a `<think>` block: the block is
 force-closed at half the request's `max_tokens` and the model still answers,
@@ -374,7 +376,8 @@ q27 treats the GDN summary as a first-class object instead of a cache miss:
   with the process, so a restart re-prefills everything. `--prefix-cache
   DIR` writes the GDN state plus the attention/MTP rows to a file keyed on
   the token prefix. Measured: restart TTFT **8.15 s -> 1.20 s** on a
-  26,700-token prompt, bitwise identical output. A second entry cut inside
+  26,700-token prompt, bitwise identical output (at up to 2 concurrent
+  decode streams; see the union-family note above). A second entry cut inside
   the system+tools block is shared across conversations, so a NEW
   conversation restores the part it has in common with an old one -- the
   thing a block cache would have given a pure-attention model for free.

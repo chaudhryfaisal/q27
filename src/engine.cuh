@@ -1670,9 +1670,10 @@ struct Engine {
         // lane's solo round did (Task 8 finding; vgemm==gemv was never
         // claimed bitwise). The view carries its own threshold: solo_view()
         // copies the member (zero change); build_union_view() sets it per
-        // union class -- all-gated 99 (GEMV, bitwise vs solo), all-suffix 2
-        // (vgemm, the family solo suffix rounds took), Q27_BATCH_GEMM=1
-        // forces 2 (the tolerance-class perf leg).
+        // union class -- all-gated/mixed at k <= 2: 99 (GEMV, bitwise vs
+        // solo); all-suffix, or k >= 3, or Q27_BATCH_GEMM=1: 2 (vgemm, the
+        // tolerance class -- the C-sweep default, BUILDLOG (g));
+        // Q27_BATCH_GEMM=0 restores always-GEMV for gated/mixed.
         int gemm_min;
     };
     LaneView solo_view() {
