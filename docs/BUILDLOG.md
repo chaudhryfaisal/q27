@@ -11288,16 +11288,24 @@ at it, so not one prefill call site changed. Serving passes the arena; every
 CLI/tool site passes nullptr and self-provisions bit-for-bit (which is why
 both canonical anchors hold unchanged). Q27_PF_ARENA=0 restores per-engine.
 
-THE HAZARD, AND WHY EXCLUSIVITY WAS NOT ENOUGH. The 2026-07-04 R1b-prereq
+THE HAZARD, AND WHAT THE EVIDENCE ACTUALLY SHOWS. The 2026-07-04 R1b-prereq
 entry made the WY panels per-engine for exactly this: "two engines with
 chunks in flight would race one panel set across streams". The GpuGate
 serializes ISSUE, but engines run on different streams and GpuGate::Lease
-documents an exemption for work still in flight at release. So the arena
-enforces the handoff itself: claim(owner, stm) synchronizes the PREVIOUS
-owner's stream on an ownership change. Precisely: the YIELD path was already
-drained (the server hook syncs before maybe_yield); claim() covers the
-LEASE-RELEASE path at end-of-prefill, where nothing else guarantees it. Cost
-is one sync per prefill-owner change against 0.1-70 s prefills.
+documents an exemption for work still in flight at release, whose stated
+rationale ("all target per-engine buffers") stops holding once scratch is
+shared. So the arena enforces the handoff itself: claim(owner, stm)
+synchronizes the PREVIOUS owner's stream on an ownership change, and is
+called PER CHUNK -- ownership ping-pongs at the gate handovers, so a claim
+taken once at prefill entry records the last CLAIMER while another engine is
+the last WRITER (review HIGH; the first cut of this change had that bug).
+HONESTY ON THE DRAIN: it is DEFENCE IN DEPTH, not a fix for a demonstrated
+corruption. Every yield handover is already drained by the server hook, so
+the only unguarded window is end-of-prefill lease release with trailing work
+in flight, and the race gate could not make it bite -- it passes with the
+drain disabled (Q27_PF_ARENA_NODRAIN=1) as well as with it. Kept anyway: one
+branch per chunk, a sync that no-ops in the common case, and it restores the
+premise the Lease exemption depends on.
 
 PREFILL-ONLY BY CONTRACT (the coupling that had to be cut first): M1's commit
 Fold borrowed the prefill oT for its <= W_MAX output rows -- sound while that
@@ -11336,10 +11344,24 @@ GATES: canonical EXACT on BOTH anchors (q4s f64e7c02, vanilla a2982c51);
 ninv chunk+fold bitwise ALL PASS (the fold's output buffer moved); fused_smoke
 all legs x {fp16, fp8}; admission matrix (default / Q27_KV_POOL=0 /
 Q27_PF_ARENA=0) with no SKIPPED slots; prod-shaped boot. NEW GATE
-bench/ladder/prefill_race.py: 4 concurrent 6,370-token (7-chunk) prefills,
-telemetry confirms **yields=8 each** so they genuinely interleaved
-chunk-by-chunk through one arena, and every output byte-identical to solo --
-the gate is sensitive because the interleaving is verified, not assumed.
+bench/ladder/prefill_race.py: concurrent multi-chunk prefills with per-run
+unique prompts, asserting from telemetry that they actually interleaved.
+
+**THE GATE'S OWN LESSON -- a confound that produced two false conclusions
+before the control caught it.** The first version compared FULL responses
+solo-vs-concurrent and "failed" convincingly (3/6, 2/6) on the pre-fix and
+no-drain builds. Then the control (Q27_PF_ARENA=0 -- no arena at all) failed
+the same way, 1/6. Cause: under concurrency the trim floors granted width and
+attention switches between fd2 and fdmma at ntok >= 4; those are
+TOLERANCE-class twins, not bitwise, so a near-tie argmax flips and forks the
+whole trajectory. Concurrent-vs-solo full-text identity is therefore NOT an
+invariant of this engine and never was. The gate now compares only the FIRST
+token, which the prefill epilogue produces before any batched round exists,
+isolating the one thing the arena touches. On that sound gate all four legs
+(fixed / claim-at-entry / no-drain / no-arena) PASS 6/6 -- which is why the
+drain is documented above as unproven insurance rather than a demonstrated
+fix. Generalize: when a new gate fails, run the feature-disabled control
+BEFORE believing the failure.
 
 NEXT: the ladder is now bounded by k <= 8 (conductor.h:276), not by memory --
 peak 400-420 t/s at the ceiling. Both remaining levers are the parked ones:

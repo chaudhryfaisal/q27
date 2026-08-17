@@ -1875,7 +1875,8 @@ struct Engine {
             }
     }
     // Per-T fold graphs (captured in build_spec_graphs: every pointer above
-    // is init-fixed, T is the shape) collapse the 96-launch eager fold to one
+    // -- committed state, record arena, fold_o -- is init-fixed, T is the
+    // shape; NOTE fold_o not the shared arena's oT, see fold_launches) collapse the 96-launch eager fold to one
     // graph launch -- the eager form costs ~0.26 ms/round of submit overhead
     // (measured -1.4% single-stream on the A/B). Eager fallback pre-capture.
     // Idempotent -- callers may flush defensively. Runs OUTSIDE any capture
@@ -2455,7 +2456,8 @@ struct Engine {
         // M1: per-T commit-Fold graphs. Warm the fold kernels once (the junk
         // fold below mutates S/ring exactly like the spec warm above -- the
         // reset_gdn_mtp after this block restores clean state), then capture
-        // T=1..W_MAX-1. Every pointer (committed state, record arena, oT) is
+        // T=1..W_MAX-1. Every pointer (committed state, record arena, fold_o
+        // -- NOT the shared prefill arena, which decode must never touch) is
         // init-fixed, so the captures are replayable for the engine lifetime.
         fold_launches(1, stm);
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -4321,10 +4323,11 @@ struct Engine {
             }
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }
-            // M3a: take the shared prefill arena for this prefill. On an
-            // owner change this drains the previous owner's stream, so no
-            // sibling's in-flight chunk kernels can still be reading these
-            // buffers (prefill_arena.h). No-op when self-provisioned.
+            // M3a: take the shared prefill arena. The per-CHUNK claims in the
+            // loops below are the load-bearing ones (ownership ping-pongs at
+            // the gate handovers between chunks -- prefill_arena.h); this one
+            // covers any arena touch before the first chunk. No-op when
+            // self-provisioned.
             if (pfarena) pfarena->claim(this, stm);
             if (d_prompt_cap < NP) {
                 if (d_prompt) CUDA_CHECK(cudaFree(d_prompt));
@@ -4339,6 +4342,7 @@ struct Engine {
             int last_ck = base;
             for (int c0 = base; c0 < snap_upto; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, snap_upto - c0);
+                if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
@@ -4365,6 +4369,7 @@ struct Engine {
                 pfx_persist(prompt, snap_upto);
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);
+                if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);

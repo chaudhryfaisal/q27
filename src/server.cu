@@ -539,10 +539,18 @@ int main(int argc, char** argv) {
     // partials + fp4 pair + g64 FFN staging + WY/split-K panels. Charged ONCE
     // per process when the arena is on (like kEngBase); per-slot otherwise.
     const bool pf_arena_on = !getenv("Q27_PF_ARENA") || atoi(getenv("Q27_PF_ARENA")) != 0;
-    // Shared prefill arena size, for the estimators that run BEFORE it is
-    // allocated (auto-ctx). ~0.75 GB measured; the arena prints its exact
-    // size at boot, and the pool block re-measures free VRAM after the fact.
-    const double kEngArena = 0.75e9;
+    // Shared prefill arena size, for the estimator that runs BEFORE it is
+    // allocated (auto-ctx multi-slot). 0.84 GB: the PF_T staging set is 0.75,
+    // and xquant_alloc + the WY panels + the SM-count-sized split-K partials
+    // add ~0.09 that an earlier 0.75 constant missed (review 2026-08-16; the
+    // arena itself now MEASURES its footprint and prints it at boot, and the
+    // pool block re-measures free VRAM, so this constant binds only here).
+    // CALIBRATION NOTE: single-slot auto-ctx does NOT subtract this -- slot 0
+    // would have allocated the same scratch itself, so the terms cancel. That
+    // cancellation is why kEngBase must be recalibrated with Q27_PF_ARENA=0;
+    // recalibrating on an arena-on boot would fold the arena into kEngBase and
+    // then double-charge it on every multi-slot boot.
+    const double kEngArena = 0.84e9;
     // NOTE the arena is NOT modeled here: it is physically allocated before
     // the sizing block below and deducted from the measured free bytes, so
     // adding it to the model too would double-charge it. kEngBase remains the
@@ -788,11 +796,12 @@ int main(int argc, char** argv) {
         const char* e = getenv("Q27_KV_POOL");
         return !e || atoi(e) != 0;
     }();
-    // M3a: the shared prefill arena is allocated FIRST -- before any Engine
-    // exists (allocation during serving is illegal under graph capture, the
-    // pool's discipline) and before free VRAM is measured anywhere, so every
-    // downstream number (fit_slots, per_extra, pool_b, the per-slot skip
-    // checks) sees the real remaining budget. Each engine then skips its own
+    // M3a: the shared prefill arena is allocated before any Engine exists
+    // (allocation during serving is illegal under graph capture, the pool's
+    // discipline) and before the POOL BLOCK measures free VRAM, so its numbers
+    // (fit_slots, per_extra, pool_b, the per-slot skip checks) see the real
+    // remaining budget. The auto-ctx block above runs EARLIER still and
+    // therefore charges kEngArena explicitly instead of measuring. Each engine then skips its own
     // ~0.75 GB of chunk scratch, which is why ENG_FIXED_BYTES drops the old
     // prefill fudge. INDEPENDENT OF KV POOLING: ENG_FIXED_BYTES shrinks on
     // pf_arena_on alone, so gating this on want_pool would leave a

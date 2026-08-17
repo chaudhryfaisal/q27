@@ -61,10 +61,15 @@ struct PrefillArena {
     // makes allocation from any thread illegal).
     void init(int PF_T, int N_EMBD, int N_FFN, int N_HEAD, int N_KV, int HEAD_DIM,
               int GDN_CH, int GDN_V, int GDN_HEADS) {
+        // Size is MEASURED, not summed: xquant_alloc, wy_scratch_reserve and
+        // splitk_scratch_reserve allocate internally (and split-K is sized off
+        // the SM count), so a hand-sum both under-reports today and rots the
+        // next time something is added here.
+        size_t free_before = 0, tb = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_before, &tb));
         auto fal = [&](size_t n) {
             float* p;
             CUDA_CHECK(cudaMalloc((void**)&p, n * 4));
-            total_bytes += n * 4;
             return p;
         };
         const size_t T = (size_t)PF_T;
@@ -85,29 +90,64 @@ struct PrefillArena {
             const size_t tp = (T + 127) & ~(size_t)127;
             CUDA_CHECK(cudaMalloc((void**)&pf4_ac, tp * N_FFN / 2));
             CUDA_CHECK(cudaMalloc((void**)&pf4_as, tp * N_FFN / 16));
-            total_bytes += tp * N_FFN / 2 + tp * N_FFN / 16;
         }
         q27k::wy_scratch_reserve(&wy_scratch, PF_T);
         q27k::splitk_scratch_reserve(&splitk_ws);
+        size_t free_after = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &tb));
+        total_bytes = free_before > free_after ? free_before - free_after : 0;
     }
 
     // Hand the arena to `owner`, whose prefill work will run on `stm`. On an
-    // owner CHANGE this drains the previous owner's stream: its last chunk's
-    // kernels may still be reading these buffers (the gate's drained-handover
-    // invariant has a documented in-flight exemption, and end-of-prefill
-    // releases the Lease without a yield when nobody is queued). Same-owner
-    // re-claims are free -- an engine is already ordered against itself.
-    // Call from the prefill entry point, INSIDE the caller's gate lease.
+    // owner CHANGE this drains the previous owner's stream, so its kernels
+    // have RETIRED before the new owner writes.
+    //
+    // STATUS OF THE EVIDENCE, stated plainly: this drain is DEFENCE IN DEPTH,
+    // not a fix for a demonstrated corruption. Every yield handover is already
+    // drained by the server's hook (cudaStreamSynchronize before maybe_yield),
+    // so the only unguarded window is a Lease released at end-of-prefill with
+    // trailing kernels in flight -- narrow, because the request thread syncs
+    // soon after anyway. bench/ladder/prefill_race.py could NOT make that
+    // window bite: it passes with the drain disabled (Q27_PF_ARENA_NODRAIN=1)
+    // as well as with it. Keep the drain regardless -- it costs one branch per
+    // chunk plus a sync that is a no-op in the common case, and it restores
+    // the premise GpuGate::Lease's in-flight exemption rests on ("all target
+    // per-engine buffers"), which shared scratch otherwise breaks.
+    //
+    // CALL THIS AT THE TOP OF EVERY CHUNK, not once per prefill. Ownership
+    // ping-pongs: the gate hands over at chunk boundaries, so A-chunk,
+    // B-chunk, A-chunk is normal, and a claim taken only at prefill entry
+    // records the last CLAIMER while a different engine is the last WRITER.
+    // The dangerous edge is end-of-prefill: A finishes and releases the Lease
+    // with trailing chunk kernels still in flight (GpuGate::Lease documents
+    // exactly that exemption, and its rationale -- "all target per-engine
+    // buffers" -- stopped holding the moment this arena existed), then B
+    // resumes and writes. Only a per-chunk claim has A recorded as the last
+    // writer at that moment, which is what makes B's claim drain stmA.
+    // Same-owner re-claims are free: an engine is already ordered against
+    // itself, so the steady-state cost is one predictable branch per chunk.
     void claim(const void* owner, cudaStream_t stm) {
-        if (last_owner && last_owner != owner)
-            CUDA_CHECK(cudaStreamSynchronize(last_stm));
+        if (last_owner && last_owner != owner) {
+            // Q27_PF_ARENA_NODRAIN=1 disables the drain. Test-only: it exists
+            // so bench/ladder/prefill_race.py can be shown to go RED, i.e. so
+            // the gate is known to test this mechanism rather than assumed to.
+            static const bool nodrain = [] {
+                const char* e = getenv("Q27_PF_ARENA_NODRAIN");
+                return e && atoi(e) != 0;
+            }();
+            if (!nodrain) CUDA_CHECK(cudaStreamSynchronize(last_stm));
+        }
         last_owner = owner;
         last_stm = stm;
     }
-    // An engine going away (or releasing its KV lineage) must not leave the
-    // arena pointing at a dead stream.
+    // An engine going away must not leave the arena pointing at a stream
+    // nobody will drain: sync first, THEN clear (clearing alone would make
+    // the next claim() skip a drain it owed).
     void forget(const void* owner) {
-        if (last_owner == owner) { last_owner = nullptr; last_stm = nullptr; }
+        if (last_owner != owner) return;
+        if (last_stm) CUDA_CHECK(cudaStreamSynchronize(last_stm));
+        last_owner = nullptr;
+        last_stm = nullptr;
     }
 
 private:

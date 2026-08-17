@@ -33,16 +33,23 @@ point their existing members at it, so no prefill call site changed. Serving
 passes one arena; every CLI/tool site passes nullptr and keeps its own
 buffers bit-for-bit.
 
-**The hazard and how it is closed.** The 2026-07-04 R1b-prereq entry made WY
+**The hazard and how it is handled.** The 2026-07-04 R1b-prereq entry made WY
 panels per-engine precisely because "two engines with chunks in flight would
 race one panel set across streams". The GpuGate serializes issue, but engines
 run on different streams and `GpuGate::Lease` documents an exemption for work
-still in flight at release. So exclusivity is not enough: `claim(owner, stm)`
-synchronizes the PREVIOUS owner's stream on an ownership change. The yield
-path was already drained by the server's hook (`cudaStreamSynchronize` before
-`maybe_yield`); claim() covers the lease-release path at end-of-prefill, where
-nothing else guarantees it. One sync per prefill-owner change is unmeasurable
-against 0.1-70 s prefills.
+still in flight at release -- whose rationale ("all target per-engine
+buffers") stops holding once scratch is shared. `claim(owner, stm)`
+synchronizes the PREVIOUS owner's stream on an ownership change, and must be
+called PER CHUNK: ownership ping-pongs at the gate handovers, so a claim taken
+once at prefill entry records the last CLAIMER while another engine is the
+last WRITER (the first cut of this change had that bug; review HIGH).
+
+Evidence, stated honestly: the drain is defence in depth, NOT a fix for a
+demonstrated corruption. Every yield handover is already drained by the server
+hook, leaving only the end-of-prefill lease release as an unguarded window,
+and the race gate cannot make it bite -- it passes with the drain disabled
+(`Q27_PF_ARENA_NODRAIN=1`) as well as with it. Kept because it is nearly free
+and restores the premise the Lease exemption rests on.
 
 **Prefill-only by contract.** Decode work must never touch the arena: fused
 rounds fork per-member work onto side streams with no gate boundary between
@@ -58,6 +65,20 @@ per-engine `fold_o`. That decoupling is what makes the arena prefill-only.
   pool 12.87 GB without the arena vs 12.78 with, full 262144 window either way
 - ladder: C=8 **406-420 t/s**, a new peak over C=7's 385.4; C=2 unchanged
 - `Q27_PF_ARENA=0` reproduces pre-M3a exactly (7 slots, 2.40 GB, 3.02 GB free)
+- arena footprint is MEASURED (cudaMemGetInfo delta), 0.85 GB -- an earlier
+  hand-sum said 0.75 and missed xqT, the WY panels and the SM-sized split-K
+  partials; `kEngArena` (the auto-ctx constant, the one estimator that runs
+  before the allocation) is 0.84e9 to match
+
+## Gate design note
+
+Concurrent-vs-solo FULL-TEXT identity is not an invariant of this engine:
+under concurrency the trim floors granted width and attention switches between
+fd2 and fdmma at ntok >= 4, which are tolerance-class twins, so a near-tie
+argmax can fork the trajectory. A control boot with the arena disabled fails
+such a comparison too. `prefill_race.py` therefore compares only the FIRST
+token -- produced by the prefill epilogue before any batched round -- which
+isolates what the arena actually touches.
 
 ## Deferred: M3e (full SeqState + shared zoo)
 
