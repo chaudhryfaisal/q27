@@ -530,6 +530,19 @@ int main(int argc, char** argv) {
     const double kEngMonoSave = cc_arch >= 89 ? 0.01e9 : 0.015e9;
     const double kEngSampSave = cc_arch >= 89 ? 0.03e9 : 0.05e9;
     const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+    // M3a: chunk-sized prefill scratch. Computed from the same constants the
+    // arena allocates from (not a guess): the PF_T staging set + split-attn
+    // partials + fp4 pair + g64 FFN staging + WY/split-K panels. Charged ONCE
+    // per process when the arena is on (like kEngBase); per-slot otherwise.
+    const bool pf_arena_on = !getenv("Q27_PF_ARENA") || atoi(getenv("Q27_PF_ARENA")) != 0;
+    // Shared prefill arena size, for the estimators that run BEFORE it is
+    // allocated (auto-ctx). ~0.75 GB measured; the arena prints its exact
+    // size at boot, and the pool block re-measures free VRAM after the fact.
+    const double kEngArena = 0.75e9;
+    // NOTE the arena is NOT modeled here: it is physically allocated before
+    // the sizing block below and deducted from the measured free bytes, so
+    // adding it to the model too would double-charge it. kEngBase remains the
+    // only once-per-process term slots 1+ do not pay.
     // GDN recurrent state, M1 record+fold: committed + snapshot sets
     // (2 x 0.157 GB) + the record arena ((W_MAX-1) rows x ~3.95 MB across the
     // 48 GDN layers). MIRRORS Engine gdn_state_bytes -- the 11 spare role
@@ -538,8 +551,13 @@ int main(int argc, char** argv) {
     // per-slot non-KV = single-engine stack + co-residency scratch (the
     // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
     // this + KV so it agrees with what auto-ctx sized for.
+    // M3a: the old 1.0e9 fudge was documented as "prefill scratch ~0.84 +
+    // slack". With the arena on, no engine allocates that scratch at all --
+    // it is one real allocation deducted from measured free VRAM below -- so
+    // what remains in the per-slot stack is the slack alone.
     const size_t ENG_FIXED_BYTES =
-        (size_t)(kEngBase + kEngGraphs + kEngGdn + 1.0e9 -
+        (size_t)(kEngBase + kEngGraphs + kEngGdn +
+                 (pf_arena_on ? 0.25e9 : 1.0e9) -
                  (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
     // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
@@ -643,12 +661,18 @@ int main(int argc, char** argv) {
                 c = budget > 0 ? (long)(budget / per_tok) : 0;
             } else {
                 // MULTI-slot: every slot is a full co-resident engine.
-                // PER_SLOT = single_fixed + 1.0 GB scratch/slack (recalibrated
+                // PER_SLOT = single_fixed + scratch/slack (recalibrated
                 // 2026-08-16 post-M1b against measured ~1.4 GB/slot marginals;
-                // the old 2.2 GB was covering the unmodeled 12x zoo). Reduce the
-                // slot count first so the picked ctx and the log are HONEST
-                // (the build-loop skip is then a pure safety net), then split.
-                const double per_slot = single_fixed + 1.0e9;
+                // the old 2.2 GB was covering the unmodeled 12x zoo). M3a: the
+                // shared prefill arena moves ~0.75 GB of that from PER-SLOT to
+                // ONCE-PER-PROCESS, so the per-slot term drops to the slack and
+                // the arena is subtracted from the budget instead. This block
+                // runs BEFORE the arena is allocated (free_b is pre-arena), so
+                // it must charge kEngArena explicitly -- unlike the pool block
+                // below, which measures free VRAM after the allocation.
+                // Mirrors ENG_FIXED_BYTES so this and the skip loop agree.
+                const double per_slot = single_fixed + (pf_arena_on ? 0.25e9 : 1.0e9);
+                if (pf_arena_on) free_b = free_b > kEngArena ? free_b - (size_t)kEngArena : 0;
                 int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
                 if (fit < 1) fit = 1;
                 if (fit < n_slots) {
@@ -750,6 +774,9 @@ int main(int argc, char** argv) {
     // ratio. Allocated HERE -- before any Engine/capture -- per the
     // Global-capture allocation rule.
     q27::KvPool kv_pool;
+    // M3a: one process-wide prefill scratch arena instead of ~0.73 GB per
+    // engine (prefill_arena.h). Q27_PF_ARENA=0 restores per-engine buffers.
+    q27::PrefillArena pf_arena;
     // DEFAULT ON since 2026-08-16 (M1b flip criterion met: pooled C=4/C=6
     // at parity with per-slot -- 270.0/309.8 vs 271.2/307.7 -- while buying
     // a 7th slot and per-request ctx). Q27_KV_POOL=0 restores per-slot KV.
@@ -757,6 +784,22 @@ int main(int argc, char** argv) {
         const char* e = getenv("Q27_KV_POOL");
         return !e || atoi(e) != 0;
     }();
+    // M3a: the shared prefill arena is allocated FIRST -- before any Engine
+    // exists (allocation during serving is illegal under graph capture, the
+    // pool's discipline) and before free VRAM is measured anywhere, so every
+    // downstream number (fit_slots, per_extra, pool_b, the per-slot skip
+    // checks) sees the real remaining budget. Each engine then skips its own
+    // ~0.75 GB of chunk scratch, which is why ENG_FIXED_BYTES drops the old
+    // prefill fudge. INDEPENDENT OF KV POOLING: ENG_FIXED_BYTES shrinks on
+    // pf_arena_on alone, so gating this on want_pool would leave a
+    // Q27_KV_POOL=0 boot under-reserving ~0.75 GB per self-provisioning slot
+    // (hard-OOM class, and Q27_KV_POOL=0 is the documented A/B rig).
+    if (pf_arena_on && n_slots >= 1) {
+        pf_arena.init(Engine::PF_T, N_EMBD, N_FFN, N_HEAD, N_KV, HEAD_DIM,
+                      GDN_CH, GDN_V, GDN_HEADS);
+        fprintf(stderr, "[prefill] shared arena %.2f GB (one per process)\n",
+                pf_arena.bytes() / 1e9);
+    }
     if (want_pool && n_slots >= 1) {
         size_t freeb = 0, totalb = 0;
         CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
@@ -918,7 +961,8 @@ int main(int argc, char** argv) {
         Slot s;
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx,
-                                         kv_pool.enabled() ? &kv_pool : nullptr);
+                                         kv_pool.enabled() ? &kv_pool : nullptr,
+                                         pf_arena.enabled() ? &pf_arena : nullptr);
         s.eng->fast_head = fast;
         if (pfx_cache.enabled()) {
             s.eng->pcache = &pfx_cache;  // P16 disk tier

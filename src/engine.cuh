@@ -28,6 +28,7 @@
 #include "loader.h"
 #include "prefix_cache.h"
 #include "kv_pool.h"
+#include "prefill_arena.h"
 #include "prefix_ram.h"
 #include "turbo3.cuh"
 #include "turbo5.cuh"
@@ -228,8 +229,15 @@ struct Engine {
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
     cudaGraphExec_t sample_graph = nullptr; // plain forward + sample (temp>0)
-    q27k::WyScratch wy_scratch;    // per-engine WY prefill panels (R1b prereq)
-    q27k::SplitKScratch splitk_ws; // per-engine split-K partials (short-prompt prefill)
+    // Prefill panels. Per-engine since the 2026-07-04 R1b prereq (interleaved
+    // chunks would race a shared panel set across streams); M3a shares them
+    // again when a PrefillArena is supplied, which closes that same hazard by
+    // draining the previous owner's stream on every ownership change.
+    q27k::WyScratch wy_scratch;
+    q27k::SplitKScratch splitk_ws;
+    q27::PrefillArena* pfarena = nullptr; // null = self-provisioned (CLI/tools)
+    q27k::WyScratch* wy_p() { return pfarena ? &pfarena->wy_scratch : &wy_scratch; }
+    q27k::SplitKScratch* splitk_p() { return pfarena ? &pfarena->splitk_ws : &splitk_ws; }
 
     // activations (device)
     float *h, *x1, *y, *qg, *kbuf, *vbuf, *attnout, *scratch;
@@ -379,6 +387,7 @@ struct Engine {
     static constexpr int PF_SB = Q27_PF_SB; // attention sub-batch (scratch rows)
     int* d_prompt = nullptr;          // whole prompt on device
     int d_prompt_cap = 0;
+    float* fold_o = nullptr; // M1 Fold scratch, W_MAX rows (was borrowed oT)
     float *hT, *x1T, *yT, *qkvT, *convT, *zT, *oT, *ogT, *qgT, *kT, *vT, *attnT;
     float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
     float* pf_part; // P4 split-attention partials: [24 heads][PF_T][SPLIT_MAX][258]
@@ -749,14 +758,22 @@ struct Engine {
     // (kv_entitle) and belong to the slot lineage. pool == nullptr (every
     // CLI/tool site) keeps the M2a self-provisioned identity path
     // bit-for-bit.
-    Engine(q27::Model& m, q27::DeviceModel& d, int ctx, q27::KvPool* pool = nullptr)
-        : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx), kvpool(pool) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
+    // M3a: arena != nullptr shares the process-wide prefill scratch instead of
+    // allocating ~0.73 GB per engine (prefill_arena.h). Serving passes one;
+    // every CLI/tool site passes nullptr and keeps its own buffers.
+    Engine(q27::Model& m, q27::DeviceModel& d, int ctx, q27::KvPool* pool = nullptr,
+           q27::PrefillArena* arena = nullptr)
+        : model(m), dm(d), max_ctx(ctx < 32 ? 32 : ctx), kvpool(pool),
+          pfarena(arena && arena->enabled() ? arena : nullptr) {  // floor: spec-graph warmup touches ~gate_maxd+2 positions
         init(ctx, /*own_weights=*/false);
     }
     // P16 only: a detached prefix-cache writer would outlive its pinned
     // staging buffer at shutdown. Everything else this class owns is still
     // released by process exit as before.
     ~Engine() {
+        // M3a: never leave the shared arena holding a dead stream (the server
+        // outlives its engines, but an embedder may not).
+        if (pfarena) pfarena->forget(this);
         if (pfx_thr.joinable()) pfx_thr.join();
         if (pfx_stage) cudaFreeHost(pfx_stage);
         if (pfx_wstage) cudaFreeHost(pfx_wstage);
@@ -1008,7 +1025,22 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
-        // batched prefill buffers (~130MB) + attention scratch
+        // batched prefill buffers (~0.71 GB) + attention scratch. M3a: when a
+        // PrefillArena is supplied these POINT AT IT (one copy per process,
+        // ~0.73 GB back per additional slot); otherwise the engine allocates
+        // its own, bit-for-bit the pre-M3a path.
+        if (pfarena) {
+            hT = pfarena->hT; x1T = pfarena->x1T; yT = pfarena->yT;
+            qkvT = pfarena->qkvT; convT = pfarena->convT; zT = pfarena->zT;
+            oT = pfarena->oT; ogT = pfarena->ogT; qgT = pfarena->qgT;
+            kT = pfarena->kT; vT = pfarena->vT; attnT = pfarena->attnT;
+            alphaT = pfarena->alphaT; betarT = pfarena->betarT;
+            gT = pfarena->gT; betaT = pfarena->betaT;
+            ffnGT = pfarena->ffnGT; ffnUT = pfarena->ffnUT;
+            embT = pfarena->embT; ehnT = pfarena->ehnT; xmtpT = pfarena->xmtpT;
+            pf_part = pfarena->pf_part; xqT = pfarena->xqT;
+            pf4_ac = pfarena->pf4_ac; pf4_as = pfarena->pf4_as;
+        } else {
         auto fal = [](size_t n) { float* p; CUDA_CHECK(cudaMalloc((void**)&p, n * 4)); return p; };
         hT = fal((size_t)PF_T * N_EMBD); x1T = fal((size_t)PF_T * N_EMBD);
         yT = fal((size_t)PF_T * N_EMBD); qkvT = fal((size_t)PF_T * GDN_CH);
@@ -1034,6 +1066,11 @@ struct Engine {
         }
         q27k::wy_scratch_reserve(&wy_scratch, PF_T); // fixed cap: no mid-serving regrow
         q27k::splitk_scratch_reserve(&splitk_ws);    // fixed cap: no mid-serving regrow
+        }
+        // M1 Fold output rows (<= W_MAX): its own buffer since M3a, so the
+        // decode-time Fold never touches arena scratch (prefill-only by
+        // contract -- fused rounds fork per-member work onto side streams).
+        A((void**)&fold_o, (size_t)W_MAX * GDN_V * 4);
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 CUDA_CHECK(cudaMalloc((void**)&S_snap[il],
@@ -1824,14 +1861,16 @@ struct Engine {
     // Ring: raw qkv of the last 3 accepted inputs (conv_ring_update shifts in
     // the post-lane-0 ring when T < 3). S: T bitwise-exact delta steps over
     // the recorded post-norm conv rows (delta_scan_seq == k_delta_step per
-    // step; NEVER the WY scan -- reduction reorder = format change). oT is
-    // dead prefill scratch (idle during decode: prefill is FIFO-serialized
-    // against this engine's own rounds; T*GDN_V floats << PF_T*GDN_V).
+    // step; NEVER the WY scan -- reduction reorder = format change). Output
+    // goes to the engine's OWN fold_o (W_MAX rows): M1 borrowed the prefill
+    // oT, which was sound while that buffer was per-engine, but M3a shares
+    // prefill scratch process-wide and the Fold is decode-time work with no
+    // gate boundary against a sibling's prefill. Own buffer, no coupling.
     void fold_launches(int T_, cudaStream_t st) {
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 q27k::conv_ring_update(conv_ring[il], rec_qkv[il], GDN_CH, T_, st);
-                q27k::delta_scan_seq(S[il], rec_conv[il], rec_g[il], rec_beta[il], oT, T_,
+                q27k::delta_scan_seq(S[il], rec_conv[il], rec_g[il], rec_beta[il], fold_o, T_,
                                      st);
             }
     }
@@ -3166,11 +3205,11 @@ struct Engine {
         switch (w.dtype) {
             case DType::Q4_G64:
                 q27k::gemm_q4_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
-                                w.rows, w.cols, T, stm, &splitk_ws);
+                                w.rows, w.cols, T, stm, splitk_p());
                 break;
             case DType::Q8_G128:
                 q27k::gemm_q8_T((const int8_t*)w.data, (const __half*)w.scales, xqT, yout,
-                                w.rows, w.cols, T, stm, &splitk_ws);
+                                w.rows, w.cols, T, stm, splitk_p());
                 break;
             case DType::F16:
                 q27k::gemm_f16_T((const __half*)w.data, xT, yout, w.rows, w.cols, T, stm);
@@ -3194,7 +3233,7 @@ struct Engine {
                              stm);
         q27k::l2norm_heads_T(convT, 16, GDN_DIM, GDN_CH, T, EPS, stm);
         q27k::l2norm_heads_T(convT + 2048, 16, GDN_DIM, GDN_CH, T, EPS, stm);
-        q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm, &wy_scratch);
+        q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm, wy_p());
         q27k::gated_norm_gdn_T(oT, (const float*)T2(il, "ssm_norm.weight").data, zT, ogT,
                                GDN_HEADS, GDN_DIM, T, EPS, stm);
         qxT(ogT, GDN_V, T);
@@ -4282,6 +4321,11 @@ struct Engine {
             }
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }
+            // M3a: take the shared prefill arena for this prefill. On an
+            // owner change this drains the previous owner's stream, so no
+            // sibling's in-flight chunk kernels can still be reading these
+            // buffers (prefill_arena.h). No-op when self-provisioned.
+            if (pfarena) pfarena->claim(this, stm);
             if (d_prompt_cap < NP) {
                 if (d_prompt) CUDA_CHECK(cudaFree(d_prompt));
                 CUDA_CHECK(cudaMalloc((void**)&d_prompt, (size_t)NP * 4));

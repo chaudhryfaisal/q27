@@ -11258,3 +11258,87 @@ first post-build canonical run returned the EMPTY-output md5 because the
 spot-check bench server was still resident (the documented co-residency
 trap) -- killed it, clean rerun. Prod (qwen38, port 8080) + s2s restored
 on the new binary; banner confirms batch-gemm=auto(k>=3).
+
+## 2026-08-16 (i): M3a SHIPPED -- one shared prefill arena, 8 slots, C=8 is the new peak
+
+M3 as the spec wrote it (SeqState extraction + seq-indexed views + unified
+tails + shared zoo, 1-2 weeks) was scoped against an engine that no longer
+exists: M1 deleted the role rotation ring and M1b collapsed the per-engine
+zoo. A HEAD allocation census (4-agent recon, hand-verified) repriced what
+is left, and the answer moved the work:
+
+| class | GB/slot | to recover |
+|---|--:|---|
+| B: prefill chunk scratch | 0.75 | one process arena, NO capture work |
+| C: capture-baked decode state (zoo 0.13 + record arena 0.043 + fd scratch + mask pool + logits2) | ~0.25 | the whole SeqState refactor |
+| A: irreducible per-seq (committed GDN + snapshot + tables) | ~0.31 | not recoverable today |
+
+77% of the recoverable memory is class B. Class C costs the entire risk
+surface for ~0.25 GB/slot on sm_120 and CANNOT raise the k <= 8 member
+ceiling that now bounds the ladder. So M3a takes class B and M3e (the rest)
+is deferred behind a written bar (plan doc, section "Deferred").
+
+SHIPPED: src/prefill_arena.h -- one process-wide arena holding the PF_T=1024
+staging set (22 float buffers), split-attention partials, the fp4 pair, g64
+FFN staging, and the WY/split-K panels. Engines POINT their existing members
+at it, so not one prefill call site changed. Serving passes the arena; every
+CLI/tool site passes nullptr and self-provisions bit-for-bit (which is why
+both canonical anchors hold unchanged). Q27_PF_ARENA=0 restores per-engine.
+
+THE HAZARD, AND WHY EXCLUSIVITY WAS NOT ENOUGH. The 2026-07-04 R1b-prereq
+entry made the WY panels per-engine for exactly this: "two engines with
+chunks in flight would race one panel set across streams". The GpuGate
+serializes ISSUE, but engines run on different streams and GpuGate::Lease
+documents an exemption for work still in flight at release. So the arena
+enforces the handoff itself: claim(owner, stm) synchronizes the PREVIOUS
+owner's stream on an ownership change. Precisely: the YIELD path was already
+drained (the server hook syncs before maybe_yield); claim() covers the
+LEASE-RELEASE path at end-of-prefill, where nothing else guarantees it. Cost
+is one sync per prefill-owner change against 0.1-70 s prefills.
+
+PREFILL-ONLY BY CONTRACT (the coupling that had to be cut first): M1's commit
+Fold borrowed the prefill oT for its <= W_MAX output rows -- sound while that
+buffer was per-engine, unsound the moment it is shared, because fused rounds
+fork per-member work onto CONCURRENT side streams. The Fold now owns a
+per-engine fold_o (W_MAX x GDN_V, 0.3 MB). The header states the rule: if a
+consumer is not strictly inside a prefill chunk, it does not belong in the
+arena.
+
+ESTIMATOR: ENG_FIXED_BYTES drops the old 1.0e9 fudge (documented as "prefill
+scratch ~0.84 + slack") to 0.25e9 slack. The two estimators see the arena
+DIFFERENTLY on purpose: auto-ctx runs BEFORE the allocation so it subtracts
+kEngArena from free_b explicitly; the pool block runs after and re-measures
+free VRAM, so modeling it there too would double-charge. Arena init is
+deliberately NOT inside the want_pool block -- gating it there (as first
+written) left a Q27_KV_POOL=0 boot shrinking ENG_FIXED_BYTES while every
+engine still self-provisioned: ~0.75 GB/slot under-reserve, hard-OOM class,
+on the exact config the token-identity A/B rig uses. Caught by review before
+it ran.
+
+MEASURED (q4s, fp8, 16K, --slots 8, 5090): arena 0.75 GB once; per-slot
+marginal **1.48 -> 0.64 GB**; **8 slots (the conductor member ceiling) vs 7**;
+pool **2.40 -> 5.80 GB**. Prod shape (1 slot, auto-ctx) is a WASH by
+construction -- one engine has nothing to share with -- and the controlled A/B
+says so: pool 12.87 GB (Q27_PF_ARENA=0) vs 12.78 GB (arena), i.e. -0.09 GB of
+slack rounding, full 262144 window either way with 69,632 of ~98,000
+pages/side needed so it stays genuinely entitlable. (An earlier draft of this
+entry claimed 11.42 -> 12.78 by comparing against the (f) entry's number from
+a different boot; that gain does not exist. Single-slot neutral, multi-slot is
+the whole win.) LADDER: **C=8 406.0-420.3 t/s -- a new peak** over
+C=7's 385.4 (the curve stays monotone right into the lane ceiling); C=2 207.9
+(bitwise regime untouched). Q27_PF_ARENA=0 reproduces pre-M3a exactly: 7
+slots, 2.40 GB pool, 3.02 vs 3.03 GB free.
+
+GATES: canonical EXACT on BOTH anchors (q4s f64e7c02, vanilla a2982c51);
+ninv chunk+fold bitwise ALL PASS (the fold's output buffer moved); fused_smoke
+all legs x {fp16, fp8}; admission matrix (default / Q27_KV_POOL=0 /
+Q27_PF_ARENA=0) with no SKIPPED slots; prod-shaped boot. NEW GATE
+bench/ladder/prefill_race.py: 4 concurrent 6,370-token (7-chunk) prefills,
+telemetry confirms **yields=8 each** so they genuinely interleaved
+chunk-by-chunk through one arena, and every output byte-identical to solo --
+the gate is sensitive because the interleaving is verified, not assumed.
+
+NEXT: the ladder is now bounded by k <= 8 (conductor.h:276), not by memory --
+peak 400-420 t/s at the ceiling. Both remaining levers are the parked ones:
+lane widening (W_PLUMB) for C > 8, or M3e for sm_86/89 where the zoo is 3x
+fatter. Neither is a throughput lever on this card today.
