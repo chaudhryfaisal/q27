@@ -11132,3 +11132,79 @@ gains nothing at n_slots==1 by design (the window clamp is the
 single-slot guarantee); stale texts fixed (per_slot rationale, perm in
 the conductor mirror list, "12 extra graphs", "~60 graphs", fused_smoke
 reset comment, default-aware pool-failure message).
+
+## 2026-08-16 (g): C-SWEEP + lane-ceiling scope -- the C=7 rolloff was the GEMV cliff, not depth; Q27_BATCH_GEMM=1 is worth +16-37% and the peak moves to 400.0 t/s
+
+The post-M1b question: map aggregate vs C on the pooled rig, attribute
+the C=7 rolloff (depth starvation vs something else), and price the
+union-widening options before committing to M3. Rig: q4s fp8 16K,
+--slots 8 (pool admits 7), 8192-tok sampled gens, ladder
+union-of-intervals accounting; vanilla qwen36 per the benchmark policy.
+
+WIDTH ATTRIBUTION (Q27_BATCH_DBG=1 granted-width vectors, [bat] gw=):
+at C=5, 55% of lanes run width 2 / 38% width 3; at C=6 and C=7, 88% of
+lanes run width 2. The trim floor dominates from C=5 up -- members draft
+4-6 deep (depthctl pins wants at 5 because the trim clamp poisons its
+evidence: commit_outcome logs cap=vw-1=1, so sat[] can never promote)
+and get granted 2. So C=6's "peak" was ALREADY depth-degenerate;
+the C=6 -> C=7 rolloff is NOT deeper trimming. The scoping fleet's
+code-level account: at k=7 the floor is unsatisfiable (7x2=14 > cap 12)
+and the round legally runs a 14-LANE union (W_PLUMB=16 admits it), which
+crosses the measured GEMV register cliff (q4 ffn/call 0.0554 ms @N=12 ->
+0.113 @N=16) because all-gated unions force the GEMV family via
+gemm_min=99 to keep the bitwise solo contract. Structural fact that
+reprices everything: ATTENTION NEVER SEES THE UNION -- attn_mix/gdn_mix
+run per member at granted width on side streams; only the weight sweep +
+elementwise run at union width. fdmma's 6W<=96 wall binds member width
+only. The lane ceiling is a WEIGHT-SWEEP-FAMILY problem, not a kernel
+redesign problem.
+
+A/B MATRIX (same rig, same protocol; stock = GEMV union family):
+
+| C | stock W12 | W12 + BATCH_GEMM=1 | W16 + BATCH_GEMM=1 |
+|--:|--:|--:|--:|
+| 3 | 244.3 | 283.3 (+16%) | -- |
+| 4 | 269.3 | 321.7 (+19%) | -- |
+| 5 | 296.1 / 294.7 | 331.8 (+12%) | -- |
+| 6 | 302.1-309.8 | 360.7 (+19%) | 337.2 |
+| 7 | 291.7-293.7 | **400.0 (+37%)** | 383.5 |
+
+Q27_BATCH_GEMM=1 (the existing tolerance-class force-vgemm latch,
+0 LOC) deletes the rolloff outright: the curve goes monotone through the
+slot ceiling and the peak moves 309.8 -> 400.0 t/s (+29%). The one
+losing regime is the already-measured k=2 (-1.5%, 07-15). Numerics cost:
+gated lanes in fused rounds surrender bitwise-vs-solo for the documented
+rel~1e-6 vgemm class (run-to-run deterministic). Aggregate scaling now
+~2.6x over single-stream at C=7 -- ninfer's int-tier C=8 factor is
+2.88x, so the sequence-batching gap has nearly closed without giving up
+spec decode.
+
+W_MAX=16 (cap raise to the plumbing ceiling): NEGATIVE. Rebuilt
+q27-server-w16 at HEAD (Makefile dep list gained kv_pool.h), canonical
+EXACT on the w16 CLI (q4s anchor f64e7c02, --spec; fdmma_test-w16
+widths 4..16 PASS; ninv_test-w16 PASS). At C=6 grants go [3,3,3,3,2,2]
+(16-lane union) and lose 6.5% to cap-12's all-floor 12-lane round; at
+C=7 [3,3,2,2,2,2,2] loses 4.1% to the 14-lane overshoot. The marginal
+union lanes cost more than the marginal depth returns even on the
+width-flat family -- do NOT raise W_MAX for aggregate. (Also killed by
+the fleet's arithmetic before measurement: round-robin full-width
+cohorts ~2.3x worse, split unions ~29% worse -- a marginal member at
+floor-2 adds ~E[2]=1.75 tok/round for near-zero sweep cost, which no
+few-wide schedule can beat.)
+
+ONE-OFF, UNREPRODUCED (logged for honesty): a single w16 CLI no-spec run
+returned md5 8196e65e; three repeats of the identical command returned
+the canonical f64e7c02. 1-of-4 non-determinism on the greedy path is a
+watch item; nothing in the serving config touches the w16 binary.
+
+VERDICT + SEQUENCING: the lane ceiling is NOT the binding constraint --
+after the family fix the curve is slot-bound (7 pooled @16K), and depth
+past floor-2 doesn't pay at current acceptance. Lane-widening work
+(fdmma W>16, W_PLUMB replumb) stays PARKED. Next levers in order:
+(1) flip the batch-mode union family default to vgemm above k=2 (one-line
+policy in build_union_view; product call -- the bitwise-vs-solo contract
+for gated fused lanes is the price); (2) M3 SeqState extraction as
+planned (more slots per GB is now worth more than any width work);
+(3) optional later: want-aware trim so depthctl stops pinning (evidence
+fix, not a throughput claim). Bench rig torn down; qwen38 prod + s2s
+restored on the pooled default binary.
