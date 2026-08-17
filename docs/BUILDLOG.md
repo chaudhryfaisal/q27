@@ -540,6 +540,9 @@ set across streams (k_delta_wy_kk writes what the other engine's k_delta_wy
 is still reading), and the lazy regrow cudaFrees panels the other stream's
 queued kernels still reference. Now caller-owned q27k::WyScratch (kkt/qkt/
 cap_nch), one per Engine (wy_scratch member), threaded through delta_scan_T;
+[2026-08-16 amendment: M3a moves these panels back into ONE shared arena --
+the hazard described here is real and is closed differently, by draining the
+previous owner's stream on every ownership change. See entry (i).]
 regrow syncs the owning stream before freeing, since this engine's own
 earlier chunks may still be reading the old panels. seq path ignores it.
 
