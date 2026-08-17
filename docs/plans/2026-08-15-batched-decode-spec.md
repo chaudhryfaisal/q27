@@ -187,16 +187,50 @@ Fold is gated bitwise before anything else lands.
 
 ## 7. Staging and effort
 
+**STATUS as of 2026-08-16 -- the arc is CLOSED. Every milestone below either
+shipped or was closed with a measurement; details in docs/BUILDLOG.md entries
+(a)-(j) for that date. Read this section's status markers before planning
+against the estimates, which were written pre-execution.**
+
 - M0: §6 fixes + estimator recalibration. Hours. Ships alone.
+  **-> SHIPPED** (49dfedb).
 - M1: GDN record-then-Fold. The hard, load-bearing stage (two ~80-line
   kernels + arena plumbing + bitwise gates). Pays at engine-per-slot
   immediately (~-1.5 GB/slot -> 3 slots today). Days-to-week.
+  **-> SHIPPED** in one session (f1a1df0 + 5d0cdc4), plus an unplanned
+  **M1b** (b123eeb + fa15556) that deleted the perm dimension the spec did
+  not anticipate: graph zoo 12x -> 1x, ~1.4 GB/slot back.
 - M2: paged KV pool + block tables + per-row lengths in attn/kv-store.
   Days-to-week; numerics-neutral, perf-gated on the depth rig.
+  **-> SHIPPED** (M2a d5a44e1 + 76c0aa9, M2b c630e0b + ddda6d8); pool
+  DEFAULT ON. Plan doc: docs/plans/2026-08-16-m2-paged-kv.md.
 - M3: SeqState extraction + seq-indexed union views + unified tails +
   shared zoo. The big refactor; the kernels are ready. 1-2 weeks.
+  **-> REPRICED, NOT EXECUTED.** A HEAD allocation census after M1/M1b/M2
+  found 77% of the remaining per-slot memory was prefill chunk scratch
+  (class B, no capture work) and only ~0.25 GB/slot was the capture-baked
+  state this refactor targets. **M3a** (one shared prefill arena, e442b11 +
+  3bfc8d1) took the class-B prize in a session: marginal 1.48 -> 0.64
+  GB/slot, 7 -> 8 slots, pool 2.40 -> 5.80 GB, C=8 = the new peak. The rest
+  (**M3e**) is DEFERRED behind a written bar. Plan doc:
+  docs/plans/2026-08-16-m3-prefill-arena.md.
 - M4: batch-shape graph keys + exact-B captures. Days, after M3.
+  **-> MEASURED NO-GO** (821227a, BUILDLOG (j)). The premise does not hold
+  at the operating point: at C=8 the trim floor makes the granted-width
+  vector constant, so the exec cache runs 99.78% hits with ZERO evictions
+  over 10 shapes -- the C! x W^C explosion never forms. Mid-C inflation is
+  real but prices at ~1.2% of wall. Also blocked on M3e by construction;
+  folded into that bar.
 - M5 (optional): GDN seq-dim kernels (occupancy), attention stays per-seq.
+  **-> NOT STARTED**, and not a lever today: the ladder is LANE-bound at
+  k <= 8 (conductor.h member ceiling), not occupancy-bound.
+
+**What actually binds now, and it is not in this spec:** the ladder peaks at
+C=8 (406-425 t/s) because W_PLUMB=16 gives 8 members a floor width of 2.
+Everything above is memory work, and memory stopped binding at M3a (4+ GB
+free at 8 slots). The only remaining throughput lever is raising W_PLUMB --
+an fdmma tile redesign this spec explicitly scoped out, priced during the
+2026-08-16 C-sweep and PARKED.
 
 Each stage lands with its own measurement against the ladder baseline; M1
 and M2 are independently useful and independently revertible.
