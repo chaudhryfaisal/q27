@@ -101,6 +101,37 @@ Greedy decode => interleaved output text must be BYTE-IDENTICAL to the
 same request run solo. That property is the acceptance gate, not just a
 design claim.
 
+> **AMENDMENT 2026-08-16 -- BOTH PARAGRAPHS ABOVE ARE NOW STALE. Do not
+> use them as an acceptance gate.**
+>
+> (1) *Isolation is no longer per-engine.* KV lives in a process-wide paged
+> pool (M2b, `Q27_KV_POOL`, default ON) and the prefill chunk scratch --
+> including the WY panels this document's own prereq made per-engine --
+> lives in a process-wide arena (M3a, `Q27_PF_ARENA`, default ON). Both are
+> serialized by this document's gate; the arena additionally drains the
+> previous owner's stream on every ownership change, because the gate
+> orders ISSUE while engines still run on separate streams.
+>
+> (2) *Byte-identical solo-vs-interleaved is NOT an invariant of the batched
+> engine, and has not been since P1 continuous batching.* Two independent
+> mechanisms break it, both by design: under concurrency the trim floors
+> granted width and verify attention switches between the fd2 and fdmma
+> kernels at ntok >= 4 (tolerance-class twins, not bitwise -- a near-tie
+> argmax can flip and fork the trajectory); and since 2026-08-16 the union
+> weight sweep defaults to vgemm at k >= 3 members (`Q27_BATCH_GEMM`),
+> another tolerance class. Measured: a solo-vs-concurrent full-text
+> comparison fails at 6 concurrent slots even with every shared structure
+> DISABLED -- that control is how the confound was found, after it had
+> already produced two false bug reports (BUILDLOG (i)).
+>
+> What still holds, and what to gate on instead: solo decode is untouched
+> (`k==1` falls through to `decode_step`), the CLI canonical md5s are
+> unchanged, `k <= 2` gated unions keep the bitwise contract, and
+> `Q27_BATCH_GEMM=0` restores it at any k for token-identity A/Bs. For
+> anything prefill-shaped, compare the FIRST token only
+> (`bench/ladder/prefill_race.py`) -- it is produced before any batched
+> round exists.
+
 ## Not doing (scoped out)
 
 - Concurrent kernel execution across slots (space-sharing): splits weight

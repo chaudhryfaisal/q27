@@ -11367,3 +11367,61 @@ NEXT: the ladder is now bounded by k <= 8 (conductor.h:276), not by memory --
 peak 400-420 t/s at the ceiling. Both remaining levers are the parked ones:
 lane widening (W_PLUMB) for C > 8, or M3e for sm_86/89 where the zoo is 3x
 fatter. Neither is a throughput lever on this card today.
+
+## 2026-08-16 (j): M4 MEASURED, NO-GO -- the trim floor that costs depth also collapses the graph key space
+
+M4 (batch-shape graph keys + exact-B captures) is the last unbuilt spec
+milestone. Its premise: the fused-round exec cache keys on (Engine* tuple,
+exact width vector), a C! x W^C space that "thrashes the LRU". Measured on
+the shipped rig (q4s, fp8, 16K, --slots 8, Q27_BATCH_DBG=1 exposes the
+per-round [gcache] counters; cap 64 = the serving default) before building
+anything.
+
+AT THE OPERATING PEAK (C=8), the premise is FALSE:
+
+| | rounds | hits | misses | evictions | guard trips |
+|---|--:|--:|--:|--:|--:|
+| C=8 | 4616 | 4606 | 10 | **0** | 0 |
+
+**99.78% hit rate, ZERO evictions, and only 10 distinct shapes ever
+captured.** The misses are pure warmup: r=1 (k=8), then one each as the
+ladder drains (r=3873 k=7, r=4552 k=6, r=4610..4616 k=5..2). Reason, and it
+is the C-sweep finding wearing a different hat: at k=8 every member is
+floored to width 2, so the granted-width vector is CONSTANT (k=8, gw=all-2s
+covered 3872 of 4616 rounds). The same trim floor that destroys speculative
+depth also prevents the key-space explosion M4 exists to fix.
+
+AT MID-C the inflation is real but small. C=5 (cap 64): 3676 hits / 122
+misses / **68 evictions** -- the width vectors are PERMUTATIONS of one shape
+class (3,3,2,2,2 vs 3,2,3,2,2 vs 2,3,3,2,2 each got their own exec), which is
+exactly the effect the spec named. Cost ceiling, priced from the telemetry's
+own cap+inst=9.77 ms: ~135 captures x ~9.8 ms = ~1.3 s over a ~110 s run,
+i.e. **~1.2% of wall at C=5 and ~0.02% at C=8**.
+
+THE ONE-LINE MITIGATION, MEASURED: Q27_BATCH_GRAPH_CAP=160 holds all ~135
+C=5 shapes -- evictions 68 -> **0** -- for ~1.1 GB of VRAM (8 MB/exec). The
+aggregate moved 313.3 -> 321.5 t/s, which is INSIDE C=5's run-to-run spread
+(313.3 / 321.5 / 331.8 measured across this session), so it is not a
+throughput claim. Trading 1.1 GB of the 4.06 GB transient margin for a delta
+we cannot resolve, in a regime that is not the operating point, is a bad
+deal. **Cap stays 64.**
+
+VERDICT: **M4 NO-GO, and folded into M3e's bar rather than tracked
+separately** -- it is also BLOCKED on M3e by construction: collapsing the key
+to (exact B, width class) requires membership changes to select a
+pre-instantiated exec, which needs the engine-pointer indirection M3e would
+provide (each exec today bakes its members' buffers; that is what the
+always-on hit-guard verifies). Re-open ONLY if lane widening ever lets widths
+diversify at high C -- i.e. M4's value is downstream of the W_PLUMB work that
+is itself parked.
+
+DOC FIX shipped with this entry: docs/R1b-design.md's "Correctness argument"
+asserted two things that are now false and was still being read as an
+acceptance gate -- (1) "per-engine isolation is complete ... KV ... WY
+scratch" (KV pooled since M2b, scratch shared since M3a) and (2)
+"interleaved output text must be BYTE-IDENTICAL to the same request run solo
+-- that property is the acceptance gate". (2) has not held since P1
+batching, for two by-design reasons (the fd2/fdmma width switch and the
+k>=3 vgemm union family), and believing it is what produced the two false
+bug reports corrected in entry (i). Both paragraphs now carry a loud
+amendment naming what to gate on instead.

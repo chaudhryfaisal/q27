@@ -80,12 +80,24 @@ such a comparison too. `prefill_race.py` therefore compares only the FIRST
 token -- produced by the prefill epilogue before any batched round -- which
 isolates what the arena actually touches.
 
-## Deferred: M3e (full SeqState + shared zoo)
+## Deferred: M3e (full SeqState + shared zoo), and M4 with it
 
 Un-defer only when one of these is true: (a) C > 8 is un-parked with a priced
 lane plan (today the ceiling is k <= 8, so more slots cannot buy throughput);
 (b) sm_86/89 multi-slot serving matters -- the zoo is 0.43 GB/slot there, 3x
 the sm_120 prize; (c) a measured >= 1 GB/config win is written down first.
+
+**M4 (batch-shape graph keys) folds into this bar, measured NO-GO 2026-08-16
+(BUILDLOG (j)).** At the C=8 operating peak the exec cache runs 99.78% hits
+with ZERO evictions over 10 distinct shapes, because the trim floor makes the
+granted-width vector constant -- the C! x W^C explosion M4 targets never
+forms. At C=5 the permutation inflation is real (68 evictions, ~135 shapes vs
+cap 64) but prices out at ~1.2% of wall, and the one-line mitigation
+(Q27_BATCH_GRAPH_CAP=160, evictions -> 0) costs ~1.1 GB of VRAM margin for a
+delta inside run variance. M4 is also BLOCKED on M3e by construction: a key
+of (exact B, width class) requires membership changes to select a
+pre-instantiated exec, which needs the engine-pointer indirection M3e
+provides. Re-open only downstream of lane widening.
 
 Dead ends, priced and not to be re-explored: moving decode-side buffers into
 the arena (side-stream races); cudaGraphExec parameter patching (reintroduces
