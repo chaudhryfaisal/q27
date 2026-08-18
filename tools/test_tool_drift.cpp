@@ -304,6 +304,43 @@ static void test_native_xml_dialect() {
        "native-xml: non-dialect text is not consumed");
 }
 
+// Drift mode 18 (2026-08-17, issue #24, reported against Qwen3.6 where the
+// dialect default is JSON): the model reverts to its trained XML form but
+// DROPS the `<function=` opener, writing the bare `<name>` tag and often a
+// stray `</parameter>` before the first real one. Payload intact, opener gone
+// -- the XML twin of JSON mode 10. Refusing it dumped a live tool call into
+// the text channel, where the agent read it as prose and stopped at turn 1.
+static void test_mode18_bare_name_opener() {
+    q27::ToolCall tc;
+    ok(q27::parse_native_xml_call(
+           "<name>task\n</parameter>\n"
+           "<parameter=description>\nAdd timestamp comment to hello.py\n</parameter>\n"
+           "<parameter=prompt>\nedit the file\n</parameter>\n"
+           "<parameter=subagent_type>\ngeneral\n</parameter>\n</function>", tc) &&
+           tc.ok && tc.name == "task" &&
+           tc.arguments.value("description", std::string()) ==
+               "Add timestamp comment to hello.py" &&
+           tc.arguments.value("prompt", std::string()) == "edit the file" &&
+           tc.arguments.value("subagent_type", std::string()) == "general",
+       "mode18: bare <name> opener + stray </parameter> recovers the call");
+    q27::ToolCall t2;
+    ok(q27::parse_native_xml_call("<name>ListTools\n</function>", t2) &&
+           t2.ok && t2.name == "ListTools" && t2.arguments.empty(),
+       "mode18: bare <name> with </function> and no parameters");
+    // The opener is weak evidence on its own, so corroborating dialect
+    // structure is required -- otherwise ordinary prose gets eaten.
+    q27::ToolCall t3;
+    ok(!q27::parse_native_xml_call(
+           "<name>foo is a placeholder in the docs, not a call.", t3),
+       "mode18: prose opening with <name> and no dialect is NOT a call");
+    q27::ToolCall t4;
+    ok(q27::parse_native_xml_call("<name>Read\n<parameter=file_path>\n/x/y.py\n"
+                                  "</parameter>\n</function>", t4) &&
+           t4.name == "Read" &&
+           t4.arguments.value("file_path", std::string()) == "/x/y.py",
+       "mode18: bare <name> without the stray closer");
+}
+
 static void test_mode14_tool_name_xml_dialect() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
     // Verbatim bytes from the captured transcript.
@@ -366,6 +403,7 @@ int main() {
     test_dialect_default_keying();
     test_reasoning_effort_line();
     test_native_xml_dialect();
+    test_mode18_bare_name_opener();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();

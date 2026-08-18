@@ -902,6 +902,28 @@ public:
         // a 2x alternating pool because snapshot semantics make "was the
         // prior wait consumed?" irrelevant, which is the simpler-to-justify
         // (and assert-backed) invariant.
+        // issue #25: this loop is the FIRST allocation after the server reports
+        // "at ready", so a config that sized KV + prefix-cache staging to the
+        // brim dies here -- as a bare "CUDA error: out of memory at
+        // cudaStreamCreateWithFlags", with nothing on screen connecting it to
+        // --ctx or --prefix-cache, and it crash-loops because a larger cache
+        // makes the next boot worse. The streams are structural (MAX_K is the
+        // union width), so unlike the exec cache below there is nothing to
+        // shrink; the honest fix is to say WHY before CUDA_CHECK aborts.
+        {
+            size_t freeb = 0, totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess &&
+                freeb < (64ull << 20)) {
+                fprintf(stderr,
+                        "[conductor] only %.0f MB free before creating %d side "
+                        "streams -- if this OOMs, the cause is the VRAM budget, "
+                        "not the conductor. An explicit --ctx skips the auto-ctx "
+                        "safety margin, and --prefix-cache pins staging per slot "
+                        "on top of it; drop --ctx or lower "
+                        "--prefix-cache-max-tokens.\n",
+                        freeb / 1e6, (int)ConductorCore<Member>::MAX_K);
+            }
+        }
         for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&side_[i], cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&ev_mix_[i], cudaEventDisableTiming));

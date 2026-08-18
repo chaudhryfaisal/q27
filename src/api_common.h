@@ -2118,14 +2118,45 @@ inline bool tool_strict() {
 // as non-string JSON is used parsed, anything else stays a raw string.
 inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     size_t b = seg.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos || seg.compare(b, 10, "<function=") != 0) return false;
-    size_t ns = b + 10;
-    size_t ne = seg.find('>', ns);
-    if (ne == std::string::npos) return false;
-    tc.name = seg.substr(ns, ne - ns);
+    if (b == std::string::npos) return false;
+    size_t p;
+    if (seg.compare(b, 10, "<function=") == 0) {
+        size_t ns = b + 10;
+        size_t ne = seg.find('>', ns);
+        if (ne == std::string::npos) return false;
+        tc.name = seg.substr(ns, ne - ns);
+        p = ne + 1;
+    } else if (seg.compare(b, 6, "<name>") == 0) {
+        // XML drift mode 18 (issue #24): the model drops the `<function=`
+        // opener and writes the bare trained `<name>` tag --
+        //   <name>task\n</parameter>\n<parameter=description>\n...
+        // Structurally the XML twin of JSON mode 10 (dropped `{"name":"`
+        // opener, 601d7c3): the payload is intact, only the opener is gone,
+        // and refusing it dumps a real tool call into the text channel where
+        // the agent reads it as prose and stops. The name runs to end-of-line
+        // rather than to a '>' -- the tag is already closed. Any stray
+        // `</parameter>` before the first real `<parameter=` is ignored by the
+        // scan below, which searches forward for the opener.
+        size_t ns = b + 6;
+        size_t ne = seg.find('\n', ns);
+        if (ne == std::string::npos) ne = seg.size();
+        tc.name = seg.substr(ns, ne - ns);
+        while (!tc.name.empty() &&
+               (isspace((unsigned char)tc.name.back()) || tc.name.back() == '>'))
+            tc.name.pop_back();
+        // `<function=` is self-evidently a call, so it may carry zero
+        // parameters. A bare `<name>` is weaker evidence -- ordinary prose can
+        // open that way -- so require corroborating dialect structure before
+        // claiming the whole segment as a tool call.
+        if (seg.find("<parameter=", ne) == std::string::npos &&
+            seg.find("</function>", ne) == std::string::npos)
+            return false;
+        p = ne;
+    } else {
+        return false;
+    }
     if (tc.name.empty()) return false;
     tc.arguments = json::object();
-    size_t p = ne + 1;
     static const std::string PO = "<parameter=", PC = "</parameter>";
     while (true) {
         size_t ps = seg.find(PO, p);

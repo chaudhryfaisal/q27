@@ -289,6 +289,11 @@ int main(int argc, char** argv) {
     if (served_name.size() > 4 && served_name.substr(served_name.size() - 4) == ".q27")
         served_name.resize(served_name.size() - 4);
     int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
+    // Remembered separately because the auto-ctx block writes the chosen size
+    // back into `ctx`: by the post-ready headroom check (issue #25) the value
+    // no longer says whether the OPERATOR pinned it.
+    bool ctx_explicit = false;
+    int ctx_requested = -1;
     int n_slots = 1, slot1_ctx = 32768;
     bool slot1_ctx_set = false; // explicit --slot1-ctx wins over --ctx propagation
     int fast_flag = -1;        // tri-state: explicit flag wins over profile
@@ -312,6 +317,8 @@ int main(int argc, char** argv) {
                  // SILENTLY start a ctx-0 server (issue #6); the docs advertise
                  // --ctx auto, so honor it. (Omitting --ctx also auto-sizes.)
             ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
+            ctx_explicit = ctx > 0;
+            ctx_requested = ctx;
         }
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = atoi(argv[++i]); slot1_ctx_set = true; }
@@ -1013,6 +1020,42 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         fprintf(stderr, "vram: free %.2f GB at ready\n", free_b / 1e9);
+        // issue #25: an EXPLICIT --ctx skips the auto-ctx arch margin, so
+        // --ctx N together with --prefix-cache can size KV + staging right up
+        // to the card and leave nothing for the allocations that come AFTER
+        // this line -- the conductor's side streams first. The failure landed
+        // as a bare "CUDA error: out of memory" at cudaStreamCreateWithFlags,
+        // after boot had already reported success, and it crash-looped because
+        // a bigger cache made it worse on every restart. Warn HERE, where the
+        // number that caused it is still on screen and the remedies are known.
+        // Not fatal: a config this tight can still run, and refusing to boot a
+        // server that works would be the worse failure.
+        // Q27_READY_FLOOR_MB overrides the threshold. Two uses: raising it on a
+        // card whose post-ready allocations are larger than this default
+        // assumes, and testing the branch itself without having to build a
+        // genuinely OOM-adjacent config.
+        size_t floor_mb = 192;
+        if (const char* e = getenv("Q27_READY_FLOOR_MB")) {
+            long v = atol(e);
+            if (v >= 0) floor_mb = (size_t)v;
+        }
+        if (free_b < (floor_mb << 20)) {
+            fprintf(stderr,
+                    "vram: WARNING -- only %.0f MB free at ready; the conductor, "
+                    "CUDA side streams and the exec cache still allocate after "
+                    "this point and may OOM.\n", free_b / 1e6);
+            if (ctx_explicit)
+                fprintf(stderr,
+                        "  --ctx %d was set explicitly, which skips the auto-ctx "
+                        "safety margin. Drop --ctx (or lower it) to size against "
+                        "measured free VRAM.\n", ctx_requested);
+            if (pfx_cache.enabled())
+                fprintf(stderr,
+                        "  --prefix-cache staging is pinned per slot from "
+                        "--prefix-cache-max-tokens (%d); lowering it, or "
+                        "--prefix-cache-max-gb, frees the rest.\n",
+                        pfx_cfg.max_tokens);
+        }
     }
     // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
     int max_slot_ctx = 0;
