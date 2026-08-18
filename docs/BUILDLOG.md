@@ -11886,3 +11886,92 @@ the 1.19-1.24x band. The kernel, the gates and the harness stay in tree:
 `k_mxf4_dec` is the proof that the tile was built for the regime and lost on
 merits, and the ladder-derived M distribution is reusable for any future
 decode-shape question.
+
+## 2026-08-18 (d): the 790 was never fp4 arithmetic -- and q27's two gaps are one defect
+
+T2 closed the fp4 line by measuring it. It also removed the explanation everyone
+was using for ninfer's 790 t/s, so this is the replacement, plus the first
+experiment off the back of it.
+
+**WHAT THE 790 IS NOT.** `bench/crossengine/FINDINGS.md` read the ladder as
+"fp4 MMA engaging at batch width is doing the work". It cannot be. At the union
+width batched decode actually runs, the fp4 MMA sits at **9.5% of the card's
+dense fp4 peak** -- nothing is compute-bound, so there is no arithmetic
+bottleneck for fp4 to relieve, and on the axis that does bind nvfp4 is the
+LARGER format (4.50 bpw vs 4.25). Corrected in place; the measurements stand.
+
+**WHAT IT IS.** From ninfer's own reqlogs, re-derived rather than taken from the
+probes (`server.{nvfp4,nint}.ladder.reqlog.jsonl`, shipped instances, 15
+`request_done` each, 0 errors):
+
+| leg | tok/round C=1 -> C=8 | round wall C=1 / 2 / 4 / 8 |
+|---|---|---|
+| nvfp4 | 2.397 -> 2.384 | 15.04 / **15.00** / 16.18 / 18.90 ms |
+| nint | 2.305 -> 2.325 | 16.58 / 22.02 / 38.77 / 43.40 ms |
+
+Both hold `draft_window=3` and ~0.46 acceptance at every rung. The two tiers
+differ **1.025x on tokens per round and 2.30x on round wall** -- the gap is not
+speculation and not arithmetic. **nvfp4's round wall is flat C=1 -> C=2 (15.04 ->
+15.00 ms): doubling the batch cost nothing.** No throughput story produces that;
+a "the small-batch kernel was leaving the machine idle" story does. The code
+names it -- `text_policy()` hands `AllowA4` to `QType::NVFP4` and `A16Only` to
+every other qtype, and the W4A4 route engages above ~4 tokens. **ninfer's int
+tier is locked out of its own batch kernel by policy.** fp4 did not make nvfp4
+fast; A16Only made nint slow. The within-engine control was therefore never a
+format comparison -- it holds the scheduler fixed but not the kernel family, and
+the artifacts differ in embedding/head quant and BF16 carve-outs besides.
+
+**THIS DOES NOT TRANSFER.** q27 already has what nvfp4 has and nint lacks:
+`k_vgemm` is a real batch-capable MMA GEMM at 84% of streaming SOL at M=16.
+There is no idle machine to reclaim, which is why T2 measured 1.06x and not
+1.71x. q27's own gap, per-stream at C=8, factors exactly:
+
+**2.31x = 1.34x tokens-per-round x 1.71x round wall.**
+
+**T1 OF THE FOLLOW-ON, RUN SAME DAY: the 1.34x is NOT available via width.**
+At C=4 -- the rung where the `W_MAX` cap actually binds, since at C=8
+`trim_widths` never cuts a lane at floor 2 and eight floored lanes overshoot to
+`W_PLUMB` regardless:
+
+| leg | aggregate | tok/round | round wall | phv/round |
+|---|--:|--:|--:|--:|
+| w12 (shipped) | **287.8** | 2.1157 | 28.504 ms | 22.795 ms |
+| w16, gcache cap 64 | 232.6 (-19.2%) | 2.1501 (+1.6%) | 36.115 (+26.7%) | 30.478 (+33.7%) |
+| w16, gcache cap 463 | 248.7 (-13.6%) | -- | -- | -- |
+
+Widening bought **1.6% more tokens for 13.6% of round wall**. This confirms the
+2026-08-16 C-sweep's "do NOT raise W_MAX" at C=6/C=7 (-6.5%/-4.1%) and explains
+why the penalty is steeper at C=4: the granted spread is widest there.
+
+**One correction to that verdict: ~a third of the penalty was a graph-cache
+artifact, not width.** Heterogeneous grants blow up the fused-verify variant
+space -- w12 produced 97 distinct `gw` shapes (1011 hits / 83 misses / 19
+evictions), w16 produced 192 against the shipped 64-entry cap (804 / 275 / **211
+evictions**). `Q27_BATCH_GRAPH_CAP=512` zeroed the evictions and recovered
+232.6 -> 248.7. The rest is real per-lane cost. Even at zero evictions the hit
+rate is 64.5%: the shape space is combinatorial and a third of rounds still see
+a shape cold. **Any future policy that widens grants heterogeneously must price
+that blowup, and 64 entries is too small the moment grants stop being uniform.**
+
+**THE CONTROL, and the trap it caught.** C=8 must be a null -- the cap provably
+cannot bind there. Measured 418.8 (w12) vs 419.6 (w16), 0.2%. It was not a null
+on the first attempt: the in-tree `build/q27-server-w16` was 2 days and 6
+commits stale and read **218.9 against 417.6**, a fake 48% regression at the one
+rung where the policy is identical by construction. Rebuilding at HEAD removed
+it entirely. **Rebuild every comparison binary at HEAD, and design a rung into
+the A/B where the knob must do nothing** -- without that rung the stale binary
+would have shipped as "W_MAX=16 is catastrophic at C=8".
+
+**WHERE THIS LEAVES q27.** T3 (raise `W_PLUMB`) is dead: it was gated on width
+being nearly free. More usefully, the two terms of the 2.31x turn out to be one
+defect seen twice. q27 cannot afford wider drafts *because* its per-lane verify
+cost is steep, and that same per-lane cost is why its round wall grows
+1.75-2.23 ms per added member against ninfer's 0.54-0.64. The shared weight
+sweep is only ~10.9 ms of a 32.41 ms round; the target is the other ~21.5 ms,
+and `Q27_PHASE_STATS` already splits it (`phv`/`phd`/`phs`) without a profiler.
+Plan: `docs/plans/2026-08-18-batch-round-budget.md`.
+
+Separately and independently: T2 found `k_vgemm` stages through registers while
+a cp.async tile reached 94-96% of SOL on the same shapes against k_vgemm's
+80-86%. That is ~6% in q27's decode GEMM memory pipeline, it needs no format
+change, and it is the one thing the fp4 arm produced that is worth building.

@@ -166,9 +166,65 @@ prices that at **4.10x effective prefill** against a bpw-matched ninfer tier.
 **ninfer NVFP4 peaks at 1.91x q27's best.** Its 4.96x scaling reproduces their
 published 5.67x closely, on our silicon, through our harness.
 
-This is a **format** effect, not a batching-machinery effect: ninfer's own int
-leg scales only 2.52x and peaks *below* q27. fp4 MMA engaging at batch width is
-doing the work, exactly as the 08-14 notes predicted.
+> **CORRECTED 2026-08-18. The measurement stands; the mechanism below was wrong.**
+> The original text read:
+>
+> > This is a **format** effect, not a batching-machinery effect: ninfer's own
+> > int leg scales only 2.52x and peaks *below* q27. fp4 MMA engaging at batch
+> > width is doing the work, exactly as the 08-14 notes predicted.
+>
+> fp4 MMA is not doing the work, and cannot be. T2 built a decode-shaped nvfp4
+> block-scaled MMA tile and measured it at the union width batched decode
+> actually runs: **9.5% of the card's dense fp4 peak at M=16**. Nothing at
+> decode width is compute-bound, so there is no arithmetic bottleneck for fp4 to
+> relieve -- and on the axis that does bind, nvfp4 is the LARGER format (4.50
+> bpw against Q4_G64's 4.25, 1.0588x the bytes). Measured against q27's actual
+> decode GEMM the fp4 tile was 1.06x, and 0.95x once the kernel-technique gap
+> was divided out. BUILDLOG 2026-08-18 (c).
+>
+> **What is actually happening**, from ninfer's own reqlogs (`server.{nvfp4,nint}
+> .ladder.reqlog.jsonl`, shipped instances, 15 `request_done` each):
+>
+> | leg | tok/round C=1 -> C=8 | round wall C=1 / 2 / 4 / 8 |
+> |---|---|---|
+> | nvfp4 | 2.397 -> 2.384 | 15.04 / **15.00** / 16.18 / 18.90 ms |
+> | nint | 2.305 -> 2.325 | 16.58 / 22.02 / 38.77 / 43.40 ms |
+>
+> Both legs hold `draft_window=3` and ~0.46 acceptance at every rung. The two
+> tiers differ by **1.025x on tokens per round and 2.30x on round wall**: the
+> gap is not speculation and it is not arithmetic, it is that nint's round gets
+> 2.6x slower with concurrency while nvfp4's grows 26%. **nvfp4's round wall is
+> flat from C=1 to C=2 (15.04 -> 15.00 ms)** -- doubling the batch cost nothing.
+> No arithmetic-throughput story produces that; a "the small-batch kernel was
+> leaving the machine idle" story does.
+>
+> The code names it. `text_policy()` returns `AllowA4` for `QType::NVFP4` and
+> `A16Only` for every other qtype (`src/targets/qwen3_6_27b/impl/variant.cpp`),
+> and the W4A4 route engages above ~4 tokens
+> (`src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp:87`). So ninfer's
+> int tier is locked out of its own batch-capable kernel family by policy and
+> runs eight near-independent small-T GEMVs. **fp4 did not make nvfp4 fast;
+> A16Only made nint slow, and the qtype is the flag that gates the good path.**
+> That also means the within-engine control does not license "format effect" --
+> it holds the scheduler fixed but not the kernel family.
+>
+> **This does not transfer to q27.** q27 already has what nvfp4 has and nint
+> lacks: `k_vgemm` is a real batch-capable MMA GEMM measured at 84% of streaming
+> SOL at M=16. There is no idle machine to reclaim, which is exactly why T2
+> measured 1.06x rather than 1.71x. q27's own gap decomposes, per-stream at
+> C=8, as **2.31x = 1.34x tokens-per-round x 1.71x round wall** (q4s: 1.777
+> tok/round at 32.41 ms, from its own `[req]` lines) -- a speculation-throttle
+> term and a round-overhead term, neither of which is a weight-format question.
+> Follow-on: `docs/plans/2026-08-18-batch-round-budget.md`.
+>
+> The leg-level control is otherwise clean, and was re-checked: `harness/legs.sh`
+> launches both ninfer legs from one shared branch with identical flags
+> (`--kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk
+> 1024 --no-thinking --max-concurrency 8 --max-context 16384 --kv-capacity
+> 131072`), differing only in `--port`, `--model-id` and artifact path. The
+> confound is at the ARTIFACT level, not the flag level: the two tiers also
+> differ in embedding/head quant and in which tensors are kept at BF16, so
+> "nvfp4 vs nint" was never a clean single-variable format comparison.
 
 q27's 412.9 t/s at C=8 lands inside the 406–420 band from M3a — independent
 confirmation via a different measurement path.
