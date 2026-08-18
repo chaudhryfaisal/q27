@@ -1,0 +1,6 @@
+run: 2026-08-17T18:20:36-07:00
+arms: agentic,ladder
+legs: vllm
+q27 commit: 77f46bf
+ninfer commit: 604bdc5
+driver: 580.119.02

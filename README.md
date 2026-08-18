@@ -841,9 +841,22 @@ benchmark would have caught this.
 
 Full methodology, fairness controls, the payload microbench, and reproduce
 steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,
-and raw per-instance results: [bench/swebench/](bench/swebench/). The 2026-08-17
-four-engine run, its harness, and its per-leg raw data live in
-[club-3090 results](https://github.com/noonghunna/club-3090).
+and raw per-instance results: [bench/swebench/](bench/swebench/).
+
+The 2026-08-17 four-engine run lives in
+[bench/crossengine/](bench/crossengine/) -- harness, per-leg raw data, the
+write-up in [FINDINGS.md](bench/crossengine/FINDINGS.md), and the two
+attribution experiments the headline claims rest on (the vLLM MTP corruption
+A/B and llama.cpp's slot-ceiling walk) under `isolation/`. Every table above
+regenerates with:
+
+```bash
+python3 bench/crossengine/harness/analyze.py bench/crossengine
+```
+
+That section also documents the seven harness bugs the run hit, each of which
+produced a plausible and wrong number first -- the worst of them said "ninfer
+does not scale with concurrency", which is the opposite of true.
 
 The earlier three-engine run (2026-07-14, q8 KV + greedy, llama `ngram-mod`
 fork included) is superseded but not deleted -- it is the reason ngram-style
