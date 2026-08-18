@@ -322,7 +322,10 @@ def _qwen35_base_tensor_specs():
                 prefix + "ssm_norm.weight": ("F32", (128,)),
                 prefix + "ssm_out.weight": ("BF16", (embd, 6144)),
             })
-    assert len(specs) == 851
+    # Raise, not assert: `python -O` strips asserts, and this count is the
+    # contract every other base-tensor check is measured against.
+    if len(specs) != 851:
+        raise ValueError(f"base tensor spec table is malformed: {len(specs)} != 851")
     return specs
 
 
@@ -346,7 +349,8 @@ def _qwen35_mtp_tensor_specs():
         prefix + "ffn_up.weight": ("BF16", (ffn, embd)),
         prefix + "ffn_down.weight": ("BF16", (embd, ffn)),
     }
-    assert len(specs) == 15
+    if len(specs) != 15:
+        raise ValueError(f"MTP tensor spec table is malformed: {len(specs)} != 15")
     return specs
 
 

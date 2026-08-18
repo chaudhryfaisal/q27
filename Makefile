@@ -8,7 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-repack test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
+.PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 build/q27: src/engine.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
@@ -28,9 +28,17 @@ test-inspect: build/inspect build/test_loader_contracts
 	./build/test_loader_contracts
 
 test-repack: tools/repack.py tools/test_repack_split.py tools/test_repack_split_e2e.py \
-             tools/requirements-repack-test.txt
+             tools/test_repack_canonical_gate.py tools/requirements-repack-test.txt
 	$(PYTHON) tools/test_repack_split.py
 	$(PYTHON) tools/test_repack_split_e2e.py
+	$(PYTHON) tools/test_repack_canonical_gate.py
+
+# Opt-in release gate: repack a REAL source and compare the artifact MD5 to the
+# published digest. The tests above prove the split plumbing on synthetic
+# fixtures; only this proves the bytes we ship. Skips cleanly when unconfigured.
+#   SRC_GGUF=... [SRC_MTP_GGUF=...] CANON_MD5=... make test-repack-canonical
+test-repack-canonical: tools/repack_canonical_gate.sh tools/repack.py
+	bash tools/repack_canonical_gate.sh
 
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
