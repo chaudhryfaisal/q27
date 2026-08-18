@@ -1,5 +1,6 @@
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
+PYTHON    ?= python3
 NVCC      ?= /usr/local/cuda/bin/nvcc
 # sm_120 = RTX 5090, sm_89 = RTX 4090/Ada (needs CUDA 12.4+ for e4m3 MMA),
 # sm_86 = RTX 3090 (fallback device for tests)
@@ -7,7 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
+.PHONY: all clean test-inspect test-repack test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 build/q27: src/engine.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
@@ -25,6 +26,11 @@ build/test_loader_contracts: src/test_loader_contracts.cpp src/loader.cpp src/lo
 test-inspect: build/inspect build/test_loader_contracts
 	python3 tools/test_inspect.py ./build/inspect
 	./build/test_loader_contracts
+
+test-repack: tools/repack.py tools/test_repack_split.py tools/test_repack_split_e2e.py \
+             tools/requirements-repack-test.txt
+	$(PYTHON) tools/test_repack_split.py
+	$(PYTHON) tools/test_repack_split_e2e.py
 
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@

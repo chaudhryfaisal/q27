@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Repack a BF16 GGUF into the q27 v1 format (see docs/FORMAT.md).
+"""Repack BF16 GGUF weights into the q27 v1 format (see docs/FORMAT.md).
 
 Usage:
-  repack.py input.gguf output.q27 [--only REGEX] [--report N]
+  repack.py input.gguf output.q27 [--mtp mtp.gguf] [--only REGEX] [--report N]
 
+--mtp joins the companion MTP GGUF emitted by current llama.cpp conversions;
+the primary GGUF supplies blocks 0..63 and the companion supplies block 64.
 --only limits to tensors matching REGEX (smoke tests).
 --report prints the N worst tensors by relative RMSE after quantization.
 
@@ -257,11 +259,264 @@ def repack_b1(t):
 
     return qs.tobytes(), scales.tobytes()
 
+def _field_value(reader, name):
+    field = reader.fields.get(name)
+    if field is None:
+        return None
+    value = field.contents()
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def _tensor_signature(tensor):
+    return tensor.tensor_type.name, tuple(int(d) for d in tensor.shape)
+
+
+def _tensor_data_equal(left, right):
+    left_bytes = np.asarray(left.data).view(np.uint8).reshape(-1)
+    right_bytes = np.asarray(right.data).view(np.uint8).reshape(-1)
+    if left_bytes.size != right_bytes.size:
+        return False
+    chunk = 64 * 1024 * 1024
+    return all(np.array_equal(left_bytes[off:off + chunk], right_bytes[off:off + chunk])
+               for off in range(0, left_bytes.size, chunk))
+
+
+def _qwen35_base_tensor_specs():
+    # Source GGUF shapes in ordinary row-major order; GGUFReader exposes them
+    # reversed, so _require_exact_specs reverses before comparing. These are
+    # the same frozen Qwen3.8 dimensions enforced by both runtimes.
+    embd, ffn, vocab = 5120, 17408, 248320
+    head, n_head, n_kv = 256, 24, 4
+    specs = {
+        "token_embd.weight": ("BF16", (vocab, embd)),
+        "output_norm.weight": ("F32", (embd,)),
+        "output.weight": ("BF16", (vocab, embd)),
+    }
+    for layer in range(64):
+        prefix = f"blk.{layer}."
+        specs.update({
+            prefix + "attn_norm.weight": ("F32", (embd,)),
+            prefix + "post_attention_norm.weight": ("F32", (embd,)),
+            prefix + "ffn_gate.weight": ("BF16", (ffn, embd)),
+            prefix + "ffn_up.weight": ("BF16", (ffn, embd)),
+            prefix + "ffn_down.weight": ("BF16", (embd, ffn)),
+        })
+        if layer % 4 == 3:
+            specs.update({
+                prefix + "attn_q.weight": ("BF16", (2 * n_head * head, embd)),
+                prefix + "attn_k.weight": ("BF16", (n_kv * head, embd)),
+                prefix + "attn_v.weight": ("BF16", (n_kv * head, embd)),
+                prefix + "attn_output.weight": ("BF16", (embd, n_head * head)),
+                prefix + "attn_q_norm.weight": ("F32", (head,)),
+                prefix + "attn_k_norm.weight": ("F32", (head,)),
+            })
+        else:
+            specs.update({
+                prefix + "attn_qkv.weight": ("BF16", (10240, embd)),
+                prefix + "attn_gate.weight": ("BF16", (6144, embd)),
+                prefix + "ssm_alpha.weight": ("BF16", (48, embd)),
+                prefix + "ssm_beta.weight": ("BF16", (48, embd)),
+                prefix + "ssm_a": ("F32", (48,)),
+                prefix + "ssm_dt.bias": ("F32", (48,)),
+                prefix + "ssm_conv1d.weight": ("F32", (10240, 4)),
+                prefix + "ssm_norm.weight": ("F32", (128,)),
+                prefix + "ssm_out.weight": ("BF16", (embd, 6144)),
+            })
+    assert len(specs) == 851
+    return specs
+
+
+def _qwen35_mtp_tensor_specs():
+    embd, ffn, head, n_head, n_kv = 5120, 17408, 256, 24, 4
+    prefix = "blk.64."
+    specs = {
+        prefix + "nextn.enorm.weight": ("F32", (embd,)),
+        prefix + "nextn.hnorm.weight": ("F32", (embd,)),
+        prefix + "nextn.shared_head_norm.weight": ("F32", (embd,)),
+        prefix + "nextn.eh_proj.weight": ("BF16", (embd, 2 * embd)),
+        prefix + "attn_norm.weight": ("F32", (embd,)),
+        prefix + "post_attention_norm.weight": ("F32", (embd,)),
+        prefix + "attn_q_norm.weight": ("F32", (head,)),
+        prefix + "attn_k_norm.weight": ("F32", (head,)),
+        prefix + "attn_q.weight": ("BF16", (2 * n_head * head, embd)),
+        prefix + "attn_k.weight": ("BF16", (n_kv * head, embd)),
+        prefix + "attn_v.weight": ("BF16", (n_kv * head, embd)),
+        prefix + "attn_output.weight": ("BF16", (embd, n_head * head)),
+        prefix + "ffn_gate.weight": ("BF16", (ffn, embd)),
+        prefix + "ffn_up.weight": ("BF16", (ffn, embd)),
+        prefix + "ffn_down.weight": ("BF16", (embd, ffn)),
+    }
+    assert len(specs) == 15
+    return specs
+
+
+QWEN35_BASE_SPECS = _qwen35_base_tensor_specs()
+QWEN35_MTP_SPECS = _qwen35_mtp_tensor_specs()
+QWEN35_BASE_TENSORS = frozenset(QWEN35_BASE_SPECS)
+QWEN35_MTP_TENSORS = frozenset(QWEN35_MTP_SPECS)
+QWEN35_REQUIRED_METADATA = {
+    "qwen35.embedding_length": 5120,
+    "qwen35.feed_forward_length": 17408,
+    "qwen35.attention.head_count": 24,
+    "qwen35.attention.head_count_kv": 4,
+    "qwen35.attention.key_length": 256,
+    "qwen35.attention.value_length": 256,
+    "qwen35.ssm.state_size": 128,
+    "qwen35.ssm.group_count": 16,
+    "qwen35.ssm.inner_size": 6144,
+    "qwen35.context_length": 262144,
+    "qwen35.rope.dimension_count": 64,
+    "qwen35.ssm.conv_kernel": 4,
+    "qwen35.ssm.time_step_rank": 48,
+    "qwen35.full_attention_interval": 4,
+    "qwen35.rope.freq_base": 10000000.0,
+    "qwen35.attention.layer_norm_rms_epsilon": 0.000001,
+    "qwen35.rope.dimension_sections": [11, 11, 10, 0],
+}
+
+
+def _normalized_metadata(value):
+    if isinstance(value, bytes):
+        return value.decode()
+    if isinstance(value, np.ndarray):
+        return [_normalized_metadata(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_normalized_metadata(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _exact_uint(value, expected):
+    value = _normalized_metadata(value)
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _require_qwen38_metadata(reader, label):
+    for name, expected in QWEN35_REQUIRED_METADATA.items():
+        actual = _field_value(reader, name)
+        if actual is None:
+            raise ValueError(f"--mtp {label} is missing architecture metadata: {name}")
+        actual = _normalized_metadata(actual)
+        if isinstance(expected, int):
+            matches = _exact_uint(actual, expected)
+        elif isinstance(expected, float):
+            matches = (isinstance(actual, float) and
+                       (abs(actual - expected) <= 1e-12
+                        if name == "qwen35.attention.layer_norm_rms_epsilon"
+                        else actual == expected))
+        elif isinstance(expected, list):
+            matches = (isinstance(actual, list) and
+                       all(isinstance(item, int) and not isinstance(item, bool)
+                           for item in actual) and actual == expected)
+        else:
+            matches = type(actual) is type(expected) and actual == expected
+        if not matches:
+            raise ValueError(
+                f"--mtp {label} architecture metadata mismatch: "
+                f"{name}: {actual!r} != {expected!r}")
+
+
+def _check_split_architecture_metadata(primary, companion):
+    allowed = {"qwen35.block_count", "qwen35.nextn_predict_layers"}
+    primary_fields = {name: _normalized_metadata(field.contents())
+                      for name, field in primary.fields.items()
+                      if name.startswith("qwen35.") and name not in allowed}
+    companion_fields = {name: _normalized_metadata(field.contents())
+                        for name, field in companion.fields.items()
+                        if name.startswith("qwen35.") and name not in allowed}
+    if primary_fields != companion_fields:
+        differing = sorted(set(primary_fields) ^ set(companion_fields) |
+                           {name for name in set(primary_fields) & set(companion_fields)
+                            if primary_fields[name] != companion_fields[name]})
+        raise ValueError("--mtp architecture metadata mismatch: " + ", ".join(differing))
+
+
+def _require_exact_manifest(label, actual, expected):
+    missing = expected - actual
+    unexpected = actual - expected
+    if missing or unexpected:
+        parts = []
+        if missing:
+            parts.append(f"missing {len(missing)} ({', '.join(sorted(missing)[:4])})")
+        if unexpected:
+            parts.append(f"unexpected {len(unexpected)} ({', '.join(sorted(unexpected)[:4])})")
+        raise ValueError(f"{label} tensor manifest mismatch: " + "; ".join(parts))
+
+
+def _require_exact_specs(label, tensors_by_name, expected_specs):
+    _require_exact_manifest(label, set(tensors_by_name), set(expected_specs))
+    for name, (expected_type, expected_shape) in expected_specs.items():
+        tensor = tensors_by_name[name]
+        actual_type = tensor.tensor_type.name
+        actual_shape = tuple(reversed(tuple(int(d) for d in tensor.shape)))
+        if actual_type != expected_type or actual_shape != expected_shape:
+            raise ValueError(
+                f"{label} tensor spec mismatch: {name}: "
+                f"{actual_type} {actual_shape} != {expected_type} {expected_shape}")
+
+
+def merge_mtp_tensors(primary, companion):
+    """Join ggml-org's Qwen3.8 base and MTP GGUF views fail-closed."""
+    if _field_value(primary, "general.architecture") != "qwen35":
+        raise ValueError("--mtp requires a qwen35 primary GGUF")
+    if _field_value(companion, "general.architecture") != "qwen35":
+        raise ValueError("--mtp companion is not a qwen35 GGUF")
+    primary_name = _field_value(primary, "general.name")
+    companion_name = _field_value(companion, "general.name")
+    if not isinstance(primary_name, str) or not primary_name.strip():
+        raise ValueError("--mtp primary is missing general.name")
+    if not isinstance(companion_name, str) or not companion_name.strip():
+        raise ValueError("--mtp companion is missing general.name")
+    if primary_name != companion_name:
+        raise ValueError(f"--mtp checkpoint mismatch: {primary_name!r} != {companion_name!r}")
+    if not _exact_uint(_field_value(primary, "qwen35.block_count"), 64):
+        raise ValueError("--mtp primary must contain the 64 base blocks")
+    if (not _exact_uint(_field_value(companion, "qwen35.block_count"), 65)
+            or not _exact_uint(_field_value(companion, "qwen35.nextn_predict_layers"), 1)):
+        raise ValueError("--mtp companion must describe one MTP layer (block_count=65)")
+    _require_qwen38_metadata(primary, "primary")
+    _require_qwen38_metadata(companion, "companion")
+    _check_split_architecture_metadata(primary, companion)
+
+    primary_by_name = {t.name: t for t in primary.tensors}
+    if len(primary_by_name) != len(primary.tensors):
+        raise ValueError("primary GGUF contains duplicate tensor names")
+    _require_exact_specs("primary", primary_by_name, QWEN35_BASE_SPECS)
+    companion_by_name = {t.name: t for t in companion.tensors}
+    if len(companion_by_name) != len(companion.tensors):
+        raise ValueError("MTP GGUF contains duplicate tensor names")
+
+    allowed_shared = {"token_embd.weight", "output_norm.weight", "output.weight"}
+    shared = set(primary_by_name) & set(companion_by_name)
+    unexpected = shared - allowed_shared
+    if unexpected:
+        raise ValueError("--mtp companion overlaps primary tensors: "
+                         + ", ".join(sorted(unexpected)))
+    if shared != allowed_shared:
+        missing = allowed_shared - shared
+        raise ValueError("--mtp companion is missing shared tensors: "
+                         + ", ".join(sorted(missing)))
+    for name in shared:
+        if _tensor_signature(primary_by_name[name]) != _tensor_signature(companion_by_name[name]):
+            raise ValueError(f"--mtp shared tensor shape/type mismatch: {name}")
+        if not _tensor_data_equal(primary_by_name[name], companion_by_name[name]):
+            raise ValueError(f"--mtp shared tensor contents differ: {name}")
+
+    mtp_only = [t for t in companion.tensors if t.name not in primary_by_name]
+    mtp_by_name = {t.name: t for t in mtp_only}
+    _require_exact_specs("MTP", mtp_by_name, QWEN35_MTP_SPECS)
+    _require_exact_manifest("companion", set(companion_by_name),
+                            allowed_shared | QWEN35_MTP_TENSORS)
+    return list(primary.tensors) + mtp_only
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("output")
+    ap.add_argument("--mtp", default=None,
+                    help="companion BF16 MTP GGUF (llama.cpp --mtp output)")
     ap.add_argument("--only", default=None)
     ap.add_argument("--report", type=int, default=15)
     ap.add_argument("--q8", default=None,
@@ -285,10 +540,26 @@ def main():
 
     t0 = time.time()
     r = GGUFReader(args.input)
-    ternary = any(t.tensor_type.name == "Q2_0" for t in r.tensors)
-    binary = any(t.tensor_type.name == "Q1_0" for t in r.tensors)
+    mtp_reader = GGUFReader(args.mtp) if args.mtp else None
+    source_tensors = merge_mtp_tensors(r, mtp_reader) if mtp_reader else list(r.tensors)
+    arch = _field_value(r, "general.architecture")
+    if not isinstance(arch, str) or not arch:
+        raise ValueError("source GGUF is missing general.architecture")
+    ternary = any(t.tensor_type.name == "Q2_0" for t in source_tensors)
+    binary = any(t.tensor_type.name == "Q1_0" for t in source_tensors)
+    if mtp_reader:
+        bad_types = sorted({t.tensor_type.name for t in source_tensors
+                            if t.tensor_type.name not in ("BF16", "F32")})
+        if bad_types:
+            raise ValueError("--mtp requires the pinned BF16 GGUF layout "
+                             "(BF16 matrices/F32 scalars); found "
+                             + ", ".join(bad_types))
     if binary and ternary:
         raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
+    if (not mtp_reader and not ternary and not binary
+            and _field_value(r, "general.architecture") == "qwen35"
+            and _field_value(r, "qwen35.block_count") == 64):
+        raise ValueError("base-only qwen35 GGUF: supply its companion with --mtp")
 
     meta = {"q27_version": VERSION,
             "quant_policy": args.tag or ("bonsai-t2-v1" if ternary
@@ -313,6 +584,9 @@ def main():
         meta["pf4_sidecars"] = True
         meta["group_fp4"] = GROUP_FP4
         meta["pf4_encoding"] = "e2m1 even=low, ue4m3 scale per 16"
+    # The primary owns every architectural field. Split validation proved the
+    # companion matches; only its intentional 65-block/MTP declarations may
+    # override the 64-block base view.
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
             try:
@@ -322,9 +596,12 @@ def main():
                 meta[f.name] = v
             except Exception:
                 pass
+    if mtp_reader:
+        meta["qwen35.block_count"] = 65
+        meta["qwen35.nextn_predict_layers"] = 1
     # layer map
     attn_layers, ssm_layers = set(), set()
-    for t in r.tensors:
+    for t in source_tensors:
         if t.name.startswith("blk."):
             n = int(t.name.split(".")[1])
             leaf = t.name.split(".", 2)[2]
@@ -342,7 +619,7 @@ def main():
     n_bytes_in = n_bytes_out = 0
 
     extra = []
-    for t in r.tensors:
+    for t in source_tensors:
         # MTP draft head copy: only for non-quantized-head packs and pack
         # types that carry MTP (no MTP in ternary/binary packs).
         if t.name == "output.weight" and not args.q4_head \
@@ -361,7 +638,7 @@ def main():
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
-    tensor_iter = list(r.tensors) + [_Alias(n, t) for n, t in extra]
+    tensor_iter = source_tensors + [_Alias(n, t) for n, t in extra]
     zero_fracs = []
     for t in tensor_iter:
         if only and not only.search(t.name):
