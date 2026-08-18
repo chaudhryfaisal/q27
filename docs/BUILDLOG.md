@@ -11975,3 +11975,70 @@ Separately and independently: T2 found `k_vgemm` stages through registers while
 a cp.async tile reached 94-96% of SOL on the same shapes against k_vgemm's
 80-86%. That is ~6% in q27's decode GEMM memory pipeline, it needs no format
 change, and it is the one thing the fp4 arm produced that is worth building.
+
+## 2026-08-18 (e): T2 round budget -- a quarter of the C=8 round drafts tokens the trim throws away
+
+**The instrument was unfit and had to be fixed before the measurement meant
+anything.** `phd` cannot price the draft phase at batch, by construction and by
+its own in-tree comment: the phase runs host-synced per step inside
+`Conductor::draft_widths`, BEFORE `ev_round_start` is recorded, so `phd`
+brackets only the unsynced tail. It reads **0.006 ms/round at C=8 while ~2.86
+draft steps per member actually launch.** The plan's `round_ms - phv - phd`
+model would have swept the entire draft phase into an unexplained remainder and
+called it host gap. Fixed with a host wall clock around `draft_widths()`
+(`phfd` / `GenStats::fdraft_ms`, same shared-wall semantics as phd/phv) -- exact
+precisely BECAUSE the phase host-syncs every step, and inert to arithmetic.
+
+**THE BUDGET** (q4s, `--slots 8 --ctx 16384`, `Q27_PHASE_STATS=1`):
+
+| rung | tok/rnd | round | fdraft | phd | phv | rest | accounted |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| C=1 | 2.3273 | 16.641 | -- | -- | -- | -- | n/a |
+| C=2 | 2.1951 | 22.204 | 3.903 | 0.051 | 17.847 | 0.403 | 98.2% |
+| C=4 | 2.0419 | 28.488 | 5.362 | 0.002 | 22.888 | 0.236 | 99.2% |
+| C=8 | 1.7042 | 32.144 | **8.182** | 0.006 | 23.734 | 0.222 | **99.3%** |
+
+Bar was 85%. C=1 is unattributed by construction, not by failure:
+`ConductorCore::step` takes `if (k == 1) solo_round(...)` and never enters the
+fused path, so all three stamps are 0 there.
+
+**The C=8 round is 73.8% fused verify and 25.5% DRAFT.** Per added member
+(C=2 -> C=8): round **+1.657 ms**, phv **+0.981** (59%), fdraft **+0.713**
+(43%), rest -0.030. The host round-gap this plan went looking for is 0.222 ms
+and shrinking -- it was never the problem.
+
+**THE FINDING: q27 drafts ~2.86 tokens per member per round and verifies 1.**
+`phs/round` is 2.86 at every fused rung while `trim_widths` grants width 2, and
+width W verifies W-1 drafted positions. **~65% of every drafted token is
+computed and discarded**, and because the phase host-syncs per step it scales
+linearly with members instead of amortizing across the batch.
+
+**This closes the loop with T1 the same day.** T1: q27 cannot afford to USE more
+draft depth (+1.6% tokens for -13.6% wall at C=4). T2: it is PAYING for depth it
+does not use, a quarter of the round. Same policy error from both ends -- the
+gate ladder picks depth per member with no knowledge that `trim_widths` is about
+to crush the grant to floor-2. Neither is a kernel problem and neither is a
+weight-format problem.
+
+**Upper bound on the fix** (a bound: assumes no fixed per-member cost in the
+phase): 8.182 / (8 x 2.86) = 0.357 ms per draft step. Drafting 1 step instead of
+2.86 costs **ZERO accepted tokens** -- only one drafted position is verified at
+width 2 regardless -- and would take fdraft to ~2.86 ms, the round to ~26.8 ms,
+and C=8 from 417 to **~500 t/s**. Unlike widening, this trades nothing away.
+Scoped as T4 in `docs/plans/2026-08-18-batch-round-budget.md`, with the
+accepted-tokens-must-not-fall bar as its correctness gate.
+
+**REPRODUCED, and upgraded from watch item: the greedy-path non-determinism.**
+The 2026-08-16 entry logged "ONE-OFF, UNREPRODUCED: a single w16 CLI no-spec run
+returned md5 8196e65e; three repeats returned the canonical f64e7c02". It
+returned **8196e65e again today**, same value, on the `q27` CLI rather than
+w16, on the q4s canonical recipe (`--tokens "760,6511,314,9338,369" -n 128
+--ctx 2048 --spec`). Rate today 1 in 13; 12 subsequent repeats all EXACT. Both
+observed failures were the FIRST run after a fresh build, which is the only
+pattern visible so far and is worth testing directly (rebuild-then-single-run
+cycles). It is NOT the documented co-residency trap -- that one produces the
+EMPTY-output md5, and this is a real non-empty divergent generation. It is also
+not caused by the `phfd` change: the same md5 predates it by two days and the
+diff is a clock read plus a counter. **A 1-in-13 greedy divergence undermines
+every byte-identity gate in the repo and should be chased before the next
+canonical claim is made.**

@@ -2764,6 +2764,10 @@ struct Engine {
         gs.verify_ms += verify_ms;
         gs.draft_steps += steps;
     }
+    // Fused draft-phase host wall (round-budget T2). Separate mutator rather
+    // than a 4th arg: solo rounds never call it, so the solo phd/phv/phs
+    // accounting is untouched and fdraft_ms stays identically 0 there.
+    void phase_stats_add_fdraft(double ms) { gs.fdraft_ms += ms; }
     // ---- P3 T3 exec-cache accessors (A4; plan 2026-07-16-batch-p3-capture) --
     // why: the conductor's graph-cache shape key includes each member's
     // KV-cache kind -- attn_mix's kv_store/attn_decode kernel family
@@ -3759,6 +3763,18 @@ struct Engine {
         // draft_steps is NOT shared: steps THIS member launched.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
+        // FUSED DRAFT WALL (2026-08-18, round-budget T2). phd above is only
+        // the cstm-visible tail by construction, so it cannot price the draft
+        // phase at batch -- the phase runs host-synced per step inside
+        // Conductor::draft_widths, BEFORE ev_round_start exists, and reads
+        // ~0.01 ms/round at C=4 while ~2.85 steps per member actually launch.
+        // fdraft_ms is that phase measured where it lives: a host wall clock
+        // around draft_widths(). Host timing is exact here precisely BECAUSE
+        // the phase host-syncs every step. Same SHARED-WALL semantics as
+        // phd/phv (one round, one wall, attributed in full to each member),
+        // so round_ms - fdraft_ms - phv - phd is the true unattributed
+        // remainder. Inert: a host clock read, no stream op, no capture node.
+        double fdraft_ms = 0;
         // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)
         // -- the marginal-lane cost curve that prices deep ladders with
         // draft off the critical path (Saguaro follow-up). Index by W; 0..1

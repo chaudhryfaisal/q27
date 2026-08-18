@@ -1189,11 +1189,11 @@ int main(int argc, char** argv) {
                      " phd=%.1f phv=%.1f phs=%ld"
                      " phwn=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
                      " phwm=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f"
-                     " sfxm=%.1f sfxn=%ld",
+                     " sfxm=%.1f sfxn=%ld phfd=%.1f",
                      g.draft_ms, g.verify_ms, g.draft_steps, g.vw_n[2], g.vw_n[3],
                      g.vw_n[4], g.vw_n[5], g.vw_n[6], g.vw_n[7], g.vw_n[8], g.vw_ms[2],
                      g.vw_ms[3], g.vw_ms[4], g.vw_ms[5], g.vw_ms[6], g.vw_ms[7],
-                     g.vw_ms[8], g.sfx_ms, g.sfx_rounds);
+                     g.vw_ms[8], g.sfx_ms, g.sfx_rounds, g.fdraft_ms);
         else
             phbuf[0] = '\0';
         if (getenv("Q27_NJOINT")) {

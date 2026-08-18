@@ -1286,6 +1286,9 @@ private:
         // bracket is open and CLOSES it.
         assert(!round_active && "B3: fused rounds must not overlap per Conductor");
         round_active = true;
+        // Round-budget T2: host wall around the whole draft phase. Exact
+        // because this phase host-syncs every step; see GenStats::fdraft_ms.
+        const auto fd_t0 = std::chrono::steady_clock::now();
         enum { MAX_K = ConductorCore<Member>::MAX_K };
         int act[MAX_K];                              // gated members still in the loop
         int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
@@ -1428,6 +1431,9 @@ private:
             assert(rlaunched == launched[i] && "B8: interleaved launch count diverged");
             (void)rcap; (void)rW; (void)rlaunched;
         }
+        fdraft_ms_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - fd_t0)
+                         .count();
     }
 
     // One fused round over k >= 2 members (under the caller's Lease).
@@ -1546,6 +1552,10 @@ private:
                     if (ph_s > ms[i]->md_used) ph_s = ms[i]->md_used;
                 }
                 es[i]->phase_stats_add(ph_d, ph_v, ph_s); // A4 accessor
+                // draft_widths() ran immediately before this round on this
+                // thread (core.round() pairs them), so fdraft_ms_ is THIS
+                // round's draft wall. Shared-wall, same as phd/phv.
+                es[i]->phase_stats_add_fdraft(fdraft_ms_);
             }
             // Task 10 [req] bat= telemetry FIRST: this member's round ran
             // k-wide (k >= 2 by the core's dispatch; on the catch path the
@@ -1875,6 +1885,10 @@ private:
     cudaStream_t side_[ConductorCore<Member>::MAX_K] = {};
     cudaEvent_t ev_fork_ = nullptr, ev_mix_[ConductorCore<Member>::MAX_K] = {};
     bool round_active = false;
+    // This round's draft-phase host wall (round-budget T2). Written at the end
+    // of draft_widths(), read in fused_round(); core.round() pairs the two on
+    // one thread, which is the same invariant round_active already asserts.
+    double fdraft_ms_ = 0;
     // P3 T3 exec-cache state (conductor-thread-only after the ctor, like
     // cstm; ctor comment for the graphs_on_/gc_cap_ latches). Counters feed
     // the per-round dbg lines + the teardown summary (gate e telemetry).

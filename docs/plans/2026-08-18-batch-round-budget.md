@@ -137,6 +137,59 @@ aggregate hides which one moved.
 
 ## T2 -- What is the 21.5 ms made of?
 
+> **RAN 2026-08-18. PASSES the attribution bar at 98.2-99.3%, and the answer is
+> the DRAFT PHASE, which the method as written could not have seen.**
+>
+> **The instrument had to be fixed first.** `phd` cannot price the draft phase
+> at batch, by construction and by its own in-tree comment: the phase runs
+> host-synced per step inside `Conductor::draft_widths`, BEFORE `ev_round_start`
+> is recorded, so `phd` brackets only the unsynced tail. It reads 0.006 ms/round
+> at C=8 while ~2.86 draft steps per member actually launch. The plan's
+> `round_ms - phv - phd` model would have dumped the entire draft phase into an
+> unexplained remainder and called it host gap. Fixed by bracketing
+> `draft_widths()` with a host wall clock (`phfd`/`GenStats::fdraft_ms`) --
+> exact precisely BECAUSE the phase host-syncs every step, and inert to
+> arithmetic (a clock read and a counter).
+>
+> | rung | tok/rnd | round | fdraft | phd | phv | rest | accounted |
+> |---|--:|--:|--:|--:|--:|--:|--:|
+> | C=1 | 2.3273 | 16.641 | -- | -- | -- | -- | n/a |
+> | C=2 | 2.1951 | 22.204 | 3.903 | 0.051 | 17.847 | 0.403 | 98.2% |
+> | C=4 | 2.0419 | 28.488 | 5.362 | 0.002 | 22.888 | 0.236 | 99.2% |
+> | C=8 | 1.7042 | 32.144 | **8.182** | 0.006 | 23.734 | 0.222 | **99.3%** |
+>
+> C=1 is unattributed by construction, not by failure: `ConductorCore::step`
+> takes `if (k == 1) solo_round(...)` and never enters `draft_widths`/
+> `fused_round`, so all three fused stamps are 0 there. Any future round-budget
+> work at C=1 needs the solo path stamped separately.
+>
+> **The C=8 round is 73.8% fused verify and 25.5% DRAFT.** Per added member
+> (C=2 -> C=8, 6 members): round **+1.657 ms**, of which phv **+0.981** (59%)
+> and fdraft **+0.713** (43%). The host gap the plan expected to find is
+> 0.222 ms and shrinking -- it is not the problem.
+>
+> **The finding: q27 drafts ~2.86 tokens per member per round and verifies 1.**
+> `phs/round` is 2.86 at every fused rung while `trim_widths` grants width 2, and
+> width W verifies W-1 drafted positions. **~65% of every drafted token is
+> computed and thrown away**, and because the phase is host-synced per step it
+> scales linearly with members instead of amortizing.
+>
+> **This closes the loop with T1.** T1: q27 cannot afford to USE more draft depth
+> (+1.6% tokens for -13.6% wall). T2: it is PAYING for depth it does not use, to
+> the tune of a quarter of the round. The two results are the same policy error
+> seen from both ends -- the gate ladder picks depth per member without knowing
+> `trim_widths` is about to crush the grant to floor-2.
+>
+> **Upper bound on the fix**, stated as a bound because it assumes zero fixed
+> per-member cost in the phase: 8.182 ms / (8 members x 2.86 steps) = 0.357 ms
+> per draft step. Drafting 1 step instead of 2.86 costs **zero accepted tokens**
+> (only 1 drafted position is verified at width 2 regardless), and would take
+> fdraft to ~2.86 ms, the round to ~26.8 ms, and the C=8 aggregate from 417 to
+> **~500 t/s**. Unlike T1's widening, this trades nothing away -- it is waste
+> removal. That makes T4 below the successor to this plan.
+
+### Original method (superseded by the run above)
+
 **The question.** 32.41 ms round, ~10.9 ms shared weight sweep. If the
 remainder is per-round overhead, widening and fusing pay; if it is per-member
 work, only the per-member work pays.
@@ -190,3 +243,41 @@ of SOL. The transferable finding from T2 is smaller and different: `k_vgemm`
 stages through registers while a cp.async tile reached 94-96% of SOL on the same
 shapes, so there is ~6% in q27's decode GEMM memory pipeline. That is worth
 doing and is independent of everything above.
+
+---
+
+## T4 -- Draft to the grant you will actually get (opened by T2, 2026-08-18)
+
+**The question.** The gate ladder picks each member's draft depth from its own
+margin loop (`Q27_PMIN`, `gate_maxd`, dctl) with no knowledge that
+`trim_widths` will crush the grant to floor-2 a moment later. At C=8 that costs
+~65% of every drafted token and ~25% of the round.
+
+**Method.** Feed the expected grant back into the draft ceiling: before the
+margin loop, compute what `trim_widths` will grant given the current member set
+(it is a pure function of `want[]`, `is_suffix[]`, `k`, `cap` and is already
+CPU-testable in `tools/test_conductor.cpp`), and cap `md_used` at that. At C=8
+with every lane floored this makes the ceiling 1 step. The prediction has to be
+conservative -- granting MORE than predicted must stay legal, since a member
+leaving mid-round changes k.
+
+**Pre-declared bars.**
+- C=8 aggregate strictly above 417 t/s, and `phfd`/round strictly below 8.182.
+- **Accepted tokens per round must not fall.** At floor-2 only one drafted
+  position is verified, so a correct implementation changes committed tokens by
+  ZERO; any drop means the ceiling is cutting into verified positions and the
+  change is wrong, not merely unprofitable.
+- C=1 and k <= 2 untouched: canonical digest EXACT, solo bitwise contract
+  intact. The trim never fires below the cap, so this must be a no-op there --
+  and that is the control rung, per the T1 lesson.
+- No regression at C=2/C=4 (the trim fires less there; a naive ceiling could
+  over-cut).
+
+**Risk to price first.** The margin loop may need steps it would now skip in
+order to make its depth decision at all, and dctl's histograms feed the adaptive
+ladder -- cutting steps changes what it learns. Check whether the ceiling can be
+applied to LAUNCHES without changing the decision, or whether the decision
+itself has to move.
+
+**Cost.** A policy change inside `draft_widths` plus the existing CPU conductor
+test. Days, not weeks, and T2 already built the instrument that scores it.
