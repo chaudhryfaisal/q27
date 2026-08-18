@@ -1293,6 +1293,45 @@ private:
         int act[MAX_K];                              // gated members still in the loop
         int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
         int na = 0;
+        // T4 (docs/plans/2026-08-18-batch-round-budget.md): draft no deeper than
+        // the trim can possibly GRANT. Measured 2026-08-18: at C=8 every lane is
+        // granted width 2 while ~2.86 draft steps per member launch, so ~65% of
+        // drafted tokens are computed and discarded, and the phase is 25.5% of
+        // the round.
+        //
+        // The ceiling is DERIVED, not tuned. trim_widths never trims a lane
+        // already at floor 2 (see its `want[i] <= 2` guard), so member i's grant
+        // is maximised when every OTHER member sits at that floor:
+        //     sum = want_i + 2*(k-1) <= cap   =>   want_i <= cap - 2*(k-1)
+        // and when cap - 2*(k-1) < 2 the cap is unsatisfiable, trim gives up with
+        // EVERY lane at 2. So max_grant(k) = max(2, cap - 2*(k-1)), exactly.
+        // A verify of width W checks W-1 DRAFTED positions, hence the -1.
+        //
+        // This can never drop a step whose token could have been verified, which
+        // is why accepted-tokens-per-round is unchanged BY CONSTRUCTION rather
+        // than by measurement. Suffix members do not weaken it: they skip the MTP
+        // chain entirely (the `continue` above) and trim floors them at 2 like
+        // anyone else, so "every other member >= 2" still holds.
+        //
+        // At cap=W_MAX=12 this is 9/7/5/3/1/1/1 steps for k=2..8 -- non-binding
+        // until k=5 (gate_maxd is 7) and pinned at ONE step from k=6, which is
+        // where the whole win is. Same monotone shape SGLang's batch-size table
+        // uses (bs 1-7 -> up to 7, 8-31 -> up to 3, 32+ -> 0-1), derived instead
+        // of tuned: q27 knows k and cap exactly at round start, so it needs no
+        // lagged acceptance EMA to infer what the scheduler already decided.
+        static const bool ceil_on = [] { // Q27_DRAFT_CEIL=0 restores pre-T4 depth
+            const char* e = getenv("Q27_DRAFT_CEIL");
+            return !(e && atoi(e) == 0);
+        }();
+        // Ceiling is max_grant, NOT max_grant-1. A width-W verify walks W-1
+        // drafts, but draft_and_gate's floor top-up maintains the stronger
+        // invariant "W draft ROWS must exist" (engine.cuh, the cap==0 case), so
+        // cutting to W-1 would break that invariant to save one step. Holding at
+        // max_grant preserves it exactly and still cuts C=8 from ~3.35 launched
+        // steps per member to 2. Revisiting the extra step is a separate change
+        // that has to re-derive the row invariant first.
+        const int max_grant = core.cap - 2 * (k - 1) < 2 ? 2 : core.cap - 2 * (k - 1);
+        const int step_ceiling = max_grant;
         for (int i = 0; i < k; i++) {
             Member& mm = *ms[i];
             mm.gate_cap = mm.md_used = -1;
@@ -1317,6 +1356,7 @@ private:
             // (the same dctl/gate_maxd read).
             if (mm.sampled) mm.e->draft_sample_bootstrap();
             mdu[i] = mm.e->draft_md_used(mm.sampled);
+            if (ceil_on && mdu[i] > step_ceiling) mdu[i] = step_ceiling;
             cap[i] = launched[i] = 0;
             act[na++] = i;
         }

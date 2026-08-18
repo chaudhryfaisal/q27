@@ -12042,3 +12042,56 @@ not caused by the `phfd` change: the same md5 predates it by two days and the
 diff is a clock read plus a counter. **A 1-in-13 greedy divergence undermines
 every byte-identity gate in the repo and should be chased before the next
 canonical claim is made.**
+
+## 2026-08-18 (f): T4 SHIPPED -- draft to the grant, C=8 412.7 -> 455.8 t/s at zero token cost
+
+T2 found q27 drafting ~2.86 steps per member per round while the trim granted
+width 2. T4 stops that. **C=8 aggregate 412.7 -> 455.8 t/s (+10.4%)** with
+tok/round UP 0.4% (noise), canonical digest EXACT.
+
+**The ceiling is DERIVED, not tuned.** `trim_widths` never trims a lane already
+at floor 2, so member i's grant is maximised when every other member sits at the
+floor: `want_i + 2*(k-1) <= cap`, and when `cap - 2*(k-1) < 2` the cap is
+unsatisfiable and trim gives up with EVERY lane at 2. So
+
+    max_grant(k) = max(2, cap - 2*(k-1))            exactly
+
+Checked against the 2026-08-18 [bat] census before writing code: k=2 -> bound 10
+(observed max 5, not binding), k=4 -> bound 6 (observed max 5, not binding),
+k=8 -> bound 2 (observed 2.00 in 4728/4728 lanes, exactly tight). At cap=12 this
+is non-binding until k=5 and pinned at k>=6, which is where the entire win is.
+
+Because the ceiling can never remove a step whose token could have been
+verified, **token neutrality holds by construction, not by measurement** -- the
+measured +0.4% is confirmation, not evidence.
+
+| rung | tok/round | round ms | fdraft ms | phs/rnd | aggregate |
+|---|---|---|---|---|---|
+| C=2 | 2.2165 -> 2.2141 | 21.75 -> 21.96 | 3.85 -> 3.89 | 2.82 -> 2.83 | 201.2 -> 200.3 |
+| C=4 | 2.0708 -> 2.1190 | 29.36 -> 29.13 | 5.59 -> 5.43 | 2.88 -> 2.86 | 276.4 -> 279.2 |
+| C=8 | 1.7088 -> **1.7149** | 32.48 -> **29.62** | 8.36 -> **5.71** | 2.85 -> **1.82** | 412.7 -> **455.8** |
+
+A/B is the same binary via `Q27_DRAFT_CEIL=0`, so nothing but the policy moved.
+C=2/C=4 unchanged is the control the derivation predicted, and it held.
+
+**Ceiling is max_grant, NOT max_grant-1.** A width-W verify walks W-1 drafts,
+but `draft_and_gate`'s floor top-up maintains the stronger invariant "W draft
+ROWS must exist" (the cap==0 case). Cutting to W-1 would break that invariant to
+save one more step. Holding at max_grant preserves it and still takes C=8 from
+~3.35 launched steps per member to 2. The extra step is a separate change that
+has to re-derive the row invariant first -- worth ~2.4 ms if it turns out to be
+free.
+
+**Prior art, and why the derived form beats the tuned one.** SGLang v0.5.17
+ships the same idea as a static batch-size table (`adaptive_spec_params.py`:
+bs 1-7 -> [1,3,7], 8-31 -> [0,1,3], 32-63 -> [0,1], >=64 -> [0]) plus an EMA
+ladder walk on observed acceptance. Same monotone shape. q27 does not need the
+EMA: it knows `k` and `cap` exactly at round start, so it reads the scheduler
+quantity directly instead of inferring it from a lagged, batch-averaged,
+5-batch-cadence estimate. Note also that SGLang's docstring advertises
+`clamp(round(ema_accept_len)+1, ...)` and the code does not implement it --
+anyone porting from the docstring builds the wrong thing.
+
+Remaining at C=8: round 29.62 ms of which verify is ~23.7 and the shared weight
+sweep ~10. The unexplained ~10 ms of verify is now the largest single item and
+the next target.
