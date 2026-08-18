@@ -11768,3 +11768,121 @@ STILL OWED before anyone acts on this: a proper weight-format envelope. The
 right bar is a tier the repo is willing to ship -- q4s at 455, or q6/q6k
 measured the same way -- not a KV-cache study. Nobody should re-run T2 against
 the number 19.
+
+## 2026-08-18 (c): T2 -- fp4 loses at decode shapes, 1.06x against a 1.25x bar, and the win it does show is not the format
+
+**NO-GO on the wall bar.** At the union width batched decode actually runs, a
+purpose-built decode-shaped nvfp4 tile beats the incumbent union GEMM by
+**1.016-1.085x** across the four projections (byte-weighted **1.06x** over a
+full-attention layer). The pre-declared bar was **>= 1.25x**. Divide out the
+kernel-technique gap and the format-only ratio is **0.95x** -- fp4 is slower.
+
+**FIRST: the M distribution, measured, not assumed.** The plan guessed "roughly
+8-64 rows". A live C=8 ladder (vanilla q4s, `--slots 8 --ctx 16384`,
+`Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5`, `Q27_BATCH_DBG=1`, 8x1024 tokens,
+415.7 t/s aggregate -- in line with the 412.9 on record) produced 605 fused
+rounds:
+
+| union width M | rounds | share |
+|--:|--:|--:|
+| 16 | 593 | **98.02%** |
+| 14 | 3 | 0.50% |
+| 12 | 6 | 0.99% |
+| 10 | 1 | 0.17% |
+| 6 | 2 | 0.33% |
+
+k=8 in 98% of rounds; **99.79% of lanes granted width 2**, against wanted widths
+spread 2/3/4/5 (39/18/14/29%). Mean M = 15.91. Every round all-gated, zero
+suffix. So the C-sweep's "88% of lanes at floor-2 from C=6" tightens to
+**100% at C=8**, and M is not a distribution to sample -- it is the number 16.
+
+M is also **capped at 16 structurally**, which the plan did not know: union width
+is asserted `<= W_PLUMB` (`conductor.h:466`) and `vgemm_verify` refuses
+`T > W_PLUMB` (`vgemm.cu:335`). W_MAX=12 is the trim cap, but `trim_widths`
+never trims a lane already at floor 2, so eight floored lanes overshoot it to 16
+by design. **M=32/64 do not exist today** and their rows in the table below are
+informational only.
+
+**SECOND: the baseline was wrong in the plan.** The plan offered
+"`gemm_q4_T` / the union vgemm, whichever the C-sweep verdict routes to".
+It routes to vgemm and never to `gemm_q4_T`: at k >= 3 `build_union_view` sets
+`gemm_min = 2` (`conductor.h:483`), so every projection with
+`rows >= gemm_min_rows` goes through `q27k::vgemm_verify`. `gemm_q4_T` is
+prefill-only and a fused round never reaches it. Benchmarking against it would
+have compared fp4 to a kernel decode does not run.
+
+**THE TILE.** `tools/microbench_mxf4.cu` gains `k_mxf4_dec`, sized for this
+regime rather than the BM=128 prefill point. The operands swap: m16n8k64 puts 16
+rows on A and 8 on B, so **weights take A** (output channels) and
+**activations take B** (lanes) -- the same assignment `k_vgemm` makes with its
+m16n8k32 s8 MMA, which is what keeps this a format test instead of a tile-shape
+test. NTI (8-lane B tiles) is a template parameter so the tile tracks M:
+(MR=32,NTI=1/2/4) and (MR=16,NTI=8). z comes from `q27k::vgemm_z` so both legs
+split K across CTAs identically. 50/51 regs, zero spill, 4 CTA/SM on all four
+instantiations. Gate: every output checked against a CPU reference at each
+instantiation and at both z==1 (MODE 0) and z>1 (MODE 1 + fixed-order reduce),
+with row and lane tails -- 116k exhaustive refs, PASS.
+
+Two measurement traps had to be closed first. **L2:** a rep loop over one
+15-45 MB tensor sits inside this card's 96 MB L2 and measures cache bandwidth
+for both legs, which flatters the leg with fewer bytes; each shape is replicated
+until the rotated working set clears L2 by ~3x. **Partial-traffic accounting:**
+`k_vgemm` guards its split-K store on `tok < T`, so its workspace traffic is
+`z*M*rows`, not `z*W_PLUMB*rows` -- counting the padded lanes overstated the
+baseline's GB/s by ~16% at M=4.
+
+**THE TABLE** (5090, driver clocks as-found, measured streaming-read SOL
+1692 GB/s = 95% of the 1.79 TB/s spec figure; in-run peaks fp4 868 TFLOPS,
+int8 `gemm_q4_T` 323 TFLOPS):
+
+| shape | M | vgemm ms / %SOL | fp4 ms / %SOL | ratio | fmt | %pk4 |
+|---|--:|--:|--:|--:|--:|--:|
+| attn_q+gate 12288x5120 | 16 | 0.0286 / 84.0% | 0.0263 / 95.5% | 1.085x | 0.955x | 8.8% |
+| attn_output 5120x6144 | 16 | 0.0165 / 80.4% | 0.0162 / 85.1% | 1.016x | 0.960x | 7.2% |
+| ffn_gate 17408x5120 | 16 | 0.0387 / 84.3% | 0.0364 / 94.0% | 1.062x | 0.953x | 9.0% |
+| ffn_down 5120x17408 | 16 | 0.0366 / 85.8% | 0.0344 / 95.9% | 1.065x | 0.953x | 9.5% |
+
+Three runs, agreement within 1%. Byte-weighted over one full-attention layer
+(attn_q + attn_output + ffn_gate + ffn_up + ffn_down): **1.063x**.
+
+**WHY IT LOSES, and why no kernel work fixes it.** `%pk4` tops out at 9.5% at
+M=16 (18% even at the unreachable M=64). The fp4 MMA is idle almost all the
+time; neither leg is remotely compute-bound. So the Blackwell
+dense-fp4-is-2x-int8 silicon advantage -- the thing that produced 2.13-2.97x in
+the prefill sweep and the thing this plan warned would account for "roughly 2x
+of any win" -- **buys nothing at decode.** The regime is a byte count, and on
+bytes fp4 is the LARGER format: nvfp4 spends 0.5 B/weight on e2m1 codes plus one
+ue4m3 per 16 = **0.5625 B/weight (4.50 bpw)**; Q4_G64 spends 0.5 plus one fp16
+per 64 = **0.53125 (4.25 bpw)**. fp4 moves **1.0588x the bytes for the same
+weights**, so at equal bandwidth efficiency its ceiling is 0.944x.
+
+The measured 1.06x is therefore not the format. It is that the fp4 tile reaches
+**94-96% of SOL** while `k_vgemm` reaches **80-86%** -- this tile uses cp.async,
+`k_vgemm` stages through registers. The `fmt` column divides that out (what the
+baseline would take at the fp4 kernel's own GB/s) and lands at **0.95x**. Stated
+as a decision: **fixing k_vgemm's memory pipeline is worth ~6% and beats
+adopting fp4, which costs 5.9% more bytes to get there.** That is a real,
+cheap, in-format lever this test surfaced, and it needs no new number format,
+no sm_120a gate, and no 3090/4090 exclusion.
+
+The M=32/64 rows read 1.4-1.9x, but the baseline there is ceil(M/16) vgemm calls
+re-reading the weights -- an artifact of W_PLUMB, not a win. In that hypothetical
+regime the fp4 tile's own efficiency also collapses (60-72% SOL at M=64 on
+MR=16/NTI=8), so a W_PLUMB raise would not rescue this either.
+
+**WHAT THIS SETTLES.** T2 was the last open fp4 question. Recapping the ledger:
+quality is not a blocker (T1 retracted -- fp4's 347/ninfer's 317 both beat
+shipped q4s at 455); but fp4 is 4.50 bpw against 4.25, so **5.9% bigger**; the
+quality edge is invisible to a task rubric (65/75 either way); the MMA is
+sm_120a-only, so no 3090 and no 4090; and now the speed case, which was the only
+thing holding it up, measures **1.06x against a 1.25x bar and 0.95x on format
+alone**. Every leg is negative or neutral. **The fp4 decode tier is dead**, and
+T3 (one fp4 copy serving both phases) is moot -- it was gated on T2 passing, and
+its VRAM argument cannot pay for a decode path that is slower per byte.
+
+The bar was NOT the retracted number 19; it was the 1.25x wall bar the plan
+carried forward, and this is the second time an fp4 arm has missed a wall bar in
+the 1.19-1.24x band. The kernel, the gates and the harness stay in tree:
+`k_mxf4_dec` is the proof that the tile was built for the regime and lost on
+merits, and the ladder-derived M distribution is reusable for any future
+decode-shape question.

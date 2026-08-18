@@ -131,11 +131,43 @@ envelope (+0.458% dPPL, ~19 catastrophic positions at 64K):
 
 ## T2 -- Does fp4 actually win at DECODE shapes?
 
-> **NOT RUN, and now UNBLOCKED.** It was skipped on T1's NO-GO, which is
-> retracted -- fp4 measures better than the 4-bit weight format q27 ships, so
-> the quality objection to a native fp4 tier is gone and this test is live again
-> on its original terms. Before re-running it: the >= 1.25x wall bar below is
-> fine, but do NOT carry over the number 19 as a quality envelope (see T1).
+> **RAN 2026-08-18. NO-GO, and this one holds.** Measured **1.016-1.085x**
+> across the four projections at the union width decode actually runs
+> (byte-weighted **1.063x** over a full-attention layer) against the **>= 1.25x**
+> bar below. Divide out the kernel-technique gap and the format-only ratio is
+> **0.95x**. Run record: BUILDLOG 2026-08-18 (c). Four things this section got
+> wrong, kept because they are what the measurement was for:
+>
+> 1. **M is not 8-64, it is 16.** A live C=8 ladder with `Q27_BATCH_DBG=1` over
+>    605 fused rounds: **M=16 in 98.02%** of them, mean 15.91, and 99.79% of
+>    lanes granted width 2 against wanted widths spread 2/3/4/5. The C-sweep's
+>    "88% at floor-2 from C=6" tightens to 100% at C=8. M is also **capped at 16
+>    structurally** -- union width is asserted `<= W_PLUMB` (conductor.h:466) and
+>    `vgemm_verify` refuses `T > W_PLUMB` (vgemm.cu:335). W_MAX=12 is the trim
+>    cap, but `trim_widths` never trims a lane at floor 2, so eight floored lanes
+>    overshoot it to 16 by design. **M=32/64 do not exist**; those rows are
+>    informational.
+> 2. **The baseline is vgemm, never `gemm_q4_T`.** "whichever the C-sweep verdict
+>    routes to" resolves to vgemm at every decode shape: at k >= 3
+>    `build_union_view` sets `gemm_min = 2` (conductor.h:483). `gemm_q4_T` is
+>    prefill-only and a fused round never reaches it.
+> 3. **Percent-of-peak answers the question by itself.** `%pk4` tops out at
+>    **9.5%** at M=16. The fp4 MMA is idle almost all the time and neither leg is
+>    compute-bound, so the "roughly 2x of any win is silicon" caveat below turns
+>    out to be moot in the other direction: at decode the silicon advantage buys
+>    *nothing*, because the regime is a byte count. On bytes fp4 is the LARGER
+>    format -- 0.5625 B/weight (4.50 bpw) against Q4_G64's 0.53125 (4.25 bpw),
+>    **1.0588x the bytes**, ceiling 0.944x at equal efficiency.
+> 4. **The measured 1.06x is k_vgemm, not fp4.** The fp4 tile reaches 94-96% of
+>    measured SOL; `k_vgemm` reaches 80-86% (cp.async vs register staging).
+>    Fixing k_vgemm's memory pipeline is worth ~6% and beats adopting a format
+>    that needs 5.9% more bytes to get there. That lever is the useful output of
+>    this test.
+>
+> **Consequence: the fp4 decode tier is dead, and T3 is moot** -- it was gated on
+> T2 and its VRAM argument cannot pay for a path that is slower per byte. Every
+> remaining leg is negative or neutral: 5.9% bigger, quality edge invisible to a
+> task rubric, sm_120a-only (no 3090, no 4090), and now no speed.
 
 **The question.** Phase 0 cleared the GEMM gate at 2.13-2.97x, but it swept
 M = 512..8192 -- prefill chunk widths. Batched decode at C=8 runs
@@ -177,9 +209,13 @@ A day, and it is independent of T1 -- run them in parallel if convenient.
 
 ## T3 -- Can ONE fp4 copy serve both phases?
 
-> **NOT RUN.** Was gated on T1, whose NO-GO is retracted; the VRAM arithmetic
-> that motivated it (one fp4 copy at ~10-11 GB against q4s's 15.46) is unchanged
-> and now has no quality objection standing against it.
+> **NOT RUN, and now MOOT.** Gated on T2, which is a NO-GO on 2026-08-18: the
+> decode path this section says "is exactly what T2 prices" costs 5.9% more
+> bytes per weight than what ships, so it is slower per byte no matter how the
+> copies are arranged. The VRAM arithmetic below is still correct in isolation
+> and still has no quality objection against it -- it just buys a resident-size
+> win by paying for it in every decode round, which is the wrong trade for an
+> engine whose decode is bandwidth-bound at 80-96% of SOL.
 >
 > One thing worth carrying forward if the 790 t/s ever gets revisited: ninfer
 > reaches it on NVFP4 and scores a quality TIE in the 2026-08-17 four-engine
