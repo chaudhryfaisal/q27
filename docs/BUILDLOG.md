@@ -12622,3 +12622,31 @@ plain background shell died with the tmux session, while every campaign under
 respawning 17 GB q27 processes on the 3090 until killed. Long GPU jobs go under
 `systemd-run --user`, no exceptions; and after any session crash, check
 `pgrep -af build/q27` before trusting a GPU-idle reading.
+
+## 2026-08-19: racecheck is NOT viable unfiltered on this workload -- OOM after 5.5 h
+
+`compute-sanitizer --tool racecheck --racecheck-report analysis` on the
+single-step reproducer (59-token prefix, `-n 1`, no `--spec`) ran from 22:21 to
+04:00 and was **killed by the host OOM killer** (`racecheck.service: Result=
+oom-kill`) without reaching the first hazard report. It never got past
+`sample graph captured`. Host RAM is 123 GB.
+
+Cause: racecheck tracks every shared-memory access, and one q27 forward pass is
+65 layers x several smem-using kernels, plus the boot-time graph zoo capture and
+the warm rounds -- all instrumented before the step under test even runs. The
+tool's working set grows without bound across that many launches.
+
+Collateral worth knowing: while racecheck was exhausting RAM, the CONCURRENT
+tie-loop on the other GPU stalled for hours mid-run (the 15 GB model load
+thrashes when page cache is gone) and looked wedged. It resumed on its own once
+the OOM freed memory. A stalled GPU job during a host-RAM squeeze is not
+necessarily hung -- check `free -g` before killing it.
+
+**How to actually run it (next attempt):** bound BOTH the kernel set and the
+launch window, one suspect family at a time --
+`--kernel-name regex=k_attn_fd2 --launch-count 20`. compute-sanitizer counts
+only launches matching the filter, so this instruments ~20 fd2 launches instead
+of the entire process. Suspect order (smem complexity on the decode path):
+k_attn_fd2 (s_q + s_mrg + s_ml, with the barrier-serialized cross-warp merge)
+-> k_gdn_delta_all / k_gdn_convnorm3 -> k_attn_fd_combine -> k_rmsnorm3/l2norm3
+-> k_gemv_q4_n. Do NOT re-run it unfiltered.
