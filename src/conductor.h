@@ -1340,7 +1340,36 @@ private:
         // steps per member to 2. Revisiting the extra step is a separate change
         // that has to re-derive the row invariant first.
         const int max_grant = core.cap - 2 * (k - 1) < 2 ? 2 : core.cap - 2 * (k - 1);
-        const int step_ceiling = max_grant;
+        // E3.1 (Q27_DRAFT_CEIL1=1): drop the floor from 2 steps to 1.
+        //
+        // ROW INVARIANT, RE-DERIVED (the T4 comment above asked for exactly
+        // this before touching the extra step). k_finish_round's accept walk is
+        //     for (k = 1; k <= NDRAFT; k++)
+        //         if (k <= max_draft && n == k && v[k-1] == dr[k-1]) n = k+1;
+        // with max_draft = vw-1, so it reads dr[0 .. vw-2] -- **vw-1 rows, not
+        // vw**. At the floor vw=2 that is dr[0] ALONE, and dr[0] is written by
+        // draft step 0. Step 1's output dr[1] is loaded into a register and
+        // copied to outcome[3], which the host reads only for n > 2 (outcome
+        // layout: emitted tokens live in [1..n], and n <= vw = 2 here). So the
+        // second step cannot change n, cannot change the emitted token, and
+        // cannot change h_next (src = x1s.p[n-1], n <= 2).
+        //
+        // The "W draft ROWS must exist" invariant is therefore STRONGER than
+        // the kernel needs. Its stated purpose (engine.cuh, spec_round) is
+        // "byte/round identity with the monolithic path" -- an A/B-equivalence
+        // property against Q27_DEXIT=0, not a correctness property of the
+        // verify. Under this flag that identity is knowingly given up at the
+        // floor; the EMITTED tokens are unaffected, which is what the canonical
+        // digest and tok/round measure.
+        //
+        // At C>=6 the trim floors every lane to 2, so today every member runs 2
+        // draft steps per round and uses exactly ONE of them, forever. This
+        // makes the second step pure waste at high concurrency.
+        static const bool ceil1 = [] {
+            const char* e = getenv("Q27_DRAFT_CEIL1");
+            return e && atoi(e) != 0;
+        }();
+        const int step_ceiling = (ceil1 && max_grant > 1) ? max_grant - 1 : max_grant;
         for (int i = 0; i < k; i++) {
             Member& mm = *ms[i];
             mm.gate_cap = mm.md_used = -1;

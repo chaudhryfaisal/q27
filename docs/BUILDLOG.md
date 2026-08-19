@@ -13004,3 +13004,63 @@ this instrument carries. The knob provably cannot matter there, and it doesn't.
 Estimated compounded value if E2.2 lands: C=4 raw round 26.95 -> ~23.4 ms at
 w16's 2.22 tok/round = ~0.0949 tok/ms vs today's 0.0765 = **+24%** at C=4,
 before any of E3/E4. C=8 is unaffected by both (one shape, floors to 2).
+
+## 2026-08-19 (h): E3.1 -- depth-1 at the floor. +9.8% at C=8, tokens BYTE-IDENTICAL, all gates green.
+
+T4's comment said cutting the extra draft step "has to re-derive the row
+invariant first". Done, and the invariant turns out to be stronger than the
+kernel needs.
+
+**THE DERIVATION.** k_finish_round's accept walk (spec3.cu:1361) is
+```
+for (k = 1; k <= NDRAFT; k++)
+    if (k <= max_draft && n == k && v[k-1] == dr[k-1]) n = k + 1;
+```
+with `max_draft = vw-1`, so it reads `dr[0 .. vw-2]` -- **vw-1 rows, not vw**.
+At the floor vw=2 that is `dr[0]` ALONE, written by draft step 0. Step 1's output
+`dr[1]` is loaded into a register and copied to `outcome[3]`, which the host
+reads only for n > 2 (outcome layout: emitted tokens live in [1..n], and
+n <= vw = 2 here). It cannot change n, the emitted token, or h_next
+(`src = x1s.p[n-1]`).
+
+So "W draft ROWS must exist" (engine.cuh, spec_round) is an A/B-EQUIVALENCE
+property -- its stated purpose is "byte/round identity with the monolithic path"
+(Q27_DEXIT=0) -- not a correctness property of the verify. E3.1 gives that
+identity up at the floor and keeps the emitted tokens.
+
+**Why it is worth anything: at C>=6 the trim floors every lane to 2, so every
+member runs 2 draft steps per round and uses exactly ONE, every round.**
+
+**MEASURED** (`Q27_DRAFT_CEIL1=1`, same binary both legs, 3 passes at C=8):
+
+| C=8 | tok/round | round ms | phfd | phv |
+|---|---|---|---|---|
+| base | 1.7014 | 27.21 | 5.49 | 21.36 |
+| ceil1 | 1.6969 | **24.72** | **3.02** | 21.32 |
+| delta | **-0.26%** | **-9.15%** | **-45%** | -0.19% |
+
+Aggregate **500.3 -> 549.2 t/s at C=8 (+9.8%)**, inside the plan's 550-575 band.
+The draft phase halved exactly as derived; phv is untouched (the verify never
+saw the second step). tok/round is flat at -0.26% against a 3% kill bar.
+**Null rung C=4: phfd 5.32 -> 5.42, i.e. NO change** -- the flag only binds where
+max_grant sits at the floor, which is the whole point.
+
+**GATES, all with the flag ON:**
+- `fused_smoke`: "GRAPH SMOKE PASS: both passes **byte-identical to solo**" --
+  an independent confirmation of the derivation, not a restatement of it.
+- `ninv_test`: CHUNK+FOLD BITWISE ALL PASS.
+- Canonical anchors f64e7c02 x2 + sampled 900031e9 EXACT (the CLI solo path
+  never touches the conductor, so this is by construction, but it is cheap).
+
+**SHIPPED OPT-IN, default unchanged.** The knob is `Q27_DRAFT_CEIL1=1`
+(conductor.h, clamping step_ceiling to max_grant-1). Flipping the default is a
+serving-product call, not a measurement one -- the trade is a documented +9.8%
+at C>=6 against byte-identity with the Q27_DEXIT=0 monolithic path at the floor.
+Recommendation: flip it, since fused_smoke proves the emitted tokens are
+identical to solo and the lost property only ever gated an internal A/B.
+
+**Next in E3:** E3.2 -- with the draft pinned to one unconditional step, the
+margin read no longer gates anything at C>=6, so the whole draft phase becomes
+capturable into the round graph (fdraft 3.02 -> lower still, and one less host
+sync per round). Watch dctl: pinning depth feeds degenerate observations into
+the adaptive ladder, so freeze dctl updates while the concurrency ceiling binds.
