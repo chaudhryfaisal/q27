@@ -13517,3 +13517,48 @@ floor that includes its stores.** The residual is 0.80 ms of compute phase
 scaling chain, now without the redundancy) and 0.62 ms of deterministic
 reduce. Neither has a cheap next move. Scope limit unchanged from (n): -0.47 ms
 is -1.9% of a 24.72 ms round, inside ladder noise, judged on the harness.
+
+## 2026-08-19 (p): the Metal break, verified on hardware as an A/B -- and the caveat in baa2f58 is now retired
+
+`baa2f58` shipped the FP4_G16 fix with an explicit caveat: **NOT COMPILE-VERIFIED
+ON macOS**, because neither Mac was reachable at the time. It has now been built
+and run on a base Apple M4 (macOS 26.5.2, Apple clang 17.0.0), as a controlled
+A/B rather than a single positive.
+
+**CONTROL, at the reviewed commit 8194a2a** -- the reported break reproduces
+verbatim, which is what makes the fix meaningful rather than incidental:
+
+```
+src/metal/metal_backend.mm:1119:13: error: enumeration value 'FP4_G16'
+    not handled in switch [-Werror,-Wswitch]
+```
+
+**AT 7a5d46e:** compiles clean, and everything downstream passes on device:
+
+| target | result |
+|---|---|
+| `test-metal-backend` | Metal matvec: OK (Apple M4, 17.8 GiB working set) |
+| `test-metal-ops` | decode primitives, FP16/turbo3 attention, GDN, chunked prefill: OK |
+| `test-metal-contracts` | q4s engine contracts OK; constrained MTP / stale-snapshot / chunk-logit PASS; stream format OK |
+| `test-metal-canonical` | **md5 f301095522174bdb99f75ec840ad1389** = the published metal-m4:q4s canonical, and gate 2 byte-identical |
+
+The canonical gate is the one that matters beyond the switch: it is a full greedy
+trajectory through the Metal engine, so it also covers `loader.cpp` and the
+`attn_layers` parser changes on that path, not just the compile.
+
+**METHOD, worth keeping.** The Mac's checkout tracks GitHub, which did not have
+these commits, and pushing to a public remote purely to test is the wrong order
+of operations. `git bundle create ... 8194a2a..master` (518 KB) over scp, fetched
+into a throwaway branch, built in two `git worktree` checkouts -- one at the fix,
+one at the control. `~/q27` was left exactly as found.
+
+**TWO NON-FINDINGS, recorded so they are not rediscovered as bugs.** `make
+build/metal-engine` fails with undefined symbols -- that is not a file target
+(the phony is `metal-engine`, which only builds the .o) and it fails identically
+at 8194a2a. And macOS has no `timeout(1)`, so wrapping the test targets in it
+reports three false FAILs. Both were harness errors, not code.
+
+**Still true:** `xcrun metal` is absent on that box (it needs full Xcode, not
+just the command line tools). No Metal target's recipe invokes it -- the shader
+is compiled at runtime, confirmed by the gate printing `shader sha1 0761aedd...`
+-- so the CLT-only box is sufficient for every gate above.
