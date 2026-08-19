@@ -1841,20 +1841,23 @@ struct Engine {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         q27k::conv_step(conv_ring[il], conv_ring[il], qkv, cw, convout, GDN_CH, st); // lane 0
-        if (vw > 1)
-            q27k::gdn_conv_chunk3(conv_ring[il], LANESW(qkv), cw, LANESW(convout), GDN_CH,
-                                  vw - 1, st);
-        // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
-        q27k::l2norm3(LANESW(convout), 32,
-                      GDN_DIM, eps, st, vw);
-        if (vw > 1)
-            q27k::gdn_record3(LANESW(qkv), LANESW(convout), LANESW(g), LANESW(beta),
-                              rec_qkv[il], rec_conv[il], rec_g[il], rec_beta[il], GDN_CH,
-                              GDN_HEADS, vw - 1, st);
-        q27k::delta_step(S[il], S[il], convout, g, beta, o, st); // lane 0
-        if (vw > 1)
-            q27k::gdn_delta_chunk3(S[il], LANESW(convout), LANESW(g), LANESW(beta),
-                                   LANESW(o), vw - 1, st);
+        if (vw > 1) {
+            // 2026-08-18 fusion: 6 -> 3 launches per layer. The chain wall was
+            // 38.8 us of which 13.0 us inter-kernel gap (nsys), and the delta
+            // pair moved S three times. convnorm3 = conv_chunk3 + l2norm3 +
+            // record3; delta_all = delta_step + delta_chunk3 with S staged
+            // once in smem. Bitwise twins of the replaced sequence, gated by
+            // build/gdn_fuse_eq + ninv + the canonical digest.
+            q27k::gdn_convnorm3(conv_ring[il], LANESW(qkv), cw, LANESW(convout), LANESW(g),
+                                LANESW(beta), rec_qkv[il], rec_conv[il], rec_g[il],
+                                rec_beta[il], GDN_CH, GDN_HEADS, eps, vw, st);
+            q27k::gdn_delta_all(S[il], S[il], LANESW(convout), LANESW(g), LANESW(beta),
+                                LANESW(o), vw - 1, st);
+        } else {
+            // vw == 1: today's launches, byte-for-byte.
+            q27k::l2norm3(LANESW(convout), 32, GDN_DIM, eps, st, vw);
+            q27k::delta_step(S[il], S[il], convout, g, beta, o, st);
+        }
     }
     // M1 commit Fold: advance committed GDN state by the accepted speculative
     // rows (fold_pending = n-1, set at commit, shrunk by refinish_round).

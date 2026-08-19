@@ -57,6 +57,17 @@ void gdn_delta_chunk3(const float* S0, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
 // after l2norm3) and g/beta scalars into the per-layer record arena (row L-1),
 // so the commit Fold can replay exactly the bytes the verify consumed after
 // the lane buffers are reused by the next layer.
+// 2026-08-18 GDN mix fusion: the vw>1 decode mix chain collapsed 6 -> 3
+// launches. gdn_convnorm3 = conv_chunk3 + l2norm3 + record3 (one launch, all
+// lanes); gdn_delta_all = delta_step (lane 0, commits S) + delta_chunk3
+// (lanes 1..nsp) with S staged once in smem. Both are bitwise twins of the
+// sequences they replace -- gated by build/gdn_fuse_eq; MIRROR WARNINGS in
+// spec3.cu apply.
+void gdn_convnorm3(const float* ring, CP3 qkv, const float* convw, P3 out, CP3 g, CP3 beta,
+                   float* rec_qkv, float* rec_conv, float* rec_g, float* rec_beta, int channels,
+                   int n_heads, float eps, int vw, cudaStream_t st);
+void gdn_delta_all(const float* Ssrc, float* Sdst, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
+                   cudaStream_t st);
 void gdn_record3(CP3 qkv, CP3 conv, CP3 g, CP3 beta, float* rec_qkv, float* rec_conv,
                  float* rec_g, float* rec_beta, int channels, int n_heads, int nsp,
                  cudaStream_t st = 0);

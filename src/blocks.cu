@@ -141,7 +141,8 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_conv_chunk3
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; 2026-08-18: also
+// k_gdn_convnorm3 in spec3.cu): k_gdn_conv_chunk3
 // (spec3.cu, the M1 speculative-lane chunk) and k_conv_prefill_T (prefill.cu)
 // are arithmetic twins of this tap/silu math -- any arithmetic change here
 // MUST be mirrored in both and re-gated with ninv's CHUNK+FOLD leg (bitwise,
@@ -177,11 +178,12 @@ void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const f
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_delta_chunk3
-// (spec3.cu) and k_delta_scan_T (prefill.cu, also the M1 Fold) are per-step
-// arithmetic twins of this body (smem-resident state, identical tile split
-// and part[0..3] reduction order) -- mirror any change in both and re-gate
-// with ninv's CHUNK+FOLD leg (bitwise, both arches).
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; extended 2026-08-18):
+// k_gdn_delta_chunk3 and k_gdn_delta_all (spec3.cu) and k_delta_scan_T
+// (prefill.cu, also the M1 Fold) are per-step arithmetic twins of this body
+// (smem-resident state, identical tile split and part[0..3] reduction order)
+// -- mirror any change in ALL of them and re-gate with ninv's CHUNK+FOLD leg
+// plus build/gdn_fuse_eq (bitwise, both arches).
 __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
                              const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,

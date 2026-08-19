@@ -12236,3 +12236,55 @@ reproduce -- a pre-change binary returns `227a6b08`, deterministic across runs.
 That drift predates today's sampler work (measured on the T4 build, and the
 sampler is not on the plain `--temp` CLI path). The greedy anchor `f64e7c02` is
 EXACT. The sampled anchor needs re-deriving or its recorded flags corrected.
+
+## 2026-08-18 (i): GDN mix fused 6 -> 3 kernels -- bitwise-proven, and the wall answer is the interesting part
+
+The 30.4% GDN bucket from entry (h), attacked as asked. Two new kernels in
+spec3.cu: `k_gdn_convnorm3` (= conv_chunk3 + l2norm3 + record3, one launch, all
+lanes) and `k_gdn_delta_all` (= delta_step lane-0 commit + delta_chunk3 lanes,
+S staged ONCE in smem -- S traffic drops 9 -> 6 MB per layer per member). The
+decode mix chain goes 6 launches -> 3; the vw==1 branch keeps the old launches
+byte-for-byte.
+
+**Bitwise identity is proven, not asserted:** `build/gdn_fuse_eq` bit-compares
+EVERY surface the mix touches (S, ring, all lanes' convout/o, all four record
+arenas) at vw {2,3,5,8,12,16} -- zero bytes differ. ninv CHUNK+FOLD: ALL PASS.
+Canonical f64e7c02 EXACT x3 on the fused path. A 3-lens adversarial review
+(fp-order, capture/occupancy, record/fold contract): no findings; it also
+confirmed the setattr latch fires pre-capture via the warm round and that the
+divergent __syncthreads is per-block-uniform and legal.
+
+**THE MEASUREMENT, which is the real yield.** Chain-level prediction said
+~0.5-1 ms off the round; the wall said otherwise:
+
+| | tok/rnd | round | phv | C=8 aggregate |
+|---|--:|--:|--:|--:|
+| pre-fusion | 1.7010 | 27.189 | 21.364 | 492.8 |
+| fused, run 1 | 1.8884 | 26.377 | 20.747 | 506.8 |
+| fused, run 2 | 1.6982 | 27.433 | 21.639 | 487.5 |
+
+**C=8 wall: NEUTRAL within noise.** (Run 1's 506.8 is acceptance luck --
+tok/rnd 1.888; the sampled ladder's accept rate swings +-10% across server
+instances, which dwarfs kernel effects. Judge wall changes on round/phv ms,
+never on aggregate t/s.) C=4: 307.8 -> 315.7 (+2.6%). C=1: neutral (first
+ladder point after boot reads ~5% low -- cold artifact, converges by run 3).
+
+**Why neutral at C=8, from the same capture:** the per-member mix chains run on
+the P2b side streams at a measured **4.17x overlap** (sum-of-durations /
+union-wall over 54,528 k_delta_step instances). At 8 members the chain is
+mostly HIDDEN under concurrent cstm work; what stays exposed is the per-layer
+fork/join structure itself (max-over-members straggler + join at every layer)
+and cstm's own serial work. Chain-level fusion shortens a path that is only
+~half-exposed -- hence C=4 (less overlap, more exposure) pays and C=8 does not.
+
+**Consequence for the round-budget plan:** more within-member kernel work on
+the mix is DEAD as a C=8 lever. The remaining GDN lever is structural --
+cross-member batching: one launch per layer covering all members (the
+nucleus_multi pattern one level up; delta would go 48-block launches x 8
+members -> one 384-block launch, killing the per-layer fork/join entirely).
+That is conductor-level surgery on the capture choreography, scoped separately.
+The fusion ships regardless: strictly fewer launches, strictly less traffic,
+bitwise identical, and the necessary substrate for the batched version.
+
+Chain wall for the record (nsys, one member stream): 38.8 us = 25.8 kernels +
+13.0 gaps per GDN layer pre-fusion.
