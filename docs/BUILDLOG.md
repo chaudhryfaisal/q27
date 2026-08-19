@@ -13227,3 +13227,57 @@ rounded rows against a 96-row budget, so that kernel cannot run at the target
 width and would have to fall back or be re-tiled. That is the gating design
 question for E5, ahead of the p[] structs, the vgemm NT tile and the record
 arena. Price it against the ~+11%; do not start it as a "struct widening".
+
+## 2026-08-19 (l): E4 -- NO-GO. The mix is 0.35 ms/round exposed, not ~4. Its own prerequisite killed it.
+
+E4 (cross-member batched mix, "multiple days, conductor + engine + two kernels")
+rested on the 08-18 errata: cstm idles through the mix phase and the exposed
+side-phase union is ~2 ms GDN + ~2 ms attention per round. Measured before
+building, that premise is gone.
+
+**nsys, C=8 under load, 149 shared rounds** (`--cuda-graph-trace=node`, stale
+.sqlite deleted, SIGINT + wait for finalize, fresh 27 MB report -- the full
+discipline, and kernels inside the fused graph ARE visible, so the capture is
+sound):
+
+| group | inst | sum ms | UNION ms | overlap | **ms/round** |
+|---|---|---|---|---|---|
+| decode mix, GDN | 3166 | 25.6 | 25.6 | 1.00x | 0.172 |
+| decode mix, attention | 3352 | 26.3 | 26.3 | 1.00x | 0.177 |
+| fold (serial on cstm) | 10272 | 91.9 | 91.9 | 1.00x | 0.616 |
+| weight sweep (gemv/vgemm) | 23097 | 582.7 | 582.7 | 1.00x | 3.911 |
+
+**Whole decode mix = 0.349 ms/round exposed.** The plan assumed ~4 ms and set
+bar >= 1.5 ms, kill < 0.8 ms. Removing the mix ENTIRELY would buy ~1.4% of a
+24.7 ms round. **E4 is killed by its own kill threshold, 11x over.**
+
+**Why the premise died: E4's own prerequisite ate it.** The 08-18 GDN fusion
+(ffd3f8a, 6 kernels -> 3, entry (i)) already collapsed the per-layer fork/join
+E4 was designed to remove. Entry (i) recorded that fusion as "C=8 ~neutral,
+expected win only ~0.6 ms, under ladder noise" -- correct on the wall, but it
+also removed the *headroom* a later batching pass would have claimed. A change
+that measures neutral can still delete a future change's entire budget.
+
+**Also measured: overlap is 1.00x for EVERY group, including the weight sweep
+across 16 streams.** Nothing on this path overlaps in time -- big kernels
+saturate the GPU and the hardware serialises them. So the errata's "members
+overlap 4.17x" does not hold today either; exposed wall == summed kernel time
+for the mix.
+
+**A bigger question this raises, deliberately NOT claimed yet.** Union of ALL
+95267 kernel instances is 827 ms over 149 rounds = **5.55 ms/round of GPU-busy
+against a ~24.7 ms round**; inside the decode window it is 2.85 ms busy per
+15.85 ms wall (18%). If that survives scrutiny, the round is dominated by
+something other than kernel execution and the whole E-series has been optimising
+the wrong 20%. **It is NOT yet a finding:** nsys instruments 95k kernel
+instances and the ladder ran 65.9 t/s under the profiler vs ~74 unprofiled, so
+gaps are inflated by an unknown amount. Treat 18% as an UPPER BOUND on idleness.
+The honest next step is a low-overhead measurement (CUDA events bracketing the
+round on cstm, or cupti activity with kernel tracing only) before any redesign.
+
+**Plan status after E4:** every item is now closed. E0 resolved, E2.1 killed,
+E1 retracted the width NO-GO, E3.1 +9.8% at C=8 (shipped opt-in), E3.2 declined
+(~0-1%), E2.2 +5.3% at C=4 (shipped), E5 +6.8% at C=4 as a serving knob plus a
+costed W_PLUMB case, E4 killed. Remaining named work: E6 fillers (cp.async in
+k_vgemm ~1.2 ms, PDL ~0.5 ms) -- but the 18%-busy question above should be
+settled first, because it decides whether kernel-local work is worth anything.
