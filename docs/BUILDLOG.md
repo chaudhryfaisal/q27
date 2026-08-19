@@ -13281,3 +13281,47 @@ E1 retracted the width NO-GO, E3.1 +9.8% at C=8 (shipped opt-in), E3.2 declined
 costed W_PLUMB case, E4 killed. Remaining named work: E6 fillers (cp.async in
 k_vgemm ~1.2 ms, PDL ~0.5 ms) -- but the 18%-busy question above should be
 settled first, because it decides whether kernel-local work is worth anything.
+
+## 2026-08-19 (m): the "18% GPU-busy" scare is DEAD -- the weight sweep alone is 48% of the round, measured without a profiler
+
+Entry (l) flagged, deliberately unclaimed, that nsys showed 5.55 ms/round of
+GPU-busy against a ~24.7 ms round (18% inside the decode window). Settled now,
+and it was an instrument artifact twice over.
+
+**THE DISPROOF NEEDED NO NEW RUN.** A decode round sweeps the resident weights
+once. nsys attributed 3.91 ms/round to the weight sweep; the sequence is 12.88
+GB, which at even the conservative 1453 GB/s SOL takes 8.9 ms and at the 1692
+GB/s streaming figure takes 7.6 ms. 3.91 ms implies **>3900 GB/s, 2.3x SOL** --
+impossible, so the capture was missing most of its kernels. A shorter capture
+(57 rounds, no NVTX, no ctxsw) improved to 6.38 ms/round and STILL failed the
+same SOL test, so it was not reportable either. **Any GPU-busy number that
+implies super-SOL bandwidth is measuring its own dropped records.**
+
+**THE POSITIVE NUMBER, from `tools/round_weight_cost` (no profiler, replays the
+round's exact mm5 sequence: 401 GEMV calls, 12.88 GB, at union width 16 = C=8's
+actual union):**
+
+| path | ms | GB/s | vs SOL |
+|---|---|---|---|
+| k_vgemm (shipped) | **11.82** | 1090 | **75%** |
+| legacy GEMV | 35.72 | 361 | 25% |
+
+**The weight sweep alone is 11.82 ms of a 24.72 ms round = 48%.** Add the fold,
+mix, attention, tails and sampling and the round is overwhelmingly GPU work.
+Corroborating from the other side: `phv` is 21.32 ms = 86% of the round, and
+phv is a **CUDA event bracket on cstm** (a GPU-stream span), not a host wall --
+correcting a mis-statement in entry (i), where only `phfd` is host-side.
+
+**E6 IS NOW THE BIGGEST REMAINING ITEM, and bigger than the plan priced it.**
+k_vgemm runs at **75% of SOL** on the real round sequence -- worse than the 84%
+recorded from isolated shapes. A cp.async tile reaches 94-96%. Closing that gap
+takes 12.88 GB from 11.82 ms to ~9.4 ms: **~2.4 ms, ~10% of the round**, against
+the plan's "~1.2 ms (~1.5% overall)" estimate, which was computed as a share of
+a bucket rather than against the measured sweep. It is also bitwise-safe by
+construction (a memory-pipeline change; the reduction order is untouched), which
+is a rare combination with a 10% prize.
+
+**Method note worth keeping:** when a profiler and a byte budget disagree, the
+byte budget wins. Bandwidth is a hard physical ceiling; CUPTI records are
+best-effort and drop silently under load. Price any kernel-time claim against
+bytes/SOL before believing it.
