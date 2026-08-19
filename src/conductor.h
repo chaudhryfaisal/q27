@@ -952,13 +952,22 @@ public:
             size_t freeb = 0, totalb = 0;
             CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
             const size_t per_exec = 8ull << 20;
-            if (freeb < (size_t)gc_cap_ * per_exec) {
-                int shrunk = (int)(freeb / per_exec);
+            // Reserve a margin (E2.1): the old budget was ALL free VRAM, which
+            // never bound at cap 64 (512 MB) but at cap 512 would let the exec
+            // cache claim every spare byte -- and allocations still happen after
+            // this point (prefix-cache pages, arena growth, driver scratch). A
+            // cache that starves them trades a 20-28 ms capture stall for an
+            // OOM, which is a strictly worse deal.
+            const size_t margin = 768ull << 20;
+            const size_t budget = freeb > margin ? freeb - margin : 0;
+            if ((size_t)gc_cap_ * per_exec > budget) {
+                int shrunk = (int)(budget / per_exec);
                 if (shrunk < 1) shrunk = 1;
                 fprintf(stderr,
-                        "[gcache] headroom: %.0f MB free < cap %d x 8 MB/exec -- "
-                        "shrinking exec-cache cap to %d (LRU recapture covers the rest)\n",
-                        freeb / 1e6, gc_cap_, shrunk);
+                        "[gcache] headroom: %.0f MB free (%.0f MB budget after margin) < "
+                        "cap %d x 8 MB/exec -- shrinking exec-cache cap to %d "
+                        "(LRU recapture covers the rest)\n",
+                        freeb / 1e6, budget / 1e6, gc_cap_, shrunk);
                 gc_cap_ = shrunk;
             }
             // (no gcache_.reserve here: a bad_alloc before the try block
@@ -1286,10 +1295,81 @@ private:
         // bracket is open and CLOSES it.
         assert(!round_active && "B3: fused rounds must not overlap per Conductor");
         round_active = true;
+        // Round-budget T2: host wall around the whole draft phase. Exact
+        // because this phase host-syncs every step; see GenStats::fdraft_ms.
+        const auto fd_t0 = std::chrono::steady_clock::now();
         enum { MAX_K = ConductorCore<Member>::MAX_K };
         int act[MAX_K];                              // gated members still in the loop
         int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
         int na = 0;
+        // T4 (docs/plans/2026-08-18-batch-round-budget.md): draft no deeper than
+        // the trim can possibly GRANT. Measured 2026-08-18: at C=8 every lane is
+        // granted width 2 while ~2.86 draft steps per member launch, so ~65% of
+        // drafted tokens are computed and discarded, and the phase is 25.5% of
+        // the round.
+        //
+        // The ceiling is DERIVED, not tuned. trim_widths never trims a lane
+        // already at floor 2 (see its `want[i] <= 2` guard), so member i's grant
+        // is maximised when every OTHER member sits at that floor:
+        //     sum = want_i + 2*(k-1) <= cap   =>   want_i <= cap - 2*(k-1)
+        // and when cap - 2*(k-1) < 2 the cap is unsatisfiable, trim gives up with
+        // EVERY lane at 2. So max_grant(k) = max(2, cap - 2*(k-1)), exactly.
+        // A verify of width W checks W-1 DRAFTED positions, hence the -1.
+        //
+        // This can never drop a step whose token could have been verified, which
+        // is why accepted-tokens-per-round is unchanged BY CONSTRUCTION rather
+        // than by measurement. Suffix members do not weaken it: they skip the MTP
+        // chain entirely (the `continue` above) and trim floors them at 2 like
+        // anyone else, so "every other member >= 2" still holds.
+        //
+        // At cap=W_MAX=12 this is 9/7/5/3/1/1/1 steps for k=2..8 -- non-binding
+        // until k=5 (gate_maxd is 7) and pinned at ONE step from k=6, which is
+        // where the whole win is. Same monotone shape SGLang's batch-size table
+        // uses (bs 1-7 -> up to 7, 8-31 -> up to 3, 32+ -> 0-1), derived instead
+        // of tuned: q27 knows k and cap exactly at round start, so it needs no
+        // lagged acceptance EMA to infer what the scheduler already decided.
+        static const bool ceil_on = [] { // Q27_DRAFT_CEIL=0 restores pre-T4 depth
+            const char* e = getenv("Q27_DRAFT_CEIL");
+            return !(e && atoi(e) == 0);
+        }();
+        // Ceiling is max_grant, NOT max_grant-1. A width-W verify walks W-1
+        // drafts, but draft_and_gate's floor top-up maintains the stronger
+        // invariant "W draft ROWS must exist" (engine.cuh, the cap==0 case), so
+        // cutting to W-1 would break that invariant to save one step. Holding at
+        // max_grant preserves it exactly and still cuts C=8 from ~3.35 launched
+        // steps per member to 2. Revisiting the extra step is a separate change
+        // that has to re-derive the row invariant first.
+        const int max_grant = core.cap - 2 * (k - 1) < 2 ? 2 : core.cap - 2 * (k - 1);
+        // E3.1 (Q27_DRAFT_CEIL1=1): drop the floor from 2 steps to 1.
+        //
+        // ROW INVARIANT, RE-DERIVED (the T4 comment above asked for exactly
+        // this before touching the extra step). k_finish_round's accept walk is
+        //     for (k = 1; k <= NDRAFT; k++)
+        //         if (k <= max_draft && n == k && v[k-1] == dr[k-1]) n = k+1;
+        // with max_draft = vw-1, so it reads dr[0 .. vw-2] -- **vw-1 rows, not
+        // vw**. At the floor vw=2 that is dr[0] ALONE, and dr[0] is written by
+        // draft step 0. Step 1's output dr[1] is loaded into a register and
+        // copied to outcome[3], which the host reads only for n > 2 (outcome
+        // layout: emitted tokens live in [1..n], and n <= vw = 2 here). So the
+        // second step cannot change n, cannot change the emitted token, and
+        // cannot change h_next (src = x1s.p[n-1], n <= 2).
+        //
+        // The "W draft ROWS must exist" invariant is therefore STRONGER than
+        // the kernel needs. Its stated purpose (engine.cuh, spec_round) is
+        // "byte/round identity with the monolithic path" -- an A/B-equivalence
+        // property against Q27_DEXIT=0, not a correctness property of the
+        // verify. Under this flag that identity is knowingly given up at the
+        // floor; the EMITTED tokens are unaffected, which is what the canonical
+        // digest and tok/round measure.
+        //
+        // At C>=6 the trim floors every lane to 2, so today every member runs 2
+        // draft steps per round and uses exactly ONE of them, forever. This
+        // makes the second step pure waste at high concurrency.
+        static const bool ceil1 = [] {
+            const char* e = getenv("Q27_DRAFT_CEIL1");
+            return e && atoi(e) != 0;
+        }();
+        const int step_ceiling = (ceil1 && max_grant > 1) ? max_grant - 1 : max_grant;
         for (int i = 0; i < k; i++) {
             Member& mm = *ms[i];
             mm.gate_cap = mm.md_used = -1;
@@ -1314,6 +1394,7 @@ private:
             // (the same dctl/gate_maxd read).
             if (mm.sampled) mm.e->draft_sample_bootstrap();
             mdu[i] = mm.e->draft_md_used(mm.sampled);
+            if (ceil_on && mdu[i] > step_ceiling) mdu[i] = step_ceiling;
             cap[i] = launched[i] = 0;
             act[na++] = i;
         }
@@ -1428,6 +1509,9 @@ private:
             assert(rlaunched == launched[i] && "B8: interleaved launch count diverged");
             (void)rcap; (void)rW; (void)rlaunched;
         }
+        fdraft_ms_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - fd_t0)
+                         .count();
     }
 
     // One fused round over k >= 2 members (under the caller's Lease).
@@ -1497,7 +1581,9 @@ private:
         // BeginCapture), so a replayed round never re-records them and no
         // stale timestamp node is frozen into a graph. ONE semantics
         // delta: on a MISS round the phv span absorbs the one-time
-        // capture+instantiate host stall (~2.4 ms median, T1) while the
+        // capture+instantiate host stall (measured 2026-08-18 at k=4:
+        // 20-28 ms, mean ~23 -- the earlier "~2.4 ms median, T1" was 10x
+        // stale; see BUILDLOG (j)) while the
         // GPU idles between ev_draft_end and the graph launch; HIT rounds
         // show the true replay wall. GenStats phd/phv/phs keep their
         // shared-wall per-member attribution unchanged.
@@ -1546,6 +1632,10 @@ private:
                     if (ph_s > ms[i]->md_used) ph_s = ms[i]->md_used;
                 }
                 es[i]->phase_stats_add(ph_d, ph_v, ph_s); // A4 accessor
+                // draft_widths() ran immediately before this round on this
+                // thread (core.round() pairs them), so fdraft_ms_ is THIS
+                // round's draft wall. Shared-wall, same as phd/phv.
+                es[i]->phase_stats_add_fdraft(fdraft_ms_);
             }
             // Task 10 [req] bat= telemetry FIRST: this member's round ran
             // k-wide (k >= 2 by the core's dispatch; on the catch path the
@@ -1763,7 +1853,8 @@ private:
         }
         // MISS. No warmup pre-capture pass exists anywhere (deliberate
         // deviation from the plan's "optional startup pre-capture" line):
-        // first-sight capture measured ~2.4 ms median (T1) -- warmup-class
+        // first-sight capture: 2026-08-18 [gcache] telemetry measures 20-28 ms
+        // at k=4 (the "~2.4 ms median (T1)" figure was 10x stale) -- warmup-class
         // already -- and a pre-capture pass would need synthetic round
         // state for shapes that may never arrive. YAGNI.
         gc_misses_++;
@@ -1784,13 +1875,98 @@ private:
             gc_destroy(gcache_[victim]);
             gcache_.erase(gcache_.begin() + victim);
         };
-        while ((int)gcache_.size() >= gc_cap_) evict_lru();
         cudaGraph_t g = nullptr;
         cudaGraphExec_t x = nullptr;
         CUDA_CHECK(cudaStreamBeginCapture(cstm, cudaStreamCaptureModeRelaxed));
         fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx, sampled,
                            /*ev_draft_end=*/nullptr, mf);
         CUDA_CHECK(cudaStreamEndCapture(cstm, &g));
+        const auto t_cap = std::chrono::steady_clock::now();
+        // E2.2 EXEC RECYCLING. Measured 2026-08-19: a miss is ~3.1 ms capture +
+        // ~6.1 ms INSTANTIATE, while cudaGraphExecUpdate is 0.94 ms -- the
+        // expensive half is exactly the half an update skips. Graphs whose
+        // per-lane widths are a PERMUTATION of each other have identical
+        // topology (measured: 234/234 cross-permutation updates succeed), and
+        // the C=4 shape space is 89 exact keys over just 30 topology classes.
+        // So rather than evicting an exec and instantiating a new one, re-point
+        // the LRU same-class exec at this round's pointers and re-key it.
+        // Exact-key hits stay free; only the miss path changes.
+        //
+        // Safety: cudaGraphExecUpdate must not touch an exec pending execution.
+        // Every fused round ends with the outcome D2H + host sync on cstm
+        // before the next round captures, and round_active asserts rounds never
+        // overlap -- so no cached exec is in flight here.
+        static const bool recycle_on = [] { // Q27_GC_RECYCLE=0 -> always instantiate
+            const char* e = getenv("Q27_GC_RECYCLE");
+            return !(e && atoi(e) == 0);
+        }();
+        auto same_class = [&](const GraphKey& a, const GraphKey& b) {
+            if (a.k != b.k) return false;
+            int va[GK_MAX], vb[GK_MAX];
+            unsigned ta[GK_MAX], tb[GK_MAX];
+            for (int i = 0; i < a.k; i++) {
+                va[i] = a.gw[i];
+                vb[i] = b.gw[i];
+                // sfx/smp/kvk select WHICH kernels run, not just their extents,
+                // so they must match as a multiset too.
+                ta[i] = ((unsigned)a.sfx[i] << 24) | ((unsigned)a.smp[i] << 16) | (unsigned)a.kvk[i];
+                tb[i] = ((unsigned)b.sfx[i] << 24) | ((unsigned)b.smp[i] << 16) | (unsigned)b.kvk[i];
+            }
+            std::sort(va, va + a.k); std::sort(vb, vb + b.k);
+            std::sort(ta, ta + a.k); std::sort(tb, tb + b.k);
+            for (int i = 0; i < a.k; i++)
+                if (va[i] != vb[i] || ta[i] != tb[i]) return false;
+            return true;
+        };
+        // ONLY recycle an entry the cache was about to destroy anyway.
+        //
+        // v1 of this recycled the LRU same-class entry on EVERY miss, which
+        // measured 4.6% SLOWER (round 28.28 vs 27.04 at C=4): re-keying an
+        // entry steals a shape that would later have been a FREE exact-key hit.
+        // The control leg showed 138 of 191 rounds were hits, and v1 turned
+        // them into 139 recycles at ~6.5 ms each -- strictly more work than 53
+        // misses at ~14 ms. Caching a recurring shape beats re-pointing it as
+        // soon as it recurs ~3 times, and here shapes recur ~6 times.
+        //
+        // So gate on the cache being FULL. At capacity every miss already pays
+        // evict + instantiate, i.e. an exec is destroyed regardless; recycling
+        // the LRU same-class victim replaces ~6 ms of instantiate with 0.94 ms
+        // of update and costs no hit that was not already being given up.
+        int recycle = -1;
+        if (recycle_on && (int)gcache_.size() >= gc_cap_)
+            for (size_t i = 0; i < gcache_.size(); i++)
+                if (same_class(gcache_[i].key, key) &&
+                    (recycle < 0 || gcache_[i].tick < gcache_[recycle].tick))
+                    recycle = (int)i;
+        if (recycle >= 0) {
+            cudaGraphExecUpdateResultInfo info{};
+            cudaError_t uerr = cudaGraphExecUpdate(gcache_[recycle].exec, g, &info);
+            if (uerr == cudaSuccess) {
+                GCacheEnt& ent = gcache_[recycle];
+                CUDA_CHECK(cudaGraphDestroy(ent.graph)); // the shape it used to hold
+                ent.graph = g;
+                ent.key = key;
+                ent.uv = build_union_view(es, granted, k, cstm, sfx); // guard reference
+                ent.tick = ++gc_tick_;
+                CUDA_CHECK(cudaGraphGetNodes(g, nullptr, &ent.nodes));
+                gc_recycles_++;
+                const auto t_r = std::chrono::steady_clock::now();
+                CUDA_CHECK(cudaGraphLaunch(ent.exec, cstm)); // THIS round runs via it
+                if (dbg)
+                    fprintf(stderr,
+                            "[gcache] r=%ld recycle k=%d gw=%s nodes=%zu cap+upd=%.2fms "
+                            "(cap=%.2f upd=%.2f) h=%ld m=%ld rc=%ld rcf=%ld\n",
+                            gc_rounds_, k, gws, ent.nodes,
+                            std::chrono::duration<double, std::milli>(t_r - t0).count(),
+                            std::chrono::duration<double, std::milli>(t_cap - t0).count(),
+                            std::chrono::duration<double, std::milli>(t_r - t_cap).count(),
+                            gc_hits_, gc_misses_, gc_recycles_, gc_recycle_fails_);
+                return;
+            }
+            (void)cudaGetLastError(); // refused: fall through to a real instantiate
+            gc_recycle_fails_++;
+        }
+        while ((int)gcache_.size() >= gc_cap_) evict_lru();
         // Instantiate is the one device allocation on the round path that can
         // OOM on a tight boot (this line killed a 4x49152 server mid-traffic,
         // BUILDLOG 2026-07-17). Shrink-never-abort, same recovery shape as
@@ -1837,10 +2013,13 @@ private:
         gcache_.push_back(ent);
         if (dbg)
             fprintf(stderr,
-                    "[gcache] r=%ld miss k=%d gw=%s nodes=%zu cap+inst=%.2fms h=%ld "
+                    "[gcache] r=%ld miss k=%d gw=%s nodes=%zu cap+inst=%.2fms "
+                    "(cap=%.2f inst=%.2f) h=%ld "
                     "m=%ld ev=%ld gt=%ld\n",
                     gc_rounds_, k, gws, ent.nodes,
-                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gc_hits_,
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                    std::chrono::duration<double, std::milli>(t_cap - t0).count(),
+                    std::chrono::duration<double, std::milli>(t1 - t_cap).count(), gc_hits_,
                     gc_misses_, gc_evictions_, gc_guard_trips_);
     }
 
@@ -1875,6 +2054,10 @@ private:
     cudaStream_t side_[ConductorCore<Member>::MAX_K] = {};
     cudaEvent_t ev_fork_ = nullptr, ev_mix_[ConductorCore<Member>::MAX_K] = {};
     bool round_active = false;
+    // This round's draft-phase host wall (round-budget T2). Written at the end
+    // of draft_widths(), read in fused_round(); core.round() pairs the two on
+    // one thread, which is the same invariant round_active already asserts.
+    double fdraft_ms_ = 0;
     // P3 T3 exec-cache state (conductor-thread-only after the ctor, like
     // cstm; ctor comment for the graphs_on_/gc_cap_ latches). Counters feed
     // the per-round dbg lines + the teardown summary (gate e telemetry).
@@ -1882,6 +2065,7 @@ private:
     int gc_cap_ = 32; // LRU capacity (Q27_BATCH_GRAPH_CAP; headroom-shrunk)
     long gc_tick_ = 0, gc_rounds_ = 0;
     long gc_hits_ = 0, gc_misses_ = 0, gc_evictions_ = 0, gc_guard_trips_ = 0;
+    long gc_recycles_ = 0, gc_recycle_fails_ = 0;
     std::vector<GCacheEnt> gcache_;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)

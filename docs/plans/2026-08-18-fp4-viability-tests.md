@@ -30,6 +30,43 @@ the per-position dump is the only instrument that sees it.
 
 ## T1 -- Is the fp4 weight grid survivable on its own?
 
+> **RAN 2026-08-17. First read NO-GO at 347; that verdict is RETRACTED
+> 2026-08-18.** The bar below is the fp8-KV envelope, which prices an 8-bit KV
+> CACHE format -- and q27's own shipped q4s tier scores **455** on this same
+> instrument, worse than fp4's 347 and worse than ninfer's 317. Against the only
+> like-for-like control, the 4-bit weight format we actually ship, **fp4 is
+> BETTER on every unsigned divergence metric.** The measurements below stand;
+> the NO-GO does not, and T2/T3 are open again on their original speed and
+> memory terms. Full retraction: BUILDLOG 2026-08-18 (b).
+>
+> The run record is BUILDLOG 2026-08-17. Three things this plan did not
+> anticipate, kept because they change how the next fp4 question gets asked:
+>
+> 1. **The codec was miscalibrated, and the first answer was a false kill.**
+>    `quant_nvfp4` -- and so every `--pf4` sidecar, and so the W4A4 arm this
+>    plan is built on -- stores the ue4m3 block scale in ABSOLUTE units with no
+>    per-tensor global scale, which puts ~100% of this checkpoint's blocks in
+>    ue4m3's subnormal region. Canonical two-level NVFP4 cuts rel RMSE
+>    0.1274 -> 0.0950 (oracle 0.0941) and moved the result 442 -> 347. The
+>    verdict survived; it would not have been honest without the correction.
+> 2. **e2m1 and Q4_G64 put their error in different places.** fp4 beats Q4_G64
+>    on RMSE and zeroes half as many weights, yet is 2.06x worse on the top 1%
+>    by magnitude: e2m1 spends resolution near zero and leaves gaps at the top.
+>    Real and measured -- but it does NOT dominate, which is why fp4 still wins
+>    the aggregate against q4s. This was written up as the mechanism of a kill;
+>    it is a difference in error placement, not a disqualification.
+> 3. **The decomposition premise below is false.** W4A4 is not weight damage
+>    plus activation damage -- fp4 activations REPAIR positions fp4 weights
+>    alone break. Quote the envelope ratio, not the "% of 561".
+>
+> Also corrected against the code, for anyone re-running this: `--nll-max` does
+> NOT cap the `--nll-long` path (it gates the chunked path only,
+> src/engine.cu:781); cap with a smaller `--nll-long`, which is min'd against
+> `--ctx` at src/engine.cu:718. The commands below also omit the required
+> `--nll <corpus>` and `--ctx`, and the corpus matters: both reference arms used
+> `scratchpad/t3_quality/corpus/agentic_req0031.i32`, not wiki, which is the
+> text where e2m1's clipping fakes a win.
+
 **The question.** W4A4 quantizes weights *and* activations. The 561
 catastrophic positions could come from either, and the two have completely
 different consequences: bad weights kill every fp4 tier permanently, bad
@@ -63,8 +100,24 @@ but leaves little room for a 64K single-pass; drop to q6k or cap with
 `--nll-max` if it does not fit. The differential holds either way -- both legs
 carry the same container error.
 
+> **Resolved, and the last sentence above is wrong.** q8 does not fit at any
+> useful ctx (OOM on the 972 MiB logits buffer at 24576). More importantly the
+> differential does NOT hold either way: Q8_G128 is transparent to the fp4 grid
+> (+0.0002 rel RMSE) but Q4_G64 adds in quadrature, so a coarse container makes
+> leg B "q4 of fp4" -- strictly worse than fp4, biasing a kill test toward a
+> false kill, and it damages the reference leg that the `ref NLL < 0.1`
+> confident mask is measured against. What ran: a purpose-built container with
+> the five include-list projections at Q8_G128 and everything else q4s-like
+> (`--q4-head --q8 '(attn_q|attn_output|ffn_gate|ffn_up|ffn_down)\.'`,
+> 24.48 GB), full 65536 single pass, fp16 KV, no concessions.
+
 **Pre-declared bar.** Weight-grid-only damage measured against the fp8-KV
 envelope (+0.458% dPPL, ~19 catastrophic positions at 64K):
+
+> **This bar is wrong and was the root cause of the retracted NO-GO.** It prices
+> an 8-bit KV CACHE format; no 4-bit WEIGHT format of any shape lands near 19,
+> and q27's shipped q4s measures 455 on it. A weight-format bar has to be a tier
+> the repo is willing to ship. Do not re-run T2 against the number 19.
 
 | outcome | reading | consequence |
 |---|---|---|
@@ -77,6 +130,44 @@ envelope (+0.458% dPPL, ~19 catastrophic positions at 64K):
 ---
 
 ## T2 -- Does fp4 actually win at DECODE shapes?
+
+> **RAN 2026-08-18. NO-GO, and this one holds.** Measured **1.016-1.085x**
+> across the four projections at the union width decode actually runs
+> (byte-weighted **1.063x** over a full-attention layer) against the **>= 1.25x**
+> bar below. Divide out the kernel-technique gap and the format-only ratio is
+> **0.95x**. Run record: BUILDLOG 2026-08-18 (c). Four things this section got
+> wrong, kept because they are what the measurement was for:
+>
+> 1. **M is not 8-64, it is 16.** A live C=8 ladder with `Q27_BATCH_DBG=1` over
+>    605 fused rounds: **M=16 in 98.02%** of them, mean 15.91, and 99.79% of
+>    lanes granted width 2 against wanted widths spread 2/3/4/5. The C-sweep's
+>    "88% at floor-2 from C=6" tightens to 100% at C=8. M is also **capped at 16
+>    structurally** -- union width is asserted `<= W_PLUMB` (conductor.h:466) and
+>    `vgemm_verify` refuses `T > W_PLUMB` (vgemm.cu:335). W_MAX=12 is the trim
+>    cap, but `trim_widths` never trims a lane at floor 2, so eight floored lanes
+>    overshoot it to 16 by design. **M=32/64 do not exist**; those rows are
+>    informational.
+> 2. **The baseline is vgemm, never `gemm_q4_T`.** "whichever the C-sweep verdict
+>    routes to" resolves to vgemm at every decode shape: at k >= 3
+>    `build_union_view` sets `gemm_min = 2` (conductor.h:483). `gemm_q4_T` is
+>    prefill-only and a fused round never reaches it.
+> 3. **Percent-of-peak answers the question by itself.** `%pk4` tops out at
+>    **9.5%** at M=16. The fp4 MMA is idle almost all the time and neither leg is
+>    compute-bound, so the "roughly 2x of any win is silicon" caveat below turns
+>    out to be moot in the other direction: at decode the silicon advantage buys
+>    *nothing*, because the regime is a byte count. On bytes fp4 is the LARGER
+>    format -- 0.5625 B/weight (4.50 bpw) against Q4_G64's 0.53125 (4.25 bpw),
+>    **1.0588x the bytes**, ceiling 0.944x at equal efficiency.
+> 4. **The measured 1.06x is k_vgemm, not fp4.** The fp4 tile reaches 94-96% of
+>    measured SOL; `k_vgemm` reaches 80-86% (cp.async vs register staging).
+>    Fixing k_vgemm's memory pipeline is worth ~6% and beats adopting a format
+>    that needs 5.9% more bytes to get there. That lever is the useful output of
+>    this test.
+>
+> **Consequence: the fp4 decode tier is dead, and T3 is moot** -- it was gated on
+> T2 and its VRAM argument cannot pay for a path that is slower per byte. Every
+> remaining leg is negative or neutral: 5.9% bigger, quality edge invisible to a
+> task rubric, sm_120a-only (no 3090, no 4090), and now no speed.
 
 **The question.** Phase 0 cleared the GEMM gate at 2.13-2.97x, but it swept
 M = 512..8192 -- prefill chunk widths. Batched decode at C=8 runs
@@ -117,6 +208,38 @@ A day, and it is independent of T1 -- run them in parallel if convenient.
 ---
 
 ## T3 -- Can ONE fp4 copy serve both phases?
+
+> **NOT RUN, and now MOOT.** Gated on T2, which is a NO-GO on 2026-08-18: the
+> decode path this section says "is exactly what T2 prices" costs 5.9% more
+> bytes per weight than what ships, so it is slower per byte no matter how the
+> copies are arranged. The VRAM arithmetic below is still correct in isolation
+> and still has no quality objection against it -- it just buys a resident-size
+> win by paying for it in every decode round, which is the wrong trade for an
+> engine whose decode is bandwidth-bound at 80-96% of SOL.
+>
+> One thing worth carrying forward if the 790 t/s ever gets revisited: ninfer
+> reaches it on NVFP4 and scores a quality TIE in the 2026-08-17 four-engine
+> run, which T1 says should not be possible with e2m1 weights. Either their
+> codec differs from what q27 measured, or a task-scored benchmark is blind to
+> the failure mode a per-position instrument sees. That is a question about
+> THEIR stack and the benchmark's sensitivity, not a reason to re-open this
+> plan, and it should be settled by instrumenting ninfer rather than by
+> building a q27 fp4 tier on the hope.
+>
+> **SETTLED 2026-08-18: their actual fp4 codes, scored through this same
+> instrument, read 317** -- better than q27's own q4s at 455 on the identical
+> reference, so the tie is two ordinary 4-bit weight quants being
+> indistinguishable to a task rubric, not a blind benchmark (BUILDLOG
+> 2026-08-18 (b)). Their codec is the same two-level
+> NVFP4 with a bit-identical global scale; they do not quantize at all but
+> consume a calibrated third-party artifact (HALO/GPTQ/block-output match, plus
+> BF16 carve-outs on 8 of q27's 224 include-list tensors), and all of that buys
+> **347 -> 317**. A tier carrying 317 catastrophic positions scores 65/75 on a
+> task rubric. That GPTQ specifically -- the method that trades per-weight error
+> for block-output fidelity -- fails to rescue it is the strongest evidence for
+> T1's mechanism: the constraint is the grid's shape, and no encoder can place a
+> code where the grid has none. 317 is a LOWER bound; they also run W4A4 at
+> batch and fp4 the GDN path this include list excludes.
 
 Only if T1 and T2 both pass.
 

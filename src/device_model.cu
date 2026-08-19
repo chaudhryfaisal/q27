@@ -14,6 +14,19 @@ DeviceModel::~DeviceModel() {
     }
 }
 
+// CPU word-sum with the same wraparound-add semantics as k_xsum64, so a host
+// total is directly comparable to the device total for the same bytes.
+static unsigned long long host_xsum(const void* p, size_t bytes) {
+    const unsigned long long* w = (const unsigned long long*)p;
+    const size_t n64 = bytes / 8;
+    unsigned long long s = 0;
+    for (size_t i = 0; i < n64; i++) s += w[i];
+    const unsigned char* tail = (const unsigned char*)p + n64 * 8;
+    unsigned long long t = 0;
+    for (size_t i = 0; i < bytes % 8; i++) t |= (unsigned long long)tail[i] << (8 * i);
+    return s + t;
+}
+
 const DevTensor& DeviceModel::upload(const std::string& name) {
     auto it = dev_.find(name);
     if (it != dev_.end()) return it->second;
@@ -26,11 +39,15 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
     d.rows = src.rows();
     d.cols = src.cols();
     CUDA_CHECK(cudaMalloc(&d.data, src.data_size));
+    // read the source bytes on the CPU immediately before handing them to the
+    // copy engine, so the two totals describe the same load
+    if (want_host_sum_) host_sum_ += host_xsum(src.data, src.data_size);
     CUDA_CHECK(cudaMemcpy(d.data, src.data, src.data_size, cudaMemcpyHostToDevice));
     bytes_ += src.data_size;
     d.data_bytes = src.data_size;
     if (src.scales) {
         CUDA_CHECK(cudaMalloc(&d.scales, src.scales_size));
+        if (want_host_sum_) host_sum_ += host_xsum(src.scales, src.scales_size);
         CUDA_CHECK(cudaMemcpy(d.scales, src.scales, src.scales_size, cudaMemcpyHostToDevice));
         bytes_ += src.scales_size;
         d.scales_bytes = src.scales_size;
@@ -80,6 +97,17 @@ void DeviceModel::checksum_baseline() {
         sums_[name] = s;
     }
     CUDA_CHECK(cudaFree(d_out));
+}
+
+unsigned long long DeviceModel::checksum_aggregate() const {
+    // Wraparound u64 add: commutative, so the unordered_map iteration order
+    // does not matter (same argument as k_xsum64's atomicAdd accumulation).
+    unsigned long long a = 0;
+    for (const auto& [name, s] : sums_) {
+        (void)name;
+        a += s;
+    }
+    return a;
 }
 
 int DeviceModel::checksum_verify(bool print) const {

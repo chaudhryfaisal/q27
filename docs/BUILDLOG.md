@@ -11470,3 +11470,2050 @@ ROI note kept in the plan, not buried: the P16 prefix cache makes the common
 agentic case a 1.20 s restore vs an 8.15 s re-prefill, so this work's value
 scales with cache MISS RATE, not prefill share. Measure the miss rate on real
 traffic before spending P1's week; "not worth it yet" is a legitimate outcome.
+
+## 2026-08-17: T1 -- the fp4 WEIGHT grid alone fails the bar, and it fails for a reason RMSE cannot see
+
+> **VERDICT RETRACTED 2026-08-18 -- see "2026-08-18 (b): CORRECTION".** The bar
+> below is the fp8-KV envelope, which prices an 8-bit KV CACHE format; q27's own
+> shipped q4s tier scores **455** on this same instrument, worse than the 347
+> here. Every measurement in this entry stands. The NO-GO does not.
+
+T1 of docs/plans/2026-08-18-fp4-viability-tests.md asked the one question every
+other fp4 question is downstream of: the W4A4 arm moved weights AND activations
+to fp4, so which of the two produced the 561 catastrophic positions? Bad
+weights kill every fp4 tier; bad activations leave a W4A8 design alive.
+
+METHOD, no kernel: `tools/repack.py --fp4-round` rounds the 224 include-list
+projections onto the e2m1 grid and stores the rounded values in an ordinary
+container, so the engine runs its normal full-activation path and the
+differential against the same container unmodified is the weight grid alone.
+Container is the five projections at Q8_G128 (`--q4-head --q8
+'(attn_q|attn_output|ffn_gate|ffn_up|ffn_down)\.'`, 24.48 GB): measured, Q8 is
+transparent to the grid (0.1276 vs 0.1274 standalone, +0.0002), while Q4_G64
+adds in quadrature and would have made leg B "q4 of fp4" -- a false-kill bias
+on a test whose job is to kill. q8 as the plan suggested does not fit at any
+useful ctx (OOM on d_lg at 24576). Corpus and length match both prior arms
+(agentic_req0031, 65536, fp16 KV, ctx 65536 -- 69632 OOMs and buys nothing
+since nll_long is min'd against ctx).
+
+| arm | dPPL | mean_absd | absd_gt4 | study_cat |
+|---|--:|--:|--:|--:|
+| envelope (fp8 KV) | +0.458% | 0.14612 | 174 | 19 |
+| W4A4 (weights + activations) | +3.734% | 0.56053 | 2731 | 561 |
+| **T1 (fp4 WEIGHTS only)** | **-1.087%** | **0.42883** | **1782** | **347** |
+
+Bars were clean <= 28, kill >= 280. **347: the grid is the problem.** The
+decisive ratio is not the 62% of W4A4 but **18x the fp8-KV envelope against a
+clean bar of 1.5x**.
+
+FINDING 1, THE CODEC WAS MISCALIBRATED AND THE FIRST ANSWER WAS A FALSE KILL.
+The first run read 442, and it was measuring the wrong thing. `quant_nvfp4`
+(and therefore every `--pf4` sidecar, and therefore the 2026-08-15 W4A4 arm)
+stores the ue4m3 block scale as amax/6 in ABSOLUTE units, with no per-tensor
+global scale. Measured on this checkpoint: median amax/6 is ~0.0033 against
+ue4m3's smallest normal of 2^-6, so **~100% of 16-element blocks land in the
+subnormal region** where the step is a flat 2^-9 and the scale itself carries
+20-40% error. Canonical two-level NVFP4 (per-tensor fp32 global scale) drops
+rel RMSE 0.1274 -> 0.0950 against an oracle exact-fp32-block-scale of 0.0941,
+so it recovers essentially all of it; 44% of the shipped codec's error VARIANCE
+was scale quantization, not e2m1. Re-running with the corrected codec moved
+study_cat 442 -> 347, |d|>4 2252 -> 1782, mean|d| 0.491 -> 0.429. The verdict
+survived the correction; it would not have been honest without it. The kernel
+already issues `mma.sync...kind::mxf4nvf4.block_scale` -- the NVFP4 variant,
+which presumes the two-level scheme -- so the global scale is a repack-side
+scalar folded into the output, not kernel work. `--fp4-round-codec {nvfp4,q27}`
+keeps both encodings available; `--pf4` and its canonical digests are untouched.
+
+FINDING 2, THE MECHANISM, and it is the generalizable part. fp4 is not a
+coarser Q4: it is a differently-shaped one. Against Q4_G64 on blk.0.ffn_gate,
+fp4 is BETTER on rel RMSE (0.0950 vs 0.1088), zeroes FEWER weights (6.9% vs
+15.0%), and beats Q4 on deciles 1-7 by magnitude -- yet loses on 8-10 and is
+**2.06x worse on the top 1% by |w|** (0.0281 vs 0.0136). e2m1 spends its
+resolution near zero (0, .5, 1, 1.5) and leaves gaps at the top (2, 3, 4, 6);
+Q4's uniform grid does the opposite. RMSE is dominated by the many small
+weights so fp4 wins it, and model quality is dominated by the few large ones so
+fp4 loses. This is the shape of the value grid, not its scaling, so **no
+calibration fix reaches it** -- which is what makes this a kill rather than
+another codec bug. The 2026-08-15 sparsification hypothesis is refuted on the
+weight axis (fp4 zeroes half as much as the tier that ships); it may still hold
+on the activation axis, where it was proposed.
+
+FINDING 3, PPL IS NOW CONVICTED ON A THIRD AXIS. T1's dPPL is **-1.087%**: the
+fp4-weight model has BETTER whole-run perplexity than its own reference while
+producing 347 catastrophic positions. 99% of the per-position divergence
+cancels in the signed mean (mean signed +0.00302 vs mean |d| 0.49063 on the
+first-codec leg), and the 16k-32k bucket improves 11.07%. Chunked PPL was
+convicted on the KV axis (2026-08-01) and the activation axis (2026-08-15);
+this convicts the long single-pass MEAN as well. Only the per-position dump
+sees it. Anyone gating on PPL ships this format as an upgrade.
+
+FINDING 4, THE DECOMPOSITION PREMISE IS FALSE. W4A4 is not weight damage plus
+activation damage. On the 46571 positions both references call confident, W4A4
+breaks 273 and T1 breaks 144, sharing only a minority; on the first-codec leg,
+at the 98 positions where fp4 WEIGHTS alone went catastrophic, W4A4's NLL was
+below 1.0 in 100% of cases (median 0.098). Adding fp4 activations on top of fp4
+weights REPAIRS positions the weight grid alone breaks. So "62% of W4A4" is not
+an additive share and should not be quoted as one; the envelope ratio is the
+defensible number.
+
+CONTROLS (the 2026-08-05 lesson: a new gate gets a control before it is
+believed). Determinism: leg A re-run produced a **bitwise identical** dump, so
+the counts are not noise. Attribution: `scratchpad/t1_leg_diff.py` hashes every
+tensor and confirms the legs differ in exactly the 224 include-list tensors and
+nowhere else (642 identical) -- it also caught itself reading a still-flushing
+artifact and failed closed rather than measuring it. Absolute-NLL sanity: leg A
+beats q4s through the identical instrument on 0-16k and loses on the echo/depth
+region, the same more-precision-is-worse-at-depth structure as the Qwen3.8
+ssm_out finding; within-container, so the differential is unaffected.
+
+VERDICT: **NO-GO, and T1 ends the line as designed.** T2 and T3 are not built.
+The W4A8 rescue the plan hoped for IS what leg B measures -- fp4 weights at
+full activation precision -- and it fails at 18x the envelope. Repro:
+`scratchpad/t1_fp4round.sh`, `t1_leg_diff.py`, `t1_verdict.py`, `t1_controls.sh`;
+dumps kept at `scratchpad/t1_fp4round/` (base, fp4w = nvfp4 codec,
+fp4w-q27codec = the shipped single-level encoding, q4s, base2 = determinism).
+
+OPEN, and it is about the OTHER arm, not this one: the 2026-08-15 W4A4 result
+(+3.734%, 561) was itself measured on the miscalibrated single-level codec. Its
+NO-GO stands on three independent bars and this changes none of them, but the
+quality number specifically is worse than the format warrants and should be
+re-quoted, not re-litigated, if anyone cites it.
+
+## 2026-08-18: ninfer's NVFP4 scored through q27's instrument -- 317, and the quality TIE is the benchmark being blind
+
+> **PARTLY RETRACTED 2026-08-18 -- see "2026-08-18 (b): CORRECTION".** 317 is
+> correct and so is everything about their codec and pipeline. But q4s reads 455
+> on the same instrument, so 317 is BETTER than what q27 ships, and the "blind
+> benchmark" reading below is wrong: a 317 tier ties a 455 tier because both are
+> ordinary 4-bit weight quant, which is a weak rubric rather than a blind one.
+
+T1 (yesterday) killed fp4 on q27's own two-level rounding: 347 catastrophic
+positions, 18x the fp8-KV envelope. ninfer ships an NVFP4 tier that wins the
+batch ladder at 790 t/s and scored a quality TIE (65/75 vs q27's 66) in the
+08-17 four-engine run. Both cannot be casually true, and the open item said to
+settle it by instrumenting them rather than by building a q27 fp4 tier on hope.
+
+METHOD, and why it is not a serving measurement. ninfer exposes no prompt
+logprobs: no `/v1/completions` (so no echo+logprobs), `/v1/responses` hard-
+rejects top_logprobs, `/v1/chat/completions` SILENTLY DROPS `logprobs:true` and
+returns 200 -- a false positive if probed there first -- and no endpoint takes
+token ids. A ninfer-side per-position NLL is a 350-400 LOC C++ patch plus a new
+reduction kernel, and it would still have no higher-precision leg to difference
+against (their int tier is 4.728 bpw on the text layers vs fp4's 4.500, so it is
+not a reference). Instead: read their fp4 codes straight out of the artifact,
+dequantize, and store THOSE VALUES in T1's container
+(`scratchpad/ninfer_fp4.py`, `tools/repack.py --fp4-round-source`). Their bytes,
+q27's validated instrument, same corpus, same bars, no serving.
+
+| leg | dPPL | mean_absd | absd_gt4 | study_cat |
+|---|--:|--:|--:|--:|
+| envelope (fp8 KV) | +0.458% | 0.14612 | 174 | 19 |
+| **ninfer, their actual weights** | **+1.662%** | **0.43091** | **1844** | **317** |
+| q27 uniform two-level (T1) | -1.087% | 0.42883 | 1782 | 347 |
+| q27 single-level (the shipped --pf4 codec) | +0.302% | 0.49063 | 2252 | 442 |
+| W4A4 weights+activations | +3.734% | 0.56053 | 2731 | 561 |
+
+**317 against a kill bar of 280 and a clean bar of 28. Their shipped tier fails
+the same bar, at 17x the fp8-KV envelope.**
+
+FINDING 1, THE CODEC IS NOT THEIR ADVANTAGE. Same two-level NVFP4, and the
+per-tensor global scale derivation is bit-identical (theirs 1/2879.196044921875
+== q27's amax/(6*448) on blk.0.ffn_down). Their per-block e4m3 bytes agree with
+q27's round-to-nearest-even only 48% of the time and skew low, leaving their
+weights at rel RMSE 0.1027 against q27's 0.0948 on the same BF16 base -- their
+per-weight error is WORSE.
+
+FINDING 2, THEY DO NOT QUANTIZE AT ALL, AND THE PIPELINE THAT DOES BUYS 9%.
+ninfer consumes `rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm`
+(rev 9b5389d4); their own docs say there is "no NInfer-owned canonical
+source-to-NVFP4 encoder". That upstream artifact is calibrated -- HALO, GPTQ,
+block-output match, scale sweeps -- with a mixed-precision allocation picked by
+held-out KL (0.0151) off a kneedle-selected Pareto frontier, and it keeps 8 of
+q27's 224 include-list tensors at BF16 (attn_q on 3,7,11,15,19,23; attn_output
+on 3,7) plus embeddings and lm_head at W8. All of that -- calibration, GPTQ,
+sensitivity-selected carve-outs -- moves **347 -> 317**, 30 positions, against a
+bar that needed 28. The RMSE inversion in FINDING 1 is GPTQ's signature, not a
+worse encoder: it spends per-weight error to buy block-output fidelity. That it
+spends that error and still lands at 317 is the strongest available evidence
+for T1's mechanism -- **the binding constraint is the SHAPE of the e2m1 grid at
+the top of the magnitude range, and no encoder can place a code where the grid
+has none.** If calibration could fix this, GPTQ is exactly the thing that would.
+
+FINDING 3, THE ANSWER TO THE OPEN QUESTION: THE BENCHMARK IS BLIND. The tie was
+not their format being better. A tier carrying 317 catastrophic positions on
+this corpus scores 65/75 on a task rubric. Task scoring cannot see a failure
+mode that is, by construction, rare positions where a confident model goes
+badly wrong; the per-position dump can. This is the same lesson as T1's dPPL
+result one level up: chunked PPL was convicted on the KV axis, the long-pass
+MEAN on the weight axis, and now TASK SCORES on the cross-engine axis. Three
+instruments, three blind spots, one corpus that shows all of them.
+
+FINDING 4, NON-ADDITIVITY HOLDS ACROSS ENGINES. Only 44 of ninfer's 317
+catastrophic positions are also W4A4's (14%); on the 46571 positions both
+references call confident, ninfer breaks 130 and W4A4 273. And their dPPL
+(+1.662%) is the WORST of the three fp4 legs while their catastrophic count is
+the BEST -- the two metrics disagree in direction again, on someone else's
+weights this time.
+
+DEFECT FOUND AND FIXED, recorded because it nearly shipped a wrong number. The
+first ninfer leg built with attn_q at rel RMSE **1.364** -- worse than
+predicting zero. ninfer's fused attention tensor is
+[query 6144 | key 1024 | output_gate 6144 | value 1024] and q27's attn_q is
+those two 6144-row ranges INTERLEAVED PER HEAD ([q_h0 256, gate_h0 256, ...]),
+not concatenated. The FFN split had been validated empirically; the attention
+stitch was inferred, and inference was wrong. `repack.py`'s worst-RMSE report
+caught it. `ninfer_fp4.py` now proves the mapping BYTE-EXACT against a BF16
+carve-out layer before returning anything (layer 3 is BF16 in their artifact, so
+a correct mapping must reproduce the GGUF numbers exactly); blk.27.attn_q went
+1.3542 -> 0.0986.
+
+GATES: attribution gate PASS with the 8 carve-outs declared by pattern (216
+differ, 650 identical, all changed tensors Q8_G128); `--allow-identical` is
+required rather than optional so an accidental no-op still fails. Determinism
+and container transparency inherit from T1's controls (same leg A, same binary).
+
+LIMITS, and they all point the same way -- 317 is a LOWER BOUND on their
+exposure. This prices their weight grid AS ENCODED, not ninfer-as-served: their
+dispatch runs W4A4 at batch (AttnInput T>=4, MlpGateUp T>=5, Residual T>=8,
+GdnInput UNCONDITIONALLY) and MTP `--draft-tokens 3` presents T=4 at decode, so
+activations are fp4 in production too, and the W4A4 leg above says that adds
+damage. It also omits the tensors ninfer fp4s and q27 never did -- attn_k,
+attn_v, and the whole 48-layer GDN path -- because q27's include list excludes
+them by the 2026-08-14 ssm_out lesson. Repro: `scratchpad/ninfer_fp4.py`
+(self-checks the mapping), `t1_leg_diff.py --allow-identical=`, dump at
+`scratchpad/t1_fp4round/ninfer.bin`.
+
+VERDICT: T1 stands and generalizes. fp4 weights are not survivable on this
+model at e2m1, and the best-resourced calibrated NVFP4 pipeline publicly
+available does not rescue them -- it closes 9% of the gap to a bar that needed
+92%. The 790 t/s is real and the quality tie is an artifact of what the
+benchmark can measure.
+
+## 2026-08-18 (b): CORRECTION -- T1's NO-GO is RETRACTED. The bar killed the incumbent too.
+
+The two entries above are wrong where it counts. The measurements stand; the
+verdict does not. **q27's own shipped q4s tier, scored on the identical
+instrument against the identical reference, reads 455 study_cat -- WORSE than
+either fp4 leg.**
+
+| leg (reference = t1-base, include list at Q8_G128) | dPPL | mean_absd | absd_gt1 | absd_gt4 | study_cat |
+|---|--:|--:|--:|--:|--:|
+| **q4s -- Q4_G64 on the include list, THE TIER WE SHIP** | **-2.190%** | **0.46770** | **8621** | **2083** | **455** |
+| q27 fp4, canonical two-level | -1.087% | 0.42883 | 8105 | 1782 | 347 |
+| ninfer fp4, their actual codes | +1.662% | 0.43091 | 8093 | 1844 | 317 |
+| envelope (fp8 KV) | +0.458% | 0.14612 | 2718 | 174 | 19 |
+
+fp4 beats Q4_G64 on EVERY unsigned divergence metric by 15-25%, and on rel RMSE
+(0.0948 vs 0.1088). The differential is clean: `t1_leg_diff.py` on t1-base vs
+the shipped q4s artifact shows 642 tensors BYTE-IDENTICAL and exactly the 224
+include-list tensors differing, by dtype alone (Q8_G128 vs Q4_G64). No
+repack-version drift, same corpus, same ctx, same binary.
+
+WHAT WENT WRONG, precisely. The plan pre-declared the bars against "the fp8-KV
+envelope (+0.458% dPPL, ~19 catastrophic positions)". That envelope came from
+the 2026-08-01 KV tail study -- it prices an 8-bit KV CACHE format. Applying it
+to a 4-bit WEIGHT format is apples-to-oranges: 8-bit KV barely perturbs
+per-position NLL, and no 4-bit weight format of any shape gets near 19. The
+plan chose the bar and T1 applied it without ever asking what the INCUMBENT
+scores on it. The answer is 455. A bar that fails the tier currently in
+production, by more than it fails the candidate, is not a bar.
+
+This is the 2026-08-05 lesson (a new gate gets a control before it is believed)
+landing on the arm that wrote it down. T1 ran three controls -- determinism
+(bitwise), container transparency (+0.0002), attribution (224/642) -- and none
+of them was the one that mattered. Worse: `scratchpad/t1_fp4round/q4s.bin` was
+already on disk, produced as control 2 of the T1 run, and was only ever
+inspected as BUCKET MEANS to explain an absolute-NLL puzzle. The per-position
+differential against it was never computed until someone asked whether fp4 was
+worse than our own quant.
+
+WHAT STANDS, unchanged:
+- every number in the two entries above, including 317 and 347;
+- dPPL is unusable on this axis -- and the correction sharpens it, because q4s
+  reads the BEST dPPL of all four legs (-2.190%) while carrying the MOST
+  catastrophic positions. Signed means are not merely noisy here, they are
+  anti-correlated with the metric that matters;
+- ninfer's codec is bit-identical to q27's two-level scheme, they consume a
+  calibrated third-party GPTQ artifact rather than quantizing, and the whole
+  pipeline plus 8 BF16 carve-outs buys 347 -> 317;
+- the attn_q per-head interleave defect and its fix;
+- the single-level codec finding: the shipped `--pf4`/`quant_nvfp4` encoder puts
+  ~100% of blocks in ue4m3 subnormals and wastes 44% of its error variance. That
+  is a real bug in q27's encoder and is worth fixing on its own merits.
+
+WHAT IS RETRACTED:
+- "GRID IS THE PROBLEM -- every fp4 tier dies here. Stop; do not build T2 or T3."
+  Not supported. On the only comparison that is like-for-like -- against the
+  4-bit weight format q27 actually ships -- fp4 is BETTER.
+- "the binding constraint is the SHAPE of the e2m1 grid". Overstated. e2m1 IS
+  2.06x worse than Q4_G64 on the top 1% of weights by magnitude, and that is
+  measured and real, but it does not dominate: fp4's advantage on the small
+  weights more than pays for it in aggregate NLL divergence. The mechanism is a
+  true observation promoted to a false conclusion.
+- the reading that ninfer's quality tie is "the benchmark being blind". A tier
+  at 317 ties a tier at 455 on task scores because BOTH are ordinary 4-bit
+  weight quantization and the rubric cannot separate them. That is a weak
+  rubric, not a blind one, and it is the expected result rather than a paradox.
+
+WHAT THIS MEANS FOR THE fp4 LINE. T1 asked "is the fp4 weight grid survivable".
+Re-read against the right control the answer is YES -- more survivable than the
+grid we ship. That does not resurrect the W4A4 prefill arm, whose NO-GO rests on
+three independent bars including a VRAM wall and a wall-clock miss, and it does
+not by itself justify T2/T3. It does mean the quality objection to a native fp4
+tier is GONE, and the remaining questions are the ones the plan always said were
+about speed and memory: does fp4 win at decode shapes (T2), and can one copy
+serve both phases (T3). Those are now open again, on their original terms.
+
+STILL OWED before anyone acts on this: a proper weight-format envelope. The
+right bar is a tier the repo is willing to ship -- q4s at 455, or q6/q6k
+measured the same way -- not a KV-cache study. Nobody should re-run T2 against
+the number 19.
+
+## 2026-08-18 (c): T2 -- fp4 loses at decode shapes, 1.06x against a 1.25x bar, and the win it does show is not the format
+
+**NO-GO on the wall bar.** At the union width batched decode actually runs, a
+purpose-built decode-shaped nvfp4 tile beats the incumbent union GEMM by
+**1.016-1.085x** across the four projections (byte-weighted **1.06x** over a
+full-attention layer). The pre-declared bar was **>= 1.25x**. Divide out the
+kernel-technique gap and the format-only ratio is **0.95x** -- fp4 is slower.
+
+**FIRST: the M distribution, measured, not assumed.** The plan guessed "roughly
+8-64 rows". A live C=8 ladder (vanilla q4s, `--slots 8 --ctx 16384`,
+`Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5`, `Q27_BATCH_DBG=1`, 8x1024 tokens,
+415.7 t/s aggregate -- in line with the 412.9 on record) produced 605 fused
+rounds:
+
+| union width M | rounds | share |
+|--:|--:|--:|
+| 16 | 593 | **98.02%** |
+| 14 | 3 | 0.50% |
+| 12 | 6 | 0.99% |
+| 10 | 1 | 0.17% |
+| 6 | 2 | 0.33% |
+
+k=8 in 98% of rounds; **99.79% of lanes granted width 2**, against wanted widths
+spread 2/3/4/5 (39/18/14/29%). Mean M = 15.91. Every round all-gated, zero
+suffix. So the C-sweep's "88% of lanes at floor-2 from C=6" tightens to
+**100% at C=8**, and M is not a distribution to sample -- it is the number 16.
+
+M is also **capped at 16 structurally**, which the plan did not know: union width
+is asserted `<= W_PLUMB` (`conductor.h:466`) and `vgemm_verify` refuses
+`T > W_PLUMB` (`vgemm.cu:335`). W_MAX=12 is the trim cap, but `trim_widths`
+never trims a lane already at floor 2, so eight floored lanes overshoot it to 16
+by design. **M=32/64 do not exist today** and their rows in the table below are
+informational only.
+
+**SECOND: the baseline was wrong in the plan.** The plan offered
+"`gemm_q4_T` / the union vgemm, whichever the C-sweep verdict routes to".
+It routes to vgemm and never to `gemm_q4_T`: at k >= 3 `build_union_view` sets
+`gemm_min = 2` (`conductor.h:483`), so every projection with
+`rows >= gemm_min_rows` goes through `q27k::vgemm_verify`. `gemm_q4_T` is
+prefill-only and a fused round never reaches it. Benchmarking against it would
+have compared fp4 to a kernel decode does not run.
+
+**THE TILE.** `tools/microbench_mxf4.cu` gains `k_mxf4_dec`, sized for this
+regime rather than the BM=128 prefill point. The operands swap: m16n8k64 puts 16
+rows on A and 8 on B, so **weights take A** (output channels) and
+**activations take B** (lanes) -- the same assignment `k_vgemm` makes with its
+m16n8k32 s8 MMA, which is what keeps this a format test instead of a tile-shape
+test. NTI (8-lane B tiles) is a template parameter so the tile tracks M:
+(MR=32,NTI=1/2/4) and (MR=16,NTI=8). z comes from `q27k::vgemm_z` so both legs
+split K across CTAs identically. 50/51 regs, zero spill, 4 CTA/SM on all four
+instantiations. Gate: every output checked against a CPU reference at each
+instantiation and at both z==1 (MODE 0) and z>1 (MODE 1 + fixed-order reduce),
+with row and lane tails -- 116k exhaustive refs, PASS.
+
+Two measurement traps had to be closed first. **L2:** a rep loop over one
+15-45 MB tensor sits inside this card's 96 MB L2 and measures cache bandwidth
+for both legs, which flatters the leg with fewer bytes; each shape is replicated
+until the rotated working set clears L2 by ~3x. **Partial-traffic accounting:**
+`k_vgemm` guards its split-K store on `tok < T`, so its workspace traffic is
+`z*M*rows`, not `z*W_PLUMB*rows` -- counting the padded lanes overstated the
+baseline's GB/s by ~16% at M=4.
+
+**THE TABLE** (5090, driver clocks as-found, measured streaming-read SOL
+1692 GB/s = 95% of the 1.79 TB/s spec figure; in-run peaks fp4 868 TFLOPS,
+int8 `gemm_q4_T` 323 TFLOPS):
+
+| shape | M | vgemm ms / %SOL | fp4 ms / %SOL | ratio | fmt | %pk4 |
+|---|--:|--:|--:|--:|--:|--:|
+| attn_q+gate 12288x5120 | 16 | 0.0286 / 84.0% | 0.0263 / 95.5% | 1.085x | 0.955x | 8.8% |
+| attn_output 5120x6144 | 16 | 0.0165 / 80.4% | 0.0162 / 85.1% | 1.016x | 0.960x | 7.2% |
+| ffn_gate 17408x5120 | 16 | 0.0387 / 84.3% | 0.0364 / 94.0% | 1.062x | 0.953x | 9.0% |
+| ffn_down 5120x17408 | 16 | 0.0366 / 85.8% | 0.0344 / 95.9% | 1.065x | 0.953x | 9.5% |
+
+Three runs, agreement within 1%. Byte-weighted over one full-attention layer
+(attn_q + attn_output + ffn_gate + ffn_up + ffn_down): **1.063x**.
+
+**WHY IT LOSES, and why no kernel work fixes it.** `%pk4` tops out at 9.5% at
+M=16 (18% even at the unreachable M=64). The fp4 MMA is idle almost all the
+time; neither leg is remotely compute-bound. So the Blackwell
+dense-fp4-is-2x-int8 silicon advantage -- the thing that produced 2.13-2.97x in
+the prefill sweep and the thing this plan warned would account for "roughly 2x
+of any win" -- **buys nothing at decode.** The regime is a byte count, and on
+bytes fp4 is the LARGER format: nvfp4 spends 0.5 B/weight on e2m1 codes plus one
+ue4m3 per 16 = **0.5625 B/weight (4.50 bpw)**; Q4_G64 spends 0.5 plus one fp16
+per 64 = **0.53125 (4.25 bpw)**. fp4 moves **1.0588x the bytes for the same
+weights**, so at equal bandwidth efficiency its ceiling is 0.944x.
+
+The measured 1.06x is therefore not the format. It is that the fp4 tile reaches
+**94-96% of SOL** while `k_vgemm` reaches **80-86%** -- this tile uses cp.async,
+`k_vgemm` stages through registers. The `fmt` column divides that out (what the
+baseline would take at the fp4 kernel's own GB/s) and lands at **0.95x**. Stated
+as a decision: **fixing k_vgemm's memory pipeline is worth ~6% and beats
+adopting fp4, which costs 5.9% more bytes to get there.** That is a real,
+cheap, in-format lever this test surfaced, and it needs no new number format,
+no sm_120a gate, and no 3090/4090 exclusion.
+
+The M=32/64 rows read 1.4-1.9x, but the baseline there is ceil(M/16) vgemm calls
+re-reading the weights -- an artifact of W_PLUMB, not a win. In that hypothetical
+regime the fp4 tile's own efficiency also collapses (60-72% SOL at M=64 on
+MR=16/NTI=8), so a W_PLUMB raise would not rescue this either.
+
+**WHAT THIS SETTLES.** T2 was the last open fp4 question. Recapping the ledger:
+quality is not a blocker (T1 retracted -- fp4's 347/ninfer's 317 both beat
+shipped q4s at 455); but fp4 is 4.50 bpw against 4.25, so **5.9% bigger**; the
+quality edge is invisible to a task rubric (65/75 either way); the MMA is
+sm_120a-only, so no 3090 and no 4090; and now the speed case, which was the only
+thing holding it up, measures **1.06x against a 1.25x bar and 0.95x on format
+alone**. Every leg is negative or neutral. **The fp4 decode tier is dead**, and
+T3 (one fp4 copy serving both phases) is moot -- it was gated on T2 passing, and
+its VRAM argument cannot pay for a decode path that is slower per byte.
+
+The bar was NOT the retracted number 19; it was the 1.25x wall bar the plan
+carried forward, and this is the second time an fp4 arm has missed a wall bar in
+the 1.19-1.24x band. The kernel, the gates and the harness stay in tree:
+`k_mxf4_dec` is the proof that the tile was built for the regime and lost on
+merits, and the ladder-derived M distribution is reusable for any future
+decode-shape question.
+
+## 2026-08-18 (d): the 790 was never fp4 arithmetic -- and q27's two gaps are one defect
+
+T2 closed the fp4 line by measuring it. It also removed the explanation everyone
+was using for ninfer's 790 t/s, so this is the replacement, plus the first
+experiment off the back of it.
+
+**WHAT THE 790 IS NOT.** `bench/crossengine/FINDINGS.md` read the ladder as
+"fp4 MMA engaging at batch width is doing the work". It cannot be. At the union
+width batched decode actually runs, the fp4 MMA sits at **9.5% of the card's
+dense fp4 peak** -- nothing is compute-bound, so there is no arithmetic
+bottleneck for fp4 to relieve, and on the axis that does bind nvfp4 is the
+LARGER format (4.50 bpw vs 4.25). Corrected in place; the measurements stand.
+
+**WHAT IT IS.** From ninfer's own reqlogs, re-derived rather than taken from the
+probes (`server.{nvfp4,nint}.ladder.reqlog.jsonl`, shipped instances, 15
+`request_done` each, 0 errors):
+
+| leg | tok/round C=1 -> C=8 | round wall C=1 / 2 / 4 / 8 |
+|---|---|---|
+| nvfp4 | 2.397 -> 2.384 | 15.04 / **15.00** / 16.18 / 18.90 ms |
+| nint | 2.305 -> 2.325 | 16.58 / 22.02 / 38.77 / 43.40 ms |
+
+Both hold `draft_window=3` and ~0.46 acceptance at every rung. The two tiers
+differ **1.025x on tokens per round and 2.30x on round wall** -- the gap is not
+speculation and not arithmetic. **nvfp4's round wall is flat C=1 -> C=2 (15.04 ->
+15.00 ms): doubling the batch cost nothing.** No throughput story produces that;
+a "the small-batch kernel was leaving the machine idle" story does. The code
+names it -- `text_policy()` hands `AllowA4` to `QType::NVFP4` and `A16Only` to
+every other qtype, and the W4A4 route engages above ~4 tokens. **ninfer's int
+tier is locked out of its own batch kernel by policy.** fp4 did not make nvfp4
+fast; A16Only made nint slow. The within-engine control was therefore never a
+format comparison -- it holds the scheduler fixed but not the kernel family, and
+the artifacts differ in embedding/head quant and BF16 carve-outs besides.
+
+**THIS DOES NOT TRANSFER.** q27 already has what nvfp4 has and nint lacks:
+`k_vgemm` is a real batch-capable MMA GEMM at 84% of streaming SOL at M=16.
+There is no idle machine to reclaim, which is why T2 measured 1.06x and not
+1.71x. q27's own gap, per-stream at C=8, factors exactly:
+
+**2.31x = 1.34x tokens-per-round x 1.71x round wall.**
+
+**T1 OF THE FOLLOW-ON, RUN SAME DAY: the 1.34x is NOT available via width.**
+At C=4 -- the rung where the `W_MAX` cap actually binds, since at C=8
+`trim_widths` never cuts a lane at floor 2 and eight floored lanes overshoot to
+`W_PLUMB` regardless:
+
+| leg | aggregate | tok/round | round wall | phv/round |
+|---|--:|--:|--:|--:|
+| w12 (shipped) | **287.8** | 2.1157 | 28.504 ms | 22.795 ms |
+| w16, gcache cap 64 | 232.6 (-19.2%) | 2.1501 (+1.6%) | 36.115 (+26.7%) | 30.478 (+33.7%) |
+| w16, gcache cap 463 | 248.7 (-13.6%) | -- | -- | -- |
+
+Widening bought **1.6% more tokens for 13.6% of round wall**. This confirms the
+2026-08-16 C-sweep's "do NOT raise W_MAX" at C=6/C=7 (-6.5%/-4.1%) and explains
+why the penalty is steeper at C=4: the granted spread is widest there.
+
+**One correction to that verdict: ~a third of the penalty was a graph-cache
+artifact, not width.** Heterogeneous grants blow up the fused-verify variant
+space -- w12 produced 97 distinct `gw` shapes (1011 hits / 83 misses / 19
+evictions), w16 produced 192 against the shipped 64-entry cap (804 / 275 / **211
+evictions**). `Q27_BATCH_GRAPH_CAP=512` zeroed the evictions and recovered
+232.6 -> 248.7. The rest is real per-lane cost. Even at zero evictions the hit
+rate is 64.5%: the shape space is combinatorial and a third of rounds still see
+a shape cold. **Any future policy that widens grants heterogeneously must price
+that blowup, and 64 entries is too small the moment grants stop being uniform.**
+
+**THE CONTROL, and the trap it caught.** C=8 must be a null -- the cap provably
+cannot bind there. Measured 418.8 (w12) vs 419.6 (w16), 0.2%. It was not a null
+on the first attempt: the in-tree `build/q27-server-w16` was 2 days and 6
+commits stale and read **218.9 against 417.6**, a fake 48% regression at the one
+rung where the policy is identical by construction. Rebuilding at HEAD removed
+it entirely. **Rebuild every comparison binary at HEAD, and design a rung into
+the A/B where the knob must do nothing** -- without that rung the stale binary
+would have shipped as "W_MAX=16 is catastrophic at C=8".
+
+**WHERE THIS LEAVES q27.** T3 (raise `W_PLUMB`) is dead: it was gated on width
+being nearly free. More usefully, the two terms of the 2.31x turn out to be one
+defect seen twice. q27 cannot afford wider drafts *because* its per-lane verify
+cost is steep, and that same per-lane cost is why its round wall grows
+1.75-2.23 ms per added member against ninfer's 0.54-0.64. The shared weight
+sweep is only ~10.9 ms of a 32.41 ms round; the target is the other ~21.5 ms,
+and `Q27_PHASE_STATS` already splits it (`phv`/`phd`/`phs`) without a profiler.
+Plan: `docs/plans/2026-08-18-batch-round-budget.md`.
+
+Separately and independently: T2 found `k_vgemm` stages through registers while
+a cp.async tile reached 94-96% of SOL on the same shapes against k_vgemm's
+80-86%. That is ~6% in q27's decode GEMM memory pipeline, it needs no format
+change, and it is the one thing the fp4 arm produced that is worth building.
+
+## 2026-08-18 (e): T2 round budget -- a quarter of the C=8 round drafts tokens the trim throws away
+
+**The instrument was unfit and had to be fixed before the measurement meant
+anything.** `phd` cannot price the draft phase at batch, by construction and by
+its own in-tree comment: the phase runs host-synced per step inside
+`Conductor::draft_widths`, BEFORE `ev_round_start` is recorded, so `phd`
+brackets only the unsynced tail. It reads **0.006 ms/round at C=8 while ~2.86
+draft steps per member actually launch.** The plan's `round_ms - phv - phd`
+model would have swept the entire draft phase into an unexplained remainder and
+called it host gap. Fixed with a host wall clock around `draft_widths()`
+(`phfd` / `GenStats::fdraft_ms`, same shared-wall semantics as phd/phv) -- exact
+precisely BECAUSE the phase host-syncs every step, and inert to arithmetic.
+
+**THE BUDGET** (q4s, `--slots 8 --ctx 16384`, `Q27_PHASE_STATS=1`):
+
+| rung | tok/rnd | round | fdraft | phd | phv | rest | accounted |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| C=1 | 2.3273 | 16.641 | -- | -- | -- | -- | n/a |
+| C=2 | 2.1951 | 22.204 | 3.903 | 0.051 | 17.847 | 0.403 | 98.2% |
+| C=4 | 2.0419 | 28.488 | 5.362 | 0.002 | 22.888 | 0.236 | 99.2% |
+| C=8 | 1.7042 | 32.144 | **8.182** | 0.006 | 23.734 | 0.222 | **99.3%** |
+
+Bar was 85%. C=1 is unattributed by construction, not by failure:
+`ConductorCore::step` takes `if (k == 1) solo_round(...)` and never enters the
+fused path, so all three stamps are 0 there.
+
+**The C=8 round is 73.8% fused verify and 25.5% DRAFT.** Per added member
+(C=2 -> C=8): round **+1.657 ms**, phv **+0.981** (59%), fdraft **+0.713**
+(43%), rest -0.030. The host round-gap this plan went looking for is 0.222 ms
+and shrinking -- it was never the problem.
+
+**THE FINDING: q27 drafts ~2.86 tokens per member per round and verifies 1.**
+`phs/round` is 2.86 at every fused rung while `trim_widths` grants width 2, and
+width W verifies W-1 drafted positions. **~65% of every drafted token is
+computed and discarded**, and because the phase host-syncs per step it scales
+linearly with members instead of amortizing across the batch.
+
+**This closes the loop with T1 the same day.** T1: q27 cannot afford to USE more
+draft depth (+1.6% tokens for -13.6% wall at C=4). T2: it is PAYING for depth it
+does not use, a quarter of the round. Same policy error from both ends -- the
+gate ladder picks depth per member with no knowledge that `trim_widths` is about
+to crush the grant to floor-2. Neither is a kernel problem and neither is a
+weight-format problem.
+
+**Upper bound on the fix** (a bound: assumes no fixed per-member cost in the
+phase): 8.182 / (8 x 2.86) = 0.357 ms per draft step. Drafting 1 step instead of
+2.86 costs **ZERO accepted tokens** -- only one drafted position is verified at
+width 2 regardless -- and would take fdraft to ~2.86 ms, the round to ~26.8 ms,
+and C=8 from 417 to **~500 t/s**. Unlike widening, this trades nothing away.
+Scoped as T4 in `docs/plans/2026-08-18-batch-round-budget.md`, with the
+accepted-tokens-must-not-fall bar as its correctness gate.
+
+**REPRODUCED, and upgraded from watch item: the greedy-path non-determinism.**
+The 2026-08-16 entry logged "ONE-OFF, UNREPRODUCED: a single w16 CLI no-spec run
+returned md5 8196e65e; three repeats returned the canonical f64e7c02". It
+returned **8196e65e again today**, same value, on the `q27` CLI rather than
+w16, on the q4s canonical recipe (`--tokens "760,6511,314,9338,369" -n 128
+--ctx 2048 --spec`). Rate today 1 in 13; 12 subsequent repeats all EXACT. Both
+observed failures were the FIRST run after a fresh build, which is the only
+pattern visible so far and is worth testing directly (rebuild-then-single-run
+cycles). It is NOT the documented co-residency trap -- that one produces the
+EMPTY-output md5, and this is a real non-empty divergent generation. It is also
+not caused by the `phfd` change: the same md5 predates it by two days and the
+diff is a clock read plus a counter. **A 1-in-13 greedy divergence undermines
+every byte-identity gate in the repo and should be chased before the next
+canonical claim is made.**
+
+## 2026-08-18 (f): T4 SHIPPED -- draft to the grant, C=8 412.7 -> 455.8 t/s at zero token cost
+
+T2 found q27 drafting ~2.86 steps per member per round while the trim granted
+width 2. T4 stops that. **C=8 aggregate 412.7 -> 455.8 t/s (+10.4%)** with
+tok/round UP 0.4% (noise), canonical digest EXACT.
+
+**The ceiling is DERIVED, not tuned.** `trim_widths` never trims a lane already
+at floor 2, so member i's grant is maximised when every other member sits at the
+floor: `want_i + 2*(k-1) <= cap`, and when `cap - 2*(k-1) < 2` the cap is
+unsatisfiable and trim gives up with EVERY lane at 2. So
+
+    max_grant(k) = max(2, cap - 2*(k-1))            exactly
+
+Checked against the 2026-08-18 [bat] census before writing code: k=2 -> bound 10
+(observed max 5, not binding), k=4 -> bound 6 (observed max 5, not binding),
+k=8 -> bound 2 (observed 2.00 in 4728/4728 lanes, exactly tight). At cap=12 this
+is non-binding until k=5 and pinned at k>=6, which is where the entire win is.
+
+Because the ceiling can never remove a step whose token could have been
+verified, **token neutrality holds by construction, not by measurement** -- the
+measured +0.4% is confirmation, not evidence.
+
+| rung | tok/round | round ms | fdraft ms | phs/rnd | aggregate |
+|---|---|---|---|---|---|
+| C=2 | 2.2165 -> 2.2141 | 21.75 -> 21.96 | 3.85 -> 3.89 | 2.82 -> 2.83 | 201.2 -> 200.3 |
+| C=4 | 2.0708 -> 2.1190 | 29.36 -> 29.13 | 5.59 -> 5.43 | 2.88 -> 2.86 | 276.4 -> 279.2 |
+| C=8 | 1.7088 -> **1.7149** | 32.48 -> **29.62** | 8.36 -> **5.71** | 2.85 -> **1.82** | 412.7 -> **455.8** |
+
+A/B is the same binary via `Q27_DRAFT_CEIL=0`, so nothing but the policy moved.
+C=2/C=4 unchanged is the control the derivation predicted, and it held.
+
+**Ceiling is max_grant, NOT max_grant-1.** A width-W verify walks W-1 drafts,
+but `draft_and_gate`'s floor top-up maintains the stronger invariant "W draft
+ROWS must exist" (the cap==0 case). Cutting to W-1 would break that invariant to
+save one more step. Holding at max_grant preserves it and still takes C=8 from
+~3.35 launched steps per member to 2. The extra step is a separate change that
+has to re-derive the row invariant first -- worth ~2.4 ms if it turns out to be
+free.
+
+**Prior art, and why the derived form beats the tuned one.** SGLang v0.5.17
+ships the same idea as a static batch-size table (`adaptive_spec_params.py`:
+bs 1-7 -> [1,3,7], 8-31 -> [0,1,3], 32-63 -> [0,1], >=64 -> [0]) plus an EMA
+ladder walk on observed acceptance. Same monotone shape. q27 does not need the
+EMA: it knows `k` and `cap` exactly at round start, so it reads the scheduler
+quantity directly instead of inferring it from a lagged, batch-averaged,
+5-batch-cadence estimate. Note also that SGLang's docstring advertises
+`clamp(round(ema_accept_len)+1, ...)` and the code does not implement it --
+anyone porting from the docstring builds the wrong thing.
+
+Remaining at C=8: round 29.62 ms of which verify is ~23.7 and the shared weight
+sweep ~10. The unexplained ~10 ms of verify is now the largest single item and
+the next target.
+
+## 2026-08-18 (g): DSpark drafter measured head-to-head -- ties the MTP head we already have, for 2.5x the draft compute
+
+The 2026-07-09 DFlash NO-GO set DO-NOT-RETRY condition (a): "a drafter retrained
+on q27-quant hiddens exists". A DSpark drafter for this exact target now exists
+and is public (`satgeze/Qwen3.6-27B-DSpark`, apache-2.0, 3.73 GB GGUF,
+markov_rank 256, mask_token_id 248200, confidence head), so the condition is
+close enough to fire. **Measured. The NO-GO stands.**
+
+**No CUDA was written.** Local llama.cpp (build 2114) already implements
+`--spec-type draft-dspark`, so this is a single-variable A/B: same engine, same
+target, same prompt, only the drafter head changes. That is a better test than
+the P0a rig would have been -- and `scratchpad/dflash_p0a.py` is gone anyway
+(scratchpad is untracked); only `--dump-taps` survives in engine.cu.
+
+Single-stream, greedy, 512 tokens, Q4_K_M target, ctx 8192, CUDA_VISIBLE_DEVICES=0:
+
+| probe | leg | decode t/s | mean accept len | acceptance | draft tokens |
+|---|---|--:|--:|--:|--:|
+| prose | none | 75.5 | -- | -- | -- |
+| prose | **draft-mtp** | **87.1** | **2.77** | 0.295 | **1111** |
+| prose | draft-dspark | 79.2 | 2.63 | 0.111 | 2868 |
+| code | **draft-mtp** | **101.9** | 3.27 | 0.381 | **930** |
+| code | draft-dspark | 100.4 | 3.30 | 0.155 | 2302 |
+
+**DSpark loses on prose and ties on code, and pays ~2.5x the draft tokens in
+both.** The in-checkpoint MTP head -- the one q27 already drives -- is the better
+drafter for this target at block 15.
+
+**The target-quant confound was bounded, not ignored.** Q4_K_M was forced: the
+Q5_K_M target (19.5 GB) plus the 3.5 GB draft OOMs at -ngl 99 even at ctx 4096,
+because llama.cpp's fitter aborts when n_gpu_layers is user-pinned. satgeze's
+card says acceptance tracks target coherence, so a coarser target could depress
+it. Control: MTP scores **2.77 on Q4_K_M and 2.88 on Q5_K_M**, a 4% spread. The
+target is not degraded enough to explain a gap of the size needed to overturn
+the result.
+
+Neither leg reproduces satgeze's headline 5.35-5.53 AL. Their own varied-prompt
+acceptance (0.19-0.20) is much closer to the 0.155 measured here than their
+narrow-probe 0.29-0.31, which is exactly the caution their card prints: "when
+you compare drafter heads, make sure you compare the same kind of probe."
+
+**WHY THIS SETTLES IT FOR q27, on economics rather than acceptance.** A drafter
+that spends 2.5x the draft tokens is precisely backwards for q27's batch regime:
+T4 (same day) bought +10.4% at C=8 by REMOVING draft work the trim discards, and
+at C=8 the trim grants width 2 no matter how many tokens a block drafter
+proposes. So DSpark is a C=1-2 play at best, and at C=1-2 it does not beat what
+q27 already has. Building the mask-fill block forward, the rank-256 markov head,
+the confidence head and a `DSparkDraftModel` loader -- weeks of CUDA, plus 2.7-8.8
+GB of VRAM against the 4.06 GB free at 8 slots / 16K -- buys a tie.
+
+**Consequence for the ninfer/SGLang gap.** If the drafter head is a wash, then a
+third-party single-stream figure like 206 t/s cannot be attributed to the
+drafter. It has to be round wall, which is where every measurement today has
+pointed. q27's remaining C=8 target is unchanged and unglamorous: ~29.6 ms round
+after T4, verify ~23.7 of it, shared weight sweep ~10, and **~10 ms of verify
+still unattributed.**
+
+Artifacts kept: `/mnt/ai/models/qwen36-27b-dspark/Qwen3.6-27B-DSpark.gguf`.
+Re-run: `--spec-type draft-dspark -md <gguf> --spec-draft-n-max 15`. Note
+llama-cli ignores `-no-cnv` here and spins an interactive loop (it wrote a 3.9 GB
+log of empty prompts); drive llama-server over HTTP instead, and require an
+HTTP **200** from /health -- it answers 503 while still loading, which will
+happily accept requests into a model that is not up.
+
+## 2026-08-18 (h): the round budget, profiled -- GDN state is the "unexplained 10 ms", and the sampler was launching one block at a time
+
+Round-budget T2 left ~10.66 ms of the C=8 verify unattributed. nsys settles it.
+**Both profilers ARE available** (`/usr/local/bin/nsys`, `/usr/local/cuda/bin/ncu`);
+the standing note that they are not on PATH is stale.
+
+**Read this before trusting any q27 profile.** Three consecutive captures were
+junk and each failed differently:
+1. **nsys hides CUDA-graph interiors by default.** q27's fused verify is a
+   captured graph, so the first profile showed `k_vgemm` **not running at all**
+   and the GEMV family dominating -- a conclusion that is flatly false and was
+   one step from being written down. `--cuda-graph-trace=node` is mandatory here.
+2. **`nsys stats` silently reuses an existing `.sqlite`.** Delete it or you will
+   re-read the previous capture's numbers.
+3. **Killing the target before nsys finalizes leaves the old `.nsys-rep` in
+   place.** Two runs "succeeded" while writing nothing. The tell was an
+   identical 609 ms total across three different capture windows -- when a
+   measurement does not move when the input does, the instrument is stuck.
+Correct invocation: `--cuda-graph-trace=node`, a delay/duration window verified
+to overlap the ladder, SIGINT the server, wait for the process, check the report
+mtime. Real capture is 93 MB and 23,079 ms of kernel time, not 4 MB and 609 ms.
+
+**THE ATTRIBUTION** (C=8 ladder, graph-node trace; shares of GPU kernel time --
+side streams overlap, so these are shares, not additive per-round ms):
+
+| bucket | share | ~ms/round |
+|---|--:|--:|
+| **GDN recurrent state** | **30.4%** | ~8.9 |
+| verify GEMM (k_vgemm + reduce_z) | 25.5% | ~7.5 |
+| attention (fd2 / combine / KV) | 15.4% | ~4.5 |
+| GEMV family | 10.8% | ~3.2 |
+| **sampling (k_nucleus_d)** | **10.6%** | ~3.1 |
+| norm / rope / quant / elemwise | 5.2% | ~1.5 |
+
+**GDN at ~8.9 ms/round IS the unexplained ~10.66 ms.** It is per-sequence
+recurrent state across seven kernels (`k_delta_step` and `k_gdn_delta_chunk3` at
+200352 instances each, `k_delta_scan_T` 140064, plus conv/record/l2norm), each
+2-11 us. It cannot amortize across the batch the way a weight read does, which
+is also why the marginal member costs what it does. Fusing those passes is the
+lever; the state itself is irreducible. NOT YET BUILT.
+
+**SHIPPED SAME DAY: the sampler was launch-geometry-bound, not algorithm-bound.**
+`k_nucleus_d` is a bisection, not a sort -- but it ran `<<<1, 1024>>>`, one block
+on one SM of 170, doing ~19 grid-stride sweeps of the 248,320 vocab (max,
+logsumexp, 16 bisection iterations, mass). Worse, `spec_sample_round` called it
+**once per verify lane in a loop**, so C=8 paid ~16 serialized single-block
+launches per round at ~280 us each.
+
+Fix is geometry only: factor the body into `nucleus_body`, add `k_nucleus_multi`
+with **one block per lane in one launch**. No cross-block state and every
+reduction is intra-block, so L lanes as L blocks is **bitwise identical** to L
+sequential launches. Gated exactly that way (`build/nuc_eq`, 16 lanes x full
+248320 vocab, raw-bit compare of all 4 outputs per lane): **0/64 fields differ.**
+`build/test_kernels` sampling + spec-nucleus suites all PASS.
+
+| | tok/round | round | verify | draft | C=8 aggregate |
+|---|--:|--:|--:|--:|--:|
+| after T4 | 1.7149 | 29.617 ms | 23.705 | 5.712 | 455.8 |
+| **+ batched nucleus** | 1.7010 | **27.189 ms** | **21.364** | 5.599 | **492.8** |
+
+Verify -9.9%, round -8.2%, **C=8 +8.1%** (C=4 279.2 -> 307.8, +10.2%). Tokens
+-0.81%, which is sampled-path run-to-run variance, not a policy change -- the
+kernel is bitwise identical per lane.
+
+**Day total at C=8: 412.7 -> 492.8 t/s (+19.4%)**, from T4 (draft to the grant)
+plus this, neither of which changed a number format or a kernel's arithmetic.
+
+Remaining, in order: GDN state fusion (~30%, the big one), attention fd2/combine
+(15.4%), cp.async in k_vgemm (~6% of a 25.5% bucket, so ~1.5% overall -- smaller
+than earlier entries implied).
+
+**Also flagged:** the recorded q4s sampled-seed anchor `900031e9` does NOT
+reproduce -- a pre-change binary returns `227a6b08`, deterministic across runs.
+That drift predates today's sampler work (measured on the T4 build, and the
+sampler is not on the plain `--temp` CLI path). The greedy anchor `f64e7c02` is
+EXACT. The sampled anchor needs re-deriving or its recorded flags corrected.
+[ERRATA (k): wrong -- the anchor reproduces EXACT on HEAD with the full
+recipe. `227a6b08` is the NO-`--spec` trajectory; this repro omitted the flag.]
+
+## 2026-08-18 (i): GDN mix fused 6 -> 3 kernels -- bitwise-proven, and the wall answer is the interesting part
+
+The 30.4% GDN bucket from entry (h), attacked as asked. Two new kernels in
+spec3.cu: `k_gdn_convnorm3` (= conv_chunk3 + l2norm3 + record3, one launch, all
+lanes) and `k_gdn_delta_all` (= delta_step lane-0 commit + delta_chunk3 lanes,
+S staged ONCE in smem -- S traffic drops 9 -> 6 MB per layer per member). The
+decode mix chain goes 6 launches -> 3; the vw==1 branch keeps the old launches
+byte-for-byte.
+
+**Bitwise identity is proven, not asserted:** `build/gdn_fuse_eq` bit-compares
+EVERY surface the mix touches (S, ring, all lanes' convout/o, all four record
+arenas) at vw {2,3,5,8,12,16} -- zero bytes differ. ninv CHUNK+FOLD: ALL PASS.
+Canonical f64e7c02 EXACT x3 on the fused path. A 3-lens adversarial review
+(fp-order, capture/occupancy, record/fold contract): no findings; it also
+confirmed the setattr latch fires pre-capture via the warm round and that the
+divergent __syncthreads is per-block-uniform and legal.
+
+**THE MEASUREMENT, which is the real yield.** Chain-level prediction said
+~0.5-1 ms off the round; the wall said otherwise:
+
+| | tok/rnd | round | phv | C=8 aggregate |
+|---|--:|--:|--:|--:|
+| pre-fusion | 1.7010 | 27.189 | 21.364 | 492.8 |
+| fused, run 1 | 1.8884 | 26.377 | 20.747 | 506.8 |
+| fused, run 2 | 1.6982 | 27.433 | 21.639 | 487.5 |
+
+**C=8 wall: NEUTRAL within noise.** (Run 1's 506.8 is acceptance luck --
+tok/rnd 1.888; the sampled ladder's accept rate swings +-10% across server
+instances, which dwarfs kernel effects. Judge wall changes on round/phv ms,
+never on aggregate t/s.) C=4: 307.8 -> 315.7 (+2.6%). C=1: neutral (first
+ladder point after boot reads ~5% low -- cold artifact, converges by run 3).
+
+**Why neutral at C=8, from the same capture:** the per-member mix chains run on
+the P2b side streams at a measured **4.17x overlap** (sum-of-durations /
+union-wall over 54,528 k_delta_step instances). At 8 members the chain is
+mostly HIDDEN under concurrent cstm work; what stays exposed is the per-layer
+fork/join structure itself (max-over-members straggler + join at every layer)
+and cstm's own serial work. Chain-level fusion shortens a path that is only
+~half-exposed -- hence C=4 (less overlap, more exposure) pays and C=8 does not.
+
+**Consequence for the round-budget plan:** more within-member kernel work on
+the mix is DEAD as a C=8 lever. The remaining GDN lever is structural --
+cross-member batching: one launch per layer covering all members (the
+nucleus_multi pattern one level up; delta would go 48-block launches x 8
+members -> one 384-block launch, killing the per-layer fork/join entirely).
+That is conductor-level surgery on the capture choreography, scoped separately.
+The fusion ships regardless: strictly fewer launches, strictly less traffic,
+bitwise identical, and the necessary substrate for the batched version.
+
+Chain wall for the record (nsys, one member stream): 38.8 us = 25.8 kernels +
+13.0 gaps per GDN layer pre-fusion.
+
+## 2026-08-18 (j): ERRATA from the end-of-day audit -- two of today's own entries corrected, and the width door reopens
+
+A 3-lens adversarial audit of entries (c)-(i), with every load-bearing claim
+re-verified against the raw logs/sqlite before acceptance. Four corrections,
+two of them to measurements made TODAY.
+
+**E1 -- entry (i)'s explanation of the fusion-neutral result is WRONG.** It
+said the mix chains are "mostly HIDDEN under concurrent cstm work". Measured
+(q27g.sqlite): cstm busy time strictly inside mix-kernel intervals is
+**0.000 ms** -- cstm IDLES through the entire mix phase; the graph is a strict
+per-layer fork/join. The 4.17x overlap is members hiding under EACH OTHER. The
+side-phase union (~2 ms GDN + ~2 ms attention per round) is fully EXPOSED round
+wall. Corrected reading: the fusion's expected win was ~0.6 ms (~2%), invisible
+under the ladder's +-10% acceptance noise -- "neutral" was never evidence that
+mix time doesn't matter. Consequence: cross-member batching is WORTH MORE than
+entry (i) implied (the full ~4 ms is on the table) and it extends to the
+attention mix, which no entry today flagged.
+
+**E2 -- entry (h)'s "GDN ~8.9 ms/round IS the unexplained 10.66 ms" was invalid
+arithmetic.** Share-of-GPU-time x round-wall is only valid for SERIAL-on-cstm
+buckets; entry (h) stated that caveat and then violated it for the overlapped
+side-stream buckets. GDN's exposed wall is ~2 ms, attention ~2 ms; the rest of
+the "unexplained" verify was serial cstm work (pre-fix nucleus ~4.5, gemv/norm/
+quantize chains ~5.5). This is also WHY the sampler fix paid in full (serial:
+share == wall) while the GDN fusion did not. The "GDN 30%, the big one" prize
+was overstated ~4x.
+
+**E3 -- T1's width verdict was 87% a cache artifact, and today's straggler
+"finding" had the mechanism ordering inverted.** From the [gcache] telemetry
+(per-miss `cap+inst=` walls, verified by hand): a fused-verify graph capture
+costs **20-28 ms, mean ~23** -- the in-tree "~2.4 ms median" comment was 10x
+stale (now corrected at both sites). Per fused round at C=4 that is 2.87 ms of
+capture stall inside phv for w12 vs 7.75 ms for w16-cap463 (35% miss rate from
+shape-space exhaustion, zero evictions): **delta 4.89 ms = 87% of the 5.63 ms
+width penalty.** Steady-state width cost is ~+0.75 ms/round (~3%) against
++2.3% tokens -- a rough WASH, not the emphatic negative recorded. The T1 entry
+and the 08-16 C-sweep W_MAX verdict were BOTH measured in a cold-cache
+heterogeneous-shape regime; "the 1.34x tok/round gap is not available via
+width" is UNSETTLED until a warm-cache control runs. The incumbent-through-
+the-bar lesson, third occurrence this week.
+
+**E4 -- entry (i)'s "fused run 1" C=8 row was a parsing error, struck.** The
+slice blended C=4 and C=8 requests; the real run-1 C=8 is tok/rnd 1.7152 /
+round 26.703 (vs 27.189 pre-fusion), and the "tok/rnd 1.888 acceptance luck"
+story was an artifact of the bad slice. Verdict unchanged (neutral-to-slightly-
+positive); provenance corrected.
+
+Smaller: the 2.31x per-stream gap framing used a stale tok/round (1.777, the
+08-17 binary) -- quote **1.91x aggregate** for the ninfer gap; the 0.39 ms/
+union-column vgemm coefficient was fit on PRE-nucleus-batching logs where the
+serial sampler scaled with width -- post-fix it is ~0.11-0.12; the DSpark A/B
+ran MTP at n-max 6 vs DSpark at n-max 15 (never swept) -- the C>=4 NO-GO
+stands on economics, but the C=1 claim carries an op-point caveat, recorded.
+And per the audit, ninfer keeps GDN S in fp32 -- their 0.54 ms/member slope is
+NOT bought with state dtype, which demotes the bf16-S idea below the
+structural work.
+
+**CORRECTED JUICE LIST** (C=8 baseline 27.2 ms / 1.70 tok / ~493 t/s):
+1. **Pre-capture / graph-key slimming.** The capture tax is ~2.9-7.8 ms/round
+   at C=4-6 TODAY (production regime), ~0 at uniform C=8. Also the gate for
+   any width policy. High confidence, structural.
+2. **Draft into the round graph + depth policy at C>=6.** fdraft 5.7 -> ~3;
+   post-T4 the margin gate buys ~0.06 ms/round. ~550-575 t/s. Medium-high.
+3. **Cross-member batched mix, GDN AND attention.** ~4 ms exposed fork/join.
+   ~630 compounded. Medium (endpoint proven by ninfer's whole-model fold).
+4. **Width policy, AFTER 1+3.** tok/round 1.70 -> ~1.95-2.1 realistic
+   (uniform-3 bound 2.22 is selection-biased); ~680-710 compounded upside.
+5. cp.async vgemm (~1.2 ms), PDL on cstm chains (~0.5) -- kernel-local.
+Not reachable on this list: ninfer's 18.9 ms round (their per-member slope is
+0.54 ms with S in fp32 -- structural all the way down). The agentic wall,
+where q27 wins 4.10x on prefix reuse, was never at issue today.
+
+**ORDER:** the two broken determinism anchors first (every gate above leans on
+them), then the warm-cache width control (cheap: score the second pass of the
+same server), then 1 -> 2 -> 3 -> 4.
+
+## 2026-08-18 (k): E0 first half -- the sampled anchor was never broken; --spec omission bites a second time
+
+Round-wall plan E0.2, resolved in four CLI runs. On the HEAD binary (b5bbfe4
+tree, warm, greedy warm-up f64e7c02 EXACT first, CUDA_VISIBLE_DEVICES=0, GPU
+otherwise idle):
+
+- Full recorded recipe (`--tokens "760,6511,314,9338,369" --ctx 2048 --spec
+  -n 64 --temp 0.7 --top-p 0.95 --seed 42`): **900031e9 x2 EXACT.** The
+  anchor holds.
+- Same command WITHOUT `--spec`: **227a6b08 x2** -- byte-for-byte the md5
+  entry (h) recorded as "the anchor does not reproduce".
+
+So (h)'s flag was a rig error, not drift: the repro ran the no-spec sampled
+trajectory, the exact trap that bit v0.5.0 gating (07-13 gotcha: sampled
+anchors REQUIRE `--ctx 2048 --spec`; both trajectories are valid, so the
+wrong one looks plausible). Second bite of the same trap. Corroboration that
+no drift was possible: every commit between the T4 build (h) measured on and
+HEAD is bitwise-proven (b15fc1b nucleus_multi, ffd3f8a gdn_fuse_eq) or
+docs-only, so the with-spec trajectory could not have changed across that
+window.
+
+**Durable fix, shipped:** the anchor's exact command line is now PUBLISHED
+next to its digest -- `sampled_md5_for()` in tools/canonical_md5.sh
+(sm120:q4s -> 900031e9, full command in the comment), and
+tools/sampling_gate.sh grew **gate 2b**: it runs the exact recipe through the
+same `gen()` (which hard-codes `--ctx 2048 --spec`) and compares against the
+published digest; tiers without a published sampled anchor SKIP cleanly. The
+anchor stops being BUILDLOG prose that every session re-types by hand.
+
+Scope limit: verified sm120/q4s only, x2 per leg, one binary (HEAD). Residual
+uncertainty: whether (h)'s rig error was a missing `--spec` or a stale
+`Q27_SAMPLE_PLAIN=1` in that shell's env is not distinguishable after the
+fact -- the no-spec md5 match makes the former overwhelmingly likely; a
+Q27_SAMPLE_PLAIN control run is queued behind the E0.1 loop currently holding
+the GPU. E0.1 (greedy first-run-after-fresh-build divergence) is running:
+24x rebuild-then-first-run vs 20x warm, logged with per-rebuild binary md5s.
+
+## 2026-08-18 (l): the greedy anchor divergence REPRODUCED and CAPTURED -- it is NOT a first-run-after-build effect, and the full digest finally exists
+
+E0.1. Caught **twice on a warm binary** -- runs 92 and 151 of a 300-run campaign
+against a PINNED copy of build/q27 (md5 0a370e3e), GPU at 2887-2917 MHz /
+55-56 C, nothing else resident on GPU0. **Full divergent digest:
+`8196e65e8939dcb9ed04bd2ae2d50a8b`** -- the first time more than the 8-char
+prefix has ever been recorded, which is precisely why the 08-16 and 08-18
+sightings were unchaseable.
+
+**Both hits produced the IDENTICAL digest.** The divergence is therefore not
+noise: it is a binary fork into ONE specific alternate trajectory, reached
+twice independently. That is the signature of a single near-tie token flipping
+with everything downstream following deterministically -- and it means the
+alternate stream can be studied as a fixed object rather than a random one.
+
+**The "FIRST RUN AFTER A FRESH BUILD" pattern is RETRACTED.** It was a
+small-sample artifact of two sightings. Direct test: 24 rebuild-then-single-run
+cycles (a genuine full nvcc rebuild each time, per-cycle binary md5 logged) gave
+**0 divergences**, while the warm campaign hit one at run 92. The plan's E0.1
+hypothesis ("suspect JIT/module-load or uninitialized device state on first
+run") is dead, and so is the proposed pre-run warmup rule -- warming does not
+help because warmth was never the variable.
+
+**Rate: 2 in 300 (1 in 150)** on this instrument, not the 1-in-13 recorded on
+08-18. At a true 1/13 the 44 clean runs of the rebuild loop alone would have had
+p=0.03. Do not over-trust the exact figure -- two events is a wide interval
+(roughly 1-in-40 to 1-in-550) -- but the ORDER is ~1%, not ~8%.
+
+**What the divergent run is NOT** (each positively excluded today, not argued):
+- **Not artifact corruption.** The loader checksums the weights on every load;
+  the divergent run printed `resident: 15.46 GB (checksummed)` like every other.
+- **Not residual VRAM from prior processes.** Direct probe
+  (scratchpad/vram_probe.cu): wrote 20 GB of 0xDEADBEEF, exited, re-read from a
+  fresh process -> **100.0000% zeros**. This driver (r580) scrubs between
+  processes, so an uninitialized *global* read is a deterministic zero, not a
+  lottery. This also means the rebuild loop could never have tested that
+  hypothesis, which is why it was probed directly.
+- **Not an env latch.** 11 configs swept (PMIN/MAXD 5,6,7/DEXIT/FD/KV/SUFFIX/
+  BATCH/BATCH_GEMM); all give the canonical except Q27_FD=mma (43c4c97c) and
+  Q27_KV=fp8 (13c725bb), which have their own distinct digests. Neither is
+  8196e65e, so the "ambient exported Q27_* in the build shell" theory is out.
+- **Not a different build config.** build/q27-w16 returns the canonical 5/5
+  (3 spec + 2 no-spec), killing "the w16 binary simply has its own basin".
+- **Not cold clocks or thermal transient.** Boost clocks, 56 C, warm binary.
+- **Not co-residency.** GPU0 held only the desktop's ~1 GB.
+
+**What it looks like:** a coherent ALTERNATIVE trajectory, not corruption. The
+divergent run's acceptance profile is healthy -- round outcomes
+`1-tok 9, 2-tok 7, 3-tok 6, 4-tok 12, 5-tok 8` (42 rounds/129 tok) against the
+canonical `13, 8, 6, 9, 9` (45 rounds/128 tok). Garbage state would depress
+acceptance; this is the documented near-tie basin fork (07-09 gotcha), reached
+run-to-run on ONE binary rather than across builds. Consistent with 8196e65e
+being byte-exact the sm_86/sm_89-family canonical (07-17): at that fork there
+are two continuations, and both SASS families and this flip pick between them.
+
+**Where that leaves the mechanism.** A parallel three-lens source audit of the
+exact anchor path (uninit reads / sync races / arch-numeric divergence) returned
+one structurally important negative: on this recipe every launch geometry in the
+replayed spec graph is a compile-time or model-shape constant -- no SM count, no
+cudaMemGetInfo, no occupancy query, no clock reaches any grid, block or split
+count (the `cudaMemGetInfo` at engine.cuh:2192 is in the OOM advisory path
+only). So a run-to-run flip CANNOT be launch geometry, and the argmax cannot be
+a tie-break race (am_pack + atomicMax is order-independent with a lowest-index
+tie-break). The surviving candidates are intra-kernel: a shared-memory hazard
+(smem is not scrubbed between launches and block->SM assignment varies run to
+run) or a missing intra-block sync. compute-sanitizer racecheck is the next
+instrument, and it does not need to catch the 1-in-92 event to find the hazard.
+
+**Shipped this session (E0 deliverables):**
+- `tools/anchor_check.sh` -- anchor gate that DIAGNOSES its own failure: dumps
+  full digest, binary md5+mtime, artifact + CHECKSUMS entry, device/driver/
+  clocks/temp, co-resident processes, every Q27_*/CUDA_* latch, stderr and the
+  generated text, then repeats to separate a sticky config error from the
+  transient. Failure path verified by forcing a mismatch (control run), not
+  assumed. This is what makes the NEXT sighting actionable.
+- Lane slots 5..7 now zeroed at init (engine.cuh). `k_finish_round`
+  dereferences all W_PLUMB draft/verdict slots every round and copies them to
+  the host, but a below-ceiling run (the canonical is depth-4/width-5) never
+  writes lanes 5..7; only lanes 8..15 were zeroed. Benign today ONLY because the
+  driver scrubs -- a courtesy, not a guarantee. Not the divergence (it is
+  value-gated out by `k <= max_draft`).
+- `prefill.cu` `cur_nsm()` / `cur_sm_major()`: return codes were discarded
+  against an UNINITIALIZED `cudaDeviceProp`, so a failed query latched stack
+  garbage for the process lifetime -- and those values pick a prefill kernel
+  (MR=128 vs 64) and `gemm_splitk_nsp`, i.e. a real reduction-order change.
+  Now zero-initialized and CUDA_CHECK'd, matching pf4.cu which already did it
+  right. Off the anchor path (5-token prompts never reach prefill), so this is
+  a latent-defect fix, not a divergence fix.
+- `spec3.cuh`'s split-K header contract corrected: it claimed every split
+  writes its partial even when empty, which is true only of the frozen v1
+  kernel. The live fd2 skips empty splits and correctness rests on
+  k_attn_fd_combine re-deriving the same `used` bound.
+
+All four shipped items above are gated: `tools/anchor_check.sh -n 3` on the
+rebuilt binary returns canonical f64e7c02 x3 + sampled 900031e9, all EXACT.
+
+**Scope limit:** two divergences captured, sm120/q4s, greedy `--spec` recipe,
+one box. The rate is a single-instrument estimate on two events. The mechanism
+is NOT yet identified -- do not treat any A/B's byte identity as trustworthy at
+better than ~1% until it is. Note the 08-16 sighting was a **no-spec** run, so
+the defect lives in the core forward pass shared by both paths, not in the
+draft/verify machinery; that is the strongest localization currently in hand.
+Next instruments, in order: (1) capture the divergent TEXT and locate the fork
+TOKEN (a campaign that saves stdout is running; the whole-trajectory md5 says
+two runs differ but not where, and the fork index names the round); (2)
+compute-sanitizer racecheck for an intra-block shared-memory hazard, which does
+not need to catch the rare event to find the defect.
+
+**A route deliberately NOT taken:** the 3090 should reproduce the sm_86-family
+trajectory on demand (which would both confirm the 8196e65e identification and
+hand over the divergent text for free), but GPU1's 6.6 GB is held by a LIVE
+realtime speech service, and occupying 15.5 GB there risks OOMing it on a burst.
+The GPU0 capture campaign yields the same primary artifact safely. (Also: the
+`vox-transcriber` unit named in the ops notes has been failed since 2026-07-29
+and no longer owns GPU1 -- stopping it is now a no-op.)
+
+## 2026-08-18 (m): the divergence is ONE near-tie token, and the 3090 emits the divergent trajectory ON DEMAND
+
+Gabe cleared stopping 3090 services, which unlocked the identification test the
+GPU0-only route could not do safely.
+
+**IDENTIFICATION, byte-exact.** The 3090 (sm_86, same tri-arch binary, same q4s
+artifact, same recipe) returns **`8196e65e8939dcb9ed04bd2ae2d50a8b`** -- the
+identical full digest the 5090 emits on its rare divergent runs. A third 5090
+divergence (capture campaign run 232, this time with the TEXT saved) is
+byte-identical to the 3090 output. So the 5090's flip is not "some other
+basin": it lands exactly on the sm_86-family trajectory, which is now
+reproducible on demand instead of at 1-in-150.
+
+**THE DIVERGENCE IS ONE TOKEN.** difflib over the two 128-token streams:
+
+```
+equal   A[0:53]   == B[0:53]     (53 tokens)
+delete  A[53:55]  = [248045, 271]  ->  B: absent
+equal   A[55:124] == B[53:122]   (69 tokens)
+replace A[124:128] vs B[122:128]  (tail: pure 2-token shift, both stop at 128)
+```
+
+One event, at token 53: the 5090 emits an extra `248045 271` (delimiter +
+newline) pair; sm_86 skips straight to the content token. The streams then
+re-converge and stay identical for 69 tokens. This is textbook 07-09
+("a near-tie logit -- '\n' vs '\n\n' -- forks the whole trajectory"), except it
+happens run-to-run on ONE binary rather than across builds. It also explains
+why all five sightings (2 historical + 3 today) carry the same digest: at a
+knife-edge with two candidates, ANY perturbation big enough to flip it yields
+the same continuation. That sameness is also evidence AGAINST random silent
+data corruption (non-ECC GDDR7), which would land elsewhere sometimes and
+produce other digests.
+
+**MINIMAL REPRODUCER, and it is a single forward pass.** The first differing
+index is **54**: canonical `271`, divergent `846` (the difflib script above
+aligns the delete at 53:55 because 248045 repeats -- both alignments are valid,
+but the first DIFFERING position, which is what a reproducer must target, is
+54). So the prefix is 5 prompt + A[0:54] = **59 tokens**
+(`scratchpad/prefix_tie.txt`).
+
+Verified both sides in ONE forward pass, `-n 1`, no `--spec` (the 08-16
+sighting was no-spec; the defect is in the core forward pass):
+- 5090: `271` (canonical side)
+- 3090: `846` x2 (divergent side, deterministic)
+
+That is the whole arch-family split reproduced without generating 45 rounds. It
+turns a 3.7 s/45-round trial into a ~3 s single-step trial and shrinks the
+instrumented surface from the entire decode loop to one pass.
+
+(Recorded honestly: the first cut of this used a 58-token prefix -- one token
+short -- and returned `248045`, which is the token BEFORE the tie, not a side
+of it. A reproducer that reports the wrong token is worse than none; check that
+the emitted token is one of the two tie candidates before trusting it.)
+
+Next: loop the 59-token reproducer on the 5090 to confirm it flips to `846` at
+~1/150 (~300 runs), which would prove the single step carries the whole defect;
+then bisect inside that step. compute-sanitizer racecheck is running against
+the same single-pass shape now.
+
+**What is still NOT known:** the source of the ULP-level nondeterminism on the
+5090. Everything measured says the margin at token 53 is small enough that a
+sub-ULP perturbation decides it, and the perturbation exists on sm_120 at
+~0.7% of executions. Since all reduction orders on this path are structurally
+fixed (entry (l)), the surviving hypothesis is an intra-kernel hazard with
+exactly two possible orderings -- which is what racecheck is being asked.
+
+**Do not read this as a quality problem.** Both continuations are valid model
+outputs at a genuine tie; the greedy anchor's job is byte-identity for A/B
+gating, and that is what is compromised, at ~1%. Until the mechanism is found,
+a single md5 mismatch on a greedy gate is NOT sufficient evidence of a
+regression -- re-run via `tools/anchor_check.sh -n 3` and read the
+distribution it prints.
+
+## 2026-08-18 (n): the single-step reproducer FLIPS -- the whole defect is one forward pass
+
+The 59-token tie prefix (`scratchpad/prefix_tie.txt`, 5 prompt + canonical
+A[0:54]) run with `-n 1`, no `--spec`, on the 5090: **run 131 returned `846`**
+instead of the canonical `271`. Loop: `scratchpad/tie_loop.sh <dev> <N> <expect>`.
+
+That is the whole result. The defect does NOT need 45 rounds of generation, a
+draft/verify ladder, or a 128-token trajectory: **one prefill + one decode step
+at this position reproduces it**, at a rate consistent with the full-run figure
+(1 in 131 here vs 2 in 300 there). Everything downstream in the 128-token run
+was just the tie's consequence.
+
+Why this matters more than the rate: it collapses the instrumented surface from
+the entire decode loop to a single pass, which is what makes compute-sanitizer,
+an ncu capture, or a per-kernel bisect affordable. Any future work on this bug
+should start from the 59-token prefix, not the anchor recipe.
+
+Control, same prefix on the 3090: `846` deterministically (150/150 runs, 0
+flips, from the pre-crash leg of the same loop) -- the sm_86 family sits on the
+other side of the tie with no ambiguity. So sm_120 is the arch whose result is
+unstable at this position; sm_86 is not.
+
+Session-hygiene note paid for today: a `compute-sanitizer` run launched as a
+plain background shell died with the tmux session, while every campaign under
+`systemd-run --user` survived and completed -- exactly what
+[[ops-long-jobs-haight]] says. The crash also orphaned a `tie_loop.sh` that kept
+respawning 17 GB q27 processes on the 3090 until killed. Long GPU jobs go under
+`systemd-run --user`, no exceptions; and after any session crash, check
+`pgrep -af build/q27` before trusting a GPU-idle reading.
+
+## 2026-08-19: racecheck is NOT viable unfiltered on this workload -- OOM after 5.5 h
+
+`compute-sanitizer --tool racecheck --racecheck-report analysis` on the
+single-step reproducer (59-token prefix, `-n 1`, no `--spec`) ran from 22:21 to
+04:00 and was **killed by the host OOM killer** (`racecheck.service: Result=
+oom-kill`) without reaching the first hazard report. It never got past
+`sample graph captured`. Host RAM is 123 GB.
+
+Cause: racecheck tracks every shared-memory access, and one q27 forward pass is
+65 layers x several smem-using kernels, plus the boot-time graph zoo capture and
+the warm rounds -- all instrumented before the step under test even runs. The
+tool's working set grows without bound across that many launches.
+
+Collateral worth knowing: while racecheck was exhausting RAM, the CONCURRENT
+tie-loop on the other GPU stalled for hours mid-run (the 15 GB model load
+thrashes when page cache is gone) and looked wedged. It resumed on its own once
+the OOM freed memory. A stalled GPU job during a host-RAM squeeze is not
+necessarily hung -- check `free -g` before killing it.
+
+**How to actually run it (next attempt):** bound BOTH the kernel set and the
+launch window, one suspect family at a time --
+`--kernel-name regex=k_attn_fd2 --launch-count 20`. compute-sanitizer counts
+only launches matching the filter, so this instruments ~20 fd2 launches instead
+of the entire process. Suspect order (smem complexity on the decode path):
+k_attn_fd2 (s_q + s_mrg + s_ml, with the barrier-serialized cross-warp merge)
+-> k_gdn_delta_all / k_gdn_convnorm3 -> k_attn_fd_combine -> k_rmsnorm3/l2norm3
+-> k_gemv_q4_n. Do NOT re-run it unfiltered.
+
+## 2026-08-19 (b): flip rate is 1.67% and REPRODUCIBLE; the memory-pressure lead was chance
+
+Two independent 300-run campaigns of the single-step reproducer (59-token
+prefix, `-n 1`, no `--spec`, 5090) both returned **5 flips / 300 = 1.67%**.
+Every flip emitted `846`; no run produced anything other than `271` or `846`.
+The harness now distinguishes a FAILED run (empty token) from a genuine flip --
+an empty token silently counted as a flip would inflate any rate here.
+
+**RETRACTED: the post-OOM cluster.** The 08-18 loop put 4 of its 5 flips in a
+90-second window right after the host OOM-kill, which looked like a page-cache /
+memory-pressure effect. It was not:
+- The upload path is a SYNCHRONOUS `cudaMemcpy` (device_model.cu:29) -- there is
+  no async H2D race to exploit.
+- The post-OOM runs were FASTER (2.5 s vs 3.1 s), the opposite of what a cold
+  page cache would do.
+- The control reproduces 1.67% with 105 GB free and no pressure at all.
+Selecting that window after seeing the flips inflated it; under uniform
+clustering it was only ~p=0.03 before that correction. Logged because the wrong
+story was nearly written up.
+
+**RETRACTED mid-run: "flips happen on fast runs."** The first four flips all had
+below-average duration (mean z=-0.76, ~1.5 sigma). The fifth landed at z=+1.79
+and killed it (mean z=-0.25). It is recorded because it had already been turned
+into a pre-registered prediction for the clock arm; the prediction died before
+the experiment ran, which is the correct order.
+
+Nothing in the per-run telemetry predicts a flip: clocks 2902-2910 MHz (vs 2891
+mean), temps 52-56 C (vs 54.6 mean), 105-106 GB free, inter-flip gaps 26/47/74/
+32/73 with no periodicity.
+
+**Structural nondeterminism sources are now exhaustively excluded.** Added to
+entry (l)'s list: there are NO float atomics anywhere in the kernels -- the only
+atomics are an order-independent u64 word-sum (device_model.cu, checksums) and
+the packed-u64 `atomicMax` argmax (blocks.cu), both exact regardless of order.
+`vgemm.cuh:18` documents that the author already measured this exact hazard
+class: "A grid.z atomicAdd epilogue is NOT [deterministic] (measured: 11-20K of
+61K floats differ run-to-run on ffn_down at z=8). So there are NO atomics here."
+Both K-splits are fixed-order by design. A manual smem audit of the decode
+kernels (k_delta_step, k_gdn_delta_chunk3, k_attn_fd2, k_attn_fd_combine) found
+every cross-thread `sq`/`sk`/`part`/`dj`/`s_mrg`/`s_ml` access barrier-separated,
+`s_mrg` explicitly zeroed, and `s_q` fully covered (gqa=6 x head_dim=256 = the
+1536 floats the compute loop reads). Three agent lenses plus manual passes: no
+defect found. **So the variation violates the design, or is not in the logic.**
+
+**A blind spot worth naming:** an uninitialized SHARED-memory read is not a race
+(nothing else writes the location), so racecheck need not report it, and
+initcheck only covers global memory. smem is never scrubbed between launches and
+block->SM assignment varies run to run, which is exactly this bug's shape. The
+manual audit above was aimed at that gap; it came back clean, but the tooling
+cannot confirm it.
+
+**TWO ARMS RUNNING, predictions pre-registered:**
+1. `Q27_PF_BATCH_MIN=1000` forces SERIAL prefill at 59 tokens. **Confound being
+   tested:** the reproducer's 59-token prompt crosses `pf_batch_min=32`
+   (engine.cuh:4248) into BATCHED prefill (`k_attn_prefill_mma`, split-K GEMMs),
+   which the original 5-token/128-token divergence NEVER touched. Rate holds =>
+   defect is in the shared decode path and the reproducer is faithful. Rate goes
+   to 0 => this is a SECOND, distinct nondeterminism in batched prefill and the
+   anchor bug is still uncharacterized.
+2. SM clock locked 1000 MHz (vs 3090 max). Rate holds => logic race with a
+   cycle-fixed window. Rate collapses => timing/voltage-marginal behavior, i.e.
+   hardware. **Note the earlier argument that "all sightings share one digest,
+   so it is not silent data corruption" was WRONG and is withdrawn:** at a
+   two-candidate knife-edge ANY sufficient perturbation yields the same
+   alternate trajectory, so SDC was never excluded by that observation.
+
+## 2026-08-19 (c): it was NEVER a near-tie -- ~1-2% of runs compute a WRONGLY-PERTURBED FORWARD PASS
+
+The biggest reframing of this investigation, and it retracts the model every
+prior entry has been built on.
+
+`--dump-logits` works on the EAGER `--tokens` path (engine.cu:1160, right after
+the prompt loop, before generation) -- it is NOT `--pf`-only; the `--pf`-gated
+block at :1086 is the batched leg's separate dump. So the tie-deciding
+distribution can be captured directly.
+
+**The margin is not a knife edge.** At the tie position: 271 = +14.158872604,
+846 = +14.158126831, margin **7.457733e-04** = ~782 ULP, with rank 3 a full 2.89
+logits back. Reassociation noise on this engine is documented at 1.05e-6 (Q4) /
+2.80e-6 (Q8) relative (vgemm.cuh:34) -- **20-50x too small to cross this gap**.
+The long-held "sub-ULP perturbation decides a knife-edge tie" model is WRONG.
+
+**What bad runs actually do.** 20 consecutive good runs produced BITWISE-
+IDENTICAL logits (one md5 over 248320 floats). Two captured bad runs each
+perturb **100.00% of all 248320 logits**:
+
+| event | differing | max abs delta | mean abs delta | tok271 | tok846 | winner |
+|---|---|---|---|---|---|---|
+| ref (x20) | -- | -- | -- | +14.158873 | +14.158127 | 271 (by 7.5e-4) |
+| run 161 | 248320 (100%) | 8.34e-01 | 1.11e-01 | +13.733006 | +13.950596 | **846 by 0.218** |
+| run 194 | 248320 (100%) | 1.43e+00 | 1.79e-01 | +14.262596 | +13.856833 | 271 by 0.406 |
+
+So the process is BIMODAL: exact almost always, occasionally wrong by ~1e-1 on
+every logit. The tie is not the bug -- it is merely the most sensitive DETECTOR
+of a much larger fault that was previously invisible.
+
+**Each bad run is uniquely wrong.** The two event vectors differ from EACH OTHER
+(max 1.40, mean 0.179), not just from the reference. A single stale state (one
+polluted buffer, one specific wrong value) would reproduce the SAME wrong logits
+every time. It does not. The corruption's extent varies run to run.
+
+**The flip rate was undercounting by ~2x.** Run 194 perturbed everything and
+still emitted 271, because its perturbation pushed 271 FURTHER ahead. Only
+perturbations landing in the right direction cross the margin, so token-watching
+sees roughly half the events. Measured 2 events / 200 runs = **1% perturbation**
+vs the 1.78% flip rate over 900 runs (the two are consistent given n; the point
+is that the fault rate is AT LEAST the flip rate, and flips are a lossy proxy).
+**Every campaign in entries (l)-(b) counted flips, so all of them are floors.**
+
+**Corrected consequence for A/B discipline:** this is worse than a rare tie
+re-roll. ~1-2% of runs produce materially different logits everywhere, which
+means a byte-identity gate can PASS while the run was numerically wrong (the
+perturbation simply did not cross a decision boundary). Any single-run A/B on
+this box carries a ~1-2% chance of comparing a corrupted pass.
+
+**Arm results, with one correction.** Control 5/300, clock-locked-1000MHz 4/300
+(997 MHz, 41 C vs 2900 MHz, 56 C -- a 3x clock cut and 15 C changes nothing, so
+voltage/timing marginality is disfavored). **ARM 1 WAS A NO-OP and its
+"serial prefill excluded" reading is WITHDRAWN:** engine.cu:1144 prefills the
+`--tokens` path with a plain `for` loop of `e.step_with()`, which never consults
+`pf_batch_min`/`batched_prefill` at all -- confirmed by a timing A/B (2.492 s vs
+2.484 s, identical). The reproducer was ALWAYS on the eager path, so the batched-
+prefill confound never existed; arm 1 is simply a third replication (7/300).
+
+**RUNNING:** 300 runs with a ONE-token prompt (`--tokens "760" -n 1`). If bad
+runs persist at ~1%, the corruption is present at INIT (boot / reset_gdn_mtp /
+warm rounds / graph capture) rather than accumulated across 59 prompt steps --
+which moves the hunt off the decode kernels entirely. Standing suspect: the
+race-lens finding at engine.cuh:2306, where `reset_gdn_mtp()`'s legacy-stream
+memsets of S / conv_ring / MTP-KV interleave with stm-ordered warm-round work;
+a lost race there leaves polluted committed state whose EXTENT varies with
+timing, which matches "each bad run uniquely wrong".
+
+## 2026-08-19 (d): ROOT CAUSE -- SINGLE-BIT CORRUPTION OF THE RESIDENT WEIGHTS. This is not an engine bug.
+
+**The anchor divergence is silent data corruption.** Added
+`DeviceModel::checksum_aggregate()` (device_model.h/.cu) -- one u64 digest over
+every tensor's baseline word-sum, printed at load under `Q27_PRINT_WSUM=1`
+(engine.cuh). The SAME artifact must produce the SAME aggregate on every load.
+It does not:
+
+| run | wsum | delta vs ref | decomposition |
+|---|---|---|---|
+| ref (97/100) | `935aa78756189480` | -- | -- |
+| 34 | `9b5aa78756189480` | **+2^59** | ONE bit |
+| 38 | `8b5aa78756189480` | **-2^59** | ONE bit |
+| 52 | `6b5aa78756189480` | **-(2^59+2^61)** | TWO bits |
+
+Every delta is an exact sum of powers of two, i.e. individual bit flips in the
+resident weights. **3 of 100 launches carried a flipped weight bit.**
+
+**All three events land in BYTE 7 of the u64 word (bits 59, 61).** Uniform
+random corruption would put three-for-three in one byte at (1/8)^3 = 0.2%.
+Bits 56-63 are exactly the span of ONE x8 DRAM device on a 64-bit bus -- the
+signature of a single marginal memory chip, not scattered cosmic-ray SDC. Note
+[[user_hardware]]: 4x32 GB dual-rank DDR5 that would not hold EXPO 5200 and runs
+at JEDEC. HOST-vs-DEVICE localization is running (8 full re-reads of the
+15.46 GB artifact vs its known-good md5 7e5454e0c0ded717136ad3e42634ba25).
+
+**This explains every negative result in entries (l) through (c):**
+- No kernel audit could find it -- the kernels are correct; their INPUT is wrong.
+- racecheck/initcheck could not see it (and the unfiltered run OOMed for nothing).
+- Clock/thermal/memory-pressure/prefill-route arms all read null because none of
+  them touch the failing path.
+- `--verify-weights` PASSES on a corrupt load: `checksum_baseline()` is taken
+  AFTER the upload, so it blesses whatever landed. device_model.h:52 even
+  anticipates "OC/heat bit flips ... which token-identity gates cannot see" --
+  but nothing compared the baseline ACROSS processes until now.
+
+**The rate hierarchy, all measured:**
+- ~3-6% of launches: at least one flipped weight bit (`wsum` differs).
+- ~1-2% of launches: the flip perturbs the logits (100% of 248320 logits move,
+  mean |delta| ~1e-1). Runs 38 and 52 flipped a bit but produced BITWISE-
+  IDENTICAL logits -- consistent with a flip landing in a tensor a no-`--spec`
+  pass never reads (the MTP head is resident but unused).
+- 1.78% of runs (16/900): the perturbation crosses the 7.46e-4 margin at token
+  54 and becomes the visible `8196e65e` divergence.
+
+So the greedy anchor was a CANARY: the one position in that trajectory whose
+top-2 margin was narrow enough to register a fault that is otherwise invisible.
+
+**CONSEQUENCES -- read before trusting any number measured on this box:**
+1. **Byte-identity gates are necessary but nowhere near sufficient.** A run can
+   carry corrupted weights and still emit identical tokens (measured: 2 of 3
+   corrupt runs did exactly that). Passing the canonical md5 does NOT mean the
+   forward pass was correct.
+2. **Every quality measurement has a ~1-6% per-run chance of running on subtly
+   wrong weights.** The thunderdome campaigns, the PPL ladders, the KV tail
+   study, the cross-engine quality scores -- all of them sampled this.
+   Single-run A/Bs are the most exposed; anything with n>=3 and agreement is
+   probably fine.
+3. **`Q27_PRINT_WSUM=1` is now the cheap integrity check.** Print it at the top
+   of any campaign and discard runs whose aggregate differs. That is a real gate
+   -- it caught what nine kernel-level exclusions could not.
+4. The round-wall plan's E1-E6 A/Bs lean on byte identity; they need either
+   repetition or a wsum check per leg.
+
+**NOT yet established:** whether the flip happens in host DRAM / page cache, on
+the PCIe/DMA transfer, or in VRAM. The artifact re-read test discriminates
+host-side from device-side. Do not act on a hardware theory (memtest, EXPO
+changes, RMA) until that lands.
+
+## 2026-08-19 (e): the causal chain CLOSED -- corrupt weights -> perturbed pass -> token flip. And the rate is NOT stationary.
+
+**The correlation that closes it.** 300 runs of the tie reproducer recording BOTH
+the weight digest and the emitted token IN THE SAME PROCESS:
+**flips=2, wsum_events=2, both=2.** Every token flip carried a corrupt weight
+digest; neither symptom ever appeared alone. Signatures `-2^59` (run 179) and
+`+2^59` (run 260) -- the same byte-7 bits as every other event.
+
+Chain: **a bit flips in the resident weights -> the whole forward pass is
+perturbed (100% of 248320 logits, ~1e-1) -> at the one position whose top-2
+margin is 7.46e-4, the token changes -> the canonical md5 reads `8196e65e`.**
+
+**Data corruption, not a compute fault.** The recompute test (Q27_PRINT_WSUM=3,
+digest recomputed 3x per process) never caught a corrupt run, so it answered
+nothing directly. But the correlation settles it another way: TWO INDEPENDENT
+computations -- the checksum kernel and the full forward pass -- are wrong
+together in the same process. Two simultaneous independent compute faults is far
+less likely than one shared corrupt input. Combined with zero in-run drift
+(`--verify-weights`, 150 runs), the weights land wrong and then sit stably wrong
+for that process's lifetime.
+
+**THE RATE IS NOT STATIONARY -- and this weakens several of today's null
+results.** 5090 event history: 6 events in the first ~300 loads (05:14-05:39),
+**0 across the next ~350** (drift2, recompute), then 2 more in 300 (06:08-06:20).
+Roughly 8 / 950 ~= 0.8% overall, but bursty. Consequences, stated plainly:
+- The **4.8 TB H2D soak** (0 errors, 3.22 TB pageable + 1.61 TB pinned) and the
+  **GPU-internal VRAM pattern test** (0 errors) BOTH ran inside the quiet
+  window. Their null results are much weaker than they look and do NOT clear
+  the transfer path or VRAM. Re-run them during an active window before
+  believing either.
+- The **3090 control (0/150) SURVIVES**: it ran 05:28-05:35, inside the active
+  window, between two 5090 events. The card asymmetry is the one cross-hardware
+  result whose timing is defensible.
+- The recompute campaign's 0/200 is a non-result, not evidence of health.
+
+**Still open:** whether the flip happens during the H2D transfer, during the
+device-side write, or in VRAM shortly after. The synthetic tests that would
+distinguish these are the ones invalidated by the quiet window. Note also
+`nvidia-smi -q` shows the 5090's PCIe AER `CESta: Timeout+` (replay-timer
+correctable error) while the 3090's is clear -- suggestive of link marginality,
+though correctable PCIe errors are retried and should not by themselves produce
+silent corruption.
+
+**What q27 should do about it (engine-side, independent of the hardware fix):**
+1. `Q27_PRINT_WSUM=1` at the top of every campaign; discard runs whose `wsum`
+   differs from the modal value. This is the only gate on this box that can see
+   the fault.
+2. Consider making `checksum_baseline()` comparable across processes by default
+   (print the aggregate in the load banner), so a corrupt load is visible
+   without opting in.
+3. The canonical md5 gate should be understood as necessary-not-sufficient: a
+   run can carry corrupt weights and still emit identical tokens (measured: 2 of
+   3 corrupt runs did).
+
+## 2026-08-19 (f): E2.1 (graph-cap raise) MEASURED -> NO-GO. The misses are shape-space, not LRU.
+
+The plan listed the `Q27_BATCH_GRAPH_CAP` default raise as step 1, "free,
+already measured +6.9% at C=4-w16". It does not reproduce here, and the control
+says why.
+
+**A/B, same binary, only the env differs** (w12 server, q4s, `--slots 8
+--ctx 16384`, `Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5 Q27_BATCH_DBG=1`, ladder at
+C=4 x3 then a C=8 null rung, 384 max tokens):
+
+| leg | C=4 misses | C=4 capture ms | evictions | C=8 null |
+|---|---|---|---|---|
+| cap 387 (512, headroom-shrunk) | 50 / 56 / 58 | 770 / 884 / 914 | ~0 | 7 miss, 121 ms |
+| cap 64 (default) | 51 / 59 / 59 | 777 / 688 / 620 | 0 / 46 / 59 | 6 miss, 77 ms |
+
+**Misses are identical.** Cap 64 evicts hard (46-59 per pass) and pays nothing
+for it, because the evicted shapes are never requested again. That is the
+signature of shape-space exhaustion, which entry (l) and the plan both already
+diagnosed -- a bigger cache just holds more one-shot shapes. Capture wall was if
+anything WORSE at 387. Null rung behaves (C=8 is one shape: 6-7 misses either
+way).
+
+**Shipped: revert to 64.** Same throughput for 512 MB instead of ~3 GB of exec
+cache. **Kept: a real bug found on the way.** The ctor headroom check budgeted
+ALL free VRAM (`freeb / per_exec`), which never bound at cap 64 (512 MB) but at
+any large cap would let the exec cache claim every spare byte -- and allocations
+still happen after that point. It now reserves a 768 MB margin, so the cache can
+never trade a 20-28 ms capture stall for an OOM. On this box: 4053 MB free ->
+3248 MB budget -> cap 512 shrinks to 387.
+
+**Two instrument bugs caught, each of which would have shipped a wrong verdict:**
+1. The `[gcache] ... miss ... cap+inst=` line is gated behind `Q27_BATCH_DBG`.
+   The first pass grepped for it with debug OFF and read "0 misses" -- zero
+   INSTRUMENT, not zero misses. Same config with debug on: 50-58.
+2. The control leg's env was passed as an expanded `$2` in command position,
+   where bash treats it as a command name, not an assignment ("command not
+   found"). It logged all zeros; without checking `rounds_sum` (also 0), "cap 64
+   -> 0 misses" would have read as the RAISE being harmful. Always assert the
+   leg actually did work before comparing.
+
+**Consequence for the plan:** E2.1 is closed as a no-go, so the capture tax has
+to come from **E2.2 (graph-key slimming)** -- collapse the shape space by
+indirecting lane pointers through a device table so shapes with equal
+(k, sorted-gw, sfx, smp, kvk) share one exec -- and then **E2.3 (pre-capture)**.
+Those attack the cause; the cap never was the cause.
+
+## 2026-08-19 (g): E1 -- width PAYS warm (+6.2%), and the capture tax eats it (-6.8% raw). E5 is unblocked but STRICTLY behind E2.2.
+
+The reopened question from the 08-18 errata (T1's -13.6% at C=4 was 87% capture
+stalls, so the 08-16 "do NOT raise W_MAX" verdict was unsettled, not settled).
+Both binaries REBUILT AT HEAD, one server instance per leg, ladder C=4 x3 then
+C=8 x2, pass 1 discarded as cold, passes 2-3 averaged.
+
+**Baseline reproduces exactly, which validates the harness:** w12 at C=8 gives
+tok/round 1.702-1.716 at round 27.22-27.48 ms, phv 21.3-21.4, phfd 5.5-5.6 --
+against the plan's recorded "27.2 ms = phv 21.4 + fdraft 5.7, tok/round 1.70".
+
+**WARM C=4 (passes 2-3 averaged):**
+
+| | tok/round | raw round ms | capture ms/rnd | steady round ms | misses/pass |
+|---|---|---|---|---|---|
+| w12 | 2.0617 | 26.95 | 3.58 | 23.38 | 54-61 |
+| w16 | 2.2213 | 31.18 | 7.46 | 23.72 | 110-115 |
+| delta | **+7.74%** | +15.7% | **+108%** | **+1.45%** | **+2x** |
+
+- **Steady-state throughput: +6.20%** (0.08818 -> 0.09365 tok/ms). The real
+  kernel cost of width is only **+1.45% wall** against **+7.74% tokens**.
+- **Raw throughput: -6.84%.** w16 DOUBLES the shape space, so capture misses
+  double (57 -> 113 per pass) and the capture tax doubles (3.58 -> 7.46
+  ms/round), which more than eats the steady-state gain.
+
+**The plan's own cross-check PASSES** (cold-pass phv minus summed cap+inst must
+agree with the warm number within ~0.5 ms/round): w12 23.19 vs 23.38 (0.19 ms),
+w16 23.96 vs 23.72 (0.24 ms). The capture accounting is sound.
+
+**Null rung behaves:** C=8 is trim-floored to width 2 regardless of W_MAX, and
+reads tok/round -1.18%, round +0.91% -- both inside the +-10% acceptance noise
+this instrument carries. The knob provably cannot matter there, and it doesn't.
+
+**VERDICTS.**
+1. **The 08-16 "do NOT raise W_MAX" verdict is RETRACTED for warm-cache
+   serving.** The plan's bar was "tok/round gain >= wall cost, both in %";
+   measured +7.74% vs +1.45%, a 5.3x margin. Width is not expensive. It was
+   never expensive; the capture churn it induces is.
+2. **It STANDS for production as shipped today.** Raw C=4 throughput is -6.8%
+   with w16, because nothing has fixed the shape space. Do not ship a W_MAX
+   raise now.
+3. **E5 (width policy) is unblocked but STRICTLY gated behind E2.2.** This
+   converts E2.2 (graph-key slimming: indirect lane pointers through a device
+   table so shapes sharing (k, sorted-gw, sfx, smp, kvk) collapse to one exec)
+   from "nice capture-tax win" into **the critical path** -- it is what turns a
+   measured +6.2% steady-state width gain into a shippable one, and E2.1 already
+   proved a bigger cache cannot substitute for it.
+
+Estimated compounded value if E2.2 lands: C=4 raw round 26.95 -> ~23.4 ms at
+w16's 2.22 tok/round = ~0.0949 tok/ms vs today's 0.0765 = **+24%** at C=4,
+before any of E3/E4. C=8 is unaffected by both (one shape, floors to 2).
+
+## 2026-08-19 (h): E3.1 -- depth-1 at the floor. +9.8% at C=8, tokens BYTE-IDENTICAL, all gates green.
+
+T4's comment said cutting the extra draft step "has to re-derive the row
+invariant first". Done, and the invariant turns out to be stronger than the
+kernel needs.
+
+**THE DERIVATION.** k_finish_round's accept walk (spec3.cu:1361) is
+```
+for (k = 1; k <= NDRAFT; k++)
+    if (k <= max_draft && n == k && v[k-1] == dr[k-1]) n = k + 1;
+```
+with `max_draft = vw-1`, so it reads `dr[0 .. vw-2]` -- **vw-1 rows, not vw**.
+At the floor vw=2 that is `dr[0]` ALONE, written by draft step 0. Step 1's output
+`dr[1]` is loaded into a register and copied to `outcome[3]`, which the host
+reads only for n > 2 (outcome layout: emitted tokens live in [1..n], and
+n <= vw = 2 here). It cannot change n, the emitted token, or h_next
+(`src = x1s.p[n-1]`).
+
+So "W draft ROWS must exist" (engine.cuh, spec_round) is an A/B-EQUIVALENCE
+property -- its stated purpose is "byte/round identity with the monolithic path"
+(Q27_DEXIT=0) -- not a correctness property of the verify. E3.1 gives that
+identity up at the floor and keeps the emitted tokens.
+
+**Why it is worth anything: at C>=6 the trim floors every lane to 2, so every
+member runs 2 draft steps per round and uses exactly ONE, every round.**
+
+**MEASURED** (`Q27_DRAFT_CEIL1=1`, same binary both legs, 3 passes at C=8):
+
+| C=8 | tok/round | round ms | phfd | phv |
+|---|---|---|---|---|
+| base | 1.7014 | 27.21 | 5.49 | 21.36 |
+| ceil1 | 1.6969 | **24.72** | **3.02** | 21.32 |
+| delta | **-0.26%** | **-9.15%** | **-45%** | -0.19% |
+
+Aggregate **500.3 -> 549.2 t/s at C=8 (+9.8%)**, inside the plan's 550-575 band.
+The draft phase halved exactly as derived; phv is untouched (the verify never
+saw the second step). tok/round is flat at -0.26% against a 3% kill bar.
+**Null rung C=4: phfd 5.32 -> 5.42, i.e. NO change** -- the flag only binds where
+max_grant sits at the floor, which is the whole point.
+
+**GATES, all with the flag ON:**
+- `fused_smoke`: "GRAPH SMOKE PASS: both passes **byte-identical to solo**" --
+  an independent confirmation of the derivation, not a restatement of it.
+- `ninv_test`: CHUNK+FOLD BITWISE ALL PASS.
+- Canonical anchors f64e7c02 x2 + sampled 900031e9 EXACT (the CLI solo path
+  never touches the conductor, so this is by construction, but it is cheap).
+
+**SHIPPED OPT-IN, default unchanged.** The knob is `Q27_DRAFT_CEIL1=1`
+(conductor.h, clamping step_ceiling to max_grant-1). Flipping the default is a
+serving-product call, not a measurement one -- the trade is a documented +9.8%
+at C>=6 against byte-identity with the Q27_DEXIT=0 monolithic path at the floor.
+Recommendation: flip it, since fused_smoke proves the emitted tokens are
+identical to solo and the lost property only ever gated an internal A/B.
+
+**Next in E3:** E3.2 -- with the draft pinned to one unconditional step, the
+margin read no longer gates anything at C>=6, so the whole draft phase becomes
+capturable into the round graph (fdraft 3.02 -> lower still, and one less host
+sync per round). Watch dctl: pinning depth feeds degenerate observations into
+the adaptive ladder, so freeze dctl updates while the concurrency ceiling binds.
+
+## 2026-08-19 (i): E3.2 -- NO-GO, and the reason is a phase-accounting trap worth keeping
+
+E3.2 was "capture the single fused draft step + margin-free gating into the
+round graph" (~a day of conductor work). Before paying for it, a
+measurement-only probe bounded the win: when the ceiling pins every member to
+ONE step, `W = max(2, cap+1) = 2` whether the margin passes or not, so the
+per-step margin D2H + host sync cannot change the round's width. The probe
+skipped them outright (falsifying gate_cap and disabling B8 -- never shippable,
+and now removed from the tree).
+
+**Result at C=8, 3 passes each, same binary:**
+
+| | phfd | phv | round ms | rest = round-phfd-phv |
+|---|---|---|---|---|
+| depth-1 (sync intact) | 3.05 | 21.33 | 24.76 | 0.38 |
+| + no-sync probe | **0.41** | 21.16 | **24.46** | **2.89** |
+
+**phfd collapses 87% and the round wall does not move** (24.76 -> 24.46, and
+passes 1-2 alone read 24.71/24.85 vs 24.66/24.79 -- indistinguishable; the third
+nosync pass at 23.93 also carried phv 20.70, i.e. an acceptance draw, not the
+flag). The 2.64 ms did not vanish: it reappeared in `rest`, which went
+0.38 -> 2.89. The wait simply relocated to the outcome D2H sync in
+fused_round, outside both phase brackets.
+
+**THE TRAP (reusable):** `phfd`/`phv` are HOST-WALL brackets that include
+waiting for GPU work. Moving a sync moves the NUMBER without moving the WALL.
+A phase that looks like 3 ms of "overhead" can be 2.6 ms of unavoidable GPU
+execution being waited on. **Never price a change off a phase bracket alone --
+check that the round wall actually moved, and check where the time went when it
+did not.** This is the same class as the 08-18 share-x-wall error (side-stream
+work overlaps, so GPU-time share overstates exposed wall), from the other
+direction.
+
+**Verdict: E3.2 is a NO-GO at ~0-1% of round wall.** The draft step's GPU time
+is real and must be paid before the verify can run; the sync's placement is
+bookkeeping. Graph capture would additionally remove per-launch overhead, but
+the probe bounds the whole draft-phase-beyond-GPU-compute contribution at
+<= ~1%, which does not justify a day plus a dctl-freeze redesign.
+
+E3 therefore closes with E3.1's +9.8% banked and E3.2 declined on measurement.
+**Next: E2.2 (graph-key slimming), which E1 established as the critical path** --
+it is what converts the measured +6.2% steady-state width gain into a shippable
+one, and E2.1 proved a bigger cache cannot substitute for it.
+
+## 2026-08-19 (j): E2.2 SHIPPED as exec RECYCLING -- +5.3% at C=4, and the first design was a 4.6% regression
+
+The plan's E2.2 was "slim the graph key ... indirect lane pointers through a
+device table so the shape space collapses", a day-plus touching every kernel on
+the fused path. Measurement found a cheaper route to the same prize.
+
+**WHY THE PLAN'S FRAMING WAS INCOMPLETE.** A miss is not one cost. Split
+(new `cap=`/`inst=` fields on the `[gcache] miss` line): **capture 3.1 ms,
+INSTANTIATE 6.1 ms** over 2661-node graphs -- instantiate is 64%. And
+`cudaGraphExecUpdate` costs **0.94 ms**. So the expensive half of a miss is
+exactly the half an update skips.
+
+**THE ENABLING FACT, MEASURED NOT ASSUMED.** Graphs whose per-lane widths are a
+PERMUTATION of each other have identical topology: **234/234 cross-permutation
+`cudaGraphExecUpdate` calls succeeded**, and the 30 misses that found no
+same-class entry match the 30 topology classes exactly (C=4 shape space: 89
+exact keys over 30 classes, a 2.97x collapse from ordering alone).
+
+**v1 WAS A REGRESSION, and the reason is the useful part.** Recycling the LRU
+same-class entry on EVERY miss measured **28.36 vs 27.20 ms at C=4, 4.6%
+SLOWER**. Misses did collapse (53 -> 0 by pass 3) but re-keying an entry STEALS
+a shape that would later have been a free exact-key hit: the control shows 138
+of 191 rounds are hits, and v1 turned them into 139 recycles at ~6.5 ms each --
+strictly more work than 53 misses at ~14 ms. **Caching a recurring shape beats
+re-pointing it once it recurs ~3 times, and here shapes recur ~6 times.**
+Re-pointing only wins for shapes that are one-offs *or already doomed*.
+
+**v2 (shipped): recycle ONLY when the cache is at capacity.** At capacity every
+miss already pays evict + instantiate -- an exec is destroyed regardless -- so
+recycling the LRU same-class victim swaps ~6 ms of instantiate for 0.94 ms of
+update and gives up no hit that was not already being surrendered.
+
+**MEASURED, warm passes 2-3 at C=4 (pass 1 discarded: cold cache cannot recycle):**
+
+| | round ms | graph overhead ms/round | misses | recycles |
+|---|---|---|---|---|
+| recycle ON | **25.37** | **2.24** | 15, 4 | 34, 62 |
+| recycle OFF | 26.71 | 3.65 | 57, 58 | 0 |
+| delta | **-5.05%** | **-39%** | | |
+
+**= +5.3% throughput at C=4.** The mechanism cross-checks: the overhead saving
+(1.40 ms/round) matches the round-wall delta (1.35 ms) to within 0.05 ms, so the
+win is the graph path and not an acceptance draw. **Null rung C=8 reads -0.88%**
+(one topology class, so the cache never fills and recycling barely fires) --
+inside noise, as required.
+
+**GATES (recycling ON, which is the default):** `fused_smoke` GRAPH SMOKE PASS
+**byte-identical to solo**; `ninv_test` CHUNK+FOLD BITWISE ALL PASS; canonical
+f64e7c02 x2 + sampled 900031e9 EXACT.
+
+**Safety argument for mutating a cached exec:** `cudaGraphExecUpdate` must not
+touch an exec pending execution. Every fused round ends with the outcome D2H +
+host sync on cstm before the next round begins capture, and `round_active`
+asserts rounds never overlap -- so nothing in the cache is in flight at the
+recycle point. The class test also compares sfx/smp/kvk as a sorted MULTISET
+alongside the widths, because those select WHICH kernels run, not merely their
+extents; matching widths alone would offer a structurally different graph.
+
+`Q27_GC_RECYCLE=0` restores instantiate-always.
+
+**What this does NOT do:** the first 64 shapes (cap) still instantiate, and
+capture is still paid on every miss. Full pointer indirection would remove the
+capture too. On these numbers that remaining half is ~2.2 ms/round at C=4 --
+worth revisiting only if C=3-6 production traffic becomes the priority.
+
+## 2026-08-19 (k): E5 -- theta is a SHAPE-UNIFORMITY knob, not a token knob. +6.8% at C=4 free; the C=8 token prize needs the union-cap raise.
+
+E5 asked for uniform grants to lift tok/round (1.70 vs ninfer's 2.38). Two
+structural facts came first, then the sweep inverted the expected mechanism.
+
+**STRUCTURAL: at C=8 the union cap is EXACTLY saturated.** `trim_widths` only
+trims DOWN from want (= margin cap + 1), and 8 lanes x width 2 = 16 = W_PLUMB.
+Not one lane can receive a third column. Measured want-vs-granted:
+
+| | want mean | grant mean | lanes trimmed | width destroyed |
+|---|---|---|---|---|
+| C=4 th=0.5 | 3.39 | 2.89 | 35% | 15% of demand |
+| **C=8 th=0.5** | **2.60** | **2.00** | **60%** | **23% of demand** |
+| C=8 th=0.3 | 2.76 | 2.00 | 76% | 27% |
+
+At C=8, 1055 of 1752 lanes want 3 and every one is cut to 2. Wants top out at 3
+because T4's ceiling already caps draft depth there.
+
+**THETA DOES NOT BUY TOKENS.** C=4 sweep, tok/round: 2.069 (th=0.5), 2.058
+(0.3), 2.052 (0.15), 2.051 (0.05) -- FLAT across a 10x change, while the granted
+width-3 share goes 42% -> 92%. Acceptance is the limit, not width. This is the
+plan's own "selection bias" caveat, measured: the extra drafts a lower gate
+admits are simply not accepted.
+
+**THETA BUYS WALL, VIA SHAPE UNIFORMITY.** Same sweep, round ms: 26.45 -> 26.14
+-> 25.41 -> **24.77** (-6.4%, i.e. **+6.8% throughput at flat tokens**), because
+near-uniform grants collapse the shape space: misses per pass 51/21 -> 12/10 and
+capture 3.87 -> 0.92 ms/round. **Capture-subtracted round is IDENTICAL** (23.83
+vs 23.92), so the entire gain is fewer distinct graphs -- the exact reason
+SGLang pads to uniform, arrived at from the other direction. It compounds with
+E2.2, which attacks the same tax by a different route.
+
+C=8 is inert to theta as predicted (tok/round 1.692/1.703/1.682; round
+26.89/26.91/27.05; grants 1590-of-1593 at width 2) -- a clean null rung, since
+the trim discards any extra width there.
+
+**SHIPPABLE NOW:** for low-concurrency serving (C~2-5), `Q27_PMIN=0.05..0.15`
+is worth ~+6.8% at C=4 for zero code and no token cost. Left as a serving knob
+rather than a default change: the default must also be right at C=8 (where it
+does nothing) and under mixed traffic, which this sweep did not cover.
+
+**THE C=8 PRIZE, NOW COSTED.** Granting C=8 its measured mean want (2.60 vs
+2.00) projects to **tok/round ~1.95** by interpolation from C=4 (mean grant 2.89
+-> 2.07 tok/round) -- exactly the plan's E5 bar. Against +8 union columns at the
+post-nucleus coefficient (~0.115 ms/col = +0.92 ms/round on E3.1's 24.72 ms
+round) that is **~+11% at C=8**, on top of E3.1's +9.8%.
+
+**THE BLOCKER, and it is not just struct widths.** W_PLUMB 16 -> 24 breaks
+`6*W <= 96` in fdmma (the fp8-MMA verify attention): at W=24 s_q needs 144
+rounded rows against a 96-row budget, so that kernel cannot run at the target
+width and would have to fall back or be re-tiled. That is the gating design
+question for E5, ahead of the p[] structs, the vgemm NT tile and the record
+arena. Price it against the ~+11%; do not start it as a "struct widening".
+
+## 2026-08-19 (l): E4 -- NO-GO. The mix is 0.35 ms/round exposed, not ~4. Its own prerequisite killed it.
+
+E4 (cross-member batched mix, "multiple days, conductor + engine + two kernels")
+rested on the 08-18 errata: cstm idles through the mix phase and the exposed
+side-phase union is ~2 ms GDN + ~2 ms attention per round. Measured before
+building, that premise is gone.
+
+**nsys, C=8 under load, 149 shared rounds** (`--cuda-graph-trace=node`, stale
+.sqlite deleted, SIGINT + wait for finalize, fresh 27 MB report -- the full
+discipline, and kernels inside the fused graph ARE visible, so the capture is
+sound):
+
+| group | inst | sum ms | UNION ms | overlap | **ms/round** |
+|---|---|---|---|---|---|
+| decode mix, GDN | 3166 | 25.6 | 25.6 | 1.00x | 0.172 |
+| decode mix, attention | 3352 | 26.3 | 26.3 | 1.00x | 0.177 |
+| fold (serial on cstm) | 10272 | 91.9 | 91.9 | 1.00x | 0.616 |
+| weight sweep (gemv/vgemm) | 23097 | 582.7 | 582.7 | 1.00x | 3.911 |
+
+**Whole decode mix = 0.349 ms/round exposed.** The plan assumed ~4 ms and set
+bar >= 1.5 ms, kill < 0.8 ms. Removing the mix ENTIRELY would buy ~1.4% of a
+24.7 ms round. **E4 is killed by its own kill threshold, 11x over.**
+
+**Why the premise died: E4's own prerequisite ate it.** The 08-18 GDN fusion
+(ffd3f8a, 6 kernels -> 3, entry (i)) already collapsed the per-layer fork/join
+E4 was designed to remove. Entry (i) recorded that fusion as "C=8 ~neutral,
+expected win only ~0.6 ms, under ladder noise" -- correct on the wall, but it
+also removed the *headroom* a later batching pass would have claimed. A change
+that measures neutral can still delete a future change's entire budget.
+
+**Also measured: overlap is 1.00x for EVERY group, including the weight sweep
+across 16 streams.** Nothing on this path overlaps in time -- big kernels
+saturate the GPU and the hardware serialises them. So the errata's "members
+overlap 4.17x" does not hold today either; exposed wall == summed kernel time
+for the mix.
+
+**A bigger question this raises, deliberately NOT claimed yet.** Union of ALL
+95267 kernel instances is 827 ms over 149 rounds = **5.55 ms/round of GPU-busy
+against a ~24.7 ms round**; inside the decode window it is 2.85 ms busy per
+15.85 ms wall (18%). If that survives scrutiny, the round is dominated by
+something other than kernel execution and the whole E-series has been optimising
+the wrong 20%. **It is NOT yet a finding:** nsys instruments 95k kernel
+instances and the ladder ran 65.9 t/s under the profiler vs ~74 unprofiled, so
+gaps are inflated by an unknown amount. Treat 18% as an UPPER BOUND on idleness.
+The honest next step is a low-overhead measurement (CUDA events bracketing the
+round on cstm, or cupti activity with kernel tracing only) before any redesign.
+
+**Plan status after E4:** every item is now closed. E0 resolved, E2.1 killed,
+E1 retracted the width NO-GO, E3.1 +9.8% at C=8 (shipped opt-in), E3.2 declined
+(~0-1%), E2.2 +5.3% at C=4 (shipped), E5 +6.8% at C=4 as a serving knob plus a
+costed W_PLUMB case, E4 killed. Remaining named work: E6 fillers (cp.async in
+k_vgemm ~1.2 ms, PDL ~0.5 ms) -- but the 18%-busy question above should be
+settled first, because it decides whether kernel-local work is worth anything.
+
+## 2026-08-19 (m): the "18% GPU-busy" scare is DEAD -- the weight sweep alone is 48% of the round, measured without a profiler
+
+Entry (l) flagged, deliberately unclaimed, that nsys showed 5.55 ms/round of
+GPU-busy against a ~24.7 ms round (18% inside the decode window). Settled now,
+and it was an instrument artifact twice over.
+
+**THE DISPROOF NEEDED NO NEW RUN.** A decode round sweeps the resident weights
+once. nsys attributed 3.91 ms/round to the weight sweep; the sequence is 12.88
+GB, which at even the conservative 1453 GB/s SOL takes 8.9 ms and at the 1692
+GB/s streaming figure takes 7.6 ms. 3.91 ms implies **>3900 GB/s, 2.3x SOL** --
+impossible, so the capture was missing most of its kernels. A shorter capture
+(57 rounds, no NVTX, no ctxsw) improved to 6.38 ms/round and STILL failed the
+same SOL test, so it was not reportable either. **Any GPU-busy number that
+implies super-SOL bandwidth is measuring its own dropped records.**
+
+**THE POSITIVE NUMBER, from `tools/round_weight_cost` (no profiler, replays the
+round's exact mm5 sequence: 401 GEMV calls, 12.88 GB, at union width 16 = C=8's
+actual union):**
+
+| path | ms | GB/s | vs SOL |
+|---|---|---|---|
+| k_vgemm (shipped) | **11.82** | 1090 | **75%** |
+| legacy GEMV | 35.72 | 361 | 25% |
+
+**The weight sweep alone is 11.82 ms of a 24.72 ms round = 48%.** Add the fold,
+mix, attention, tails and sampling and the round is overwhelmingly GPU work.
+Corroborating from the other side: `phv` is 21.32 ms = 86% of the round, and
+phv is a **CUDA event bracket on cstm** (a GPU-stream span), not a host wall --
+correcting a mis-statement in entry (i), where only `phfd` is host-side.
+
+**E6 IS NOW THE BIGGEST REMAINING ITEM, and bigger than the plan priced it.**
+k_vgemm runs at **75% of SOL** on the real round sequence -- worse than the 84%
+recorded from isolated shapes. A cp.async tile reaches 94-96%. Closing that gap
+takes 12.88 GB from 11.82 ms to ~9.4 ms: **~2.4 ms, ~10% of the round**, against
+the plan's "~1.2 ms (~1.5% overall)" estimate, which was computed as a share of
+a bucket rather than against the measured sweep. It is also bitwise-safe by
+construction (a memory-pipeline change; the reduction order is untouched), which
+is a rare combination with a 10% prize.
+
+**Method note worth keeping:** when a profiler and a byte budget disagree, the
+byte budget wins. Bandwidth is a hard physical ceiling; CUPTI records are
+best-effort and drop silently under load. Price any kernel-time claim against
+bytes/SOL before believing it.
+
+## 2026-08-19 (n): E6 -- cp.async is a NO-GO. The staging path is 0.25 ms off a same-grid floor; the exposed cost is the MMA phase. Shipped the 16-byte staging (-2.7%, bit-identical).
+
+Entry (m) named E6 "the biggest remaining item... ~2.4 ms, ~10% of the round",
+priced from k_vgemm sitting at 75% of SOL against a cp.async tile's 94-96%.
+Both halves of that comparison were instrument artifacts. Measured properly,
+the memory pipeline has 0.25 ms left in it and cp.async would spend that
+buying instructions in the phase that is already exposed.
+
+**NEW INSTRUMENT: `tools/vgemm_e6`** (make build/vgemm_e6). Replays the same
+401-weight round sequence as round_weight_cost, but adds the four controls the
+verdict needs: a MEASURED read SOL, CUDA-graph replay, a same-grid floor
+kernel, and a no-MMA build of the real kernel.
+
+**THREE CORRECTIONS TO (m)'s NUMBERS, none of which change its conclusion that
+the weight sweep dominates the round:**
+
+1. **round_weight_cost launches eagerly; the engine does not.** 401 main + 400
+   reduce launches cost **1.7 ms** of pure launch gap that a captured graph
+   does not pay. The sweep is **11.12 ms graph-replayed, not 12.41 ms**.
+2. **The sweep moves 14.66 GB, not 13.89.** round_weight_cost counts codes
+   only; the fp16 group scales are another 0.77 GB (+5.5%).
+3. **`1453` is not this machine's SOL.** Measured streaming-read SOL here is
+   **1691 GB/s** (2 GiB uint4 probe). round_weight_cost's "75% of SOL" and
+   microbench_mxf4's "84%" were computed against different denominators and
+   were never comparable -- the entire "84% -> 94-96%" premise for E6 was a
+   unit mismatch.
+
+**THE DECOMPOSITION** (T=16, graph-replayed, 14.66 GB read + 1.13 GB stored):
+
+| leg | ms | what it isolates |
+|---|---|---|
+| null-launch floor (801 launches) | 0.31 | graph launch overhead |
+| weight-read floor, k_vgemm's exact grid | 9.15 | grid + tail + occupancy class |
+| ... + k_vgemm's epilogue stores | 9.24 | the grid.z partials |
+| k_vgemm with the MMA compiled out | 9.49 | the whole staging path |
+| k_vgemm, main kernel only | 10.21 | + the MMA phase |
+| k_reduce_z alone | 0.62 | the deterministic epilogue |
+| **shipped sweep** | **10.83** | |
+
+Read down the column: the grid costs 5% (**wave quantization is NOT the
+problem** -- 1.9-2.4 waves reaches 95% of SOL), the partial stores cost
+**0.09 ms** (a byte budget predicted 0.71 ms; 96 MB of L2 absorbs them
+entirely, and only the control caught that), the staging path costs
+**0.25 ms**, and the MMA phase costs **0.72 ms**.
+
+**E6 (cp.async) IS DEAD, AND THE DECOMPOSITION IS WHY.** cp.async attacks the
+0.25 ms. On the Q4 leg it cannot even do that for free: cp.async copies raw
+bytes, so the nibble unpack has to move out of the smem store and INTO the MMA
+loop -- about +640 warp-instructions per CTA per super-step, added to the
+0.72 ms phase that is already the exposed cost. Best case it trades 0.25 ms
+for a larger number.
+
+**SHIPPED -- E6a, 16-byte staging (`src/vgemm.cu`).** The tile staged W and X
+through **4-byte** `__ldg`/`STS.32`. One uint4 per thread per array per
+super-step instead: Q4 loads 16 packed bytes, unpacks to 32, and writes two
+`STS.128`; Q8 and X copy 16 bytes straight through. LDW/LDX are multiples of
+16 so every store stays aligned.
+
+| | sweep ms (graph) | main kernel | %SOL |
+|---|---|---|---|
+| before | 11.12 / 11.14 / 11.14 | 10.51 | 82% |
+| **E6a** | **10.82 / 10.83 / 10.84** | **10.21** | **91%** |
+
+**-0.30 ms, -2.7%, against a +-0.01 ms run-to-run spread** (3 paired runs,
+both binaries rebuilt at HEAD). The whole gain is memory-level parallelism:
+an SM has a bounded number of outstanding load slots, and a 4-byte request
+buys a quarter of the in-flight bytes a 16-byte one does.
+
+**BIT-IDENTICAL, and the canonical md5 CANNOT say so.** Solo greedy decode
+stays on the GEMV (`gemm_min`) and never reaches k_vgemm, so `a2982c51...`
+reproducing proves only that nothing else broke. `tools/vgemm_e6` therefore
+folds the raw float bits of every lane output after each of the 401 weights
+into one digest: **base and E6a agree exactly at T=2, 5, 12 and 16.** Plus
+vgemm_test gates 3+4 (no spill, CTA/SM=4 held on all four instantiations),
+racecheck 0 hazards, memcheck 0 errors, fused_smoke union-vs-solo byte-
+identical, canonical a2982c51 with a stable wsum across two runs.
+
+**TWO NO-GOs, both measured:**
+
+- **Depth-2 register prefetch of W: -9%** (11.12 -> 11.82 ms). Prefetching two
+  super-steps doubles the in-flight bytes per CTA, which Little's law says
+  this tile wants. It loses anyway. The register budget is the reason: the
+  gate has zero slack at 64 regs, so the extra uint4 forces the compiler to
+  reschedule rather than allocate, and it defeats the prefetch it was given.
+  Making the buffer index compile-time (WPF-way unroll) recovered only
+  0.20 ms of the 0.70 -- so the select chains were a symptom, not the cause.
+- **The grid.z CTA target is already at its optimum.** Swept
+  `Q27_VG_CTA_TARGET` (a new read-once env override, default = the shipped
+  1400) over 400/700/1000/1400/2000/2800: the sweep is **flat at 10.79-10.84
+  ms from 1000 up** and only degrades below it (11.13 at 400). Lower z gives
+  longer K-slices and a cheaper reduce but starves the machine; higher z
+  shrinks the tile gap and grows the reduce by the same amount. A clean null
+  with the knob's own control rung built in.
+
+**WHAT IS ACTUALLY LEFT IN THE WEIGHT SWEEP**, in size order: the MMA phase
+exposed for **0.72 ms** (at T=16 the round is ~442 GMAC of int8, ~2.1 ms of
+tensor time against a 9.2 ms memory floor -- so this is imperfect overlap of
+real work, not waste), and the deterministic reduce at **0.62 ms**. Neither is
+a memory-pipeline problem and neither is cheap: the first wants a bigger tile
+(MR=64 spills, per vgemm.cuh) and the second is the price of no atomics.
+
+**SCOPE LIMIT, stated plainly.** -0.30 ms is -1.2% of a 24.72 ms round. That
+is well inside the +-10% ladder acceptance noise this plan's own instrument
+rules warn about, so **E6a is judged on the weight-sweep harness and is NOT
+separably measurable in a ladder A/B.** It is shipped because it is free,
+bit-identical, and deterministic to measure -- not because a ladder saw it.
+
+**Method note worth keeping, and it is the twin of (m)'s.** (m) said: when a
+profiler and a byte budget disagree, the byte budget wins. This entry says the
+byte budget also loses to a control -- it predicted 0.71 ms for the partial
+stores and the measured answer was 0.09 ms, because 96 MB of L2 sits between
+the kernel and DRAM. **A bandwidth argument is only sound for traffic that
+actually reaches DRAM. Build the floor kernel.**
+
+## 2026-08-19 (o): the exposed cost is NOT the tensor cores -- it is the smem scale reads. -4.2% cumulative, still bit-identical.
+
+Entry (n) closed cp.async and left two named residuals: 0.72 ms of "exposed
+MMA" and 0.62 ms of reduce. Both were assumed structural. One of them was a
+redundant load the compiler never removed.
+
+**THE 0.72 ms IS NOT TENSOR TIME.** A `-DQ27_VGEMM_NOTC` build -- every
+fragment LDS and the whole fp32 scaling chain kept live, only `mma.sync`
+dropped -- lands at **10.11 ms** against 10.21 full and 9.49 staging-only. So
+the compute phase splits **0.62 ms of smem reads + scaling, 0.10 ms of
+tensor-core issue.** The tensor cores are ~2.0-2.5 ms of work and are already
+~96% hidden behind the weight stream; the thing standing in the round's way is
+the arithmetic around them.
+
+**SASS SAID WHERE.** `cuobjdump -sass` on `k_vgemm<32,true,1>`: **40 LDS per
+super-step**, and the cc loop is fully unrolled so that is the whole body.
+16 A-fragment + 8 B-fragment + **16 SCALE loads -- for six distinct values.**
+ptxas never CSEd them, because `kb / 64` and `kb / 32` hide the invariance
+behind an integer divide it will not fold across the unroll.
+
+**SHIPPED -- E6c, hoist the scale loads (16 -> 4).** Spelled out, the
+invariance is obvious and the loads vectorize:
+- Q4's two w-scales over the whole cc range are ADJACENT (`kb/64 = kg*2 +
+  cc/2`), so one LDS.64 per row instead of four LDS.32.
+- Q8 needs exactly ONE (`kb/128 == kg` for every cc).
+- The four x-scales are CONSECUTIVE (`kb/32 = kg*4 + cc`), so one LDS.128
+  instead of four LDS.32, twice.
+
+Same values, same multiply order, bit-identical by inspection and by digest.
+SASS 424 -> 400 instructions, LDS 40 -> 30.
+
+**CUMULATIVE, paired 3-run A/B, both binaries rebuilt at HEAD:**
+
+| | sweep ms (graph) | main kernel | tile gap vs floor |
+|---|---|---|---|
+| pre-E6 | 11.12 / 11.12 / 11.13 | 10.51 | 1.27 |
+| E6a (16-byte staging) | 10.82 / 10.83 / 10.84 | 10.21 | 0.97 |
+| **E6a+E6c** | **10.66 / 10.66 / 10.65** | **10.04** | **0.80** |
+
+**-0.47 ms, -4.2% of the weight sweep**, against a +-0.01 ms spread. Output
+digest IDENTICAL to pre-E6 at T=2, 5, 12 and 16 over all 401 weights. Gates:
+vgemm_test 3+4 (no spill, CTA/SM=4 on all four instantiations), racecheck 0
+hazards, fused_smoke union-vs-solo byte-identical, canonical a2982c51.
+
+**TWO MORE NO-GOs, both priced before building:**
+
+- **Fusing k_reduce_z into the main kernel: NOT WORTH IT.** Priced three ways
+  and it fails all three. The reduce's 0.62 ms is ~0.155 ms of launch (400
+  graph-replayed launches) plus ~0.46 ms of work, and a fused last-CTA
+  epilogue only saves 1/z of the partial traffic -- which the store control in
+  (n) already showed L2 makes nearly free. The second-order case was the graph
+  nodes: measured **1.6 us per node** to capture+instantiate (801 nodes 1.06 ms
+  vs 401 nodes 0.42 ms), so deleting all 400 reduce nodes saves 0.64 ms of a
+  ~23 ms round capture -- under 3%. Total realistic prize ~0.2 ms, for a
+  semaphore-based cross-CTA reduce in the determinism path. Declined.
+- **ldmatrix for the A/B fragments: REVERTED.** It does exactly what it should
+  on paper -- 24 scalar LDS collapse into 4 `ldmatrix.x4` + 4 `.x2`, and the
+  lane->register mapping IS the m16n8k32 fragment layout, so it stayed
+  bit-identical. It measured a consistent but tiny **-0.02 ms** (10.655 ->
+  10.633, 3 paired runs), and **SASS instruction count did not move at all**
+  (400 -> 400): the lane-masking address math replaced what the LDS removal
+  saved. It re-encoded the work instead of removing it. Not worth
+  hand-derived PTX fragment mappings in this kernel for 0.08% of a round.
+
+**THE DIFFERENCE BETWEEN E6c AND THE ldmatrix ARM IS THE WHOLE LESSON.** Both
+cut the same instruction class in the same phase. E6c removed *redundant work*
+-- 16 loads serving 6 values -- and paid 0.17 ms. ldmatrix removed *encoding*
+-- the same six values, fetched more compactly -- and paid nothing. When a
+phase is issue-bound, look for work that is being done twice before looking
+for a wider instruction to do it in.
+
+**WHERE THE WEIGHT SWEEP NOW STANDS: 10.66 ms against a 9.24 ms same-grid
+floor that includes its stores.** The residual is 0.80 ms of compute phase
+(of which only ~0.10 is tensor issue; the rest is fragment reads and the
+scaling chain, now without the redundancy) and 0.62 ms of deterministic
+reduce. Neither has a cheap next move. Scope limit unchanged from (n): -0.47 ms
+is -1.9% of a 24.72 ms round, inside ladder noise, judged on the harness.

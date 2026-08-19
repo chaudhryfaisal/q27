@@ -60,6 +60,19 @@ GROUP_FP4 = 16
 Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
 Q4_HEAD = False  # set from --q4-head (q4s tier: single Q4 lm_head)
 PF4 = False      # set from --pf4 (fp4 prefill sidecars, ninfer-steals phase 2)
+FP4_ROUND = False  # set from --fp4-round (T1 weight-grid attribution arm)
+
+# The fp4 prefill include list, shared by --pf4 (which emits sidecars for these)
+# and --fp4-round (which rounds these in place). Keeping one definition is the
+# point: T1 only attributes the phase-2 W4A4 result if it moves the same
+# tensors. blk.64 (MTP) is outside the prefill loop and the SSM path is
+# deliberately excluded (ssm_out cancellation lesson, BUILDLOG 2026-08-14).
+PF4_INCLUDE = re.compile(r"blk\.(\d+)\.(ffn_gate|ffn_up|ffn_down|attn_q|attn_output)\.weight$")
+
+
+def pf4_included(name: str) -> bool:
+    m = PF4_INCLUDE.match(name)
+    return bool(m) and int(m.group(1)) < 64
 
 
 def policy(name: str) -> int:
@@ -157,6 +170,54 @@ def quant_nvfp4(w: np.ndarray):
     deq = (np.where(codes & 8, -1.0, 1.0) * _E2M1_POS[codes & 7]
            * sw[..., None]).reshape(rows, cols).astype(np.float32)
     return packed.tobytes(), sb.tobytes(), deq
+
+
+def fp4_round(w: np.ndarray, codec: str) -> np.ndarray:
+    """Round w onto the e2m1 grid and return the DEQUANTIZED values (no packing).
+
+    Two codecs, because they are not the same measurement:
+
+    `q27` reproduces quant_nvfp4 exactly -- one ue4m3 byte per 16 holding
+    amax/6 in ABSOLUTE units. That is what --pf4 emits and what src/pf4.cu
+    reads, so it is the right choice for reproducing the shipped sidecars.
+    It is also miscalibrated for weights: measured on this checkpoint, ~100% of
+    16-element blocks have amax/6 near 0.0033, which is BELOW ue4m3's smallest
+    normal (2^-6 = 0.015625), so the scale lands in the subnormal region where
+    the step is a flat 2^-9. The scale itself then carries 20-40% error before
+    the value grid is applied, and 44% of the resulting error VARIANCE is scale
+    quantization rather than e2m1.
+
+    `nvfp4` is the canonical two-level scheme: a per-tensor fp32 global scale
+    normalizes the block scales into e4m3's normal range, where precision is
+    relative rather than absolute. Measured rel RMSE 0.0950 vs the q27 codec's
+    0.1274 on blk.0.ffn_gate, against an oracle (exact fp32 block scale) of
+    0.0941 -- so it recovers essentially all of the gap and what is left IS the
+    value grid. This is the codec to use when the question is "is the fp4
+    WEIGHT GRID survivable", which is what T1 asks.
+
+    Storing the global scale needs a format change the sidecar payload cannot
+    take (src/loader.cpp fixes the payload at codes + one scale byte per 16),
+    so this path deliberately returns values rather than a pack: T1 puts them
+    in an ordinary container tier and never serializes fp4.
+    """
+    rows, cols = (1, w.shape[0]) if w.ndim == 1 else (int(np.prod(w.shape[:-1])), w.shape[-1])
+    assert cols % GROUP_FP4 == 0, f"cols {cols} not divisible by {GROUP_FP4}"
+    g = w.reshape(rows, cols // GROUP_FP4, GROUP_FP4).astype(np.float32)
+    amax = np.abs(g).max(axis=2)
+    if codec == "nvfp4":
+        # amax_tensor / (6 * 448): maps the largest block's scale to the top of
+        # the ue4m3 range so no block is left in the subnormals.
+        sg = float(np.abs(w).max()) / (6.0 * _UE4M3[-1])
+        sg = sg if sg > 0 else 1.0
+        sw = _UE4M3[_nearest_even(np.minimum(amax / 6.0 / sg, _UE4M3[-1]), _UE4M3)] * sg
+    elif codec == "q27":
+        sw = _UE4M3[_nearest_even(np.minimum(amax / 6.0, _UE4M3[-1]), _UE4M3)]
+    else:
+        raise ValueError(f"unknown fp4 codec {codec!r}")
+    inv = np.where(sw > 0, 1.0 / np.where(sw > 0, sw, 1), 0.0).astype(np.float32)
+    ci = _nearest_even(np.minimum(np.abs(g) * inv[..., None], 6.0), _E2M1_POS)
+    deq = np.where(g < 0, -1.0, 1.0) * _E2M1_POS[ci] * sw[..., None]
+    return deq.reshape(rows, cols).astype(np.float32)
 
 
 def quant_q8(w: np.ndarray):
@@ -535,12 +596,45 @@ def main():
                          "attn+FFN projection weights for the fp4 prefill path "
                          "(Q27_PREFILL=fp4; ninfer-steals phase 2). ~10.5 GB extra; readers "
                          "older than DTYPE 7 cannot open the resulting file")
+    ap.add_argument("--fp4-round", action="store_true",
+                    help="T1 attribution arm (docs/plans/2026-08-18-fp4-viability-tests.md): "
+                         "round the fp4 include-list projections onto the e2m1 grid with the "
+                         "ue4m3 per-16 scale BEFORE the container quantizer, then store the "
+                         "rounded values in the normal tier. The engine runs its ordinary "
+                         "full-precision-activation path, so a differential against the same "
+                         "container unmodified isolates fp4 WEIGHT-GRID damage from the "
+                         "activation damage the W4A4 arm confounded it with. Emits no "
+                         "sidecars and needs no new kernel; pair with a container fine enough "
+                         "to preserve the rounded values (Q8_G128 on the include list)")
+    ap.add_argument("--fp4-round-exclude", default=None,
+                    help="regex of include-list tensors to LEAVE at base precision. Pairs with "
+                         "--fp4-round-source to isolate an outside tier's two variables: run "
+                         "its weights with its carve-outs, then q27's own rounding with the "
+                         "SAME carve-outs, and the difference is that tier's encoder alone")
+    ap.add_argument("--fp4-round-source", default=None,
+                    help="instead of rounding here, take the already-quantized fp4 values from "
+                         "another engine's artifact and store those (scratchpad/ninfer_fp4.py "
+                         "supplies the reader). Lets q27's per-position instrument score a "
+                         "THIRD-PARTY fp4 tier -- including its mixed-precision carve-outs, "
+                         "since a tensor that engine does not store as fp4 is left at base "
+                         "precision. Valid only because that pipeline applies no AWQ/smoothing "
+                         "compensation; if it ever does, its weights stop being droppable")
+    ap.add_argument("--fp4-round-codec", choices=("nvfp4", "q27"), default="nvfp4",
+                    help="which fp4 encoding --fp4-round applies. nvfp4 (default) is the "
+                         "canonical two-level scheme -- a per-tensor fp32 global scale keeps "
+                         "the ue4m3 block scales out of the subnormal region -- and is the "
+                         "one that isolates the VALUE grid. q27 reproduces the single-level "
+                         "encoding quant_nvfp4/--pf4 actually ship, which on this checkpoint "
+                         "puts ~100%% of blocks in ue4m3 subnormals and charges 44%% of its "
+                         "error variance to scale quantization; use it to price the shipped "
+                         "sidecars, not to answer whether fp4 weights are viable")
     args = ap.parse_args()
-    global Q8_EXTRA, Q4_HEAD, PF4
+    global Q8_EXTRA, Q4_HEAD, PF4, FP4_ROUND
     if args.q8:
         Q8_EXTRA = re.compile(args.q8)
     Q4_HEAD = args.q4_head
     PF4 = args.pf4
+    FP4_ROUND = args.fp4_round
 
     t0 = time.time()
     r = GGUFReader(args.input)
@@ -588,6 +682,21 @@ def main():
         meta["pf4_sidecars"] = True
         meta["group_fp4"] = GROUP_FP4
         meta["pf4_encoding"] = "e2m1 even=low, ue4m3 scale per 16"
+    if args.fp4_round:
+        # Self-describing: this artifact is NOT a shippable tier, it is one leg
+        # of the T1 differential. Anything that reads quant_policy should see it.
+        meta["fp4_round"] = True
+        meta["group_fp4"] = GROUP_FP4
+        meta["fp4_round_include"] = PF4_INCLUDE.pattern
+        if args.fp4_round_exclude:
+            meta["fp4_round_exclude"] = args.fp4_round_exclude
+        meta["fp4_round_codec"] = ("borrowed:" + args.fp4_round_source
+                                   if args.fp4_round_source else args.fp4_round_codec)
+        meta["fp4_round_encoding"] = (
+            "e2m1 + ue4m3 per 16 (two-level, per-tensor fp32 global scale), "
+            "dequantized into the container tier" if args.fp4_round_codec == "nvfp4" else
+            "e2m1 + ue4m3 per 16 (single-level, absolute block scale -- the shipped "
+            "--pf4 encoding), dequantized into the container tier")
     # The primary owns every architectural field. Split validation proved the
     # companion matches; only its intentional 65-block/MTP declarations may
     # override the 64-block base view.
@@ -630,20 +739,23 @@ def main():
                 and not ternary and not binary:
             extra.append(("output_q4.weight", t))
     if PF4:
-        # fp4 prefill sidecars: attn+FFN projections only. attn_q/attn_output
-        # exist only on attention layers; blk.64 (MTP) is outside the prefill
-        # loop; the SSM path (attn_qkv/attn_gate/ssm_*) is deliberately
-        # excluded (ssm_out cancellation lesson, BUILDLOG 2026-08-14).
-        pf4_re = re.compile(r"blk\.(\d+)\.(ffn_gate|ffn_up|ffn_down|attn_q|attn_output)\.weight$")
+        # fp4 prefill sidecars: attn+FFN projections only, per PF4_INCLUDE.
         for t in r.tensors:
-            m = pf4_re.match(t.name)
-            if m and int(m.group(1)) < 64:
+            if pf4_included(t.name):
                 extra.append((t.name + ".pf4", t))
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
     tensor_iter = source_tensors + [_Alias(n, t) for n, t in extra]
     zero_fracs = []
+    fp4_rounded, fp4_containers, fp4_skipped = [], {}, []
+    fp4_src = None
+    fp4_exclude = re.compile(args.fp4_round_exclude) if args.fp4_round_exclude else None
+    if FP4_ROUND and args.fp4_round_source:
+        sys.path.insert(0, str(__import__("os").path.dirname(__import__("os").path.abspath(__file__))
+                              + "/../scratchpad"))
+        from ninfer_fp4 import NinferWeights
+        fp4_src = NinferWeights(args.fp4_round_source)
     for t in tensor_iter:
         if only and not only.search(t.name):
             continue
@@ -680,6 +792,30 @@ def main():
                              f"binary pack (expected Q1_0 or F32 only)")
         w = to_f32(t)
         n_bytes_in += w.nbytes
+        w_ref = w  # error is always reported against the SOURCE weights
+        if FP4_ROUND and pf4_included(t.name) and fp4_exclude and fp4_exclude.search(t.name):
+            fp4_skipped.append(t.name)
+        elif FP4_ROUND and pf4_included(t.name):
+            # Round onto the e2m1 grid, then hand the rounded values to the
+            # container quantizer. Groups run along the contiguous axis, same
+            # as the sidecars. See fp4_round() for why the codec is a choice
+            # and not a constant.
+            if w.ndim < 2 or w.shape[-1] % GROUP_FP4 != 0:
+                raise ValueError(f"{t.name}: --fp4-round needs a 2-D tensor whose contiguous "
+                                 f"axis divides {GROUP_FP4}; got shape {w.shape}")
+            if fp4_src is not None:
+                borrowed = fp4_src.get(t.name)
+                if borrowed is None:
+                    fp4_skipped.append(t.name)  # their recipe keeps this one high-precision
+                else:
+                    if borrowed.shape != w.shape:
+                        raise ValueError(f"{t.name}: --fp4-round-source gave {borrowed.shape}, "
+                                         f"expected {w.shape}")
+                    w = borrowed.astype(np.float32)
+                    fp4_rounded.append(t.name)
+            else:
+                w = fp4_round(w, args.fp4_round_codec).reshape(w.shape)
+                fp4_rounded.append(t.name)
         dt = policy(t.name)
         if dt == DTYPE_Q4 and w.shape[-1] % GROUP_Q4 != 0:
             dt = DTYPE_F16  # fallback, shouldn't happen on this model
@@ -700,9 +836,13 @@ def main():
         else:
             data, scales, deq = quant_q4(w)
 
-        denom = float(np.sqrt(np.mean(w.astype(np.float64) ** 2))) or 1e-12
-        rel_rmse = float(np.sqrt(np.mean((w - deq.reshape(w.shape)).astype(np.float64) ** 2))) / denom
+        denom = float(np.sqrt(np.mean(w_ref.astype(np.float64) ** 2))) or 1e-12
+        rel_rmse = float(np.sqrt(np.mean(
+            (w_ref - deq.reshape(w_ref.shape)).astype(np.float64) ** 2))) / denom
         errors.append((rel_rmse, t.name, DTYPE_NAMES[dt]))
+        if FP4_ROUND and w is not w_ref:
+            fp4_containers.setdefault(DTYPE_NAMES[dt], 0)
+            fp4_containers[DTYPE_NAMES[dt]] += 1
 
         data_off = offset
         offset += len(data)
@@ -716,7 +856,7 @@ def main():
         blobs.append((data_off, data))
         if scales:
             blobs.append((scale_off, scales))
-        del w, deq
+        del w, w_ref, deq
 
     meta_b = json.dumps(meta).encode()
     with open(args.output, "wb") as f:
@@ -745,6 +885,28 @@ def main():
     print(f"\nworst {args.report} tensors by relative RMSE:")
     for rmse, name, dtn in errors[:args.report]:
         print(f"  {rmse:.4f}  {dtn:8s} {name}")
+
+    if FP4_ROUND:
+        by_tier = ", ".join(f"{n}x {k}" for k, n in sorted(fp4_containers.items()))
+        print(f"\nfp4-round: {len(fp4_rounded)} include-list tensors rounded to the e2m1/ue4m3 "
+              f"grid before packing ({by_tier or 'none'})")
+        coarse = {k: n for k, n in fp4_containers.items() if k != "Q8_G128"}
+        if coarse:
+            # A Q4_G64 container cannot represent the rounded values (16 levels
+            # over 64 elements vs fp4's per-16 scale), so leg B stops being
+            # "fp4 weights" and becomes "q4 of fp4" -- strictly worse, which
+            # biases T1 toward a FALSE kill. Say so where it will be read.
+            print(f"  WARNING: {sum(coarse.values())} landed in a container coarser than "
+                  f"Q8_G128 ({', '.join(sorted(coarse))}). The differential against the same "
+                  f"container is CONTAMINATED there -- re-run with "
+                  f"--q8 '(attn_q|attn_output|ffn_gate|ffn_up|ffn_down)\\.'")
+        if fp4_skipped:
+            print(f"  {len(fp4_skipped)} left at base precision -- the source tier keeps them "
+                  f"high-precision, and reproducing that carve-out is the point: "
+                  f"{', '.join(fp4_skipped[:8])}{' ...' if len(fp4_skipped) > 8 else ''}")
+        if len(fp4_rounded) + len(fp4_skipped) != 224:
+            print(f"  NOTE: expected 224 include-list tensors (5 projections x 64/16 layers); "
+                  f"got {len(fp4_rounded) + len(fp4_skipped)} -- check --only")
 
     if zero_fracs:
         total = sum(n for _, n, _ in zero_fracs)

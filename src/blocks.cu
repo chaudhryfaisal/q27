@@ -141,7 +141,8 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_conv_chunk3
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; 2026-08-18: also
+// k_gdn_convnorm3 in spec3.cu): k_gdn_conv_chunk3
 // (spec3.cu, the M1 speculative-lane chunk) and k_conv_prefill_T (prefill.cu)
 // are arithmetic twins of this tap/silu math -- any arithmetic change here
 // MUST be mirrored in both and re-gated with ninv's CHUNK+FOLD leg (bitwise,
@@ -177,11 +178,12 @@ void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const f
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_delta_chunk3
-// (spec3.cu) and k_delta_scan_T (prefill.cu, also the M1 Fold) are per-step
-// arithmetic twins of this body (smem-resident state, identical tile split
-// and part[0..3] reduction order) -- mirror any change in both and re-gate
-// with ninv's CHUNK+FOLD leg (bitwise, both arches).
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; extended 2026-08-18):
+// k_gdn_delta_chunk3 and k_gdn_delta_all (spec3.cu) and k_delta_scan_T
+// (prefill.cu, also the M1 Fold) are per-step arithmetic twins of this body
+// (smem-resident state, identical tile split and part[0..3] reduction order)
+// -- mirror any change in ALL of them and re-gate with ninv's CHUNK+FOLD leg
+// plus build/gdn_fuse_eq (bitwise, both arches).
 __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
                              const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,
@@ -534,8 +536,15 @@ __device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigne
 // inv_temp/top_p from the device param block (graph-fixed pointer). Writes
 // out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh clamped <= M so the argmax
 // token is always in the nucleus (guards degenerate/tiny top_p).
-__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
-                            float* __restrict__ out) {
+// Body factored out so the single-lane and multi-lane entry points cannot drift:
+// one block computes one lane, exactly as before. Every reduction is within the
+// block and no state crosses blocks, so running L lanes as L BLOCKS is bitwise
+// identical to L sequential single-block launches -- it only stops them
+// serializing on one SM. Measured 2026-08-18 (nsys, C=8): the per-lane loop was
+// ~16 launches/round x 280 us, one SM of 170 each, 10.6% of all GPU kernel time.
+__device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
+                                             const SampleParams* __restrict__ sp,
+                                             float* __restrict__ out) {
     const float inv_temp = sp->inv_temp, top_p = sp->top_p;
     __shared__ float sh[1024];
     __shared__ float s_M, s_logZ, s_lo, s_hi, s_thresh;
@@ -614,6 +623,18 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
     }
 }
 
+__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
+                            float* __restrict__ out) {
+    nucleus_body(x, n, sp, out);
+}
+
+// One block per verify lane, one launch. Same body, same per-block reduction
+// order -> bitwise identical to the loop it replaces.
+__global__ void k_nucleus_multi(CP3 xs, int n, const SampleParams* __restrict__ sp,
+                                float* __restrict__ out) {
+    nucleus_body(xs.p[blockIdx.x], n, sp, out + blockIdx.x * 4);
+}
+
 // Gumbel-max over the nucleus: argmax_i (inv_temp*x_i + G_i), G_i from Philox,
 // restricted to x_i >= nuc[0]. Reads inv_temp/seed from the param block and the
 // key position from *d_pos (device). Same am_pack+atomicMax reduction as
@@ -661,6 +682,16 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st) {
     k_nucleus_d<<<1, 1024, 0, st>>>(logits, n, d_sp, d_nuc);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Batched twin: L lanes in ONE launch, block b == lane b. Replaces the per-lane
+// nucleus() loop in the sampled verify (engine.cuh). Bitwise identical per lane;
+// the win is purely that L single-block launches stop serializing on one SM.
+void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
+                   cudaStream_t st) {
+    if (L <= 0) return;
+    k_nucleus_multi<<<L, 1024, 0, st>>>(xs, n, d_sp, d_nuc);
     CUDA_CHECK(cudaGetLastError());
 }
 

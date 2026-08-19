@@ -685,13 +685,20 @@ __global__ void k_gemm_splitk_reduce(const float* __restrict__ tmp, float* __res
 }
 
 // SM count for the current device, cached per device index.
+// Both queries are CHECKED (2026-08-18): the return codes used to be discarded
+// against an UNINITIALIZED cudaDeviceProp, so a failed query latched stack
+// garbage into the cache for the whole process -- and this value picks
+// gemm_splitk_nsp, i.e. how many partials k_gemm_splitk_reduce sums, a real
+// reduction-order (numeric) change. A device query that can silently choose a
+// different answer is the exact defect class the greedy-anchor hunt was
+// chasing; it is off that path, but it is not worth leaving armed.
 static int cur_nsm() {
     static int cache[16] = {0};
     int dev = 0;
-    cudaGetDevice(&dev);
+    CUDA_CHECK(cudaGetDevice(&dev));
     if (dev >= 0 && dev < 16 && cache[dev]) return cache[dev];
-    cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, dev);
+    cudaDeviceProp p{};
+    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
     int n = p.multiProcessorCount;
     if (dev >= 0 && dev < 16) cache[dev] = n;
     return n;
@@ -704,10 +711,10 @@ static int cur_nsm() {
 static int cur_sm_major() {
     static int cache[16] = {0};
     int dev = 0;
-    cudaGetDevice(&dev);
+    CUDA_CHECK(cudaGetDevice(&dev));
     if (dev >= 0 && dev < 16 && cache[dev]) return cache[dev];
-    cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, dev);
+    cudaDeviceProp p{};
+    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
     int maj = p.major;
     if (dev >= 0 && dev < 16) cache[dev] = maj;
     return maj;

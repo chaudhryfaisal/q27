@@ -144,9 +144,12 @@ MXF4FLAGS = -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a -Xcompiler -W
 build/pf4.o: src/pf4.cu src/pf4.h | build
 	$(NVCC) $(MXF4FLAGS) -c src/pf4.cu -o $@
 
-build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp \
-                       src/prefill.cuh src/kernels.cuh src/device_model.h src/loader.h src/cuda_common.h | build
-	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
+# src/vgemm.cu is in the link line for the T2 decode leg: the union GEMM the
+# C-sweep routes batched decode to at k >= 3 is the BASELINE at decode shapes
+# (gemm_q4_T is prefill-only and is never reached from a fused round).
+build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+                       src/prefill.cuh src/kernels.cuh src/vgemm.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
@@ -162,6 +165,14 @@ build/vgemm_test: tools/vgemm_test.cu src/vgemm.cuh $(VGEMM_SRC) | build
 
 build/vgemm_race: tools/vgemm_race.cu src/vgemm.cuh $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/vgemm_race.cu $(VGEMM_SRC) -o $@
+
+# E6 attribution harness: splits the weight sweep's missing bandwidth into launch
+# gaps / reduce epilogue / grid tail / the tile itself, against a MEASURED SOL.
+build/vgemm_e6: tools/vgemm_e6.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/vgemm_e6.cu $(VGEMM_SRC) -o $@
+
+build/round_weight_cost: tools/round_weight_cost.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/round_weight_cost.cu $(VGEMM_SRC) -o $@
 
 build/fdmma_test: tools/fdmma_test.cu src/fdmma.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/fdmma_test.cu -o $@

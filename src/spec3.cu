@@ -151,6 +151,227 @@ void gdn_delta_chunk3(const float* S0, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- 2026-08-18 GDN mix fusion (round-budget follow-on) -------------------
+// nsys attribution: the decode mix ran 6 kernels x 48 layers x members per
+// round, chain wall 38.8 us of which 13.0 us was inter-kernel gap, and the
+// delta pair moved S three times (delta_step read+write, chunk3 re-read).
+// These two kernels collapse the chain to 3 launches (conv_step + convnorm3 +
+// delta_all) and move S twice (read once, write once).
+//
+// MIRROR WARNING (extends the M1 warning above): k_gdn_delta_all's lane-0
+// phase is the FOURTH copy of the delta-step arithmetic (k_delta_step,
+// k_delta_scan_T, k_gdn_delta_chunk3, here) -- same tile split, same
+// part[0..3] reduction order, same decay/pred/d/update sequence. Any
+// arithmetic change in one MUST land in all four, re-gated with
+// build/gdn_fuse_eq (bitwise) + ninv's CHUNK+FOLD leg.
+
+// k_gdn_delta_all: lane 0's committed delta step PLUS lanes 1..nsp's chunk
+// outputs, one launch. S is staged raw into smem, lane 0 updates it in smem
+// (writing the committed rows to global exactly as k_delta_step does), then
+// the chunk loop runs from the smem copy -- which holds bit-for-bit the bytes
+// chunk3 would have re-read from global, because fp32 stored to smem and fp32
+// stored to global are the same value. Lane 0's arithmetic is k_delta_step's
+// with S[i*SK+j] standing in for the sreg[] registers: same per-element
+// expressions, same accumulation order (the pragma-unroll difference does not
+// reassociate the single-accumulator chains).
+__global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
+                                __grid_constant__ const CP3 conv3,
+                                __grid_constant__ const CP3 g3,
+                                __grid_constant__ const CP3 beta3,
+                                __grid_constant__ const P3 o3, int nsp) {
+    constexpr int SK = 128;
+    extern __shared__ float S[]; // [128][128] = 64KB
+    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
+    const int h = blockIdx.x;
+    const int j = threadIdx.x & (SK - 1);
+    const int it = threadIdx.x >> 7;
+    const int i0 = it * 32;
+#if Q27_GDN_HEAD_TILE
+    const int qk = h % 16;
+#else
+    const int qk = h / 3;
+#endif
+    const float scale = rsqrtf((float)SK);
+    const float* Sgh = Ssrc + (size_t)h * SK * SK;
+    float* Soh = Sdst + (size_t)h * SK * SK;
+    for (int i = i0; i < i0 + 32; i++) S[i * SK + j] = Sgh[i * SK + j];
+    __syncthreads();
+    // ---- lane 0: k_delta_step, smem-resident, committed rows written out ----
+    {
+        const float* conv = conv3.p[0];
+        if (it == 0) {
+            sq[j] = conv[qk * SK + j] * scale;
+            sk[j] = conv[2048 + qk * SK + j];
+        }
+        __syncthreads();
+        const float decay = expf(g3.p[0][h]);
+        float pred = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] * decay;
+            S[i * SK + j] = s;
+            pred += sk[i] * s;
+        }
+        part[it][j] = pred;
+        __syncthreads();
+        if (it == 0) {
+            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float vj = conv[4096 + h * SK + j];
+            dj[j] = beta3.p[0][h] * (vj - p);
+        }
+        __syncthreads();
+        float d = dj[j];
+        float acc = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] + sk[i] * d;
+            S[i * SK + j] = s;
+            Soh[i * SK + j] = s;
+            acc += sq[i] * s;
+        }
+        part[it][j] = acc;
+        __syncthreads();
+        if (it == 0)
+            o3.p[0][h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        __syncthreads();
+    }
+    // ---- lanes 1..nsp: k_gdn_delta_chunk3's loop, verbatim ----
+    for (int t = 0; t < nsp; t++) {
+        const float* conv = conv3.p[t + 1];
+        if (it == 0) {
+            sq[j] = conv[qk * SK + j] * scale;
+            sk[j] = conv[2048 + qk * SK + j];
+        }
+        __syncthreads();
+        const float decay = expf(g3.p[t + 1][h]);
+        float pred = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] * decay;
+            S[i * SK + j] = s;
+            pred += sk[i] * s;
+        }
+        part[it][j] = pred;
+        __syncthreads();
+        if (it == 0) {
+            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float vj = conv[4096 + h * SK + j];
+            dj[j] = beta3.p[t + 1][h] * (vj - p);
+        }
+        __syncthreads();
+        float d = dj[j];
+        float acc = 0.f;
+#pragma unroll 8
+        for (int i = i0; i < i0 + 32; i++) {
+            float s = S[i * SK + j] + sk[i] * d;
+            S[i * SK + j] = s;
+            acc += sq[i] * s;
+        }
+        part[it][j] = acc;
+        __syncthreads();
+        if (it == 0)
+            o3.p[t + 1][h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        __syncthreads();
+    }
+}
+
+void gdn_delta_all(const float* Ssrc, float* Sdst, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
+                   cudaStream_t st) {
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gdn_delta_all,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        128 * 128 * 4));
+        attr = true;
+    }
+    k_gdn_delta_all<<<48, 512, 128 * 128 * 4, st>>>(Ssrc, Sdst, conv, g, beta, o, nsp);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// k_gdn_convnorm3: lanes 1..vw-1's conv (k_gdn_conv_chunk3's tap arithmetic,
+// verbatim) + ALL lanes' q||k l2norm (k_l2norm3's 128-thread tree, verbatim
+// pairing order) + the record copies (k_gdn_record3), one launch. Lane 0's
+// conv values come from k_conv_step (stream-ordered, unchanged). The norm
+// blocks write the post-norm value once instead of chunk3's write + l2norm3's
+// read-modify-write -- same final bytes.
+//
+// Grid, 128 threads/block:
+//   blocks [0, 32*vw)          role A: lane = bx/32, head = bx%32, channels
+//                              head*128 + tid (q||k, 0..4095). conv (lane>=1)
+//                              -> norm (all lanes) -> record (lane>=1).
+//   blocks [32*vw, +48*(vw-1)) role B: v channels 4096..10239 for lanes
+//                              1..vw-1, conv + record only. First block of a
+//                              lane's segment also records g/beta (tid < 48).
+__global__ void k_gdn_convnorm3(const float* __restrict__ ring,
+                                __grid_constant__ const CP3 qkv,
+                                const float* __restrict__ w,
+                                __grid_constant__ const P3 out,
+                                __grid_constant__ const CP3 g3,
+                                __grid_constant__ const CP3 beta3,
+                                float* __restrict__ rq, float* __restrict__ rc,
+                                float* __restrict__ rg, float* __restrict__ rb,
+                                int channels, int n_heads, float eps, int vw) {
+    constexpr int HD = 128; // norm head_dim == the l2norm3 call's GDN_DIM
+    const int bx = blockIdx.x, tid = threadIdx.x;
+    const int na = 32 * vw;
+    auto conv_at = [&](int L, int c) {
+        const float* wc = w + (size_t)c * 4;
+        auto tap = [&](int a) {
+            return a >= 1 ? qkv.p[a][c] : ring[(size_t)(a + 2) * channels + c];
+        };
+        float r0 = tap(L - 3), r1 = tap(L - 2), r2 = tap(L - 1), x = tap(L);
+#if Q27_CONV_OLDEST_FIRST
+        float acc = r0 * wc[0] + r1 * wc[1] + r2 * wc[2] + x * wc[3];
+#else
+        float acc = r0 * wc[3] + r1 * wc[2] + r2 * wc[1] + x * wc[0];
+#endif
+        return acc / (1.0f + expf(-acc)); // silu
+    };
+    if (bx < na) { // role A: q||k conv + norm + record
+        const int lane = bx / 32, head = bx - lane * 32;
+        const int c = head * HD + tid;
+        float val = lane == 0 ? out.p[0][c] : conv_at(lane, c);
+        __shared__ float sh[128];
+        sh[tid] = val * val;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) { // k_l2norm3's tree, blockDim 128
+            if (tid < s) sh[tid] += sh[tid + s];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(fmaxf(sh[0], eps * eps));
+        const float nv = val * inv;
+        out.p[lane][c] = nv;
+        if (lane >= 1) {
+            const int t = lane - 1;
+            rc[(size_t)t * channels + c] = nv;
+            rq[(size_t)t * channels + c] = qkv.p[lane][c];
+        }
+    } else { // role B: v-region conv + record, lanes 1..vw-1
+        const int b2 = bx - na;
+        const int vblk = (channels - 32 * HD) / 128; // 48
+        const int lane = b2 / vblk + 1, cb = (b2 - (lane - 1) * vblk) * 128 + 32 * HD;
+        const int c = cb + tid;
+        const float val = conv_at(lane, c);
+        out.p[lane][c] = val;
+        const int t = lane - 1;
+        rc[(size_t)t * channels + c] = val;
+        rq[(size_t)t * channels + c] = qkv.p[lane][c];
+        if (cb == 32 * HD && tid < n_heads) {
+            rg[(size_t)t * n_heads + tid] = g3.p[lane][tid];
+            rb[(size_t)t * n_heads + tid] = beta3.p[lane][tid];
+        }
+    }
+}
+
+void gdn_convnorm3(const float* ring, CP3 qkv, const float* convw, P3 out, CP3 g, CP3 beta,
+                   float* rec_qkv, float* rec_conv, float* rec_g, float* rec_beta, int channels,
+                   int n_heads, float eps, int vw, cudaStream_t st) {
+    const int nblk = 32 * vw + ((channels - 4096) / 128) * (vw - 1);
+    k_gdn_convnorm3<<<nblk, 128, 0, st>>>(ring, qkv, convw, out, g, beta, rec_qkv, rec_conv,
+                                          rec_g, rec_beta, channels, n_heads, eps, vw);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Record lanes 1..nsp into the per-layer arena (row L-1): raw qkv + post-norm
 // conv rows (contiguous [row][channels], so the Fold's conv_ring_update /
 // delta_scan_seq consume them with prefill's row stride), g/beta scalars
