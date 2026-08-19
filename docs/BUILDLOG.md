@@ -12906,3 +12906,49 @@ silent corruption.
 3. The canonical md5 gate should be understood as necessary-not-sufficient: a
    run can carry corrupt weights and still emit identical tokens (measured: 2 of
    3 corrupt runs did).
+
+## 2026-08-19 (f): E2.1 (graph-cap raise) MEASURED -> NO-GO. The misses are shape-space, not LRU.
+
+The plan listed the `Q27_BATCH_GRAPH_CAP` default raise as step 1, "free,
+already measured +6.9% at C=4-w16". It does not reproduce here, and the control
+says why.
+
+**A/B, same binary, only the env differs** (w12 server, q4s, `--slots 8
+--ctx 16384`, `Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5 Q27_BATCH_DBG=1`, ladder at
+C=4 x3 then a C=8 null rung, 384 max tokens):
+
+| leg | C=4 misses | C=4 capture ms | evictions | C=8 null |
+|---|---|---|---|---|
+| cap 387 (512, headroom-shrunk) | 50 / 56 / 58 | 770 / 884 / 914 | ~0 | 7 miss, 121 ms |
+| cap 64 (default) | 51 / 59 / 59 | 777 / 688 / 620 | 0 / 46 / 59 | 6 miss, 77 ms |
+
+**Misses are identical.** Cap 64 evicts hard (46-59 per pass) and pays nothing
+for it, because the evicted shapes are never requested again. That is the
+signature of shape-space exhaustion, which entry (l) and the plan both already
+diagnosed -- a bigger cache just holds more one-shot shapes. Capture wall was if
+anything WORSE at 387. Null rung behaves (C=8 is one shape: 6-7 misses either
+way).
+
+**Shipped: revert to 64.** Same throughput for 512 MB instead of ~3 GB of exec
+cache. **Kept: a real bug found on the way.** The ctor headroom check budgeted
+ALL free VRAM (`freeb / per_exec`), which never bound at cap 64 (512 MB) but at
+any large cap would let the exec cache claim every spare byte -- and allocations
+still happen after that point. It now reserves a 768 MB margin, so the cache can
+never trade a 20-28 ms capture stall for an OOM. On this box: 4053 MB free ->
+3248 MB budget -> cap 512 shrinks to 387.
+
+**Two instrument bugs caught, each of which would have shipped a wrong verdict:**
+1. The `[gcache] ... miss ... cap+inst=` line is gated behind `Q27_BATCH_DBG`.
+   The first pass grepped for it with debug OFF and read "0 misses" -- zero
+   INSTRUMENT, not zero misses. Same config with debug on: 50-58.
+2. The control leg's env was passed as an expanded `$2` in command position,
+   where bash treats it as a command name, not an assignment ("command not
+   found"). It logged all zeros; without checking `rounds_sum` (also 0), "cap 64
+   -> 0 misses" would have read as the RAISE being harmful. Always assert the
+   leg actually did work before comparing.
+
+**Consequence for the plan:** E2.1 is closed as a no-go, so the capture tax has
+to come from **E2.2 (graph-key slimming)** -- collapse the shape space by
+indirecting lane pointers through a device table so shapes with equal
+(k, sorted-gw, sfx, smp, kvk) share one exec -- and then **E2.3 (pre-capture)**.
+Those attack the cause; the cap never was the cause.

@@ -478,11 +478,15 @@ int main(int argc, char** argv) {
         // fp8 / 1.40x turbo3 (bar 1.38x), live CC fused rounds -17..-19%
         // phv/round at matched depth, solo cost 0.00% -- a single-slot server
         // pays nothing (k=1 falls through to the proven solo path, byte-
-        // identical). GRAPH_CAP=64: live CC traffic drew a 44+ graph-key
-        // alphabet vs the LRU-32 default (86% hits, benign eviction churn);
-        // 64 swallows the observed alphabet at ~460 MB worst case, and the
-        // conductor's ctor headroom check SHRINKS-never-aborts, so tight
-        // configs self-protect. Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0,
+        // identical). GRAPH_CAP: live CC traffic drew a 44+ graph-key alphabet
+        // vs the LRU-32 default (86% hits, benign eviction churn); 64 swallowed
+        // THAT alphabet, but the 2026-08-18 capture-tax measurement found the
+        // real cost is elsewhere -- heterogeneous C=3..6 explodes the shape
+        // space (35% miss at C=4 with ZERO evictions, i.e. shape-space
+        // exhaustion, not LRU pressure), and each miss costs 20-28 ms of
+        // capture+instantiate. Raised to 512 (E2.1): the conductor's ctor
+        // headroom check SHRINKS-never-aborts, so tight configs self-protect,
+        // and uniform C=8 is unaffected (one shape, always a hit). Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0,
         // Q27_PROFILE=ref (ref skips this whole block, so it stays off there).
         setenv("Q27_BATCH", "1", 0);
         setenv("Q27_BATCH_GRAPH", "1", 0);

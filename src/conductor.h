@@ -952,13 +952,22 @@ public:
             size_t freeb = 0, totalb = 0;
             CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
             const size_t per_exec = 8ull << 20;
-            if (freeb < (size_t)gc_cap_ * per_exec) {
-                int shrunk = (int)(freeb / per_exec);
+            // Reserve a margin (E2.1): the old budget was ALL free VRAM, which
+            // never bound at cap 64 (512 MB) but at cap 512 would let the exec
+            // cache claim every spare byte -- and allocations still happen after
+            // this point (prefix-cache pages, arena growth, driver scratch). A
+            // cache that starves them trades a 20-28 ms capture stall for an
+            // OOM, which is a strictly worse deal.
+            const size_t margin = 768ull << 20;
+            const size_t budget = freeb > margin ? freeb - margin : 0;
+            if ((size_t)gc_cap_ * per_exec > budget) {
+                int shrunk = (int)(budget / per_exec);
                 if (shrunk < 1) shrunk = 1;
                 fprintf(stderr,
-                        "[gcache] headroom: %.0f MB free < cap %d x 8 MB/exec -- "
-                        "shrinking exec-cache cap to %d (LRU recapture covers the rest)\n",
-                        freeb / 1e6, gc_cap_, shrunk);
+                        "[gcache] headroom: %.0f MB free (%.0f MB budget after margin) < "
+                        "cap %d x 8 MB/exec -- shrinking exec-cache cap to %d "
+                        "(LRU recapture covers the rest)\n",
+                        freeb / 1e6, budget / 1e6, gc_cap_, shrunk);
                 gc_cap_ = shrunk;
             }
             // (no gcache_.reserve here: a bad_alloc before the try block
