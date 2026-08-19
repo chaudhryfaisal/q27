@@ -12592,3 +12592,33 @@ gating, and that is what is compromised, at ~1%. Until the mechanism is found,
 a single md5 mismatch on a greedy gate is NOT sufficient evidence of a
 regression -- re-run via `tools/anchor_check.sh -n 3` and read the
 distribution it prints.
+
+## 2026-08-18 (n): the single-step reproducer FLIPS -- the whole defect is one forward pass
+
+The 59-token tie prefix (`scratchpad/prefix_tie.txt`, 5 prompt + canonical
+A[0:54]) run with `-n 1`, no `--spec`, on the 5090: **run 131 returned `846`**
+instead of the canonical `271`. Loop: `scratchpad/tie_loop.sh <dev> <N> <expect>`.
+
+That is the whole result. The defect does NOT need 45 rounds of generation, a
+draft/verify ladder, or a 128-token trajectory: **one prefill + one decode step
+at this position reproduces it**, at a rate consistent with the full-run figure
+(1 in 131 here vs 2 in 300 there). Everything downstream in the 128-token run
+was just the tie's consequence.
+
+Why this matters more than the rate: it collapses the instrumented surface from
+the entire decode loop to a single pass, which is what makes compute-sanitizer,
+an ncu capture, or a per-kernel bisect affordable. Any future work on this bug
+should start from the 59-token prefix, not the anchor recipe.
+
+Control, same prefix on the 3090: `846` deterministically (150/150 runs, 0
+flips, from the pre-crash leg of the same loop) -- the sm_86 family sits on the
+other side of the tie with no ambiguity. So sm_120 is the arch whose result is
+unstable at this position; sm_86 is not.
+
+Session-hygiene note paid for today: a `compute-sanitizer` run launched as a
+plain background shell died with the tmux session, while every campaign under
+`systemd-run --user` survived and completed -- exactly what
+[[ops-long-jobs-haight]] says. The crash also orphaned a `tie_loop.sh` that kept
+respawning 17 GB q27 processes on the 3090 until killed. Long GPU jobs go under
+`systemd-run --user`, no exceptions; and after any session crash, check
+`pgrep -af build/q27` before trusting a GPU-idle reading.
