@@ -12095,3 +12095,67 @@ anyone porting from the docstring builds the wrong thing.
 Remaining at C=8: round 29.62 ms of which verify is ~23.7 and the shared weight
 sweep ~10. The unexplained ~10 ms of verify is now the largest single item and
 the next target.
+
+## 2026-08-18 (g): DSpark drafter measured head-to-head -- ties the MTP head we already have, for 2.5x the draft compute
+
+The 2026-07-09 DFlash NO-GO set DO-NOT-RETRY condition (a): "a drafter retrained
+on q27-quant hiddens exists". A DSpark drafter for this exact target now exists
+and is public (`satgeze/Qwen3.6-27B-DSpark`, apache-2.0, 3.73 GB GGUF,
+markov_rank 256, mask_token_id 248200, confidence head), so the condition is
+close enough to fire. **Measured. The NO-GO stands.**
+
+**No CUDA was written.** Local llama.cpp (build 2114) already implements
+`--spec-type draft-dspark`, so this is a single-variable A/B: same engine, same
+target, same prompt, only the drafter head changes. That is a better test than
+the P0a rig would have been -- and `scratchpad/dflash_p0a.py` is gone anyway
+(scratchpad is untracked); only `--dump-taps` survives in engine.cu.
+
+Single-stream, greedy, 512 tokens, Q4_K_M target, ctx 8192, CUDA_VISIBLE_DEVICES=0:
+
+| probe | leg | decode t/s | mean accept len | acceptance | draft tokens |
+|---|---|--:|--:|--:|--:|
+| prose | none | 75.5 | -- | -- | -- |
+| prose | **draft-mtp** | **87.1** | **2.77** | 0.295 | **1111** |
+| prose | draft-dspark | 79.2 | 2.63 | 0.111 | 2868 |
+| code | **draft-mtp** | **101.9** | 3.27 | 0.381 | **930** |
+| code | draft-dspark | 100.4 | 3.30 | 0.155 | 2302 |
+
+**DSpark loses on prose and ties on code, and pays ~2.5x the draft tokens in
+both.** The in-checkpoint MTP head -- the one q27 already drives -- is the better
+drafter for this target at block 15.
+
+**The target-quant confound was bounded, not ignored.** Q4_K_M was forced: the
+Q5_K_M target (19.5 GB) plus the 3.5 GB draft OOMs at -ngl 99 even at ctx 4096,
+because llama.cpp's fitter aborts when n_gpu_layers is user-pinned. satgeze's
+card says acceptance tracks target coherence, so a coarser target could depress
+it. Control: MTP scores **2.77 on Q4_K_M and 2.88 on Q5_K_M**, a 4% spread. The
+target is not degraded enough to explain a gap of the size needed to overturn
+the result.
+
+Neither leg reproduces satgeze's headline 5.35-5.53 AL. Their own varied-prompt
+acceptance (0.19-0.20) is much closer to the 0.155 measured here than their
+narrow-probe 0.29-0.31, which is exactly the caution their card prints: "when
+you compare drafter heads, make sure you compare the same kind of probe."
+
+**WHY THIS SETTLES IT FOR q27, on economics rather than acceptance.** A drafter
+that spends 2.5x the draft tokens is precisely backwards for q27's batch regime:
+T4 (same day) bought +10.4% at C=8 by REMOVING draft work the trim discards, and
+at C=8 the trim grants width 2 no matter how many tokens a block drafter
+proposes. So DSpark is a C=1-2 play at best, and at C=1-2 it does not beat what
+q27 already has. Building the mask-fill block forward, the rank-256 markov head,
+the confidence head and a `DSparkDraftModel` loader -- weeks of CUDA, plus 2.7-8.8
+GB of VRAM against the 4.06 GB free at 8 slots / 16K -- buys a tie.
+
+**Consequence for the ninfer/SGLang gap.** If the drafter head is a wash, then a
+third-party single-stream figure like 206 t/s cannot be attributed to the
+drafter. It has to be round wall, which is where every measurement today has
+pointed. q27's remaining C=8 target is unchanged and unglamorous: ~29.6 ms round
+after T4, verify ~23.7 of it, shared weight sweep ~10, and **~10 ms of verify
+still unattributed.**
+
+Artifacts kept: `/mnt/ai/models/qwen36-27b-dspark/Qwen3.6-27B-DSpark.gguf`.
+Re-run: `--spec-type draft-dspark -md <gguf> --spec-draft-n-max 15`. Note
+llama-cli ignores `-no-cnv` here and spins an interactive loop (it wrote a 3.9 GB
+log of empty prompts); drive llama-server over HTTP instead, and require an
+HTTP **200** from /health -- it answers 503 while still loading, which will
+happily accept requests into a model that is not up.
