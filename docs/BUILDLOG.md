@@ -13173,3 +13173,57 @@ extents; matching widths alone would offer a structurally different graph.
 capture is still paid on every miss. Full pointer indirection would remove the
 capture too. On these numbers that remaining half is ~2.2 ms/round at C=4 --
 worth revisiting only if C=3-6 production traffic becomes the priority.
+
+## 2026-08-19 (k): E5 -- theta is a SHAPE-UNIFORMITY knob, not a token knob. +6.8% at C=4 free; the C=8 token prize needs the union-cap raise.
+
+E5 asked for uniform grants to lift tok/round (1.70 vs ninfer's 2.38). Two
+structural facts came first, then the sweep inverted the expected mechanism.
+
+**STRUCTURAL: at C=8 the union cap is EXACTLY saturated.** `trim_widths` only
+trims DOWN from want (= margin cap + 1), and 8 lanes x width 2 = 16 = W_PLUMB.
+Not one lane can receive a third column. Measured want-vs-granted:
+
+| | want mean | grant mean | lanes trimmed | width destroyed |
+|---|---|---|---|---|
+| C=4 th=0.5 | 3.39 | 2.89 | 35% | 15% of demand |
+| **C=8 th=0.5** | **2.60** | **2.00** | **60%** | **23% of demand** |
+| C=8 th=0.3 | 2.76 | 2.00 | 76% | 27% |
+
+At C=8, 1055 of 1752 lanes want 3 and every one is cut to 2. Wants top out at 3
+because T4's ceiling already caps draft depth there.
+
+**THETA DOES NOT BUY TOKENS.** C=4 sweep, tok/round: 2.069 (th=0.5), 2.058
+(0.3), 2.052 (0.15), 2.051 (0.05) -- FLAT across a 10x change, while the granted
+width-3 share goes 42% -> 92%. Acceptance is the limit, not width. This is the
+plan's own "selection bias" caveat, measured: the extra drafts a lower gate
+admits are simply not accepted.
+
+**THETA BUYS WALL, VIA SHAPE UNIFORMITY.** Same sweep, round ms: 26.45 -> 26.14
+-> 25.41 -> **24.77** (-6.4%, i.e. **+6.8% throughput at flat tokens**), because
+near-uniform grants collapse the shape space: misses per pass 51/21 -> 12/10 and
+capture 3.87 -> 0.92 ms/round. **Capture-subtracted round is IDENTICAL** (23.83
+vs 23.92), so the entire gain is fewer distinct graphs -- the exact reason
+SGLang pads to uniform, arrived at from the other direction. It compounds with
+E2.2, which attacks the same tax by a different route.
+
+C=8 is inert to theta as predicted (tok/round 1.692/1.703/1.682; round
+26.89/26.91/27.05; grants 1590-of-1593 at width 2) -- a clean null rung, since
+the trim discards any extra width there.
+
+**SHIPPABLE NOW:** for low-concurrency serving (C~2-5), `Q27_PMIN=0.05..0.15`
+is worth ~+6.8% at C=4 for zero code and no token cost. Left as a serving knob
+rather than a default change: the default must also be right at C=8 (where it
+does nothing) and under mixed traffic, which this sweep did not cover.
+
+**THE C=8 PRIZE, NOW COSTED.** Granting C=8 its measured mean want (2.60 vs
+2.00) projects to **tok/round ~1.95** by interpolation from C=4 (mean grant 2.89
+-> 2.07 tok/round) -- exactly the plan's E5 bar. Against +8 union columns at the
+post-nucleus coefficient (~0.115 ms/col = +0.92 ms/round on E3.1's 24.72 ms
+round) that is **~+11% at C=8**, on top of E3.1's +9.8%.
+
+**THE BLOCKER, and it is not just struct widths.** W_PLUMB 16 -> 24 breaks
+`6*W <= 96` in fdmma (the fp8-MMA verify attention): at W=24 s_q needs 144
+rounded rows against a 96-row budget, so that kernel cannot run at the target
+width and would have to fall back or be re-tiled. That is the gating design
+question for E5, ahead of the p[] structs, the vgemm NT tile and the record
+arena. Price it against the ~+11%; do not start it as a "struct widening".
