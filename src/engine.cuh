@@ -810,8 +810,16 @@ struct Engine {
         p += strlen("\"attn_layers\": [");
         while (p < mj.size() && mj[p] != ']') {
             int v = atoi(mj.c_str() + p);
-            if (v <= N_LAYER) attn_layer[v] = true;
+            // atoi happily returns a NEGATIVE value, and attn_layer[-n] = true is
+            // an out-of-bounds write into this object. The upper bound was always
+            // right (the array is deliberately N_LAYER + 1 wide); the lower bound
+            // was missing.
+            if (v >= 0 && v <= N_LAYER) attn_layer[v] = true;
             p = mj.find_first_of(",]", p);
+            // A truncated meta_json -- "attn_layers": [0,1,2 with no closing
+            // bracket -- returns npos here, and mj[npos] is out of bounds. The
+            // loop head cannot catch it: it runs after this read.
+            if (p == std::string::npos) break;
             if (mj[p] == ',') p++;
         }
 

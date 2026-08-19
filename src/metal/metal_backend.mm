@@ -1091,6 +1091,12 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (!weight.data) throw std::runtime_error("q27 Metal: matvec weight has no data");
     if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX)
         throw std::runtime_error("q27 Metal: unsupported matvec dimensions");
+    // Before the byte-size math below, which assumes a dtype this backend has a
+    // kernel for. Rejected here so the failure names the dtype instead of
+    // surfacing as a confusing "matvec weight" range error.
+    if (!metal_weight_dtype_supported(weight.dtype))
+        throw std::runtime_error("q27 Metal: unsupported weight dtype " +
+                                 std::string(dtype_name(weight.dtype)));
 
     const MetalBuffer& data = metal_buffer_view(weight.data);
     const MetalBuffer& input = metal_buffer(x);
@@ -1124,6 +1130,13 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         case DType::T2_G128: pipeline = impl_->t2; label = "q27_matvec_t2_g128"; break;
         case DType::T3_G128: pipeline = impl_->t3; label = "q27_matvec_t3_g128"; break;
         case DType::B1_G128: pipeline = impl_->b1; label = "q27_matvec_b1_g128"; break;
+        // No Metal kernel: rejected above. The case is still listed because this
+        // switch deliberately has no default -- that is what makes -Wswitch
+        // -Werror force an answer for every future dtype. Throwing rather than
+        // falling through matters: a nil pipeline reaches
+        // setComputePipelineState: below and traps inside Metal.
+        case DType::FP4_G16:
+            throw std::runtime_error("q27 Metal: FP4_G16 is a CUDA-only prefill sidecar");
     }
     const MetalBuffer* quant_scales = nullptr;
     if (quant_group) {

@@ -4,9 +4,13 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
 
 ## Why this is interesting
 
-- **Fastest known way to run this model on real agentic traffic.** 47 s per
+- **Fastest of the four engines tested, on this harness.** 47 s per
   SWE-bench instance against llama.cpp's 71 s, ninfer's 97 s and vLLM's 84 s,
-  same 12 tasks and one harness (2026-08-17, four engines, table below). The
+  same 12 tasks and one harness (2026-08-17, four engines, table below).
+  n=1 per instance, legs ran sequentially, and sampling was left at each
+  engine's defaults rather than matched -- so read it as a result for this
+  pinned run, not a general ranking. Caveats in
+  [FINDINGS.md](bench/crossengine/FINDINGS.md#6-caveats). The
   win is prefix reuse, not raw decode -- ninfer decodes *faster* than q27
   (250-261 t/s vs 215-223) and still takes 2-7x the wall time, because it
   re-prefills every turn. On a 24GB 3090: +19% decode at 2x the context over
@@ -59,9 +63,15 @@ campaign replaces it.
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.4+ at
-`/usr/local/cuda` (12.4 is a hard floor: older ptxas rejects the sm_89
-e4m3 MMA forms), and gcc. `make` builds ONE tri-arch binary (sm_86 +
+Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.8+ at
+`/usr/local/cuda`, and gcc. **12.8 is the floor for the default build on
+every card, including a 3090**: `make` unconditionally emits `sm_120` and
+links `build/pf4.o`, which is compiled for the arch-specific `sm_120a`
+target, into every engine binary. (12.4 is only the floor for the sm_89
+e4m3 MMA forms; older ptxas rejects those too.) To build on a 12.4
+toolkit you would have to drop the sm_120 gencode from `NVCCFLAGS` and
+the `build/pf4.o` dependency from the engine targets -- untested.
+`make` builds ONE tri-arch binary (sm_86 +
 sm_89 + sm_120: 3090, 4090/Ada, and 5090 class); arch dispatch is at
 runtime -- fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80)
 runs the fp16-MMA verify (h16) and fp16/turbo3 KV. (v0.3.1+
@@ -239,8 +249,17 @@ checkpoint already skips their prefill. Deep cold prefill (the saturated
 large-T grid) gets a complementary lever since v0.3.4: an ntx M-minitile
 GEMM that shares one activation `ldmatrix` load across two row-tiles
 (+3.4% GEMM / ~6% cold-prefill wall, bitwise, sm_120; `Q27_PF_NTX=0`
-opts out). fp4/`tcgen05` is a hardware dead end here -- consumer/
-workstation Blackwell has no fp4 MMA in PTX, so int8 is the ceiling.
+opts out). fp4 is **not** a hardware dead end here -- that earlier verdict
+was a toolchain trap, retracted 2026-08-14. The block-scaled fp4 MMA
+(`mma.sync...kind::mxf4nvf4`) does exist on consumer Blackwell, but only
+behind the arch-SPECIFIC `sm_120a` target; under the plain `sm_120`
+gencode ptxas rejects the instruction and the failure is indistinguishable
+from missing silicon. It runs, at 780-868 TFLOPS (`tools/microbench_mxf4`).
+`tcgen05` really is absent. fp4 still loses at decode, for an unrelated
+reason: nvfp4 spends 0.5 B of e2m1 plus one ue4m3 per 16 = 4.50 bpw
+against Q4_G64's 0.5 plus one fp16 per 64 = 4.25, so it moves **1.0588x
+the bytes for the same weights**, and decode here is a byte count, not a
+FLOP count. Measured 1.016-1.085x end to end against a >=1.25x bar.
 
 Two serving-side additions since: **P16 persistent prefix cache** (opt-in,
 `--prefix-cache DIR`) survives a restart or a fresh conversation by writing the
@@ -777,7 +796,11 @@ Four engines, one 5090, one harness, one accounting convention, same
 Qwen3.6-27B-MTP weights. 12 pinned SWE-bench_Verified instances driven through
 Claude Code; requests normalized across engines so each sees identical bytes;
 timing taken client-side by a measurement proxy rather than from four different
-log dialects (2026-08-17).
+log dialects (2026-08-17). What is normalized is the request payload -- SAMPLING
+IS NOT MATCHED (each engine applies its own defaults when the client sends
+none, which is the real-world configuration but not a controlled one), and
+trajectories diverged between legs, so the reuse comparison is across different
+conversation populations. n=1 per instance.
 
 **Real agentic traffic** -- the workload the engine exists for:
 
@@ -811,9 +834,16 @@ llama.cpp and vLLM all solve that; ninfer is the outlier.
 | vLLM NVFP4 | 67.5 | 110.0 | 216.5 | 398.8 | 6.53 |
 | llama.cpp | 90.1 | 156.1 | 129.1 | 230.3 | **6** |
 
-**q27 loses this half.** ninfer's NVFP4 peaks at 1.91x q27's best, riding fp4
-MMA that engages at batch width -- a *format* win, not a batching one: their own
-int8 tier peaks below q27. Client-side accounting agrees with q27's internal
+**q27 loses this half.** ninfer's NVFP4 peaks at 1.91x q27's best. *An earlier
+draft of this section read that as a format win -- fp4 MMA engaging at batch
+width -- because ninfer's own int8 tier peaks below q27. That attribution was
+wrong, and their source says so: `text_policy()` hands `AllowA4` to
+`QType::NVFP4` and `A16Only` to every other qtype, so **their int tier is locked
+out of their own batch kernel by policy**. fp4 did not make nvfp4 fast; A16Only
+made nint slow, and the within-engine comparison was never a format control. The
+real gap is per-lane cost: their round wall is FLAT from C=1 to C=2 (15.04 ->
+15.00 ms), which is a reclaimed-idle-machine story, not an arithmetic one.*
+Client-side accounting agrees with q27's internal
 `[req]` telemetry to within 0.1% at every rung, so these are comparable across
 engines and to q27's own ladder history.
 
@@ -826,8 +856,10 @@ its per-slot GDN cost -- that is what the 412.9 t/s rung is made of.
 **Quality does not separate them.** benchlocal `--medium`, 5 packs / 75
 deterministic-verifier scenarios, temp 0: q27 q5f **66**, llama.cpp **66**,
 vLLM **66**, ninfer NVFP4 65, q27 q4s 64, ninfer int8 64 -- four engines and
-five quant formats inside a 2-point band. Engine and quant choice do not
-measurably move correctness on this model, so the throughput numbers above
+five quant formats inside a 2-point band. No difference was DETECTED on these
+75 scenarios -- at n=1 per scenario that is a null result, not a demonstration
+of equivalence, and it does not rule out differences smaller than the band or
+outside these packs. On this evidence the throughput numbers above
 carry no quality asterisk.
 
 **Defect found, filable upstream:** vLLM's MTP speculative path produces
@@ -847,12 +879,22 @@ The 2026-08-17 four-engine run lives in
 [bench/crossengine/](bench/crossengine/) -- harness, per-leg raw data, the
 write-up in [FINDINGS.md](bench/crossengine/FINDINGS.md), and the two
 attribution experiments the headline claims rest on (the vLLM MTP corruption
-A/B and llama.cpp's slot-ceiling walk) under `isolation/`. Every table above
-regenerates with:
+A/B and llama.cpp's slot-ceiling walk) under `isolation/`. The wall-time,
+prefill and decode tables regenerate from the committed data with:
 
 ```bash
 python3 bench/crossengine/harness/analyze.py bench/crossengine
 ```
+
+**The prefix-reuse column does not.** It prints `n/a` for the q27 and ninfer
+legs on a fresh clone, because that number comes from each engine's own
+instrument and only llama.cpp's travels in the committed transcripts
+(`cache_read_input_tokens`, in `agentic.llama.jsonl`). q27's reuse is parsed
+from `[gen] prompt=N prefix_hit=M` server lines and ninfer's from its request
+log, neither of which is in the archive; vLLM emits no such field at all. So
+the headline "the win is prefix reuse" rests on telemetry you have to re-run
+the harness to reproduce, not on the archive. The numbers as measured are in
+[FINDINGS.md](bench/crossengine/FINDINGS.md).
 
 That section also documents the seven harness bugs the run hit, each of which
 produced a plausible and wrong number first -- the worst of them said "ninfer
