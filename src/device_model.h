@@ -63,11 +63,21 @@ class DeviceModel {
     // is the only way to see a bad upload: the same artifact must produce the
     // same aggregate on every load. Printed at load under Q27_PRINT_WSUM=1.
     unsigned long long checksum_aggregate() const;
+    // HOST-side twin of the above, summed on the CPU from the SOURCE bytes
+    // immediately before each cudaMemcpy (enabled by Q27_PRINT_WSUM=1, since it
+    // touches the whole model on the CPU). Comparing the two localizes a
+    // corrupt load: host==device but both varying across runs => the bytes were
+    // already wrong in host memory (page cache / DRAM / read path); host stable
+    // while device varies => the copy or VRAM is at fault.
+    unsigned long long host_aggregate() const { return host_sum_; }
+    void enable_host_sum(bool on) { want_host_sum_ = on; }
 
   private:
     const Model& model_;
     std::unordered_map<std::string, DevTensor> dev_;
     std::unordered_map<std::string, unsigned long long> sums_;
+    unsigned long long host_sum_ = 0;
+    bool want_host_sum_ = false;
     size_t bytes_ = 0;
 };
 

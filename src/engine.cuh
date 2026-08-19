@@ -1219,6 +1219,7 @@ struct Engine {
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
+            if (getenv("Q27_PRINT_WSUM")) dm.enable_host_sum(true);
             dm.upload_all(q27k::pf4_on(), q27k::pf4_instrument());
             dm.checksum_baseline();
             fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
@@ -1226,8 +1227,22 @@ struct Engine {
             // print the SAME value on every load; a difference means the upload
             // itself landed wrong, which checksum_verify() cannot see because
             // its baseline is taken after the copy (2026-08-19 investigation).
-            if (getenv("Q27_PRINT_WSUM"))
-                fprintf(stderr, "wsum: %016llx\n", dm.checksum_aggregate());
+            if (const char* pw = getenv("Q27_PRINT_WSUM")) {
+                fprintf(stderr, "wsum: %016llx hsum: %016llx\n", dm.checksum_aggregate(),
+                        dm.host_aggregate());
+                // Q27_PRINT_WSUM=3: recompute the digest twice more from the SAME
+                // resident bytes. A wsum that differs from the canonical value but
+                // is STABLE across recomputes means the DATA is corrupt; one that
+                // varies between recomputes means the checksum COMPUTE is
+                // unreliable. Both produce identical +-2^k deltas in one sample,
+                // so only repetition separates them.
+                if (atoi(pw) >= 3)
+                    for (int r = 0; r < 2; r++) {
+                        dm.checksum_baseline();
+                        fprintf(stderr, "wsum_recompute%d: %016llx\n", r + 1,
+                                dm.checksum_aggregate());
+                    }
+            }
         }
         if (q27k::pf4_on()) {
             if (dm.model_has("blk.0.ffn_gate.weight.pf4"))

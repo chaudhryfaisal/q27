@@ -12852,3 +12852,57 @@ top-2 margin was narrow enough to register a fault that is otherwise invisible.
 the PCIe/DMA transfer, or in VRAM. The artifact re-read test discriminates
 host-side from device-side. Do not act on a hardware theory (memtest, EXPO
 changes, RMA) until that lands.
+
+## 2026-08-19 (e): the causal chain CLOSED -- corrupt weights -> perturbed pass -> token flip. And the rate is NOT stationary.
+
+**The correlation that closes it.** 300 runs of the tie reproducer recording BOTH
+the weight digest and the emitted token IN THE SAME PROCESS:
+**flips=2, wsum_events=2, both=2.** Every token flip carried a corrupt weight
+digest; neither symptom ever appeared alone. Signatures `-2^59` (run 179) and
+`+2^59` (run 260) -- the same byte-7 bits as every other event.
+
+Chain: **a bit flips in the resident weights -> the whole forward pass is
+perturbed (100% of 248320 logits, ~1e-1) -> at the one position whose top-2
+margin is 7.46e-4, the token changes -> the canonical md5 reads `8196e65e`.**
+
+**Data corruption, not a compute fault.** The recompute test (Q27_PRINT_WSUM=3,
+digest recomputed 3x per process) never caught a corrupt run, so it answered
+nothing directly. But the correlation settles it another way: TWO INDEPENDENT
+computations -- the checksum kernel and the full forward pass -- are wrong
+together in the same process. Two simultaneous independent compute faults is far
+less likely than one shared corrupt input. Combined with zero in-run drift
+(`--verify-weights`, 150 runs), the weights land wrong and then sit stably wrong
+for that process's lifetime.
+
+**THE RATE IS NOT STATIONARY -- and this weakens several of today's null
+results.** 5090 event history: 6 events in the first ~300 loads (05:14-05:39),
+**0 across the next ~350** (drift2, recompute), then 2 more in 300 (06:08-06:20).
+Roughly 8 / 950 ~= 0.8% overall, but bursty. Consequences, stated plainly:
+- The **4.8 TB H2D soak** (0 errors, 3.22 TB pageable + 1.61 TB pinned) and the
+  **GPU-internal VRAM pattern test** (0 errors) BOTH ran inside the quiet
+  window. Their null results are much weaker than they look and do NOT clear
+  the transfer path or VRAM. Re-run them during an active window before
+  believing either.
+- The **3090 control (0/150) SURVIVES**: it ran 05:28-05:35, inside the active
+  window, between two 5090 events. The card asymmetry is the one cross-hardware
+  result whose timing is defensible.
+- The recompute campaign's 0/200 is a non-result, not evidence of health.
+
+**Still open:** whether the flip happens during the H2D transfer, during the
+device-side write, or in VRAM shortly after. The synthetic tests that would
+distinguish these are the ones invalidated by the quiet window. Note also
+`nvidia-smi -q` shows the 5090's PCIe AER `CESta: Timeout+` (replay-timer
+correctable error) while the 3090's is clear -- suggestive of link marginality,
+though correctable PCIe errors are retried and should not by themselves produce
+silent corruption.
+
+**What q27 should do about it (engine-side, independent of the hardware fix):**
+1. `Q27_PRINT_WSUM=1` at the top of every campaign; discard runs whose `wsum`
+   differs from the modal value. This is the only gate on this box that can see
+   the fault.
+2. Consider making `checksum_baseline()` comparable across processes by default
+   (print the aggregate in the load banner), so a corrupt load is visible
+   without opting in.
+3. The canonical md5 gate should be understood as necessary-not-sufficient: a
+   run can carry corrupt weights and still emit identical tokens (measured: 2 of
+   3 corrupt runs did).
