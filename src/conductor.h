@@ -1875,13 +1875,98 @@ private:
             gc_destroy(gcache_[victim]);
             gcache_.erase(gcache_.begin() + victim);
         };
-        while ((int)gcache_.size() >= gc_cap_) evict_lru();
         cudaGraph_t g = nullptr;
         cudaGraphExec_t x = nullptr;
         CUDA_CHECK(cudaStreamBeginCapture(cstm, cudaStreamCaptureModeRelaxed));
         fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx, sampled,
                            /*ev_draft_end=*/nullptr, mf);
         CUDA_CHECK(cudaStreamEndCapture(cstm, &g));
+        const auto t_cap = std::chrono::steady_clock::now();
+        // E2.2 EXEC RECYCLING. Measured 2026-08-19: a miss is ~3.1 ms capture +
+        // ~6.1 ms INSTANTIATE, while cudaGraphExecUpdate is 0.94 ms -- the
+        // expensive half is exactly the half an update skips. Graphs whose
+        // per-lane widths are a PERMUTATION of each other have identical
+        // topology (measured: 234/234 cross-permutation updates succeed), and
+        // the C=4 shape space is 89 exact keys over just 30 topology classes.
+        // So rather than evicting an exec and instantiating a new one, re-point
+        // the LRU same-class exec at this round's pointers and re-key it.
+        // Exact-key hits stay free; only the miss path changes.
+        //
+        // Safety: cudaGraphExecUpdate must not touch an exec pending execution.
+        // Every fused round ends with the outcome D2H + host sync on cstm
+        // before the next round captures, and round_active asserts rounds never
+        // overlap -- so no cached exec is in flight here.
+        static const bool recycle_on = [] { // Q27_GC_RECYCLE=0 -> always instantiate
+            const char* e = getenv("Q27_GC_RECYCLE");
+            return !(e && atoi(e) == 0);
+        }();
+        auto same_class = [&](const GraphKey& a, const GraphKey& b) {
+            if (a.k != b.k) return false;
+            int va[GK_MAX], vb[GK_MAX];
+            unsigned ta[GK_MAX], tb[GK_MAX];
+            for (int i = 0; i < a.k; i++) {
+                va[i] = a.gw[i];
+                vb[i] = b.gw[i];
+                // sfx/smp/kvk select WHICH kernels run, not just their extents,
+                // so they must match as a multiset too.
+                ta[i] = ((unsigned)a.sfx[i] << 24) | ((unsigned)a.smp[i] << 16) | (unsigned)a.kvk[i];
+                tb[i] = ((unsigned)b.sfx[i] << 24) | ((unsigned)b.smp[i] << 16) | (unsigned)b.kvk[i];
+            }
+            std::sort(va, va + a.k); std::sort(vb, vb + b.k);
+            std::sort(ta, ta + a.k); std::sort(tb, tb + b.k);
+            for (int i = 0; i < a.k; i++)
+                if (va[i] != vb[i] || ta[i] != tb[i]) return false;
+            return true;
+        };
+        // ONLY recycle an entry the cache was about to destroy anyway.
+        //
+        // v1 of this recycled the LRU same-class entry on EVERY miss, which
+        // measured 4.6% SLOWER (round 28.28 vs 27.04 at C=4): re-keying an
+        // entry steals a shape that would later have been a FREE exact-key hit.
+        // The control leg showed 138 of 191 rounds were hits, and v1 turned
+        // them into 139 recycles at ~6.5 ms each -- strictly more work than 53
+        // misses at ~14 ms. Caching a recurring shape beats re-pointing it as
+        // soon as it recurs ~3 times, and here shapes recur ~6 times.
+        //
+        // So gate on the cache being FULL. At capacity every miss already pays
+        // evict + instantiate, i.e. an exec is destroyed regardless; recycling
+        // the LRU same-class victim replaces ~6 ms of instantiate with 0.94 ms
+        // of update and costs no hit that was not already being given up.
+        int recycle = -1;
+        if (recycle_on && (int)gcache_.size() >= gc_cap_)
+            for (size_t i = 0; i < gcache_.size(); i++)
+                if (same_class(gcache_[i].key, key) &&
+                    (recycle < 0 || gcache_[i].tick < gcache_[recycle].tick))
+                    recycle = (int)i;
+        if (recycle >= 0) {
+            cudaGraphExecUpdateResultInfo info{};
+            cudaError_t uerr = cudaGraphExecUpdate(gcache_[recycle].exec, g, &info);
+            if (uerr == cudaSuccess) {
+                GCacheEnt& ent = gcache_[recycle];
+                CUDA_CHECK(cudaGraphDestroy(ent.graph)); // the shape it used to hold
+                ent.graph = g;
+                ent.key = key;
+                ent.uv = build_union_view(es, granted, k, cstm, sfx); // guard reference
+                ent.tick = ++gc_tick_;
+                CUDA_CHECK(cudaGraphGetNodes(g, nullptr, &ent.nodes));
+                gc_recycles_++;
+                const auto t_r = std::chrono::steady_clock::now();
+                CUDA_CHECK(cudaGraphLaunch(ent.exec, cstm)); // THIS round runs via it
+                if (dbg)
+                    fprintf(stderr,
+                            "[gcache] r=%ld recycle k=%d gw=%s nodes=%zu cap+upd=%.2fms "
+                            "(cap=%.2f upd=%.2f) h=%ld m=%ld rc=%ld rcf=%ld\n",
+                            gc_rounds_, k, gws, ent.nodes,
+                            std::chrono::duration<double, std::milli>(t_r - t0).count(),
+                            std::chrono::duration<double, std::milli>(t_cap - t0).count(),
+                            std::chrono::duration<double, std::milli>(t_r - t_cap).count(),
+                            gc_hits_, gc_misses_, gc_recycles_, gc_recycle_fails_);
+                return;
+            }
+            (void)cudaGetLastError(); // refused: fall through to a real instantiate
+            gc_recycle_fails_++;
+        }
+        while ((int)gcache_.size() >= gc_cap_) evict_lru();
         // Instantiate is the one device allocation on the round path that can
         // OOM on a tight boot (this line killed a 4x49152 server mid-traffic,
         // BUILDLOG 2026-07-17). Shrink-never-abort, same recovery shape as
@@ -1928,10 +2013,13 @@ private:
         gcache_.push_back(ent);
         if (dbg)
             fprintf(stderr,
-                    "[gcache] r=%ld miss k=%d gw=%s nodes=%zu cap+inst=%.2fms h=%ld "
+                    "[gcache] r=%ld miss k=%d gw=%s nodes=%zu cap+inst=%.2fms "
+                    "(cap=%.2f inst=%.2f) h=%ld "
                     "m=%ld ev=%ld gt=%ld\n",
                     gc_rounds_, k, gws, ent.nodes,
-                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gc_hits_,
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                    std::chrono::duration<double, std::milli>(t_cap - t0).count(),
+                    std::chrono::duration<double, std::milli>(t1 - t_cap).count(), gc_hits_,
                     gc_misses_, gc_evictions_, gc_guard_trips_);
     }
 
@@ -1977,6 +2065,7 @@ private:
     int gc_cap_ = 32; // LRU capacity (Q27_BATCH_GRAPH_CAP; headroom-shrunk)
     long gc_tick_ = 0, gc_rounds_ = 0;
     long gc_hits_ = 0, gc_misses_ = 0, gc_evictions_ = 0, gc_guard_trips_ = 0;
+    long gc_recycles_ = 0, gc_recycle_fails_ = 0;
     std::vector<GCacheEnt> gcache_;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)

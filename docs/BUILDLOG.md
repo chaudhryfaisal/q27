@@ -13108,3 +13108,68 @@ E3 therefore closes with E3.1's +9.8% banked and E3.2 declined on measurement.
 **Next: E2.2 (graph-key slimming), which E1 established as the critical path** --
 it is what converts the measured +6.2% steady-state width gain into a shippable
 one, and E2.1 proved a bigger cache cannot substitute for it.
+
+## 2026-08-19 (j): E2.2 SHIPPED as exec RECYCLING -- +5.3% at C=4, and the first design was a 4.6% regression
+
+The plan's E2.2 was "slim the graph key ... indirect lane pointers through a
+device table so the shape space collapses", a day-plus touching every kernel on
+the fused path. Measurement found a cheaper route to the same prize.
+
+**WHY THE PLAN'S FRAMING WAS INCOMPLETE.** A miss is not one cost. Split
+(new `cap=`/`inst=` fields on the `[gcache] miss` line): **capture 3.1 ms,
+INSTANTIATE 6.1 ms** over 2661-node graphs -- instantiate is 64%. And
+`cudaGraphExecUpdate` costs **0.94 ms**. So the expensive half of a miss is
+exactly the half an update skips.
+
+**THE ENABLING FACT, MEASURED NOT ASSUMED.** Graphs whose per-lane widths are a
+PERMUTATION of each other have identical topology: **234/234 cross-permutation
+`cudaGraphExecUpdate` calls succeeded**, and the 30 misses that found no
+same-class entry match the 30 topology classes exactly (C=4 shape space: 89
+exact keys over 30 classes, a 2.97x collapse from ordering alone).
+
+**v1 WAS A REGRESSION, and the reason is the useful part.** Recycling the LRU
+same-class entry on EVERY miss measured **28.36 vs 27.20 ms at C=4, 4.6%
+SLOWER**. Misses did collapse (53 -> 0 by pass 3) but re-keying an entry STEALS
+a shape that would later have been a free exact-key hit: the control shows 138
+of 191 rounds are hits, and v1 turned them into 139 recycles at ~6.5 ms each --
+strictly more work than 53 misses at ~14 ms. **Caching a recurring shape beats
+re-pointing it once it recurs ~3 times, and here shapes recur ~6 times.**
+Re-pointing only wins for shapes that are one-offs *or already doomed*.
+
+**v2 (shipped): recycle ONLY when the cache is at capacity.** At capacity every
+miss already pays evict + instantiate -- an exec is destroyed regardless -- so
+recycling the LRU same-class victim swaps ~6 ms of instantiate for 0.94 ms of
+update and gives up no hit that was not already being surrendered.
+
+**MEASURED, warm passes 2-3 at C=4 (pass 1 discarded: cold cache cannot recycle):**
+
+| | round ms | graph overhead ms/round | misses | recycles |
+|---|---|---|---|---|
+| recycle ON | **25.37** | **2.24** | 15, 4 | 34, 62 |
+| recycle OFF | 26.71 | 3.65 | 57, 58 | 0 |
+| delta | **-5.05%** | **-39%** | | |
+
+**= +5.3% throughput at C=4.** The mechanism cross-checks: the overhead saving
+(1.40 ms/round) matches the round-wall delta (1.35 ms) to within 0.05 ms, so the
+win is the graph path and not an acceptance draw. **Null rung C=8 reads -0.88%**
+(one topology class, so the cache never fills and recycling barely fires) --
+inside noise, as required.
+
+**GATES (recycling ON, which is the default):** `fused_smoke` GRAPH SMOKE PASS
+**byte-identical to solo**; `ninv_test` CHUNK+FOLD BITWISE ALL PASS; canonical
+f64e7c02 x2 + sampled 900031e9 EXACT.
+
+**Safety argument for mutating a cached exec:** `cudaGraphExecUpdate` must not
+touch an exec pending execution. Every fused round ends with the outcome D2H +
+host sync on cstm before the next round begins capture, and `round_active`
+asserts rounds never overlap -- so nothing in the cache is in flight at the
+recycle point. The class test also compares sfx/smp/kvk as a sorted MULTISET
+alongside the widths, because those select WHICH kernels run, not merely their
+extents; matching widths alone would offer a structurally different graph.
+
+`Q27_GC_RECYCLE=0` restores instantiate-always.
+
+**What this does NOT do:** the first 64 shapes (cap) still instantiate, and
+capture is still paid on every miss. Full pointer indirection would remove the
+capture too. On these numbers that remaining half is ~2.2 ms/round at C=4 --
+worth revisiting only if C=3-6 production traffic becomes the priority.
