@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_common.h" // KvKind
+#include "kernels.cuh"   // CP3 (per-lane logits pointers for nucleus_multi)
 
 // VERIFY-1/3/4/5 all resolved against ggml source (workflow wf_b19a6dde, high confidence):
 // head expansion = tile/modulo (converter pre-permutes V heads to tiled order),
@@ -139,6 +140,12 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 // d_nuc + lane*4). Identical kernel to sample_g's -> spec/plain share the target.
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st = 0);
+// Batched twin: L lanes in ONE launch (block b == lane b), writing d_nuc + b*4.
+// Bitwise identical per lane -- same body, same per-block reduction order. The
+// per-lane loop it replaces cost ~16 single-block launches per round at C=8,
+// each on one SM of 170 (nsys 2026-08-18: 10.6% of all GPU kernel time).
+void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
+                   cudaStream_t st = 0);
 // Rejection-sampling accept walk over up to max_draft greedy drafts vs logits2.
 // d_nuc5 = [5][4], d_P = committed position (Philox key), cap forces n=1.
 // max_draft = accept-walk depth (P14 confidence gate: width-W verify walks W-1

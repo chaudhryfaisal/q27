@@ -12159,3 +12159,80 @@ llama-cli ignores `-no-cnv` here and spins an interactive loop (it wrote a 3.9 G
 log of empty prompts); drive llama-server over HTTP instead, and require an
 HTTP **200** from /health -- it answers 503 while still loading, which will
 happily accept requests into a model that is not up.
+
+## 2026-08-18 (h): the round budget, profiled -- GDN state is the "unexplained 10 ms", and the sampler was launching one block at a time
+
+Round-budget T2 left ~10.66 ms of the C=8 verify unattributed. nsys settles it.
+**Both profilers ARE available** (`/usr/local/bin/nsys`, `/usr/local/cuda/bin/ncu`);
+the standing note that they are not on PATH is stale.
+
+**Read this before trusting any q27 profile.** Three consecutive captures were
+junk and each failed differently:
+1. **nsys hides CUDA-graph interiors by default.** q27's fused verify is a
+   captured graph, so the first profile showed `k_vgemm` **not running at all**
+   and the GEMV family dominating -- a conclusion that is flatly false and was
+   one step from being written down. `--cuda-graph-trace=node` is mandatory here.
+2. **`nsys stats` silently reuses an existing `.sqlite`.** Delete it or you will
+   re-read the previous capture's numbers.
+3. **Killing the target before nsys finalizes leaves the old `.nsys-rep` in
+   place.** Two runs "succeeded" while writing nothing. The tell was an
+   identical 609 ms total across three different capture windows -- when a
+   measurement does not move when the input does, the instrument is stuck.
+Correct invocation: `--cuda-graph-trace=node`, a delay/duration window verified
+to overlap the ladder, SIGINT the server, wait for the process, check the report
+mtime. Real capture is 93 MB and 23,079 ms of kernel time, not 4 MB and 609 ms.
+
+**THE ATTRIBUTION** (C=8 ladder, graph-node trace; shares of GPU kernel time --
+side streams overlap, so these are shares, not additive per-round ms):
+
+| bucket | share | ~ms/round |
+|---|--:|--:|
+| **GDN recurrent state** | **30.4%** | ~8.9 |
+| verify GEMM (k_vgemm + reduce_z) | 25.5% | ~7.5 |
+| attention (fd2 / combine / KV) | 15.4% | ~4.5 |
+| GEMV family | 10.8% | ~3.2 |
+| **sampling (k_nucleus_d)** | **10.6%** | ~3.1 |
+| norm / rope / quant / elemwise | 5.2% | ~1.5 |
+
+**GDN at ~8.9 ms/round IS the unexplained ~10.66 ms.** It is per-sequence
+recurrent state across seven kernels (`k_delta_step` and `k_gdn_delta_chunk3` at
+200352 instances each, `k_delta_scan_T` 140064, plus conv/record/l2norm), each
+2-11 us. It cannot amortize across the batch the way a weight read does, which
+is also why the marginal member costs what it does. Fusing those passes is the
+lever; the state itself is irreducible. NOT YET BUILT.
+
+**SHIPPED SAME DAY: the sampler was launch-geometry-bound, not algorithm-bound.**
+`k_nucleus_d` is a bisection, not a sort -- but it ran `<<<1, 1024>>>`, one block
+on one SM of 170, doing ~19 grid-stride sweeps of the 248,320 vocab (max,
+logsumexp, 16 bisection iterations, mass). Worse, `spec_sample_round` called it
+**once per verify lane in a loop**, so C=8 paid ~16 serialized single-block
+launches per round at ~280 us each.
+
+Fix is geometry only: factor the body into `nucleus_body`, add `k_nucleus_multi`
+with **one block per lane in one launch**. No cross-block state and every
+reduction is intra-block, so L lanes as L blocks is **bitwise identical** to L
+sequential launches. Gated exactly that way (`build/nuc_eq`, 16 lanes x full
+248320 vocab, raw-bit compare of all 4 outputs per lane): **0/64 fields differ.**
+`build/test_kernels` sampling + spec-nucleus suites all PASS.
+
+| | tok/round | round | verify | draft | C=8 aggregate |
+|---|--:|--:|--:|--:|--:|
+| after T4 | 1.7149 | 29.617 ms | 23.705 | 5.712 | 455.8 |
+| **+ batched nucleus** | 1.7010 | **27.189 ms** | **21.364** | 5.599 | **492.8** |
+
+Verify -9.9%, round -8.2%, **C=8 +8.1%** (C=4 279.2 -> 307.8, +10.2%). Tokens
+-0.81%, which is sampled-path run-to-run variance, not a policy change -- the
+kernel is bitwise identical per lane.
+
+**Day total at C=8: 412.7 -> 492.8 t/s (+19.4%)**, from T4 (draft to the grant)
+plus this, neither of which changed a number format or a kernel's arithmetic.
+
+Remaining, in order: GDN state fusion (~30%, the big one), attention fd2/combine
+(15.4%), cp.async in k_vgemm (~6% of a 25.5% bucket, so ~1.5% overall -- smaller
+than earlier entries implied).
+
+**Also flagged:** the recorded q4s sampled-seed anchor `900031e9` does NOT
+reproduce -- a pre-change binary returns `227a6b08`, deterministic across runs.
+That drift predates today's sampler work (measured on the T4 build, and the
+sampler is not on the plain `--temp` CLI path). The greedy anchor `f64e7c02` is
+EXACT. The sampled anchor needs re-deriving or its recorded flags corrected.

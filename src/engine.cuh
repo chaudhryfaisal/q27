@@ -2140,8 +2140,14 @@ struct Engine {
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
         // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
         // unchanged: it keys on n<=vw and its src select covers n in 1..5.
-        for (int k = 0; k < v.vw; k++)
-            q27k::nucleus(v.lg[k], VOCAB, d_samp, d_nuc + k * 4, v.stm);
+        // One launch, one block per lane (2026-08-18): bitwise identical per
+        // lane, but the lanes no longer serialize as vw single-block kernels
+        // each occupying one SM of 170.
+        {
+            q27k::CP3 lgs{};
+            for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
+            q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
+        }
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
                           d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);

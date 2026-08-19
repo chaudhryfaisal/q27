@@ -534,8 +534,15 @@ __device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigne
 // inv_temp/top_p from the device param block (graph-fixed pointer). Writes
 // out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh clamped <= M so the argmax
 // token is always in the nucleus (guards degenerate/tiny top_p).
-__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
-                            float* __restrict__ out) {
+// Body factored out so the single-lane and multi-lane entry points cannot drift:
+// one block computes one lane, exactly as before. Every reduction is within the
+// block and no state crosses blocks, so running L lanes as L BLOCKS is bitwise
+// identical to L sequential single-block launches -- it only stops them
+// serializing on one SM. Measured 2026-08-18 (nsys, C=8): the per-lane loop was
+// ~16 launches/round x 280 us, one SM of 170 each, 10.6% of all GPU kernel time.
+__device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
+                                             const SampleParams* __restrict__ sp,
+                                             float* __restrict__ out) {
     const float inv_temp = sp->inv_temp, top_p = sp->top_p;
     __shared__ float sh[1024];
     __shared__ float s_M, s_logZ, s_lo, s_hi, s_thresh;
@@ -614,6 +621,18 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
     }
 }
 
+__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
+                            float* __restrict__ out) {
+    nucleus_body(x, n, sp, out);
+}
+
+// One block per verify lane, one launch. Same body, same per-block reduction
+// order -> bitwise identical to the loop it replaces.
+__global__ void k_nucleus_multi(CP3 xs, int n, const SampleParams* __restrict__ sp,
+                                float* __restrict__ out) {
+    nucleus_body(xs.p[blockIdx.x], n, sp, out + blockIdx.x * 4);
+}
+
 // Gumbel-max over the nucleus: argmax_i (inv_temp*x_i + G_i), G_i from Philox,
 // restricted to x_i >= nuc[0]. Reads inv_temp/seed from the param block and the
 // key position from *d_pos (device). Same am_pack+atomicMax reduction as
@@ -661,6 +680,16 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st) {
     k_nucleus_d<<<1, 1024, 0, st>>>(logits, n, d_sp, d_nuc);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Batched twin: L lanes in ONE launch, block b == lane b. Replaces the per-lane
+// nucleus() loop in the sampled verify (engine.cuh). Bitwise identical per lane;
+// the win is purely that L single-block launches stop serializing on one SM.
+void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
+                   cudaStream_t st) {
+    if (L <= 0) return;
+    k_nucleus_multi<<<L, 1024, 0, st>>>(xs, n, d_sp, d_nuc);
     CUDA_CHECK(cudaGetLastError());
 }
 
