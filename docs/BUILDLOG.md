@@ -12519,3 +12519,60 @@ realtime speech service, and occupying 15.5 GB there risks OOMing it on a burst.
 The GPU0 capture campaign yields the same primary artifact safely. (Also: the
 `vox-transcriber` unit named in the ops notes has been failed since 2026-07-29
 and no longer owns GPU1 -- stopping it is now a no-op.)
+
+## 2026-08-18 (m): the divergence is ONE near-tie token, and the 3090 emits the divergent trajectory ON DEMAND
+
+Gabe cleared stopping 3090 services, which unlocked the identification test the
+GPU0-only route could not do safely.
+
+**IDENTIFICATION, byte-exact.** The 3090 (sm_86, same tri-arch binary, same q4s
+artifact, same recipe) returns **`8196e65e8939dcb9ed04bd2ae2d50a8b`** -- the
+identical full digest the 5090 emits on its rare divergent runs. A third 5090
+divergence (capture campaign run 232, this time with the TEXT saved) is
+byte-identical to the 3090 output. So the 5090's flip is not "some other
+basin": it lands exactly on the sm_86-family trajectory, which is now
+reproducible on demand instead of at 1-in-150.
+
+**THE DIVERGENCE IS ONE TOKEN.** difflib over the two 128-token streams:
+
+```
+equal   A[0:53]   == B[0:53]     (53 tokens)
+delete  A[53:55]  = [248045, 271]  ->  B: absent
+equal   A[55:124] == B[53:122]   (69 tokens)
+replace A[124:128] vs B[122:128]  (tail: pure 2-token shift, both stop at 128)
+```
+
+One event, at token 53: the 5090 emits an extra `248045 271` (delimiter +
+newline) pair; sm_86 skips straight to the content token. The streams then
+re-converge and stay identical for 69 tokens. This is textbook 07-09
+("a near-tie logit -- '\n' vs '\n\n' -- forks the whole trajectory"), except it
+happens run-to-run on ONE binary rather than across builds. It also explains
+why all five sightings (2 historical + 3 today) carry the same digest: at a
+knife-edge with two candidates, ANY perturbation big enough to flip it yields
+the same continuation. That sameness is also evidence AGAINST random silent
+data corruption (non-ECC GDDR7), which would land elsewhere sometimes and
+produce other digests.
+
+**MINIMAL REPRODUCER, and it is a single forward pass.** Feeding the 58-token
+prefix (5 prompt + A[0:53], in scratchpad/prefix58.txt) with `-n 1` returns
+`248045` -- the canonical side of the tie -- so the fork position is reachable
+directly, no 45-round generation required. `--spec` is not needed (the 08-16
+sighting was a no-spec run; the defect is in the core forward pass). This turns
+a 3.7 s/45-round trial into a ~3 s single-step trial and, more importantly,
+shrinks the instrumented surface from the whole decode loop to one pass. Next
+session: loop it to confirm it flips to `846` at ~1/150 (~300 runs), then
+bisect. compute-sanitizer racecheck is running against this reproducer now.
+
+**What is still NOT known:** the source of the ULP-level nondeterminism on the
+5090. Everything measured says the margin at token 53 is small enough that a
+sub-ULP perturbation decides it, and the perturbation exists on sm_120 at
+~0.7% of executions. Since all reduction orders on this path are structurally
+fixed (entry (l)), the surviving hypothesis is an intra-kernel hazard with
+exactly two possible orderings -- which is what racecheck is being asked.
+
+**Do not read this as a quality problem.** Both continuations are valid model
+outputs at a genuine tie; the greedy anchor's job is byte-identity for A/B
+gating, and that is what is compromised, at ~1%. Until the mechanism is found,
+a single md5 mismatch on a greedy gate is NOT sufficient evidence of a
+regression -- re-run via `tools/anchor_check.sh -n 3` and read the
+distribution it prints.
