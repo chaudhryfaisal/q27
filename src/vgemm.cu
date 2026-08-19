@@ -162,34 +162,68 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
     // the intra-CTA reduce, the epilogue) and drops only the tensor work, which
     // is what splits the tile's cost into memory pipeline vs compute phase.
     // Measured 2026-08-19: 9.49 ms staging-only vs 10.21 ms full, against a
-    // 9.24 ms same-grid floor -- i.e. 0.25 ms of pipeline, 0.72 ms of MMA.
+    // 9.24 ms same-grid floor -- 0.25 ms of pipeline, 0.72 ms of compute phase.
+    // A -DQ27_VGEMM_NOTC build splits that 0.72 again: the tensor-core issue is
+    // only 0.10 ms of it, the rest is these smem reads and the scaling chain.
     auto do_mma = [&]() {
         {
             const int kbase = kg * KS; // this warp-group's slice of the staged K
+            const int tb = wn * 8;
+
+            // E6c: hoist the SCALE loads out of the cc loop. SASS showed 40 LDS
+            // per super-step, 16 of them scales -- for 6 distinct values that
+            // ptxas never CSEd, because kb/64 and kb/32 hide the invariance
+            // behind an integer divide it will not fold across the unroll.
+            // Spelled out here it is 4 LDS: the two w-scales a Q4 row needs over
+            // the whole cc range are ADJACENT (kb/64 = kg*2 + cc/2, so one
+            // LDS.64), Q8 needs exactly one (kb/128 == kg for every cc), and the
+            // four x-scales are consecutive (kb/32 = kg*4 + cc, so one LDS.128).
+            // Same values, same multiply order, so bit-identical by inspection.
+            constexpr int NWC = Q4IN ? 2 : 1; // distinct w-scales over the cc range
+            float wsA[NWC], wsB[NWC];
+            const int wr0 = wm * 16 + gid, wr1 = wm * 16 + gid + 8;
+            if constexpr (Q4IN) {
+                const float2 v0 = *(const float2*)&s_ws[wr0 * (KG * 2) + kg * 2];
+                const float2 v1 = *(const float2*)&s_ws[wr1 * (KG * 2) + kg * 2];
+                wsA[0] = v0.x; wsA[1] = v0.y;
+                wsB[0] = v1.x; wsB[1] = v1.y;
+            } else {
+                wsA[0] = s_ws[wr0 * KG + kg];
+                wsB[0] = s_ws[wr1 * KG + kg];
+            }
+            const float4 x0v = *(const float4*)&s_xs[(tb + tg * 2) * (KG * XSC) + kg * XSC];
+            const float4 x1v = *(const float4*)&s_xs[(tb + tg * 2 + 1) * (KG * XSC) + kg * XSC];
+            const float xs0v[4] = {x0v.x, x0v.y, x0v.z, x0v.w};
+            const float xs1v[4] = {x1v.x, x1v.y, x1v.z, x1v.w};
+
 #pragma unroll
             for (int cc = 0; cc < 4; cc++) {
                 const int kb = kbase + cc * 32;
-                const int8_t* wrow0 = s_w + (wm * 16 + gid) * LDW + kb;
-                uint32_t a0 = *(const uint32_t*)(wrow0 + tg * 4);
-                uint32_t a1 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4);
-                uint32_t a2 = *(const uint32_t*)(wrow0 + tg * 4 + 16);
-                uint32_t a3 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4 + 16);
-                float wsc0, wsc1;
-                if constexpr (Q4IN) {
-                    wsc0 = s_ws[(wm * 16 + gid) * (KG * 2) + kb / 64];
-                    wsc1 = s_ws[(wm * 16 + gid + 8) * (KG * 2) + kb / 64];
-                } else {
-                    wsc0 = s_ws[(wm * 16 + gid) * KG + kb / 128];
-                    wsc1 = s_ws[(wm * 16 + gid + 8) * KG + kb / 128];
-                }
-                const int tb = wn * 8;
+                // ldmatrix was tried here and REVERTED (BUILDLOG 08-19 (o)):
+                // consistently -0.02 ms, but SASS instruction count was flat --
+                // it re-encoded these six loads rather than removing work.
+                const int8_t* wrow0 = s_w + wr0 * LDW + kb;
+                const uint32_t a0 = *(const uint32_t*)(wrow0 + tg * 4);
+                const uint32_t a1 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4);
+                const uint32_t a2 = *(const uint32_t*)(wrow0 + tg * 4 + 16);
+                const uint32_t a3 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4 + 16);
                 const int8_t* xcol = s_x + (tb + gid) * LDX + kb;
-                uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
-                uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+                const uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
+                const uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+                const float wsc0 = wsA[Q4IN ? cc / 2 : 0];
+                const float wsc1 = wsB[Q4IN ? cc / 2 : 0];
                 int d0, d1, d2, d3;
+#ifndef Q27_VGEMM_NOTC
                 mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
-                const float xs0 = s_xs[(tb + tg * 2) * (KG * XSC) + kb / 32];
-                const float xs1 = s_xs[(tb + tg * 2 + 1) * (KG * XSC) + kb / 32];
+#else
+                // attribution build (BUILDLOG 08-19 (o)): keep every fragment
+                // load and the scaling chain live, drop ONLY the tensor-core
+                // issue. 10.11 ms vs 10.21 full vs 9.49 staging-only -- i.e. the
+                // tensor cores are 0.10 ms of the compute phase, not 0.72.
+                d0 = (int)(a0 ^ b0); d1 = (int)(a1 ^ b1);
+                d2 = (int)(a2 ^ b0); d3 = (int)(a3 ^ b1);
+#endif
+                const float xs0 = xs0v[cc], xs1 = xs1v[cc];
                 acc[0] += wsc0 * xs0 * (float)d0;
                 acc[1] += wsc0 * xs1 * (float)d1;
                 acc[2] += wsc1 * xs0 * (float)d2;

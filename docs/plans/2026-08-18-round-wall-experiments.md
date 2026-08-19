@@ -204,7 +204,9 @@ the mix-side width cost that killed it before.
 
 ## E6 -- Kernel-local, anytime fillers
 
-**CLOSED 2026-08-19 (n). cp.async NO-GO; 16-byte staging shipped at -2.7%.**
+**CLOSED 2026-08-19 (n)+(o). cp.async NO-GO; shipped 16-byte staging and a
+scale-load hoist for -4.2% cumulative, bit-identical. Also NO-GO on measurement:
+depth-2 register prefetch, the z policy, fusing k_reduce_z, and ldmatrix.**
 The "84% -> 94-96% SOL" premise was a unit mismatch: the two figures used
 different SOL denominators (round_weight_cost's 1453 constant vs
 microbench_mxf4's measured ~1690). Decomposed against a same-grid floor

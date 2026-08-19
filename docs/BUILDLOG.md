@@ -13440,3 +13440,80 @@ stores and the measured answer was 0.09 ms, because 96 MB of L2 sits between
 the kernel and DRAM. **A bandwidth argument is only sound for traffic that
 actually reaches DRAM. Build the floor kernel.**
 
+## 2026-08-19 (o): the exposed cost is NOT the tensor cores -- it is the smem scale reads. -4.2% cumulative, still bit-identical.
+
+Entry (n) closed cp.async and left two named residuals: 0.72 ms of "exposed
+MMA" and 0.62 ms of reduce. Both were assumed structural. One of them was a
+redundant load the compiler never removed.
+
+**THE 0.72 ms IS NOT TENSOR TIME.** A `-DQ27_VGEMM_NOTC` build -- every
+fragment LDS and the whole fp32 scaling chain kept live, only `mma.sync`
+dropped -- lands at **10.11 ms** against 10.21 full and 9.49 staging-only. So
+the compute phase splits **0.62 ms of smem reads + scaling, 0.10 ms of
+tensor-core issue.** The tensor cores are ~2.0-2.5 ms of work and are already
+~96% hidden behind the weight stream; the thing standing in the round's way is
+the arithmetic around them.
+
+**SASS SAID WHERE.** `cuobjdump -sass` on `k_vgemm<32,true,1>`: **40 LDS per
+super-step**, and the cc loop is fully unrolled so that is the whole body.
+16 A-fragment + 8 B-fragment + **16 SCALE loads -- for six distinct values.**
+ptxas never CSEd them, because `kb / 64` and `kb / 32` hide the invariance
+behind an integer divide it will not fold across the unroll.
+
+**SHIPPED -- E6c, hoist the scale loads (16 -> 4).** Spelled out, the
+invariance is obvious and the loads vectorize:
+- Q4's two w-scales over the whole cc range are ADJACENT (`kb/64 = kg*2 +
+  cc/2`), so one LDS.64 per row instead of four LDS.32.
+- Q8 needs exactly ONE (`kb/128 == kg` for every cc).
+- The four x-scales are CONSECUTIVE (`kb/32 = kg*4 + cc`), so one LDS.128
+  instead of four LDS.32, twice.
+
+Same values, same multiply order, bit-identical by inspection and by digest.
+SASS 424 -> 400 instructions, LDS 40 -> 30.
+
+**CUMULATIVE, paired 3-run A/B, both binaries rebuilt at HEAD:**
+
+| | sweep ms (graph) | main kernel | tile gap vs floor |
+|---|---|---|---|
+| pre-E6 | 11.12 / 11.12 / 11.13 | 10.51 | 1.27 |
+| E6a (16-byte staging) | 10.82 / 10.83 / 10.84 | 10.21 | 0.97 |
+| **E6a+E6c** | **10.66 / 10.66 / 10.65** | **10.04** | **0.80** |
+
+**-0.47 ms, -4.2% of the weight sweep**, against a +-0.01 ms spread. Output
+digest IDENTICAL to pre-E6 at T=2, 5, 12 and 16 over all 401 weights. Gates:
+vgemm_test 3+4 (no spill, CTA/SM=4 on all four instantiations), racecheck 0
+hazards, fused_smoke union-vs-solo byte-identical, canonical a2982c51.
+
+**TWO MORE NO-GOs, both priced before building:**
+
+- **Fusing k_reduce_z into the main kernel: NOT WORTH IT.** Priced three ways
+  and it fails all three. The reduce's 0.62 ms is ~0.155 ms of launch (400
+  graph-replayed launches) plus ~0.46 ms of work, and a fused last-CTA
+  epilogue only saves 1/z of the partial traffic -- which the store control in
+  (n) already showed L2 makes nearly free. The second-order case was the graph
+  nodes: measured **1.6 us per node** to capture+instantiate (801 nodes 1.06 ms
+  vs 401 nodes 0.42 ms), so deleting all 400 reduce nodes saves 0.64 ms of a
+  ~23 ms round capture -- under 3%. Total realistic prize ~0.2 ms, for a
+  semaphore-based cross-CTA reduce in the determinism path. Declined.
+- **ldmatrix for the A/B fragments: REVERTED.** It does exactly what it should
+  on paper -- 24 scalar LDS collapse into 4 `ldmatrix.x4` + 4 `.x2`, and the
+  lane->register mapping IS the m16n8k32 fragment layout, so it stayed
+  bit-identical. It measured a consistent but tiny **-0.02 ms** (10.655 ->
+  10.633, 3 paired runs), and **SASS instruction count did not move at all**
+  (400 -> 400): the lane-masking address math replaced what the LDS removal
+  saved. It re-encoded the work instead of removing it. Not worth
+  hand-derived PTX fragment mappings in this kernel for 0.08% of a round.
+
+**THE DIFFERENCE BETWEEN E6c AND THE ldmatrix ARM IS THE WHOLE LESSON.** Both
+cut the same instruction class in the same phase. E6c removed *redundant work*
+-- 16 loads serving 6 values -- and paid 0.17 ms. ldmatrix removed *encoding*
+-- the same six values, fetched more compactly -- and paid nothing. When a
+phase is issue-bound, look for work that is being done twice before looking
+for a wider instruction to do it in.
+
+**WHERE THE WEIGHT SWEEP NOW STANDS: 10.66 ms against a 9.24 ms same-grid
+floor that includes its stores.** The residual is 0.80 ms of compute phase
+(of which only ~0.10 is tensor issue; the rest is fragment reads and the
+scaling chain, now without the redundancy) and 0.62 ms of deterministic
+reduce. Neither has a cheap next move. Scope limit unchanged from (n): -0.47 ms
+is -1.9% of a 24.72 ms round, inside ladder noise, judged on the harness.
