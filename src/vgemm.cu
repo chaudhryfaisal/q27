@@ -2,6 +2,7 @@
 // The kernel is the design spike's, promoted: the arithmetic is NOT re-derived
 // here (it was validated against gemv_q4_n/gemv_q8_n at rel 1e-6), only wrapped.
 #include <algorithm>
+#include <cstdlib>
 
 #include "device_model.h"
 #include "loader.h"
@@ -62,33 +63,45 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
     constexpr int WBY = Q4IN ? (MR * KB / 2) : (MR * KB);
-    constexpr int WLD = WBY / 4 / 256;
-    constexpr int XLD = (NT * KB / 4) / 256;
     constexpr int SLD = (MR * KG * NWS + 255) / 256;
     constexpr int XSL = (NT * KG * XSC + 255) / 256;
-    constexpr int WPR = Q4IN ? (KB / 8) : (KB / 4); // u32 per row per super-step
 
-    uint32_t rw[WLD], rx[XLD];
+    // E6a: stage W and X 16 BYTES AT A TIME, not 4. The bytes staged, the smem
+    // contents and therefore every accumulation are unchanged -- only the width
+    // of each global request and each smem store moves. The gain is memory-level
+    // parallelism: an SM has a bounded number of outstanding load slots, so a
+    // 4-byte LDG buys a quarter of the in-flight bytes a 16-byte one does, and
+    // this tile is bandwidth-bound with nothing else to hide the shortfall.
+    // Measured against a same-grid pure-read floor (tools/vgemm_e6).
+    constexpr int WCPR = (Q4IN ? KB / 2 : KB) / 16; // 16B chunks per row (Q4 8, Q8 16)
+    constexpr int WRPP = 256 / WCPR;                // rows covered per 256-thread pass
+    constexpr int WV = MR / WRPP;                   // passes = uint4 per thread (Q4 1, Q8 2)
+    constexpr int XCPR = KB / 16;                   // 16B chunks per lane row (16)
+    static_assert(WV * 256 * 16 == WBY, "W stage is not an exact uint4 per thread per pass");
+    static_assert(256 / XCPR == NT && NT * KB == 256 * 16, "X stage is not one uint4 per thread");
+
+    const int wrr = tid / WCPR, wch = tid % WCPR;
+    const int xtt = tid / XCPR, xch = tid % XCPR;
+    const int64_t wrstride = Q4IN ? (cols / 2) : cols;
+
+    uint4 rw[WV], rx;
     float rws[SLD], rxs[XSL];
 
     auto load_stage = [&](int sst) {
         const int64_t k0 = (int64_t)sst * KS;
+        const int64_t wk0 = Q4IN ? (k0 / 2) : k0;
 #pragma unroll
-        for (int i = 0; i < WLD; i++) {
-            int idx = i * 256 + tid;
-            int rr = idx / WPR, pb = idx % WPR;
-            bool ok = (r0 + rr < rows);
-            const uint8_t* base =
-                Q4IN ? (W + (r0 + rr) * (cols / 2) + k0 / 2) : (W + (r0 + rr) * cols + k0);
+        for (int p = 0; p < WV; p++) {
+            const int rr = wrr + p * WRPP;
             // 0x88 = the q4 zero point pre-bias, so padded rows contribute 0.
-            rw[i] = ok ? __ldg((const uint32_t*)base + pb) : (Q4IN ? 0x88888888u : 0u);
+            rw[p] = (r0 + rr < rows)
+                        ? __ldg((const uint4*)(W + (r0 + rr) * wrstride + wk0 + wch * 16))
+                        : (Q4IN ? make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u)
+                                : make_uint4(0u, 0u, 0u, 0u));
         }
-#pragma unroll
-        for (int i = 0; i < XLD; i++) {
-            int idx = i * 256 + tid;
-            int tt = idx / (KB / 4), u = idx % (KB / 4);
-            rx[i] = tt < T ? __ldg((const uint32_t*)(X.nat[tt] + k0) + u) : 0u;
-        }
+        // dead lanes are never dereferenced: X.nat[tt >= T] may be null.
+        rx = xtt < T ? __ldg((const uint4*)(X.nat[xtt] + k0 + xch * 16))
+                     : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
         for (int i = 0; i < SLD; i++) {
             int idx = i * 256 + tid;
@@ -105,28 +118,33 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
             rxs[i] = (idx < NT * KG * XSC && tt < T) ? __ldg(X.xs[tt] + k0 / 32 + cc) : 0.f;
         }
     };
+    // one packed u32 (8 nibbles) -> 8 unpacked int8, with the GEMV's isum "-8"
+    // bias folded in. Identical arithmetic to the pre-E6a per-u32 unpack.
+    auto unpack8 = [](uint32_t p, uint32_t& a, uint32_t& b) {
+        const uint32_t lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
+        a = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
+        b = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+    };
     auto store_stage = [&]() {
 #pragma unroll
-        for (int i = 0; i < WLD; i++) {
-            int idx = i * 256 + tid;
-            int rr = idx / WPR, pb = idx % WPR;
-            const uint32_t p = rw[i];
+        for (int p = 0; p < WV; p++) {
+            const int rr = wrr + p * WRPP;
             if constexpr (Q4IN) {
-                int8_t* dst = s_w + rr * LDW + pb * 8;
-                const uint32_t lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
-                // the GEMV's isum "-8" bias, applied at unpack instead
-                *(uint32_t*)dst = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
-                *(uint32_t*)(dst + 4) = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+                // 16 packed bytes -> 32 unpacked, written as two STS.128. LDW is
+                // a multiple of 16 and wch*32 is too, so both stay 16B-aligned.
+                int8_t* dst = s_w + rr * LDW + wch * 32;
+                uint4 o;
+                unpack8(rw[p].x, o.x, o.y);
+                unpack8(rw[p].y, o.z, o.w);
+                *(uint4*)dst = o;
+                unpack8(rw[p].z, o.x, o.y);
+                unpack8(rw[p].w, o.z, o.w);
+                *(uint4*)(dst + 16) = o;
             } else {
-                *(uint32_t*)(s_w + rr * LDW + pb * 4) = p;
+                *(uint4*)(s_w + rr * LDW + wch * 16) = rw[p];
             }
         }
-#pragma unroll
-        for (int i = 0; i < XLD; i++) {
-            int idx = i * 256 + tid;
-            int tt = idx / (KB / 4), u = idx % (KB / 4);
-            *(uint32_t*)(s_x + tt * LDX + u * 4) = rx[i];
-        }
+        *(uint4*)(s_x + xtt * LDX + xch * 16) = rx;
 #pragma unroll
         for (int i = 0; i < SLD; i++) {
             int idx = i * 256 + tid;
@@ -139,13 +157,14 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
         }
     };
 
-    load_stage(s_begin);
-    for (int sst = s_begin; sst < s_end; sst += KG) {
-        __syncthreads();
-        store_stage();
-        if (sst + KG < s_end) load_stage(sst + KG);
-        __syncthreads();
-        if (sst + kg < s_end) {
+    // Factored out so a -DQ27_VGEMM_NOMMA build can compile it away: that build
+    // keeps the ENTIRE staging path (loads, unpack, smem stores, both barriers,
+    // the intra-CTA reduce, the epilogue) and drops only the tensor work, which
+    // is what splits the tile's cost into memory pipeline vs compute phase.
+    // Measured 2026-08-19: 9.49 ms staging-only vs 10.21 ms full, against a
+    // 9.24 ms same-grid floor -- i.e. 0.25 ms of pipeline, 0.72 ms of MMA.
+    auto do_mma = [&]() {
+        {
             const int kbase = kg * KS; // this warp-group's slice of the staged K
 #pragma unroll
             for (int cc = 0; cc < 4; cc++) {
@@ -177,6 +196,19 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
                 acc[3] += wsc1 * xs1 * (float)d3;
             }
         }
+    };
+
+    load_stage(s_begin);
+    for (int sst = s_begin; sst < s_end; sst += KG) {
+        __syncthreads();
+        store_stage();
+        if (sst + KG < s_end) load_stage(sst + KG);
+        __syncthreads();
+#ifndef Q27_VGEMM_NOMMA
+        if (sst + kg < s_end) do_mma();
+#else
+        (void)do_mma; // attribution build: staging only, see the note above
+#endif
     }
 
     // intra-CTA K-split reduce, FIXED WARP ORDER (no atomics, no shuffle races).
@@ -231,7 +263,23 @@ __global__ void k_reduce_z(const float* __restrict__ ws, __grid_constant__ const
 static constexpr int VG_CTA_TARGET = 1400;
 static constexpr int VG_ZMAX = 8;
 
+// Bench-only override of the CTA target (Q27_VG_CTA_TARGET). Read ONCE, so every
+// caller -- including vgemm_ws_bytes*, which must size the workspace for exactly
+// the z the launch will use -- sees the same value for the life of the process.
+// The default is the shipped 1400; setting it changes the number of grid.z
+// partials and therefore the fp32 reduce order, so a non-default value is NOT
+// bit-compatible with the recorded anchors.
+static int vg_cta_target() {
+    static const int v = [] {
+        const char* e = getenv("Q27_VG_CTA_TARGET");
+        int x = e ? atoi(e) : VG_CTA_TARGET;
+        return x > 0 ? x : VG_CTA_TARGET;
+    }();
+    return v;
+}
+
 int vgemm_z(int64_t rows, int64_t cols) {
+    const int VG_CTA_TARGET = vg_cta_target();
     const int row_ctas = (int)((rows + VG_MR - 1) / VG_MR);
     const int n_stages = (int)(cols / VG_KS);
     int z = (VG_CTA_TARGET + row_ctas - 1) / row_ctas;

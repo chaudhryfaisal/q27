@@ -13325,3 +13325,118 @@ is a rare combination with a 10% prize.
 byte budget wins. Bandwidth is a hard physical ceiling; CUPTI records are
 best-effort and drop silently under load. Price any kernel-time claim against
 bytes/SOL before believing it.
+
+## 2026-08-19 (n): E6 -- cp.async is a NO-GO. The staging path is 0.25 ms off a same-grid floor; the exposed cost is the MMA phase. Shipped the 16-byte staging (-2.7%, bit-identical).
+
+Entry (m) named E6 "the biggest remaining item... ~2.4 ms, ~10% of the round",
+priced from k_vgemm sitting at 75% of SOL against a cp.async tile's 94-96%.
+Both halves of that comparison were instrument artifacts. Measured properly,
+the memory pipeline has 0.25 ms left in it and cp.async would spend that
+buying instructions in the phase that is already exposed.
+
+**NEW INSTRUMENT: `tools/vgemm_e6`** (make build/vgemm_e6). Replays the same
+401-weight round sequence as round_weight_cost, but adds the four controls the
+verdict needs: a MEASURED read SOL, CUDA-graph replay, a same-grid floor
+kernel, and a no-MMA build of the real kernel.
+
+**THREE CORRECTIONS TO (m)'s NUMBERS, none of which change its conclusion that
+the weight sweep dominates the round:**
+
+1. **round_weight_cost launches eagerly; the engine does not.** 401 main + 400
+   reduce launches cost **1.7 ms** of pure launch gap that a captured graph
+   does not pay. The sweep is **11.12 ms graph-replayed, not 12.41 ms**.
+2. **The sweep moves 14.66 GB, not 13.89.** round_weight_cost counts codes
+   only; the fp16 group scales are another 0.77 GB (+5.5%).
+3. **`1453` is not this machine's SOL.** Measured streaming-read SOL here is
+   **1691 GB/s** (2 GiB uint4 probe). round_weight_cost's "75% of SOL" and
+   microbench_mxf4's "84%" were computed against different denominators and
+   were never comparable -- the entire "84% -> 94-96%" premise for E6 was a
+   unit mismatch.
+
+**THE DECOMPOSITION** (T=16, graph-replayed, 14.66 GB read + 1.13 GB stored):
+
+| leg | ms | what it isolates |
+|---|---|---|
+| null-launch floor (801 launches) | 0.31 | graph launch overhead |
+| weight-read floor, k_vgemm's exact grid | 9.15 | grid + tail + occupancy class |
+| ... + k_vgemm's epilogue stores | 9.24 | the grid.z partials |
+| k_vgemm with the MMA compiled out | 9.49 | the whole staging path |
+| k_vgemm, main kernel only | 10.21 | + the MMA phase |
+| k_reduce_z alone | 0.62 | the deterministic epilogue |
+| **shipped sweep** | **10.83** | |
+
+Read down the column: the grid costs 5% (**wave quantization is NOT the
+problem** -- 1.9-2.4 waves reaches 95% of SOL), the partial stores cost
+**0.09 ms** (a byte budget predicted 0.71 ms; 96 MB of L2 absorbs them
+entirely, and only the control caught that), the staging path costs
+**0.25 ms**, and the MMA phase costs **0.72 ms**.
+
+**E6 (cp.async) IS DEAD, AND THE DECOMPOSITION IS WHY.** cp.async attacks the
+0.25 ms. On the Q4 leg it cannot even do that for free: cp.async copies raw
+bytes, so the nibble unpack has to move out of the smem store and INTO the MMA
+loop -- about +640 warp-instructions per CTA per super-step, added to the
+0.72 ms phase that is already the exposed cost. Best case it trades 0.25 ms
+for a larger number.
+
+**SHIPPED -- E6a, 16-byte staging (`src/vgemm.cu`).** The tile staged W and X
+through **4-byte** `__ldg`/`STS.32`. One uint4 per thread per array per
+super-step instead: Q4 loads 16 packed bytes, unpacks to 32, and writes two
+`STS.128`; Q8 and X copy 16 bytes straight through. LDW/LDX are multiples of
+16 so every store stays aligned.
+
+| | sweep ms (graph) | main kernel | %SOL |
+|---|---|---|---|
+| before | 11.12 / 11.14 / 11.14 | 10.51 | 82% |
+| **E6a** | **10.82 / 10.83 / 10.84** | **10.21** | **91%** |
+
+**-0.30 ms, -2.7%, against a +-0.01 ms run-to-run spread** (3 paired runs,
+both binaries rebuilt at HEAD). The whole gain is memory-level parallelism:
+an SM has a bounded number of outstanding load slots, and a 4-byte request
+buys a quarter of the in-flight bytes a 16-byte one does.
+
+**BIT-IDENTICAL, and the canonical md5 CANNOT say so.** Solo greedy decode
+stays on the GEMV (`gemm_min`) and never reaches k_vgemm, so `a2982c51...`
+reproducing proves only that nothing else broke. `tools/vgemm_e6` therefore
+folds the raw float bits of every lane output after each of the 401 weights
+into one digest: **base and E6a agree exactly at T=2, 5, 12 and 16.** Plus
+vgemm_test gates 3+4 (no spill, CTA/SM=4 held on all four instantiations),
+racecheck 0 hazards, memcheck 0 errors, fused_smoke union-vs-solo byte-
+identical, canonical a2982c51 with a stable wsum across two runs.
+
+**TWO NO-GOs, both measured:**
+
+- **Depth-2 register prefetch of W: -9%** (11.12 -> 11.82 ms). Prefetching two
+  super-steps doubles the in-flight bytes per CTA, which Little's law says
+  this tile wants. It loses anyway. The register budget is the reason: the
+  gate has zero slack at 64 regs, so the extra uint4 forces the compiler to
+  reschedule rather than allocate, and it defeats the prefetch it was given.
+  Making the buffer index compile-time (WPF-way unroll) recovered only
+  0.20 ms of the 0.70 -- so the select chains were a symptom, not the cause.
+- **The grid.z CTA target is already at its optimum.** Swept
+  `Q27_VG_CTA_TARGET` (a new read-once env override, default = the shipped
+  1400) over 400/700/1000/1400/2000/2800: the sweep is **flat at 10.79-10.84
+  ms from 1000 up** and only degrades below it (11.13 at 400). Lower z gives
+  longer K-slices and a cheaper reduce but starves the machine; higher z
+  shrinks the tile gap and grows the reduce by the same amount. A clean null
+  with the knob's own control rung built in.
+
+**WHAT IS ACTUALLY LEFT IN THE WEIGHT SWEEP**, in size order: the MMA phase
+exposed for **0.72 ms** (at T=16 the round is ~442 GMAC of int8, ~2.1 ms of
+tensor time against a 9.2 ms memory floor -- so this is imperfect overlap of
+real work, not waste), and the deterministic reduce at **0.62 ms**. Neither is
+a memory-pipeline problem and neither is cheap: the first wants a bigger tile
+(MR=64 spills, per vgemm.cuh) and the second is the price of no atomics.
+
+**SCOPE LIMIT, stated plainly.** -0.30 ms is -1.2% of a 24.72 ms round. That
+is well inside the +-10% ladder acceptance noise this plan's own instrument
+rules warn about, so **E6a is judged on the weight-sweep harness and is NOT
+separably measurable in a ladder A/B.** It is shipped because it is free,
+bit-identical, and deterministic to measure -- not because a ladder saw it.
+
+**Method note worth keeping, and it is the twin of (m)'s.** (m) said: when a
+profiler and a byte budget disagree, the byte budget wins. This entry says the
+byte budget also loses to a control -- it predicted 0.71 ms for the partial
+stores and the measured answer was 0.09 ms, because 96 MB of L2 sits between
+the kernel and DRAM. **A bandwidth argument is only sound for traffic that
+actually reaches DRAM. Build the floor kernel.**
+

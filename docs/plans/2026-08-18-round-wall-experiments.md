@@ -204,9 +204,18 @@ the mix-side width cost that killed it before.
 
 ## E6 -- Kernel-local, anytime fillers
 
-- **cp.async in k_vgemm**: 84% -> 94-96% SOL measured on identical shapes
+**CLOSED 2026-08-19 (n). cp.async NO-GO; 16-byte staging shipped at -2.7%.**
+The "84% -> 94-96% SOL" premise was a unit mismatch: the two figures used
+different SOL denominators (round_weight_cost's 1453 constant vs
+microbench_mxf4's measured ~1690). Decomposed against a same-grid floor
+(`tools/vgemm_e6`), the staging path is 0.25 ms off the floor and the exposed
+cost is the MMA phase (0.72 ms) -- which is exactly where cp.async's Q4 leg
+would have to move the nibble unpack. Shipped instead: uint4 staging,
+-0.30 ms +- 0.01, bit-identical over all 401 weights at T=2/5/12/16.
+
+- ~~**cp.async in k_vgemm**: 84% -> 94-96% SOL measured on identical shapes
   (T2's surviving fp4-arm yield); ~1.2 ms of the 10.3 ms sweep. Bitwise
-  output (memory pipeline only), canonical-gated. ~Half a day.
+  output (memory pipeline only), canonical-gated. ~Half a day.~~
 - **PDL (programmatic dependent launch) on the serial cstm chains**: the
   13 us/layer inter-kernel gaps; ~0.5 ms, partially overlaps E4's win.
 

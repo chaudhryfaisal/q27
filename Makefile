@@ -155,6 +155,14 @@ build/vgemm_test: tools/vgemm_test.cu src/vgemm.cuh $(VGEMM_SRC) | build
 build/vgemm_race: tools/vgemm_race.cu src/vgemm.cuh $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/vgemm_race.cu $(VGEMM_SRC) -o $@
 
+# E6 attribution harness: splits the weight sweep's missing bandwidth into launch
+# gaps / reduce epilogue / grid tail / the tile itself, against a MEASURED SOL.
+build/vgemm_e6: tools/vgemm_e6.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/vgemm_e6.cu $(VGEMM_SRC) -o $@
+
+build/round_weight_cost: tools/round_weight_cost.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/round_weight_cost.cu $(VGEMM_SRC) -o $@
+
 build/fdmma_test: tools/fdmma_test.cu src/fdmma.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/fdmma_test.cu -o $@
 
