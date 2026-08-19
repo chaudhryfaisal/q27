@@ -12236,6 +12236,8 @@ reproduce -- a pre-change binary returns `227a6b08`, deterministic across runs.
 That drift predates today's sampler work (measured on the T4 build, and the
 sampler is not on the plain `--temp` CLI path). The greedy anchor `f64e7c02` is
 EXACT. The sampled anchor needs re-deriving or its recorded flags corrected.
+[ERRATA (k): wrong -- the anchor reproduces EXACT on HEAD with the full
+recipe. `227a6b08` is the NO-`--spec` trajectory; this repro omitted the flag.]
 
 ## 2026-08-18 (i): GDN mix fused 6 -> 3 kernels -- bitwise-proven, and the wall answer is the interesting part
 
@@ -12364,3 +12366,156 @@ where q27 wins 4.10x on prefix reuse, was never at issue today.
 **ORDER:** the two broken determinism anchors first (every gate above leans on
 them), then the warm-cache width control (cheap: score the second pass of the
 same server), then 1 -> 2 -> 3 -> 4.
+
+## 2026-08-18 (k): E0 first half -- the sampled anchor was never broken; --spec omission bites a second time
+
+Round-wall plan E0.2, resolved in four CLI runs. On the HEAD binary (b5bbfe4
+tree, warm, greedy warm-up f64e7c02 EXACT first, CUDA_VISIBLE_DEVICES=0, GPU
+otherwise idle):
+
+- Full recorded recipe (`--tokens "760,6511,314,9338,369" --ctx 2048 --spec
+  -n 64 --temp 0.7 --top-p 0.95 --seed 42`): **900031e9 x2 EXACT.** The
+  anchor holds.
+- Same command WITHOUT `--spec`: **227a6b08 x2** -- byte-for-byte the md5
+  entry (h) recorded as "the anchor does not reproduce".
+
+So (h)'s flag was a rig error, not drift: the repro ran the no-spec sampled
+trajectory, the exact trap that bit v0.5.0 gating (07-13 gotcha: sampled
+anchors REQUIRE `--ctx 2048 --spec`; both trajectories are valid, so the
+wrong one looks plausible). Second bite of the same trap. Corroboration that
+no drift was possible: every commit between the T4 build (h) measured on and
+HEAD is bitwise-proven (b15fc1b nucleus_multi, ffd3f8a gdn_fuse_eq) or
+docs-only, so the with-spec trajectory could not have changed across that
+window.
+
+**Durable fix, shipped:** the anchor's exact command line is now PUBLISHED
+next to its digest -- `sampled_md5_for()` in tools/canonical_md5.sh
+(sm120:q4s -> 900031e9, full command in the comment), and
+tools/sampling_gate.sh grew **gate 2b**: it runs the exact recipe through the
+same `gen()` (which hard-codes `--ctx 2048 --spec`) and compares against the
+published digest; tiers without a published sampled anchor SKIP cleanly. The
+anchor stops being BUILDLOG prose that every session re-types by hand.
+
+Scope limit: verified sm120/q4s only, x2 per leg, one binary (HEAD). Residual
+uncertainty: whether (h)'s rig error was a missing `--spec` or a stale
+`Q27_SAMPLE_PLAIN=1` in that shell's env is not distinguishable after the
+fact -- the no-spec md5 match makes the former overwhelmingly likely; a
+Q27_SAMPLE_PLAIN control run is queued behind the E0.1 loop currently holding
+the GPU. E0.1 (greedy first-run-after-fresh-build divergence) is running:
+24x rebuild-then-first-run vs 20x warm, logged with per-rebuild binary md5s.
+
+## 2026-08-18 (l): the greedy anchor divergence REPRODUCED and CAPTURED -- it is NOT a first-run-after-build effect, and the full digest finally exists
+
+E0.1. Caught **twice on a warm binary** -- runs 92 and 151 of a 300-run campaign
+against a PINNED copy of build/q27 (md5 0a370e3e), GPU at 2887-2917 MHz /
+55-56 C, nothing else resident on GPU0. **Full divergent digest:
+`8196e65e8939dcb9ed04bd2ae2d50a8b`** -- the first time more than the 8-char
+prefix has ever been recorded, which is precisely why the 08-16 and 08-18
+sightings were unchaseable.
+
+**Both hits produced the IDENTICAL digest.** The divergence is therefore not
+noise: it is a binary fork into ONE specific alternate trajectory, reached
+twice independently. That is the signature of a single near-tie token flipping
+with everything downstream following deterministically -- and it means the
+alternate stream can be studied as a fixed object rather than a random one.
+
+**The "FIRST RUN AFTER A FRESH BUILD" pattern is RETRACTED.** It was a
+small-sample artifact of two sightings. Direct test: 24 rebuild-then-single-run
+cycles (a genuine full nvcc rebuild each time, per-cycle binary md5 logged) gave
+**0 divergences**, while the warm campaign hit one at run 92. The plan's E0.1
+hypothesis ("suspect JIT/module-load or uninitialized device state on first
+run") is dead, and so is the proposed pre-run warmup rule -- warming does not
+help because warmth was never the variable.
+
+**Rate: 2 in 300 (1 in 150)** on this instrument, not the 1-in-13 recorded on
+08-18. At a true 1/13 the 44 clean runs of the rebuild loop alone would have had
+p=0.03. Do not over-trust the exact figure -- two events is a wide interval
+(roughly 1-in-40 to 1-in-550) -- but the ORDER is ~1%, not ~8%.
+
+**What the divergent run is NOT** (each positively excluded today, not argued):
+- **Not artifact corruption.** The loader checksums the weights on every load;
+  the divergent run printed `resident: 15.46 GB (checksummed)` like every other.
+- **Not residual VRAM from prior processes.** Direct probe
+  (scratchpad/vram_probe.cu): wrote 20 GB of 0xDEADBEEF, exited, re-read from a
+  fresh process -> **100.0000% zeros**. This driver (r580) scrubs between
+  processes, so an uninitialized *global* read is a deterministic zero, not a
+  lottery. This also means the rebuild loop could never have tested that
+  hypothesis, which is why it was probed directly.
+- **Not an env latch.** 11 configs swept (PMIN/MAXD 5,6,7/DEXIT/FD/KV/SUFFIX/
+  BATCH/BATCH_GEMM); all give the canonical except Q27_FD=mma (43c4c97c) and
+  Q27_KV=fp8 (13c725bb), which have their own distinct digests. Neither is
+  8196e65e, so the "ambient exported Q27_* in the build shell" theory is out.
+- **Not a different build config.** build/q27-w16 returns the canonical 5/5
+  (3 spec + 2 no-spec), killing "the w16 binary simply has its own basin".
+- **Not cold clocks or thermal transient.** Boost clocks, 56 C, warm binary.
+- **Not co-residency.** GPU0 held only the desktop's ~1 GB.
+
+**What it looks like:** a coherent ALTERNATIVE trajectory, not corruption. The
+divergent run's acceptance profile is healthy -- round outcomes
+`1-tok 9, 2-tok 7, 3-tok 6, 4-tok 12, 5-tok 8` (42 rounds/129 tok) against the
+canonical `13, 8, 6, 9, 9` (45 rounds/128 tok). Garbage state would depress
+acceptance; this is the documented near-tie basin fork (07-09 gotcha), reached
+run-to-run on ONE binary rather than across builds. Consistent with 8196e65e
+being byte-exact the sm_86/sm_89-family canonical (07-17): at that fork there
+are two continuations, and both SASS families and this flip pick between them.
+
+**Where that leaves the mechanism.** A parallel three-lens source audit of the
+exact anchor path (uninit reads / sync races / arch-numeric divergence) returned
+one structurally important negative: on this recipe every launch geometry in the
+replayed spec graph is a compile-time or model-shape constant -- no SM count, no
+cudaMemGetInfo, no occupancy query, no clock reaches any grid, block or split
+count (the `cudaMemGetInfo` at engine.cuh:2192 is in the OOM advisory path
+only). So a run-to-run flip CANNOT be launch geometry, and the argmax cannot be
+a tie-break race (am_pack + atomicMax is order-independent with a lowest-index
+tie-break). The surviving candidates are intra-kernel: a shared-memory hazard
+(smem is not scrubbed between launches and block->SM assignment varies run to
+run) or a missing intra-block sync. compute-sanitizer racecheck is the next
+instrument, and it does not need to catch the 1-in-92 event to find the hazard.
+
+**Shipped this session (E0 deliverables):**
+- `tools/anchor_check.sh` -- anchor gate that DIAGNOSES its own failure: dumps
+  full digest, binary md5+mtime, artifact + CHECKSUMS entry, device/driver/
+  clocks/temp, co-resident processes, every Q27_*/CUDA_* latch, stderr and the
+  generated text, then repeats to separate a sticky config error from the
+  transient. Failure path verified by forcing a mismatch (control run), not
+  assumed. This is what makes the NEXT sighting actionable.
+- Lane slots 5..7 now zeroed at init (engine.cuh). `k_finish_round`
+  dereferences all W_PLUMB draft/verdict slots every round and copies them to
+  the host, but a below-ceiling run (the canonical is depth-4/width-5) never
+  writes lanes 5..7; only lanes 8..15 were zeroed. Benign today ONLY because the
+  driver scrubs -- a courtesy, not a guarantee. Not the divergence (it is
+  value-gated out by `k <= max_draft`).
+- `prefill.cu` `cur_nsm()` / `cur_sm_major()`: return codes were discarded
+  against an UNINITIALIZED `cudaDeviceProp`, so a failed query latched stack
+  garbage for the process lifetime -- and those values pick a prefill kernel
+  (MR=128 vs 64) and `gemm_splitk_nsp`, i.e. a real reduction-order change.
+  Now zero-initialized and CUDA_CHECK'd, matching pf4.cu which already did it
+  right. Off the anchor path (5-token prompts never reach prefill), so this is
+  a latent-defect fix, not a divergence fix.
+- `spec3.cuh`'s split-K header contract corrected: it claimed every split
+  writes its partial even when empty, which is true only of the frozen v1
+  kernel. The live fd2 skips empty splits and correctness rests on
+  k_attn_fd_combine re-deriving the same `used` bound.
+
+All four shipped items above are gated: `tools/anchor_check.sh -n 3` on the
+rebuilt binary returns canonical f64e7c02 x3 + sampled 900031e9, all EXACT.
+
+**Scope limit:** two divergences captured, sm120/q4s, greedy `--spec` recipe,
+one box. The rate is a single-instrument estimate on two events. The mechanism
+is NOT yet identified -- do not treat any A/B's byte identity as trustworthy at
+better than ~1% until it is. Note the 08-16 sighting was a **no-spec** run, so
+the defect lives in the core forward pass shared by both paths, not in the
+draft/verify machinery; that is the strongest localization currently in hand.
+Next instruments, in order: (1) capture the divergent TEXT and locate the fork
+TOKEN (a campaign that saves stdout is running; the whole-trajectory md5 says
+two runs differ but not where, and the fork index names the round); (2)
+compute-sanitizer racecheck for an intra-block shared-memory hazard, which does
+not need to catch the rare event to find the defect.
+
+**A route deliberately NOT taken:** the 3090 should reproduce the sm_86-family
+trajectory on demand (which would both confirm the 8196e65e identification and
+hand over the divergent text for free), but GPU1's 6.6 GB is held by a LIVE
+realtime speech service, and occupying 15.5 GB there risks OOMing it on a burst.
+The GPU0 capture campaign yields the same primary artifact safely. (Also: the
+`vox-transcriber` unit named in the ops notes has been failed since 2026-07-29
+and no longer owns GPU1 -- stopping it is now a no-op.)

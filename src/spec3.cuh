@@ -107,9 +107,16 @@ void wht3(P3 x, int n_heads, int head_dim, int stride, bool inv, cudaStream_t st
           int ntok = 3);
 
 // Flash-decode split-K partial layout: NS position splits per (token, head)
-// pair, each partial = {m, l, acc[256]} = FD_ST floats. Every split writes its
-// full partial (even when its position range is empty), so scratch must hold
+// pair, each partial = {m, l, acc[256]} = FD_ST floats. scratch must hold
 // ntok * n_q_heads * FD_MAXNS * FD_ST floats regardless of context length.
+// EMPTY SPLITS ARE NOT WRITTEN by fd2 (the live default path): it returns
+// early for sp*chunk >= seq, and k_attn_fd_combine re-derives the same
+// used-split count from the same *pos and never reads past it. Those cells of
+// scratch therefore hold undefined memory -- a reader that sums a fixed ns
+// instead of `used` would pull garbage into the online-softmax rescale. This
+// header used to claim every split wrote its partial, which was true only of
+// the frozen v1 kernel; the writer/reader agreement is the real contract, and
+// any new consumer of `part` must re-derive `used` exactly as the combine does.
 // FD_NS stays 16 so Q27_FD=v1 reproduces the historical kernel bit-for-bit;
 // fd2 uses its own FD2_NS -- with register accumulators the block is cheap,
 // and the grid needs ~4-5 blocks per SM resident for latency hiding

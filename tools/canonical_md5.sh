@@ -39,3 +39,31 @@ canonical_md5_for() {
     *) return 1 ;;
   esac
 }
+
+# Published sampled-seed anchors. The EXACT command is part of the anchor;
+# every flag below is load-bearing. In particular `--spec` selects a
+# different-but-valid sampled trajectory: omitting it produced a plausible
+# WRONG md5 at v0.5.0 gating and again on 2026-08-18 (recorded as "anchor
+# broken"; it never was -- see BUILDLOG 2026-08-18 (k)).
+#   build/q27 <model> --tokens "760,6511,314,9338,369" --ctx 2048 --spec \
+#     -n 64 --temp 0.7 --top-p 0.95 --seed 42 | grep '^generated:' | md5sum
+sampled_md5_for() {
+  local arch="$1" tier="$2"
+
+  case "$arch" in
+    sm120|sm_120|blackwell|5090) arch=sm120 ;;
+    sm86|sm_86|ampere|3090|a40) arch=sm86 ;;
+    metal-m4|apple-m4|m4) arch=metal-m4 ;;
+  esac
+  case "$tier" in
+    default|vanilla|qwen36-27b-mtp) tier=default ;;
+    q4s|q4s-v1) tier=q4s ;;
+    q5f|q5f-v1) tier=q5f ;;
+    q6f|q6f-v1) tier=q6f ;;
+  esac
+
+  case "$arch:$tier" in
+    sm120:q4s) printf '%s\n' 900031e9b86df8f52493e6c1f4040c2e ;;
+    *) return 1 ;;
+  esac
+}

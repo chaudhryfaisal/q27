@@ -1019,6 +1019,22 @@ struct Engine {
         d_draft_L[0] = d_draft; d_draft_L[1] = d_draft2; d_draft_L[2] = d_draft3;
         d_draft_L[3] = d_draft4; d_draft_L[4] = d_draft5; d_draft_L[5] = d_draft6;
         d_draft_L[6] = d_draft7;
+        // Same argument as the wide-lane memsets above, which the by-name
+        // lanes 5..7 were missing: k_finish_round dereferences ALL W_PLUMB
+        // draft/verdict slots every round and copies them out as outcome[],
+        // but a run below its depth ceiling (the canonical recipe is depth-4,
+        // width-5) never WRITES lanes 5..7. The accept walk value-gates the
+        // junk out via `k <= max_draft`, so this was not a live wrong-token
+        // bug; it was reading undefined memory into a host-visible struct and
+        // resting correctness on a downstream gate. Measured 2026-08-18: this
+        // driver (r580) hands a fresh process zeroed pages, so the values were
+        // already 0 here -- that is a driver courtesy, not a guarantee, and
+        // not something to leave a bitwise contract standing on.
+        for (int L = 5; L <= 7; L++) {
+            CUDA_CHECK(cudaMemset(d_draft_L[L - 1], 0, 4));
+            CUDA_CHECK(cudaMemset(d_v_L[L], 0, 4));
+            CUDA_CHECK(cudaMemset(d_pos_L[L], 0, 4));
+        }
         A((void**)&d_P, 4);
         A((void**)&d_outcome, OUTCOME_INTS * 4); // {n, t1, dr1..dr(W_PLUMB-1), pending}
         kv_memset_mtp();
