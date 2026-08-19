@@ -1543,7 +1543,9 @@ private:
         // BeginCapture), so a replayed round never re-records them and no
         // stale timestamp node is frozen into a graph. ONE semantics
         // delta: on a MISS round the phv span absorbs the one-time
-        // capture+instantiate host stall (~2.4 ms median, T1) while the
+        // capture+instantiate host stall (measured 2026-08-18 at k=4:
+        // 20-28 ms, mean ~23 -- the earlier "~2.4 ms median, T1" was 10x
+        // stale; see BUILDLOG (j)) while the
         // GPU idles between ev_draft_end and the graph launch; HIT rounds
         // show the true replay wall. GenStats phd/phv/phs keep their
         // shared-wall per-member attribution unchanged.
@@ -1813,7 +1815,8 @@ private:
         }
         // MISS. No warmup pre-capture pass exists anywhere (deliberate
         // deviation from the plan's "optional startup pre-capture" line):
-        // first-sight capture measured ~2.4 ms median (T1) -- warmup-class
+        // first-sight capture: 2026-08-18 [gcache] telemetry measures 20-28 ms
+        // at k=4 (the "~2.4 ms median (T1)" figure was 10x stale) -- warmup-class
         // already -- and a pre-capture pass would need synthetic round
         // state for shapes that may never arrive. YAGNI.
         gc_misses_++;

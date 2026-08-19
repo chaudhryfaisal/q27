@@ -12288,3 +12288,79 @@ bitwise identical, and the necessary substrate for the batched version.
 
 Chain wall for the record (nsys, one member stream): 38.8 us = 25.8 kernels +
 13.0 gaps per GDN layer pre-fusion.
+
+## 2026-08-18 (j): ERRATA from the end-of-day audit -- two of today's own entries corrected, and the width door reopens
+
+A 3-lens adversarial audit of entries (c)-(i), with every load-bearing claim
+re-verified against the raw logs/sqlite before acceptance. Four corrections,
+two of them to measurements made TODAY.
+
+**E1 -- entry (i)'s explanation of the fusion-neutral result is WRONG.** It
+said the mix chains are "mostly HIDDEN under concurrent cstm work". Measured
+(q27g.sqlite): cstm busy time strictly inside mix-kernel intervals is
+**0.000 ms** -- cstm IDLES through the entire mix phase; the graph is a strict
+per-layer fork/join. The 4.17x overlap is members hiding under EACH OTHER. The
+side-phase union (~2 ms GDN + ~2 ms attention per round) is fully EXPOSED round
+wall. Corrected reading: the fusion's expected win was ~0.6 ms (~2%), invisible
+under the ladder's +-10% acceptance noise -- "neutral" was never evidence that
+mix time doesn't matter. Consequence: cross-member batching is WORTH MORE than
+entry (i) implied (the full ~4 ms is on the table) and it extends to the
+attention mix, which no entry today flagged.
+
+**E2 -- entry (h)'s "GDN ~8.9 ms/round IS the unexplained 10.66 ms" was invalid
+arithmetic.** Share-of-GPU-time x round-wall is only valid for SERIAL-on-cstm
+buckets; entry (h) stated that caveat and then violated it for the overlapped
+side-stream buckets. GDN's exposed wall is ~2 ms, attention ~2 ms; the rest of
+the "unexplained" verify was serial cstm work (pre-fix nucleus ~4.5, gemv/norm/
+quantize chains ~5.5). This is also WHY the sampler fix paid in full (serial:
+share == wall) while the GDN fusion did not. The "GDN 30%, the big one" prize
+was overstated ~4x.
+
+**E3 -- T1's width verdict was 87% a cache artifact, and today's straggler
+"finding" had the mechanism ordering inverted.** From the [gcache] telemetry
+(per-miss `cap+inst=` walls, verified by hand): a fused-verify graph capture
+costs **20-28 ms, mean ~23** -- the in-tree "~2.4 ms median" comment was 10x
+stale (now corrected at both sites). Per fused round at C=4 that is 2.87 ms of
+capture stall inside phv for w12 vs 7.75 ms for w16-cap463 (35% miss rate from
+shape-space exhaustion, zero evictions): **delta 4.89 ms = 87% of the 5.63 ms
+width penalty.** Steady-state width cost is ~+0.75 ms/round (~3%) against
++2.3% tokens -- a rough WASH, not the emphatic negative recorded. The T1 entry
+and the 08-16 C-sweep W_MAX verdict were BOTH measured in a cold-cache
+heterogeneous-shape regime; "the 1.34x tok/round gap is not available via
+width" is UNSETTLED until a warm-cache control runs. The incumbent-through-
+the-bar lesson, third occurrence this week.
+
+**E4 -- entry (i)'s "fused run 1" C=8 row was a parsing error, struck.** The
+slice blended C=4 and C=8 requests; the real run-1 C=8 is tok/rnd 1.7152 /
+round 26.703 (vs 27.189 pre-fusion), and the "tok/rnd 1.888 acceptance luck"
+story was an artifact of the bad slice. Verdict unchanged (neutral-to-slightly-
+positive); provenance corrected.
+
+Smaller: the 2.31x per-stream gap framing used a stale tok/round (1.777, the
+08-17 binary) -- quote **1.91x aggregate** for the ninfer gap; the 0.39 ms/
+union-column vgemm coefficient was fit on PRE-nucleus-batching logs where the
+serial sampler scaled with width -- post-fix it is ~0.11-0.12; the DSpark A/B
+ran MTP at n-max 6 vs DSpark at n-max 15 (never swept) -- the C>=4 NO-GO
+stands on economics, but the C=1 claim carries an op-point caveat, recorded.
+And per the audit, ninfer keeps GDN S in fp32 -- their 0.54 ms/member slope is
+NOT bought with state dtype, which demotes the bf16-S idea below the
+structural work.
+
+**CORRECTED JUICE LIST** (C=8 baseline 27.2 ms / 1.70 tok / ~493 t/s):
+1. **Pre-capture / graph-key slimming.** The capture tax is ~2.9-7.8 ms/round
+   at C=4-6 TODAY (production regime), ~0 at uniform C=8. Also the gate for
+   any width policy. High confidence, structural.
+2. **Draft into the round graph + depth policy at C>=6.** fdraft 5.7 -> ~3;
+   post-T4 the margin gate buys ~0.06 ms/round. ~550-575 t/s. Medium-high.
+3. **Cross-member batched mix, GDN AND attention.** ~4 ms exposed fork/join.
+   ~630 compounded. Medium (endpoint proven by ninfer's whole-model fold).
+4. **Width policy, AFTER 1+3.** tok/round 1.70 -> ~1.95-2.1 realistic
+   (uniform-3 bound 2.22 is selection-biased); ~680-710 compounded upside.
+5. cp.async vgemm (~1.2 ms), PDL on cstm chains (~0.5) -- kernel-local.
+Not reachable on this list: ninfer's 18.9 ms round (their per-member slope is
+0.54 ms with S in fp32 -- structural all the way down). The agentic wall,
+where q27 wins 4.10x on prefix reuse, was never at issue today.
+
+**ORDER:** the two broken determinism anchors first (every gate above leans on
+them), then the warm-cache width control (cheap: score the second pass of the
+same server), then 1 -> 2 -> 3 -> 4.
