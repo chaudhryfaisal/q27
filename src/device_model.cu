@@ -82,6 +82,17 @@ void DeviceModel::checksum_baseline() {
     CUDA_CHECK(cudaFree(d_out));
 }
 
+unsigned long long DeviceModel::checksum_aggregate() const {
+    // Wraparound u64 add: commutative, so the unordered_map iteration order
+    // does not matter (same argument as k_xsum64's atomicAdd accumulation).
+    unsigned long long a = 0;
+    for (const auto& [name, s] : sums_) {
+        (void)name;
+        a += s;
+    }
+    return a;
+}
+
 int DeviceModel::checksum_verify(bool print) const {
     unsigned long long* d_out;
     CUDA_CHECK(cudaMalloc(&d_out, 8));

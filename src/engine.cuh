@@ -1222,6 +1222,12 @@ struct Engine {
             dm.upload_all(q27k::pf4_on(), q27k::pf4_instrument());
             dm.checksum_baseline();
             fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
+            // Q27_PRINT_WSUM=1: aggregate weight digest. The SAME artifact must
+            // print the SAME value on every load; a difference means the upload
+            // itself landed wrong, which checksum_verify() cannot see because
+            // its baseline is taken after the copy (2026-08-19 investigation).
+            if (getenv("Q27_PRINT_WSUM"))
+                fprintf(stderr, "wsum: %016llx\n", dm.checksum_aggregate());
         }
         if (q27k::pf4_on()) {
             if (dm.model_has("blk.0.ffn_gate.weight.pf4"))

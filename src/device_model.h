@@ -57,6 +57,12 @@ class DeviceModel {
     // corrupted state). ~10 ms for the full 16.75 GB model.
     void checksum_baseline();
     int checksum_verify(bool print) const; // returns number of mismatched tensors
+    // One digest over every tensor's baseline sum, comparable ACROSS PROCESSES.
+    // checksum_verify() only catches drift AFTER the baseline was taken, so an
+    // upload that landed wrong is blessed as correct and verifies clean. This
+    // is the only way to see a bad upload: the same artifact must produce the
+    // same aggregate on every load. Printed at load under Q27_PRINT_WSUM=1.
+    unsigned long long checksum_aggregate() const;
 
   private:
     const Model& model_;

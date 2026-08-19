@@ -12783,3 +12783,72 @@ race-lens finding at engine.cuh:2306, where `reset_gdn_mtp()`'s legacy-stream
 memsets of S / conv_ring / MTP-KV interleave with stm-ordered warm-round work;
 a lost race there leaves polluted committed state whose EXTENT varies with
 timing, which matches "each bad run uniquely wrong".
+
+## 2026-08-19 (d): ROOT CAUSE -- SINGLE-BIT CORRUPTION OF THE RESIDENT WEIGHTS. This is not an engine bug.
+
+**The anchor divergence is silent data corruption.** Added
+`DeviceModel::checksum_aggregate()` (device_model.h/.cu) -- one u64 digest over
+every tensor's baseline word-sum, printed at load under `Q27_PRINT_WSUM=1`
+(engine.cuh). The SAME artifact must produce the SAME aggregate on every load.
+It does not:
+
+| run | wsum | delta vs ref | decomposition |
+|---|---|---|---|
+| ref (97/100) | `935aa78756189480` | -- | -- |
+| 34 | `9b5aa78756189480` | **+2^59** | ONE bit |
+| 38 | `8b5aa78756189480` | **-2^59** | ONE bit |
+| 52 | `6b5aa78756189480` | **-(2^59+2^61)** | TWO bits |
+
+Every delta is an exact sum of powers of two, i.e. individual bit flips in the
+resident weights. **3 of 100 launches carried a flipped weight bit.**
+
+**All three events land in BYTE 7 of the u64 word (bits 59, 61).** Uniform
+random corruption would put three-for-three in one byte at (1/8)^3 = 0.2%.
+Bits 56-63 are exactly the span of ONE x8 DRAM device on a 64-bit bus -- the
+signature of a single marginal memory chip, not scattered cosmic-ray SDC. Note
+[[user_hardware]]: 4x32 GB dual-rank DDR5 that would not hold EXPO 5200 and runs
+at JEDEC. HOST-vs-DEVICE localization is running (8 full re-reads of the
+15.46 GB artifact vs its known-good md5 7e5454e0c0ded717136ad3e42634ba25).
+
+**This explains every negative result in entries (l) through (c):**
+- No kernel audit could find it -- the kernels are correct; their INPUT is wrong.
+- racecheck/initcheck could not see it (and the unfiltered run OOMed for nothing).
+- Clock/thermal/memory-pressure/prefill-route arms all read null because none of
+  them touch the failing path.
+- `--verify-weights` PASSES on a corrupt load: `checksum_baseline()` is taken
+  AFTER the upload, so it blesses whatever landed. device_model.h:52 even
+  anticipates "OC/heat bit flips ... which token-identity gates cannot see" --
+  but nothing compared the baseline ACROSS processes until now.
+
+**The rate hierarchy, all measured:**
+- ~3-6% of launches: at least one flipped weight bit (`wsum` differs).
+- ~1-2% of launches: the flip perturbs the logits (100% of 248320 logits move,
+  mean |delta| ~1e-1). Runs 38 and 52 flipped a bit but produced BITWISE-
+  IDENTICAL logits -- consistent with a flip landing in a tensor a no-`--spec`
+  pass never reads (the MTP head is resident but unused).
+- 1.78% of runs (16/900): the perturbation crosses the 7.46e-4 margin at token
+  54 and becomes the visible `8196e65e` divergence.
+
+So the greedy anchor was a CANARY: the one position in that trajectory whose
+top-2 margin was narrow enough to register a fault that is otherwise invisible.
+
+**CONSEQUENCES -- read before trusting any number measured on this box:**
+1. **Byte-identity gates are necessary but nowhere near sufficient.** A run can
+   carry corrupted weights and still emit identical tokens (measured: 2 of 3
+   corrupt runs did exactly that). Passing the canonical md5 does NOT mean the
+   forward pass was correct.
+2. **Every quality measurement has a ~1-6% per-run chance of running on subtly
+   wrong weights.** The thunderdome campaigns, the PPL ladders, the KV tail
+   study, the cross-engine quality scores -- all of them sampled this.
+   Single-run A/Bs are the most exposed; anything with n>=3 and agreement is
+   probably fine.
+3. **`Q27_PRINT_WSUM=1` is now the cheap integrity check.** Print it at the top
+   of any campaign and discard runs whose aggregate differs. That is a real gate
+   -- it caught what nine kernel-level exclusions could not.
+4. The round-wall plan's E1-E6 A/Bs lean on byte identity; they need either
+   repetition or a wsum check per leg.
+
+**NOT yet established:** whether the flip happens in host DRAM / page cache, on
+the PCIe/DMA transfer, or in VRAM. The artifact re-read test discriminates
+host-side from device-side. Do not act on a hardware theory (memtest, EXPO
+changes, RMA) until that lands.
