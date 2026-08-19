@@ -13064,3 +13064,47 @@ margin read no longer gates anything at C>=6, so the whole draft phase becomes
 capturable into the round graph (fdraft 3.02 -> lower still, and one less host
 sync per round). Watch dctl: pinning depth feeds degenerate observations into
 the adaptive ladder, so freeze dctl updates while the concurrency ceiling binds.
+
+## 2026-08-19 (i): E3.2 -- NO-GO, and the reason is a phase-accounting trap worth keeping
+
+E3.2 was "capture the single fused draft step + margin-free gating into the
+round graph" (~a day of conductor work). Before paying for it, a
+measurement-only probe bounded the win: when the ceiling pins every member to
+ONE step, `W = max(2, cap+1) = 2` whether the margin passes or not, so the
+per-step margin D2H + host sync cannot change the round's width. The probe
+skipped them outright (falsifying gate_cap and disabling B8 -- never shippable,
+and now removed from the tree).
+
+**Result at C=8, 3 passes each, same binary:**
+
+| | phfd | phv | round ms | rest = round-phfd-phv |
+|---|---|---|---|---|
+| depth-1 (sync intact) | 3.05 | 21.33 | 24.76 | 0.38 |
+| + no-sync probe | **0.41** | 21.16 | **24.46** | **2.89** |
+
+**phfd collapses 87% and the round wall does not move** (24.76 -> 24.46, and
+passes 1-2 alone read 24.71/24.85 vs 24.66/24.79 -- indistinguishable; the third
+nosync pass at 23.93 also carried phv 20.70, i.e. an acceptance draw, not the
+flag). The 2.64 ms did not vanish: it reappeared in `rest`, which went
+0.38 -> 2.89. The wait simply relocated to the outcome D2H sync in
+fused_round, outside both phase brackets.
+
+**THE TRAP (reusable):** `phfd`/`phv` are HOST-WALL brackets that include
+waiting for GPU work. Moving a sync moves the NUMBER without moving the WALL.
+A phase that looks like 3 ms of "overhead" can be 2.6 ms of unavoidable GPU
+execution being waited on. **Never price a change off a phase bracket alone --
+check that the round wall actually moved, and check where the time went when it
+did not.** This is the same class as the 08-18 share-x-wall error (side-stream
+work overlaps, so GPU-time share overstates exposed wall), from the other
+direction.
+
+**Verdict: E3.2 is a NO-GO at ~0-1% of round wall.** The draft step's GPU time
+is real and must be paid before the verify can run; the sync's placement is
+bookkeeping. Graph capture would additionally remove per-launch overhead, but
+the probe bounds the whole draft-phase-beyond-GPU-compute contribution at
+<= ~1%, which does not justify a day plus a dctl-freeze redesign.
+
+E3 therefore closes with E3.1's +9.8% banked and E3.2 declined on measurement.
+**Next: E2.2 (graph-key slimming), which E1 established as the critical path** --
+it is what converts the measured +6.2% steady-state width gain into a shippable
+one, and E2.1 proved a bigger cache cannot substitute for it.
