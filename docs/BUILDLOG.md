@@ -12952,3 +12952,55 @@ to come from **E2.2 (graph-key slimming)** -- collapse the shape space by
 indirecting lane pointers through a device table so shapes with equal
 (k, sorted-gw, sfx, smp, kvk) share one exec -- and then **E2.3 (pre-capture)**.
 Those attack the cause; the cap never was the cause.
+
+## 2026-08-19 (g): E1 -- width PAYS warm (+6.2%), and the capture tax eats it (-6.8% raw). E5 is unblocked but STRICTLY behind E2.2.
+
+The reopened question from the 08-18 errata (T1's -13.6% at C=4 was 87% capture
+stalls, so the 08-16 "do NOT raise W_MAX" verdict was unsettled, not settled).
+Both binaries REBUILT AT HEAD, one server instance per leg, ladder C=4 x3 then
+C=8 x2, pass 1 discarded as cold, passes 2-3 averaged.
+
+**Baseline reproduces exactly, which validates the harness:** w12 at C=8 gives
+tok/round 1.702-1.716 at round 27.22-27.48 ms, phv 21.3-21.4, phfd 5.5-5.6 --
+against the plan's recorded "27.2 ms = phv 21.4 + fdraft 5.7, tok/round 1.70".
+
+**WARM C=4 (passes 2-3 averaged):**
+
+| | tok/round | raw round ms | capture ms/rnd | steady round ms | misses/pass |
+|---|---|---|---|---|---|
+| w12 | 2.0617 | 26.95 | 3.58 | 23.38 | 54-61 |
+| w16 | 2.2213 | 31.18 | 7.46 | 23.72 | 110-115 |
+| delta | **+7.74%** | +15.7% | **+108%** | **+1.45%** | **+2x** |
+
+- **Steady-state throughput: +6.20%** (0.08818 -> 0.09365 tok/ms). The real
+  kernel cost of width is only **+1.45% wall** against **+7.74% tokens**.
+- **Raw throughput: -6.84%.** w16 DOUBLES the shape space, so capture misses
+  double (57 -> 113 per pass) and the capture tax doubles (3.58 -> 7.46
+  ms/round), which more than eats the steady-state gain.
+
+**The plan's own cross-check PASSES** (cold-pass phv minus summed cap+inst must
+agree with the warm number within ~0.5 ms/round): w12 23.19 vs 23.38 (0.19 ms),
+w16 23.96 vs 23.72 (0.24 ms). The capture accounting is sound.
+
+**Null rung behaves:** C=8 is trim-floored to width 2 regardless of W_MAX, and
+reads tok/round -1.18%, round +0.91% -- both inside the +-10% acceptance noise
+this instrument carries. The knob provably cannot matter there, and it doesn't.
+
+**VERDICTS.**
+1. **The 08-16 "do NOT raise W_MAX" verdict is RETRACTED for warm-cache
+   serving.** The plan's bar was "tok/round gain >= wall cost, both in %";
+   measured +7.74% vs +1.45%, a 5.3x margin. Width is not expensive. It was
+   never expensive; the capture churn it induces is.
+2. **It STANDS for production as shipped today.** Raw C=4 throughput is -6.8%
+   with w16, because nothing has fixed the shape space. Do not ship a W_MAX
+   raise now.
+3. **E5 (width policy) is unblocked but STRICTLY gated behind E2.2.** This
+   converts E2.2 (graph-key slimming: indirect lane pointers through a device
+   table so shapes sharing (k, sorted-gw, sfx, smp, kvk) collapse to one exec)
+   from "nice capture-tax win" into **the critical path** -- it is what turns a
+   measured +6.2% steady-state width gain into a shippable one, and E2.1 already
+   proved a bigger cache cannot substitute for it.
+
+Estimated compounded value if E2.2 lands: C=4 raw round 26.95 -> ~23.4 ms at
+w16's 2.22 tok/round = ~0.0949 tok/ms vs today's 0.0765 = **+24%** at C=4,
+before any of E3/E4. C=8 is unaffected by both (one shape, floors to 2).
