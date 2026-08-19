@@ -12553,15 +12553,31 @@ the same continuation. That sameness is also evidence AGAINST random silent
 data corruption (non-ECC GDDR7), which would land elsewhere sometimes and
 produce other digests.
 
-**MINIMAL REPRODUCER, and it is a single forward pass.** Feeding the 58-token
-prefix (5 prompt + A[0:53], in scratchpad/prefix58.txt) with `-n 1` returns
-`248045` -- the canonical side of the tie -- so the fork position is reachable
-directly, no 45-round generation required. `--spec` is not needed (the 08-16
-sighting was a no-spec run; the defect is in the core forward pass). This turns
-a 3.7 s/45-round trial into a ~3 s single-step trial and, more importantly,
-shrinks the instrumented surface from the whole decode loop to one pass. Next
-session: loop it to confirm it flips to `846` at ~1/150 (~300 runs), then
-bisect. compute-sanitizer racecheck is running against this reproducer now.
+**MINIMAL REPRODUCER, and it is a single forward pass.** The first differing
+index is **54**: canonical `271`, divergent `846` (the difflib script above
+aligns the delete at 53:55 because 248045 repeats -- both alignments are valid,
+but the first DIFFERING position, which is what a reproducer must target, is
+54). So the prefix is 5 prompt + A[0:54] = **59 tokens**
+(`scratchpad/prefix_tie.txt`).
+
+Verified both sides in ONE forward pass, `-n 1`, no `--spec` (the 08-16
+sighting was no-spec; the defect is in the core forward pass):
+- 5090: `271` (canonical side)
+- 3090: `846` x2 (divergent side, deterministic)
+
+That is the whole arch-family split reproduced without generating 45 rounds. It
+turns a 3.7 s/45-round trial into a ~3 s single-step trial and shrinks the
+instrumented surface from the entire decode loop to one pass.
+
+(Recorded honestly: the first cut of this used a 58-token prefix -- one token
+short -- and returned `248045`, which is the token BEFORE the tie, not a side
+of it. A reproducer that reports the wrong token is worse than none; check that
+the emitted token is one of the two tie candidates before trusting it.)
+
+Next: loop the 59-token reproducer on the 5090 to confirm it flips to `846` at
+~1/150 (~300 runs), which would prove the single step carries the whole defect;
+then bisect inside that step. compute-sanitizer racecheck is running against
+the same single-pass shape now.
 
 **What is still NOT known:** the source of the ULP-level nondeterminism on the
 5090. Everything measured says the margin at token 53 is small enough that a
