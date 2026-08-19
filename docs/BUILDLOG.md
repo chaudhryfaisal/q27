@@ -12716,3 +12716,70 @@ cannot confirm it.
    so it is not silent data corruption" was WRONG and is withdrawn:** at a
    two-candidate knife-edge ANY sufficient perturbation yields the same
    alternate trajectory, so SDC was never excluded by that observation.
+
+## 2026-08-19 (c): it was NEVER a near-tie -- ~1-2% of runs compute a WRONGLY-PERTURBED FORWARD PASS
+
+The biggest reframing of this investigation, and it retracts the model every
+prior entry has been built on.
+
+`--dump-logits` works on the EAGER `--tokens` path (engine.cu:1160, right after
+the prompt loop, before generation) -- it is NOT `--pf`-only; the `--pf`-gated
+block at :1086 is the batched leg's separate dump. So the tie-deciding
+distribution can be captured directly.
+
+**The margin is not a knife edge.** At the tie position: 271 = +14.158872604,
+846 = +14.158126831, margin **7.457733e-04** = ~782 ULP, with rank 3 a full 2.89
+logits back. Reassociation noise on this engine is documented at 1.05e-6 (Q4) /
+2.80e-6 (Q8) relative (vgemm.cuh:34) -- **20-50x too small to cross this gap**.
+The long-held "sub-ULP perturbation decides a knife-edge tie" model is WRONG.
+
+**What bad runs actually do.** 20 consecutive good runs produced BITWISE-
+IDENTICAL logits (one md5 over 248320 floats). Two captured bad runs each
+perturb **100.00% of all 248320 logits**:
+
+| event | differing | max abs delta | mean abs delta | tok271 | tok846 | winner |
+|---|---|---|---|---|---|---|
+| ref (x20) | -- | -- | -- | +14.158873 | +14.158127 | 271 (by 7.5e-4) |
+| run 161 | 248320 (100%) | 8.34e-01 | 1.11e-01 | +13.733006 | +13.950596 | **846 by 0.218** |
+| run 194 | 248320 (100%) | 1.43e+00 | 1.79e-01 | +14.262596 | +13.856833 | 271 by 0.406 |
+
+So the process is BIMODAL: exact almost always, occasionally wrong by ~1e-1 on
+every logit. The tie is not the bug -- it is merely the most sensitive DETECTOR
+of a much larger fault that was previously invisible.
+
+**Each bad run is uniquely wrong.** The two event vectors differ from EACH OTHER
+(max 1.40, mean 0.179), not just from the reference. A single stale state (one
+polluted buffer, one specific wrong value) would reproduce the SAME wrong logits
+every time. It does not. The corruption's extent varies run to run.
+
+**The flip rate was undercounting by ~2x.** Run 194 perturbed everything and
+still emitted 271, because its perturbation pushed 271 FURTHER ahead. Only
+perturbations landing in the right direction cross the margin, so token-watching
+sees roughly half the events. Measured 2 events / 200 runs = **1% perturbation**
+vs the 1.78% flip rate over 900 runs (the two are consistent given n; the point
+is that the fault rate is AT LEAST the flip rate, and flips are a lossy proxy).
+**Every campaign in entries (l)-(b) counted flips, so all of them are floors.**
+
+**Corrected consequence for A/B discipline:** this is worse than a rare tie
+re-roll. ~1-2% of runs produce materially different logits everywhere, which
+means a byte-identity gate can PASS while the run was numerically wrong (the
+perturbation simply did not cross a decision boundary). Any single-run A/B on
+this box carries a ~1-2% chance of comparing a corrupted pass.
+
+**Arm results, with one correction.** Control 5/300, clock-locked-1000MHz 4/300
+(997 MHz, 41 C vs 2900 MHz, 56 C -- a 3x clock cut and 15 C changes nothing, so
+voltage/timing marginality is disfavored). **ARM 1 WAS A NO-OP and its
+"serial prefill excluded" reading is WITHDRAWN:** engine.cu:1144 prefills the
+`--tokens` path with a plain `for` loop of `e.step_with()`, which never consults
+`pf_batch_min`/`batched_prefill` at all -- confirmed by a timing A/B (2.492 s vs
+2.484 s, identical). The reproducer was ALWAYS on the eager path, so the batched-
+prefill confound never existed; arm 1 is simply a third replication (7/300).
+
+**RUNNING:** 300 runs with a ONE-token prompt (`--tokens "760" -n 1`). If bad
+runs persist at ~1%, the corruption is present at INIT (boot / reset_gdn_mtp /
+warm rounds / graph capture) rather than accumulated across 59 prompt steps --
+which moves the hunt off the decode kernels entirely. Standing suspect: the
+race-lens finding at engine.cuh:2306, where `reset_gdn_mtp()`'s legacy-stream
+memsets of S / conv_ring / MTP-KV interleave with stm-ordered warm-round work;
+a lost race there leaves polluted committed state whose EXTENT varies with
+timing, which matches "each bad run uniquely wrong".
