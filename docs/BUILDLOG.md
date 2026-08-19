@@ -12650,3 +12650,69 @@ of the entire process. Suspect order (smem complexity on the decode path):
 k_attn_fd2 (s_q + s_mrg + s_ml, with the barrier-serialized cross-warp merge)
 -> k_gdn_delta_all / k_gdn_convnorm3 -> k_attn_fd_combine -> k_rmsnorm3/l2norm3
 -> k_gemv_q4_n. Do NOT re-run it unfiltered.
+
+## 2026-08-19 (b): flip rate is 1.67% and REPRODUCIBLE; the memory-pressure lead was chance
+
+Two independent 300-run campaigns of the single-step reproducer (59-token
+prefix, `-n 1`, no `--spec`, 5090) both returned **5 flips / 300 = 1.67%**.
+Every flip emitted `846`; no run produced anything other than `271` or `846`.
+The harness now distinguishes a FAILED run (empty token) from a genuine flip --
+an empty token silently counted as a flip would inflate any rate here.
+
+**RETRACTED: the post-OOM cluster.** The 08-18 loop put 4 of its 5 flips in a
+90-second window right after the host OOM-kill, which looked like a page-cache /
+memory-pressure effect. It was not:
+- The upload path is a SYNCHRONOUS `cudaMemcpy` (device_model.cu:29) -- there is
+  no async H2D race to exploit.
+- The post-OOM runs were FASTER (2.5 s vs 3.1 s), the opposite of what a cold
+  page cache would do.
+- The control reproduces 1.67% with 105 GB free and no pressure at all.
+Selecting that window after seeing the flips inflated it; under uniform
+clustering it was only ~p=0.03 before that correction. Logged because the wrong
+story was nearly written up.
+
+**RETRACTED mid-run: "flips happen on fast runs."** The first four flips all had
+below-average duration (mean z=-0.76, ~1.5 sigma). The fifth landed at z=+1.79
+and killed it (mean z=-0.25). It is recorded because it had already been turned
+into a pre-registered prediction for the clock arm; the prediction died before
+the experiment ran, which is the correct order.
+
+Nothing in the per-run telemetry predicts a flip: clocks 2902-2910 MHz (vs 2891
+mean), temps 52-56 C (vs 54.6 mean), 105-106 GB free, inter-flip gaps 26/47/74/
+32/73 with no periodicity.
+
+**Structural nondeterminism sources are now exhaustively excluded.** Added to
+entry (l)'s list: there are NO float atomics anywhere in the kernels -- the only
+atomics are an order-independent u64 word-sum (device_model.cu, checksums) and
+the packed-u64 `atomicMax` argmax (blocks.cu), both exact regardless of order.
+`vgemm.cuh:18` documents that the author already measured this exact hazard
+class: "A grid.z atomicAdd epilogue is NOT [deterministic] (measured: 11-20K of
+61K floats differ run-to-run on ffn_down at z=8). So there are NO atomics here."
+Both K-splits are fixed-order by design. A manual smem audit of the decode
+kernels (k_delta_step, k_gdn_delta_chunk3, k_attn_fd2, k_attn_fd_combine) found
+every cross-thread `sq`/`sk`/`part`/`dj`/`s_mrg`/`s_ml` access barrier-separated,
+`s_mrg` explicitly zeroed, and `s_q` fully covered (gqa=6 x head_dim=256 = the
+1536 floats the compute loop reads). Three agent lenses plus manual passes: no
+defect found. **So the variation violates the design, or is not in the logic.**
+
+**A blind spot worth naming:** an uninitialized SHARED-memory read is not a race
+(nothing else writes the location), so racecheck need not report it, and
+initcheck only covers global memory. smem is never scrubbed between launches and
+block->SM assignment varies run to run, which is exactly this bug's shape. The
+manual audit above was aimed at that gap; it came back clean, but the tooling
+cannot confirm it.
+
+**TWO ARMS RUNNING, predictions pre-registered:**
+1. `Q27_PF_BATCH_MIN=1000` forces SERIAL prefill at 59 tokens. **Confound being
+   tested:** the reproducer's 59-token prompt crosses `pf_batch_min=32`
+   (engine.cuh:4248) into BATCHED prefill (`k_attn_prefill_mma`, split-K GEMMs),
+   which the original 5-token/128-token divergence NEVER touched. Rate holds =>
+   defect is in the shared decode path and the reproducer is faithful. Rate goes
+   to 0 => this is a SECOND, distinct nondeterminism in batched prefill and the
+   anchor bug is still uncharacterized.
+2. SM clock locked 1000 MHz (vs 3090 max). Rate holds => logic race with a
+   cycle-fixed window. Rate collapses => timing/voltage-marginal behavior, i.e.
+   hardware. **Note the earlier argument that "all sightings share one digest,
+   so it is not silent data corruption" was WRONG and is withdrawn:** at a
+   two-candidate knife-edge ANY sufficient perturbation yields the same
+   alternate trajectory, so SDC was never excluded by that observation.
