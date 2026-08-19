@@ -101,6 +101,17 @@ build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks
 build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/test_argmax_tie.cu src/blocks.cu -o $@
 
+# Tensor-manifest gate (post-review). Positive leg needs artifacts, so it is not
+# in `all`; point it at every .q27 on the box before trusting the manifest:
+#   make build/test_manifest && ./build/test_manifest /path/to/*.q27
+build/test_manifest: tools/test_manifest.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h \
+                     src/conductor.h src/prefix_cache.h src/prefix_ram.h src/blocks.cu \
+                     src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu \
+                     src/loader.cpp build/pf4.o | build
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread tools/test_manifest.cu src/blocks.cu src/prefill.cu \
+	        src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+	        build/pf4.o -o $@
+
 
 build/q27-server: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \

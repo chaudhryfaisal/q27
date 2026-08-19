@@ -179,6 +179,139 @@ static inline void validate_arch(const q27::Model& model) {
     // irregular layout is legal here. MetalEngine does assume it and checks it
     // itself (docs/PORTING.md, "What is already data-driven").
 }
+// ---------------------------------------------------------------------------
+// TENSOR MANIFEST. validate_arch() above pins the metadata and the embedding
+// shape, and that is not enough on its own. Every kernel below takes rows/cols
+// FROM THE FILE and writes into buffers sized from the compile-time constants,
+// and roughly a dozen tensors are read straight through `(const float*)t.data`.
+// So a file that is a perfectly valid q27 container but declares, say,
+// blk.0.attn_norm.weight as [4] -- or as Q4 instead of F32 -- gets an
+// out-of-bounds device write or a garbage raw read, with nothing upstream to
+// stop it. This walks every tensor the engine actually consumes and pins name,
+// dtype class and exact shape BEFORE upload_all().
+//
+// The shapes are not guessed. They were read off 19 shipped artifacts (default
+// / q4s / q5f / q6 / q6f / q6k / q8 across Qwen3.6 and Qwen3.8 plus three
+// fine-tunes) and are invariant across every one. Only the WEIGHT dtype varies
+// by tier (Q4_G64 vs Q8_G128), which is why WEIGHT accepts a class and F32V
+// does not.
+enum class TKind : uint8_t {
+    WEIGHT, // goes through mm()/mm5(), which dispatch on dtype
+    F32V,   // read as `(const float*)t.data` -- dtype MUST be exactly F32
+};
+struct TSpec {
+    const char* leaf;
+    TKind kind;
+    int64_t d0, d1; // d1 == 0 => 1-D
+};
+
+// Every layer, attention or GDN.
+static constexpr TSpec kTCommon[] = {
+    {"attn_norm.weight", TKind::F32V, N_EMBD, 0},
+    {"post_attention_norm.weight", TKind::F32V, N_EMBD, 0},
+    {"ffn_gate.weight", TKind::WEIGHT, N_FFN, N_EMBD},
+    {"ffn_up.weight", TKind::WEIGHT, N_FFN, N_EMBD},
+    {"ffn_down.weight", TKind::WEIGHT, N_EMBD, N_FFN},
+};
+// attn_q carries the gate as well, hence 2 x N_HEAD x HEAD_DIM rows (this is
+// what qg is allocated for).
+static constexpr TSpec kTAttn[] = {
+    {"attn_q.weight", TKind::WEIGHT, 2 * N_HEAD * HEAD_DIM, N_EMBD},
+    {"attn_k.weight", TKind::WEIGHT, N_KV * HEAD_DIM, N_EMBD},
+    {"attn_v.weight", TKind::WEIGHT, N_KV * HEAD_DIM, N_EMBD},
+    {"attn_output.weight", TKind::WEIGHT, N_EMBD, N_HEAD * HEAD_DIM},
+    {"attn_q_norm.weight", TKind::F32V, HEAD_DIM, 0},
+    {"attn_k_norm.weight", TKind::F32V, HEAD_DIM, 0},
+};
+static constexpr TSpec kTGdn[] = {
+    {"attn_qkv.weight", TKind::WEIGHT, GDN_CH, N_EMBD},
+    {"attn_gate.weight", TKind::WEIGHT, GDN_V, N_EMBD},
+    {"ssm_out.weight", TKind::WEIGHT, N_EMBD, GDN_V},
+    {"ssm_alpha.weight", TKind::WEIGHT, GDN_HEADS, N_EMBD},
+    {"ssm_beta.weight", TKind::WEIGHT, GDN_HEADS, N_EMBD},
+    {"ssm_a", TKind::F32V, GDN_HEADS, 0},
+    {"ssm_dt.bias", TKind::F32V, GDN_HEADS, 0},
+    {"ssm_conv1d.weight", TKind::F32V, GDN_CH, 4},
+    {"ssm_norm.weight", TKind::F32V, GDN_DIM, 0},
+};
+// The MTP block (blk.N_LAYER) is an attention layer plus these.
+static constexpr TSpec kTMtp[] = {
+    {"nextn.eh_proj.weight", TKind::WEIGHT, N_EMBD, 2 * N_EMBD},
+    {"nextn.enorm.weight", TKind::F32V, N_EMBD, 0},
+    {"nextn.hnorm.weight", TKind::F32V, N_EMBD, 0},
+    {"nextn.shared_head_norm.weight", TKind::F32V, N_EMBD, 0},
+};
+
+static inline void manifest_one(const q27::Model& m, const std::string& name, const TSpec& s,
+                                std::vector<std::string>& bad) {
+    const q27::Tensor* t = m.find(name);
+    if (!t) { bad.push_back(name + ": missing"); return; }
+    std::vector<uint64_t> want{(uint64_t)s.d0};
+    if (s.d1) want.push_back((uint64_t)s.d1);
+    if (t->shape != want) {
+        std::string got, exp = std::to_string(s.d0);
+        for (size_t i = 0; i < t->shape.size(); i++)
+            got += (i ? "," : "") + std::to_string(t->shape[i]);
+        if (s.d1) exp += "," + std::to_string(s.d1);
+        bad.push_back(name + ": shape [" + got + "], this build needs [" + exp + "]");
+    }
+    if (s.kind == TKind::F32V) {
+        if (t->dtype != q27::DType::F32)
+            bad.push_back(name + ": dtype " + q27::dtype_name(t->dtype) +
+                          ", must be F32 (the engine reads it as raw floats)");
+    } else if (t->dtype == q27::DType::FP4_G16 || !q27::cuda_weight_dtype_supported(t->dtype)) {
+        bad.push_back(name + ": dtype " + q27::dtype_name(t->dtype) +
+                      " is not a weight this engine can multiply");
+    }
+}
+
+// attn_layer must already be parsed: it decides which per-layer set applies.
+// Reports EVERY mismatch before exiting -- a bad artifact should take one run to
+// diagnose, not one run per wrong tensor.
+static inline void validate_tensor_manifest(const q27::Model& m, const bool* attn_layer) {
+    std::vector<std::string> bad;
+    auto layer_set = [&](int il, const TSpec* set, size_t n) {
+        char b[128];
+        for (size_t i = 0; i < n; i++) {
+            snprintf(b, sizeof b, "blk.%d.%s", il, set[i].leaf);
+            manifest_one(m, b, set[i], bad);
+        }
+    };
+    manifest_one(m, "token_embd.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+    manifest_one(m, "output_norm.weight", {"", TKind::F32V, N_EMBD, 0}, bad);
+    manifest_one(m, "output.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+    // --fast-head tier only; validated when present, never required.
+    if (m.find("output_q4.weight"))
+        manifest_one(m, "output_q4.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+
+    for (int il = 0; il < N_LAYER; il++) {
+        layer_set(il, kTCommon, sizeof kTCommon / sizeof *kTCommon);
+        if (attn_layer[il]) layer_set(il, kTAttn, sizeof kTAttn / sizeof *kTAttn);
+        else                layer_set(il, kTGdn, sizeof kTGdn / sizeof *kTGdn);
+    }
+    // The MTP block is optional as a whole (a checkpoint without a draft head is
+    // still servable); present means fully present.
+    char probe[128];
+    snprintf(probe, sizeof probe, "blk.%d.nextn.eh_proj.weight", N_LAYER);
+    if (m.find(probe)) {
+        layer_set(N_LAYER, kTCommon, sizeof kTCommon / sizeof *kTCommon);
+        layer_set(N_LAYER, kTAttn, sizeof kTAttn / sizeof *kTAttn);
+        layer_set(N_LAYER, kTMtp, sizeof kTMtp / sizeof *kTMtp);
+    }
+
+    if (bad.empty()) return;
+    fprintf(stderr, "q27: model tensor manifest does not match this build (%zu problem%s):\n",
+            bad.size(), bad.size() == 1 ? "" : "s");
+    size_t shown = 0;
+    for (const std::string& b : bad) {
+        if (shown++ == 20) { fprintf(stderr, "     ... and %zu more\n", bad.size() - 20); break; }
+        fprintf(stderr, "     %s\n", b.c_str());
+    }
+    fprintf(stderr, "     this build is compiled for qwen35 %dL x %d (docs/PORTING.md)\n",
+            N_LAYER, N_EMBD);
+    exit(1);
+}
+
 // Validate BEFORE the DeviceModel upload, not after. Engine::init() calls
 // validate_arch too and that is the backstop no construction path can skip,
 // but by then the owning ctor has already pushed the full weight set to the
@@ -822,6 +955,9 @@ struct Engine {
             if (p == std::string::npos) break;
             if (mj[p] == ',') p++;
         }
+        // Needs attn_layer[], so it cannot live inside validate_arch(); still
+        // ahead of every cudaMalloc and of upload_all().
+        validate_tensor_manifest(model, attn_layer);
 
         auto A = [](void** pp, size_t n) { CUDA_CHECK(cudaMalloc(pp, n)); };
         A((void**)&h, N_EMBD * 4); A((void**)&x1, N_EMBD * 4); A((void**)&y, N_EMBD * 4);

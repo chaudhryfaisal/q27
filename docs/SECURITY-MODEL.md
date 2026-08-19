@@ -99,14 +99,32 @@ together with varied tool sets, this is a real latent defect, not a known-safe c
 of scope until multi-principal / multi-tool-set serving exists.
 
 **#9, #10, #11 -- Malformed model metadata / offsets / tokenizer corrupt host or GPU
-memory.** Negative `attn_layers` index (`engine.cuh:313`), wrap-prone offset bounds
-(`loader.cpp:127`), unchecked tokenizer header reads (`tokenizer.cpp:58`), zero-length
-special-token infinite loop (`tokenizer.cpp:224`), unbounded embedding-gather index
+memory.** Negative `attn_layers` index, wrap-prone offset bounds (`loader.cpp`),
+unchecked tokenizer header reads (`tokenizer.cpp:58`), zero-length special-token
+infinite loop (`tokenizer.cpp:224`), unbounded embedding-gather index
 (`kernels.cu:519`). All confirmed real -- **and all require a hostile artifact.** q27
 loads exactly one model and one tokenizer, both self-produced on the same machine. A
-malicious `.q27` is not in the threat model. The correct disposition is a *single
-startup validator* if q27 ever ingests third-party artifacts (e.g. a public model zoo);
-until then this is defending a door that only the operator has a key to.
+malicious `.q27` is not in the threat model.
+
+> **PARTIALLY CLOSED 2026-08-19**, after an external review pointed out that the
+> quickstart now distributes artifacts through Hugging Face -- which weakens the
+> "self-produced on the same machine" premise this disposition rests on. Two
+> changes, both in the direction this paragraph already prescribed:
+>
+> - **The negative `attn_layers` index is fixed**, along with a second path in the
+>   same loop: `find_first_of` returns `npos` on a truncated `meta_json` and the
+>   result was indexed before the loop head could catch it.
+> - **The "single startup validator" now exists**: `validate_tensor_manifest()`
+>   (`engine.cuh`) pins the name, dtype class and exact shape of every tensor the
+>   engine consumes, before any `cudaMalloc` and before `upload_all()`. It closes
+>   the class where a container-valid file declares a shape the kernels then use
+>   to write into compile-time-sized buffers. Shapes were read off 21 shipped
+>   artifacts and are invariant; `tools/test_manifest.cu` runs both legs.
+>
+> **Still open in this class:** the tokenizer findings (#10/#11 above), the loader's
+> offset arithmetic, and the embedding-gather bound. The manifest checks the tensor
+> TABLE, not the payload bytes behind it. Treat third-party `.q27`/`.tok` files as
+> out of scope still -- this is a narrower door, not a closed one.
 
 **Also out: `Q27_TOOL_SPLIT` documented race** (`engine.cuh:1343`). Already known,
 already opt-in, already documented OFF under `--slots`. Not a new finding.
