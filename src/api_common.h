@@ -518,6 +518,21 @@ inline bool resolve_think(const json& body, bool server_default, bool allow_requ
 // fraction ever exists, it should replace this.
 static constexpr double THINK_BUDGET_FRAC = 0.5;
 
+// Q27_THINK_BUDGET_FRAC overrides it, read once (server-lifetime knob, one leg
+// per run). Added 2026-08-20 to answer the comment above on its own terms: the
+// fraction is a judgement call and the note asks for a measured one to replace
+// it, which is impossible while it is a compile-time constant. Out-of-range or
+// unparseable values fall back to the default rather than half-applying.
+inline double think_budget_frac() {
+    static const double v = [] {
+        const char* e = getenv("Q27_THINK_BUDGET_FRAC");
+        if (!e) return THINK_BUDGET_FRAC;
+        const double d = atof(e);
+        return (d > 0.0 && d < 1.0) ? d : THINK_BUDGET_FRAC;
+    }();
+    return v;
+}
+
 // Resolve the server budget for a request whose public cap is `n_max`.
 // `flag` is --think-budget: <0 = use the fractional default, 0 = unbounded,
 // >0 = an explicit absolute cap. The fractional default applies only when the
@@ -527,7 +542,7 @@ static constexpr double THINK_BUDGET_FRAC = 0.5;
 inline int think_budget_default(int flag, int n_max) {
     if (flag == 0) return -1;
     if (flag > 0) return flag;
-    return n_max > 0 ? (int)(THINK_BUDGET_FRAC * n_max) : -1;
+    return n_max > 0 ? (int)(think_budget_frac() * n_max) : -1;
 }
 
 inline int think_budget_for_request(bool prompt_starts_in_think, const ThinkCfg& cfg,
@@ -3497,6 +3512,52 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 fprintf(stderr, "[q27] drift mode 20: recovered %zu nameless <tool_name> call(s)\n",
                         batch.size());
                 return batch;
+            }
+        }
+        // (d) DRIFT MODE 21 (2026-08-20, issue #24 follow-up): the parameters
+        // arrive with NO opener of any kind. Not `<function=`, not the mode-19
+        // attribute spelling, not mode-18's bare `<name>`, not mode-20's empty
+        // `<tool_name>` -- the emission simply starts at the first
+        // `<parameter=KEY>` and ends at `</function>`:
+        //
+        //   <parameter=filePath>\n/code/x.go\n</parameter>
+        //   <parameter=newString>\n...\n</parameter>\n</function>
+        //
+        // One degradation further than mode 20: there the tag was present and
+        // empty, here there is no tag at all, so the name has to come entirely
+        // from the parameter keys. Same infer_tool_name() with the same
+        // refuse-on-tie rule, which also means a model that mangles the KEY
+        // spelling (camelCase where the schema declares snake_case) is
+        // correctly NOT rescued -- guessing a tool from keys that match nothing
+        // is how you execute the wrong call.
+        //
+        // The `</function>` requirement is the guard against eating prose: a
+        // paragraph can mention <parameter= in passing, but a closing tag it
+        // never opened is dialect, not English.
+        {
+            static const std::string PO = "<parameter=";
+            size_t ps = text_in.find(PO);
+            size_t fe = ps == std::string::npos ? std::string::npos
+                                                : text_in.find("</function>", ps);
+            if (fe != std::string::npos) {
+                std::string span =
+                    "<function=q27_unnamed>\n" + text_in.substr(ps, fe + 11 - ps);
+                ToolCall tc;
+                if (parse_native_xml_call(span, tc) && !tc.arguments.empty()) {
+                    const std::string nm = infer_tool_name(*tools, tc.arguments);
+                    if (!nm.empty() && declared(nm)) {
+                        tc.name = nm;
+                        tc.ok = true;
+                        tc.source_begin = ps;
+                        tc.source_end = fe + 11;
+                        if (prefix) *prefix = text_in.substr(0, ps);
+                        if (remaining_text) *remaining_text = "";
+                        fprintf(stderr,
+                                "[q27] drift mode 21: openerless parameter list -> %s\n",
+                                nm.c_str());
+                        return std::vector<ToolCall>{std::move(tc)};
+                    }
+                }
             }
         }
     }

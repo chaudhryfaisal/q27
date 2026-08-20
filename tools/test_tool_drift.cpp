@@ -397,6 +397,53 @@ static void test_mode20_nameless_tool_name() {
     ok(no.empty(), "mode20: un-inferable parameter keys are left as text");
 }
 
+// Drift mode 21 (2026-08-20, issue #24 follow-up). One degradation past mode
+// 20: there the name tag was present and empty, here there is no opener at all
+// and the emission starts at the first <parameter=. Fixture is the reporter's
+// bytes.
+static void test_mode21_openerless_params() {
+    json tools = json::array({tool("FileAction", {{"filePath", true}, {"oldString", false},
+                                                  {"newString", false}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+    const std::string raw =
+        "I'll update the imports.\n\n"
+        "<parameter=filePath>\n/code/fileaction.go\n</parameter>\n"
+        "<parameter=newString>\nimport (\n\t\"bytes\"\n)\n</parameter>\n"
+        "<parameter=oldString>\nimport (\n\t\"fmt\"\n)\n</parameter>\n</function>";
+    std::string pre;
+    auto v = q27::parse_bare_tool_calls(raw, &pre, &tools);
+    ok(v.size() == 1 && v[0].name == "FileAction" &&
+           v[0].arguments.value("filePath", std::string()) == "/code/fileaction.go",
+       "mode21: openerless parameter list recovers via key inference");
+    ok(pre.find("update the imports") != std::string::npos,
+       "mode21: prose before the parameters is preserved as prefix");
+
+    // A closing tag it never opened is the evidence that this is dialect and
+    // not English. Without it, prose that merely mentions <parameter= is text.
+    const std::string prose =
+        "the schema uses <parameter=filePath> for the target, which is unusual.";
+    std::string p2;
+    ok(q27::parse_bare_tool_calls(prose, &p2, &tools).empty(),
+       "mode21: <parameter= in prose with no </function> is NOT a call");
+
+    // Keys that match no declared tool must refuse rather than guess. This is
+    // the camelCase-vs-snake_case case: a real risk when the model mangles the
+    // spelling, and executing the wrong tool is worse than not executing one.
+    const std::string unknown =
+        "<parameter=zzz_nothing>\nv\n</parameter>\n</function>";
+    std::string p3;
+    ok(q27::parse_bare_tool_calls(unknown, &p3, &tools).empty(),
+       "mode21: un-inferable keys refuse rather than guess a tool");
+
+    // The better-specified openers must still win, not get shadowed by this.
+    const std::string named =
+        "<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+    std::string p4;
+    auto nv = q27::parse_bare_tool_calls(named, &p4, &tools);
+    ok(nv.size() == 1 && nv[0].name == "Bash",
+       "mode21: an explicit <function= opener still resolves to Bash");
+}
+
 static void test_mode18_bare_name_opener() {
     q27::ToolCall tc;
     ok(q27::parse_native_xml_call(
@@ -493,6 +540,7 @@ int main() {
     test_mode18_bare_name_opener();
     test_mode19_attribute_opener();
     test_mode20_nameless_tool_name();
+    test_mode21_openerless_params();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();
