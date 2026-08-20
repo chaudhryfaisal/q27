@@ -23,6 +23,7 @@ set -uo pipefail
 Q27_BIN=/mnt/ai/projects/q27/build/q27-server
 NINFER_BIN=/mnt/ai/projects/ninfer/build/apps/ninfer-serve
 Q27_TOK=/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok
+Q38_TOK=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.tok
 MODELS=/mnt/ai/models
 
 LLAMA_BIN=/mnt/ai/projects/llama.cpp/build/bin/llama-server
@@ -34,7 +35,7 @@ HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
 leg_engine() {
   case "$1" in
-    q4s|q5f) echo q27 ;;
+    q4s|q5f|q38|q38q4s) echo q27 ;;
     nint|nvfp4) echo ninfer ;;
     llama) echo llama ;;
     vllm) echo vllm ;;
@@ -46,10 +47,19 @@ leg_artifact() {
   case "$1" in
     q4s)   echo $MODELS/qwen36-27b-mtp/qwen36-27b-mtp-q4s.q27 ;;
     q5f)   echo $MODELS/qwen36-27b-mtp/qwen36-27b-mtp-q5f.q27 ;;
+    q38)    echo $MODELS/qwen38-27b-mtp/qwen38-27b-mtp.q27 ;;
+    q38q4s) echo $MODELS/qwen38-27b-mtp/qwen38-27b-mtp-q4s.q27 ;;
     nint)  echo $MODELS/ninfer/qwen3_6_27b.ninfer ;;
     nvfp4) echo $MODELS/ninfer/qwen3_6_27b_nvfp4.ninfer ;;
     llama) echo $LLAMA_GGUF ;;
     vllm)  echo "$VLLM_MODEL" ;;   # HF id, resolved from the local cache
+  esac
+}
+
+leg_tok() {
+  case "$1" in
+    q38|q38q4s) echo "$Q38_TOK" ;;
+    *) echo "$Q27_TOK" ;;
   esac
 }
 
@@ -59,6 +69,7 @@ leg_port() {
   case "$1" in
     q4s) base=8110;; nint) base=8120;; q5f) base=8130;; nvfp4) base=8140;;
     llama) base=8150;; vllm) base=8160;;
+    q38) base=8170;; q38q4s) base=8180;;
   esac
   case "$2" in agentic) echo $((base+0));; ladder) echo $((base+1));; quality) echo $((base+2));; esac
 }
@@ -79,11 +90,11 @@ leg_start() {
     # ladder config additionally pins the 08-14 concurrency protocol.
     if [ "$cfg" = ladder ]; then
       Q27_KV=fp8 Q27_BATCH=1 Q27_PMIN=0.5 \
-        nohup "$Q27_BIN" "$art" "$Q27_TOK" --port "$port" --slots 8 --ctx 16384 \
+        nohup "$Q27_BIN" "$art" "$(leg_tok "$leg")" --port "$port" --slots 8 --ctx 16384 \
         >"$log" 2>&1 &
     else
       Q27_KV=fp8 \
-        nohup "$Q27_BIN" "$art" "$Q27_TOK" --port "$port" >"$log" 2>&1 &
+        nohup "$Q27_BIN" "$art" "$(leg_tok "$leg")" --port "$port" >"$log" 2>&1 &
     fi
   elif [ "$eng" = llama ]; then
     # --device CUDA0 (+ --device-draft): left alone, llama.cpp SPLITS across

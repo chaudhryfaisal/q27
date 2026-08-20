@@ -10,7 +10,9 @@
 #
 #   usage: run_all.sh <outdir> [arms] [legs]
 #     arms  csv of agentic,quality,ladder   (default: all three)
-#     legs  csv of q4s,nint,q5f,nvfp4,llama,vllm  (default: all six)
+#     legs  csv of q4s,nint,q5f,nvfp4,llama,vllm,q38,q38q4s (default: the six
+#           Qwen3.6 legs; q38/q38q4s are Qwen3.8-27B-MTP, q27-only -- no
+#           competitor has a 3.8 artifact that fits this card)
 set -u
 
 SP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +74,7 @@ cleanup() { tap_stop; [ -n "${CUR_LOG:-}" ] && leg_stop "$CUR_LOG"; }
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- serving arms
-for LEG in q4s nint q5f nvfp4 llama vllm; do
+for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s; do
   has_leg "$LEG" || continue
   { has_arm agentic || has_arm quality; } || continue
   [ -s "$OUT/agentic.$LEG.jsonl" ] && [ -s "$OUT/quality.$LEG.json" ] && \
@@ -107,7 +109,7 @@ done
 
 # ----------------------------------------------------------------- ladder arm
 if has_arm ladder; then
-for LEG in q4s nint q5f nvfp4 llama vllm; do
+for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s; do
   has_leg "$LEG" || continue
   [ -s "$OUT/ladder.$LEG.txt" ] && { echo "[skip] $LEG ladder already done"; continue; }
 

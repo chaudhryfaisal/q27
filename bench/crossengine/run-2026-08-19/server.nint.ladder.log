@@ -1,0 +1,103 @@
+[2026-08-19 16:23:02.441] [info] ninfer-serve: loading model...
+[2026-08-19 16:23:02.638] [info] ninfer-serve: load        weights                      0.00%           0 B /      16.01 GiB     0.000 s
+[2026-08-19 16:23:12.652] [info] ninfer-serve: load        weights                     76.53%     12.25 GiB /      16.01 GiB    10.014 s
+[2026-08-19 16:23:14.678] [info] ninfer-serve: load        weights                    100.00%     16.01 GiB /      16.01 GiB    12.040 s
+[2026-08-19 16:23:15.792] [info] ninfer-serve: model loaded in 13.3513 s
+[2026-08-19 16:23:15.792] [info] ninfer-serve: KV capacity explicit resolved=131072 tokens pages=2048/2048 runtime=7.58 GiB free-after-weights=13.81 GiB free-after-startup=6.85 GiB headroom=0.00 MiB slack=6.24 GiB graphs=24.00 MiB/656.00 MiB
+[2026-08-19 16:23:15.792] [info] ninfer-serve: warming up...
+[2026-08-19 16:23:15.851] [info] ninfer-serve: listening on http://127.0.0.1:8121 (model id: nint, auth: disabled)
+[2026-08-19 16:23:17.912] [info] ninfer-serve: [req 1] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=9837577846694177712] → submitted
+[2026-08-19 16:23:20.851] [info] ninfer-serve: throughput interval=5.000s prefill=12.2tok/s decode=78.6tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:25.851] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=126.4tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:30.851] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=142.8tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:35.852] [info] ninfer-serve: throughput interval=5.001s prefill=0.0tok/s decode=140.6tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:40.852] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=141.8tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:45.852] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=129.2tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:50.852] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=138.2tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:55.852] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=141.0tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:23:58.410] [info] ninfer-serve: [req 1] done finish=stop_token prompt=61 gen=5538 cache=0 reuse=full_reset ttft=85ms prefill=722.4tok/s decode=137.1tok/s wall=40.50s speculative=mtp 2.33tok/round (44.4%)
+[2026-08-19 16:24:00.853] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=68.8tok/s running=0 prefilling=0 decode_ready=0 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:24:03.976] [info] ninfer-serve: [req 2] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=7822931472035098760] → submitted
+[2026-08-19 16:24:03.976] [info] ninfer-serve: [req 3] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=9569785589276771099] → submitted
+[2026-08-19 16:24:05.853] [info] ninfer-serve: throughput interval=5.000s prefill=25.0tok/s decode=62.0tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=1.97
+[2026-08-19 16:24:10.853] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=178.8tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:15.853] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=183.2tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:20.854] [info] ninfer-serve: throughput interval=5.001s prefill=0.0tok/s decode=186.6tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:25.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=195.8tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:30.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=191.4tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:35.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=193.6tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:40.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=185.4tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:45.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=191.0tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:50.854] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=196.8tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.00
+[2026-08-19 16:24:50.990] [info] ninfer-serve: [req 2] done finish=stop_token prompt=62 gen=4395 cache=0 reuse=full_reset ttft=85ms prefill=732.4tok/s decode=93.9tok/s wall=47.01s speculative=mtp 2.34tok/round (44.8%)
+[2026-08-19 16:24:55.855] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=143.8tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.02
+[2026-08-19 16:25:00.855] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=140.8tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:25:02.144] [info] ninfer-serve: [req 3] done finish=stop_token prompt=63 gen=6032 cache=0 reuse=full_reset ttft=201ms prefill=740.8tok/s decode=104.1tok/s wall=58.17s speculative=mtp 2.40tok/round (46.7%)
+[2026-08-19 16:25:05.855] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=35.8tok/s running=0 prefilling=0 decode_ready=0 waiting=0 avg_decode_batch=1.00
+[2026-08-19 16:25:07.743] [info] ninfer-serve: [req 4] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=407076603311422993] → submitted
+[2026-08-19 16:25:07.743] [info] ninfer-serve: [req 5] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=7679417882218783069] → submitted
+[2026-08-19 16:25:07.743] [info] ninfer-serve: [req 6] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=17649770328956950741] → submitted
+[2026-08-19 16:25:07.744] [info] ninfer-serve: [req 7] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=15347232543099619196] → submitted
+[2026-08-19 16:25:10.856] [info] ninfer-serve: throughput interval=5.001s prefill=48.6tok/s decode=122.4tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=3.83
+[2026-08-19 16:25:15.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=206.8tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:20.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=217.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:25.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=214.8tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:30.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=225.2tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:35.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=220.2tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:40.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=232.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:45.856] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=218.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:50.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=232.8tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:25:55.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=237.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:00.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=227.4tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:05.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=226.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:10.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=222.6tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:15.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=221.4tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:20.857] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=219.8tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:25.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=229.0tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:30.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=233.0tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.00
+[2026-08-19 16:26:30.900] [info] ninfer-serve: [req 7] done finish=stop_token prompt=58 gen=4576 cache=0 reuse=full_reset ttft=480ms prefill=683.2tok/s decode=55.4tok/s wall=83.16s speculative=mtp 2.28tok/round (42.7%)
+[2026-08-19 16:26:35.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=214.6tok/s running=3 prefilling=0 decode_ready=3 waiting=0 avg_decode_batch=3.01
+[2026-08-19 16:26:36.404] [info] ninfer-serve: [req 6] done finish=stop_token prompt=60 gen=5006 cache=0 reuse=full_reset ttft=332ms prefill=706.6tok/s decode=56.8tok/s wall=88.66s speculative=mtp 2.32tok/round (43.8%)
+[2026-08-19 16:26:37.640] [info] ninfer-serve: [req 5] done finish=stop_token prompt=64 gen=5077 cache=0 reuse=full_reset ttft=201ms prefill=750.8tok/s decode=56.7tok/s wall=89.90s speculative=mtp 2.29tok/round (43.1%)
+[2026-08-19 16:26:40.364] [info] ninfer-serve: [req 4] done finish=stop_token prompt=61 gen=5654 cache=0 reuse=full_reset ttft=85ms prefill=720.3tok/s decode=61.3tok/s wall=92.62s speculative=mtp 2.38tok/round (46.1%)
+[2026-08-19 16:26:40.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=138.8tok/s running=0 prefilling=0 decode_ready=0 waiting=0 avg_decode_batch=1.36
+[2026-08-19 16:26:46.061] [info] ninfer-serve: [req 8] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=15508070267451833643] → submitted
+[2026-08-19 16:26:46.061] [info] ninfer-serve: [req 9] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=7925314191626981906] → submitted
+[2026-08-19 16:26:46.061] [info] ninfer-serve: [req 10] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=12252902727860358688] → submitted
+[2026-08-19 16:26:46.061] [info] ninfer-serve: [req 11] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=7705296513424273503] → submitted
+[2026-08-19 16:26:46.062] [info] ninfer-serve: [req 12] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=7720164916575506895] → submitted
+[2026-08-19 16:26:46.062] [info] ninfer-serve: [req 13] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=4279897168562911034] → submitted
+[2026-08-19 16:26:46.063] [info] ninfer-serve: [req 14] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=13100626050579309575] → submitted
+[2026-08-19 16:26:46.063] [info] ninfer-serve: [req 15] openai_chat_completions stream msgs=1 max_tokens=8192 (client) tools=0 tool_choice=auto tool_history=no thinking=off preserve_thinking=off preserve_change=no sampler=[temp=0.60 top_p=0.95 top_k=20 pres=1.50 seed=2180611264000514508] → submitted
+[2026-08-19 16:26:50.858] [info] ninfer-serve: throughput interval=5.000s prefill=99.6tok/s decode=315.6tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=7.42
+[2026-08-19 16:26:55.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=400.6tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:00.858] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=399.0tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:05.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=391.8tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:10.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=385.4tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:15.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=400.2tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:20.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=409.8tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:25.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=405.2tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:30.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=408.8tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:35.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=418.0tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:40.859] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=405.0tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:45.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=426.4tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:50.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=411.0tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:27:55.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=416.4tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:28:00.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=419.6tok/s running=8 prefilling=0 decode_ready=8 waiting=0 avg_decode_batch=8.00
+[2026-08-19 16:28:05.574] [info] ninfer-serve: [req 13] done finish=stop_token prompt=60 gen=3873 cache=0 reuse=full_reset ttft=802ms prefill=706.0tok/s decode=49.3tok/s wall=79.51s speculative=mtp 2.22tok/round (40.8%)
+[2026-08-19 16:28:05.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=411.4tok/s running=7 prefilling=0 decode_ready=7 waiting=0 avg_decode_batch=7.94
+[2026-08-19 16:28:06.700] [info] ninfer-serve: [req 8] done finish=stop_token prompt=64 gen=4061 cache=0 reuse=full_reset ttft=85ms prefill=753.2tok/s decode=50.8tok/s wall=80.64s speculative=mtp 2.29tok/round (42.9%)
+[2026-08-19 16:28:10.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=349.4tok/s running=6 prefilling=0 decode_ready=6 waiting=0 avg_decode_batch=6.16
+[2026-08-19 16:28:11.194] [info] ninfer-serve: [req 14] done finish=stop_token prompt=63 gen=4297 cache=0 reuse=full_reset ttft=965ms prefill=737.9tok/s decode=51.1tok/s wall=85.13s speculative=mtp 2.29tok/round (43.1%)
+[2026-08-19 16:28:15.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=304.0tok/s running=5 prefilling=0 decode_ready=5 waiting=0 avg_decode_batch=5.07
+[2026-08-19 16:28:20.165] [info] ninfer-serve: [req 12] done finish=stop_token prompt=60 gen=4917 cache=0 reuse=full_reset ttft=641ms prefill=705.4tok/s decode=52.8tok/s wall=94.10s speculative=mtp 2.34tok/round (44.6%)
+[2026-08-19 16:28:20.860] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=299.0tok/s running=4 prefilling=0 decode_ready=4 waiting=0 avg_decode_batch=4.87
+[2026-08-19 16:28:21.827] [info] ninfer-serve: [req 15] done finish=stop_token prompt=62 gen=4930 cache=0 reuse=full_reset ttft=1136ms prefill=726.6tok/s decode=52.1tok/s wall=95.76s speculative=mtp 2.31tok/round (43.6%)
+[2026-08-19 16:28:25.861] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=213.6tok/s running=3 prefilling=0 decode_ready=3 waiting=0 avg_decode_batch=3.17
+[2026-08-19 16:28:30.861] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=196.6tok/s running=3 prefilling=0 decode_ready=3 waiting=0 avg_decode_batch=3.00
+[2026-08-19 16:28:34.436] [info] ninfer-serve: [req 11] done finish=stop_token prompt=66 gen=5847 cache=0 reuse=full_reset ttft=481ms prefill=771.9tok/s decode=54.4tok/s wall=108.37s speculative=mtp 2.34tok/round (44.6%)
+[2026-08-19 16:28:35.861] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=200.8tok/s running=2 prefilling=0 decode_ready=2 waiting=0 avg_decode_batch=2.65
+[2026-08-19 16:28:39.615] [info] ninfer-serve: [req 10] done finish=stop_token prompt=62 gen=6291 cache=0 reuse=full_reset ttft=332ms prefill=730.5tok/s decode=55.8tok/s wall=113.55s speculative=mtp 2.32tok/round (44.1%)
+[2026-08-19 16:28:40.861] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=177.6tok/s running=1 prefilling=0 decode_ready=1 waiting=0 avg_decode_batch=1.68
+[2026-08-19 16:28:42.158] [info] ninfer-serve: [req 9] done finish=stop_token prompt=61 gen=6808 cache=0 reuse=full_reset ttft=201ms prefill=719.4tok/s decode=59.0tok/s wall=116.10s speculative=mtp 2.38tok/round (46.1%)
+[2026-08-19 16:28:45.861] [info] ninfer-serve: throughput interval=5.000s prefill=0.0tok/s decode=38.0tok/s running=0 prefilling=0 decode_ready=0 waiting=0 avg_decode_batch=1.00

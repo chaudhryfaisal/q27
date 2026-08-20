@@ -1,0 +1,99 @@
+run: 2026-08-19T17:03:05-07:00
+arms: ladder
+legs: q4s,q5f
+q27 commit: c7aec66
+ninfer commit: 604bdc5
+driver: 580.119.02
+
+################ LEG q4s (ladder) ################
+up after 4s
+[q4s] slot 0 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 1 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 2 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 3 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 4 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 5 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 6 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 7 ready: ctx=16384
+[q4s] VRAM after boot 28223 MiB
+C=1 q4s aggregate=142.5 t/s  (sum_dec=8192, union=57.5s, client_wall=57.6s)
+   per-stream tps: median=142.5 min=142.5 max=142.5
+   ttft_ms: median=94 max=94
+   [calib] server-side convention: 142.5 t/s (1 reqs, 8192 tok)  client is +0.0%
+JSON {"c": 1, "label": "q4s", "aggregate_tps": 142.5, "sum_dec": 8192, "union_s": 57.5, "client_wall_s": 57.6, "per_stream_median": 142.5, "ttft_ms_median": 94.5, "n_streams": 1, "server_side_agg": 142.5}
+C=2 q4s aggregate=226.5 t/s  (sum_dec=12151, union=53.6s, client_wall=53.8s)
+   per-stream tps: median=118.1 min=117.2 max=119.0
+   ttft_ms: median=175 max=189
+   [calib] server-side convention: 226.4 t/s (2 reqs, 12151 tok)  client is +0.1%
+JSON {"c": 2, "label": "q4s", "aggregate_tps": 226.5, "sum_dec": 12151, "union_s": 53.6, "client_wall_s": 53.8, "per_stream_median": 118.1, "ttft_ms_median": 175.0, "n_streams": 2, "server_side_agg": 226.4}
+C=4 q4s aggregate=360.3 t/s  (sum_dec=32768, union=91.0s, client_wall=91.3s)
+   per-stream tps: median=92.0 min=90.1 max=94.7
+   ttft_ms: median=339 max=340
+   [calib] server-side convention: 360.1 t/s (4 reqs, 32768 tok)  client is +0.1%
+JSON {"c": 4, "label": "q4s", "aggregate_tps": 360.3, "sum_dec": 32768, "union_s": 91.0, "client_wall_s": 91.3, "per_stream_median": 92.0, "ttft_ms_median": 339.4, "n_streams": 4, "server_side_agg": 360.1}
+C=8 q4s aggregate=488.4 t/s  (sum_dec=59687, union=122.2s, client_wall=123.0s)
+   per-stream tps: median=66.1 min=64.8 max=68.1
+   ttft_ms: median=633 max=638
+   [calib] server-side convention: 488.0 t/s (8 reqs, 59687 tok)  client is +0.1%
+JSON {"c": 8, "label": "q4s", "aggregate_tps": 488.4, "sum_dec": 59687, "union_s": 122.2, "client_wall_s": 123.0, "per_stream_median": 66.1, "ttft_ms_median": 633.0, "n_streams": 8, "server_side_agg": 488.0}
+
+################ LEG q5f (ladder) ################
+up after 4s
+[q5f] slot 0 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 1 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 2 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 3 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 4 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 5 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 6 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 7 ready: ctx=16384
+[q5f] VRAM after boot 28213 MiB
+C=1 q5f aggregate=130.6 t/s  (sum_dec=8192, union=62.7s, client_wall=62.9s)
+   per-stream tps: median=130.6 min=130.6 max=130.6
+   ttft_ms: median=99 max=99
+   [calib] server-side convention: 130.5 t/s (1 reqs, 8192 tok)  client is +0.0%
+JSON {"c": 1, "label": "q5f", "aggregate_tps": 130.6, "sum_dec": 8192, "union_s": 62.7, "client_wall_s": 62.9, "per_stream_median": 130.6, "ttft_ms_median": 99.0, "n_streams": 1, "server_side_agg": 130.5}
+C=2 q5f aggregate=197.2 t/s  (sum_dec=14441, union=73.2s, client_wall=73.4s)
+   per-stream tps: median=108.0 min=104.2 max=111.8
+   ttft_ms: median=183 max=199
+   [calib] server-side convention: 197.1 t/s (2 reqs, 14441 tok)  client is +0.0%
+JSON {"c": 2, "label": "q5f", "aggregate_tps": 197.2, "sum_dec": 14441, "union_s": 73.2, "client_wall_s": 73.4, "per_stream_median": 108.0, "ttft_ms_median": 183.3, "n_streams": 2, "server_side_agg": 197.1}
+C=4 q5f aggregate=333.0 t/s  (sum_dec=31462, union=94.5s, client_wall=94.9s)
+   per-stream tps: median=87.3 min=84.1 max=89.6
+   ttft_ms: median=350 max=351
+   [calib] server-side convention: 332.8 t/s (4 reqs, 31462 tok)  client is +0.1%
+JSON {"c": 4, "label": "q5f", "aggregate_tps": 333.0, "sum_dec": 31462, "union_s": 94.5, "client_wall_s": 94.9, "per_stream_median": 87.3, "ttft_ms_median": 350.4, "n_streams": 4, "server_side_agg": 332.8}
+C=8 q5f aggregate=472.3 t/s  (sum_dec=62710, union=132.8s, client_wall=133.6s)
+   per-stream tps: median=61.9 min=61.1 max=63.1
+   ttft_ms: median=664 max=666
+   [calib] server-side convention: 471.9 t/s (8 reqs, 62710 tok)  client is +0.1%
+JSON {"c": 8, "label": "q5f", "aggregate_tps": 472.3, "sum_dec": 62710, "union_s": 132.8, "client_wall_s": 133.6, "per_stream_median": 61.9, "ttft_ms_median": 663.9, "n_streams": 8, "server_side_agg": 471.9}
+
+################ DONE ################
+results in bench/crossengine/run-2026-08-19-stock
+total 72
+drwxrwxr-x 2 gabe gabe  4096 Aug 19 17:15 .
+drwxrwxr-x 6 gabe gabe  4096 Aug 19 17:03 ..
+-rw-rw-r-- 1 gabe gabe  1786 Aug 19 17:08 ladder.q4s.txt
+-rw-rw-r-- 1 gabe gabe  1786 Aug 19 17:15 ladder.q5f.txt
+-rw-rw-r-- 1 gabe gabe   120 Aug 19 17:03 manifest.txt
+-rw-rw-r-- 1 gabe gabe  7954 Aug 19 17:15 run.log
+-rw-rw-r-- 1 gabe gabe 15114 Aug 19 17:08 server.q4s.ladder.log
+-rw-rw-r-- 1 gabe gabe 15134 Aug 19 17:15 server.q5f.ladder.log
+-rw-rw-r-- 1 gabe gabe  3269 Aug 19 17:08 tapladder.q4s.jsonl
+-rw-rw-r-- 1 gabe gabe  3266 Aug 19 17:15 tapladder.q5f.jsonl
+-rw-rw-r-- 1 gabe gabe   131 Aug 19 17:09 tap.stderr

@@ -1,0 +1,1 @@
+[tap] :8081 -> 127.0.0.1:8181  log=bench/crossengine/run-2026-08-19-q38/tapladder.q38q4s.jsonl  strip=['output_config', 'thinking']
