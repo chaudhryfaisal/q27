@@ -2126,6 +2126,37 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         if (ne == std::string::npos) return false;
         tc.name = seg.substr(ns, ne - ns);
         p = ne + 1;
+    } else if (seg.compare(b, 9, "<function") == 0 && b + 9 < seg.size() &&
+               isspace((unsigned char)seg[b + 9])) {
+        // XML DRIFT MODE 19 (2026-08-19, found in the Qwen3.8 reasoning-effort
+        // A/B): the model writes the opener in HTML-ATTRIBUTE syntax --
+        //   <function name="Bash">\n<parameter=command>\n...\n</parameter>\n</function>
+        // -- instead of the trained `<function=Bash>`. EVERYTHING downstream is
+        // byte-identical to the native dialect: same <parameter=KEY> bodies,
+        // same </function> closer. Only the opener drifts, which makes this the
+        // narrowest rescue in the catalogue.
+        //
+        // Cost of refusing it, measured: 4 of 20 trials in that A/B emitted this
+        // form, and EVERY ONE died at ~50K tokens with hidden=0 -- Claude Code
+        // sees an assistant turn carrying no tool_use block, concludes the task
+        // is finished, and exits `completed` after 11 seconds. Three of them
+        // were the same task three times over, so it is deterministic, not
+        // trajectory noise.
+        //
+        // `<function=` is matched by the branch above and `<function>` (mode 16)
+        // has '>' at this offset, so the isspace() guard keeps those intact.
+        size_t gt = seg.find('>', b + 9);
+        if (gt == std::string::npos) return false;
+        size_t na = seg.find("name", b + 9);
+        if (na == std::string::npos || na > gt) return false;
+        size_t eq = seg.find('=', na + 4);
+        if (eq == std::string::npos || eq > gt) return false;
+        size_t q1 = seg.find_first_of("\"'", eq);
+        if (q1 == std::string::npos || q1 > gt) return false;
+        size_t q2 = seg.find(seg[q1], q1 + 1);
+        if (q2 == std::string::npos || q2 > gt) return false;
+        tc.name = seg.substr(q1 + 1, q2 - q1 - 1);
+        p = gt + 1;
     } else if (seg.compare(b, 6, "<name>") == 0) {
         // XML drift mode 18 (issue #24): the model drops the `<function=`
         // opener and writes the bare trained `<name>` tag --
@@ -3350,8 +3381,17 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     t["function"].value("name", std::string()) == nm) return true;
             return false;
         };
-        // (a) bare <function=NAME>
+        // (a) bare <function=NAME>, and its mode-19 attribute-syntax twin
+        // <function name="NAME"> -- both arrive with no <tool_call> wrapper.
         size_t fb = text_in.find("<function=");
+        if (fb == std::string::npos) {
+            size_t c = text_in.find("<function");
+            while (c != std::string::npos) {
+                if (c + 9 < text_in.size() && isspace((unsigned char)text_in[c + 9]) &&
+                    text_in.find("name", c + 9) != std::string::npos) { fb = c; break; }
+                c = text_in.find("<function", c + 9);
+            }
+        }
         if (fb != std::string::npos) {
             ToolCall tc;
             std::string span = text_in.substr(fb);
@@ -3396,6 +3436,67 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         }
                     }
                 }
+            }
+        }
+        // (c) DRIFT MODE 20 (2026-08-19, same A/B as mode 19): a BATCH of calls
+        // in which the tool NAME is structurally absent --
+        //   <tool_calls>\n<tool_name>\n<parameter=file_path>\n/x\n</parameter>\n</function>
+        //   <tool>\n<tool_name>\n<parameter=file_path>\n/y\n</parameter>\n</function>
+        // Plural `<tool_calls>` opener, an EMPTY `<tool_name>` where the name
+        // belongs, `<tool>` as a separator, and closers that do not match their
+        // openers. Mode 14 owns `<tool_name>NAME</tool_name>`; this fires only
+        // when the tag is empty, so the two cannot collide.
+        //
+        // With no name in the bytes, the only way back is to infer it from the
+        // parameter keys -- which is exactly what infer_tool_name() already does
+        // for JSON mode 6, including its refuse-on-tie rule. A wrong tool is
+        // worse than an un-rescued one, so inference failure leaves it as text.
+        //
+        // The <result>/<output> guard above is what keeps this off the
+        // HALLUCINATED-RESULT shape (<tool_calls><result><name>X</name>
+        // <output>...), which mode 16 pins with a negative fixture: those are
+        // invented tool OUTPUT, and promoting them to calls would feed the
+        // model's own fiction back as if a tool had produced it.
+        {
+            static const std::string TN = "<tool_name>";
+            std::vector<ToolCall> batch;
+            size_t scan = 0, first_begin = std::string::npos;
+            while (true) {
+                size_t tn = text_in.find(TN, scan);
+                if (tn == std::string::npos) break;
+                size_t after = text_in.find_first_not_of(" \t\r\n", tn + TN.size());
+                scan = tn + TN.size();
+                // empty tag only: a named <tool_name> belongs to mode 14
+                if (after == std::string::npos ||
+                    text_in.compare(after, 11, "<parameter=") != 0)
+                    continue;
+                size_t end = text_in.find("</function>", after);
+                size_t alt = text_in.find(TN, after);
+                if (end == std::string::npos || (alt != std::string::npos && alt < end))
+                    end = alt == std::string::npos ? text_in.size() : alt;
+                else
+                    end += 11;
+                std::string span = "<function=q27_unnamed>\n" +
+                                   text_in.substr(after, end - after);
+                if (span.find("</function>") == std::string::npos) span += "\n</function>";
+                ToolCall tc;
+                if (!parse_native_xml_call(span, tc) || tc.arguments.empty()) continue;
+                const std::string nm = infer_tool_name(*tools, tc.arguments);
+                if (nm.empty() || !declared(nm)) continue;
+                tc.name = nm;
+                tc.ok = true;
+                if (first_begin == std::string::npos) first_begin = tn;
+                batch.push_back(std::move(tc));
+                scan = end;
+            }
+            if (!batch.empty()) {
+                batch.front().source_begin = first_begin;
+                batch.back().source_end = text_in.size();
+                if (prefix) *prefix = text_in.substr(0, first_begin);
+                if (remaining_text) *remaining_text = "";
+                fprintf(stderr, "[q27] drift mode 20: recovered %zu nameless <tool_name> call(s)\n",
+                        batch.size());
+                return batch;
             }
         }
     }

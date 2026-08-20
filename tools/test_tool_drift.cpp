@@ -310,6 +310,93 @@ static void test_native_xml_dialect() {
 // stray `</parameter>` before the first real one. Payload intact, opener gone
 // -- the XML twin of JSON mode 10. Refusing it dumped a live tool call into
 // the text channel, where the agent read it as prose and stopped at turn 1.
+// Drift modes 19 and 20 (2026-08-19). Both were found by capturing the raw
+// assistant text of every trial in the Qwen3.8 reasoning-effort A/B: 4 of 20
+// trials emitted a tool call the parser refused, and every one of those died at
+// ~50K tokens with hidden=0 -- Claude Code sees no tool_use block, decides the
+// task is done, and exits `completed` in 11 seconds. The fixtures below are the
+// exact bytes from those transcripts, not reconstructions.
+static void test_mode19_attribute_opener() {
+    // xhigh/bench-task-queue trial-1..3, byte-for-byte (the same call three
+    // times over -- a deterministic basin, not trajectory noise).
+    q27::ToolCall tc;
+    ok(q27::parse_native_xml_call(
+           "<function name=\"Bash\">\n"
+           "<parameter=command>\n"
+           "for f in /workspace/phases/phase-*.md; do echo \"=== $f ===\"; cat \"$f\"; echo; done\n"
+           "</parameter>\n"
+           "<parameter=description>\nRead all phase requirement files\n</parameter>\n"
+           "</function>", tc) &&
+           tc.ok && tc.name == "Bash" &&
+           tc.arguments.value("description", std::string()) == "Read all phase requirement files" &&
+           tc.arguments.value("command", std::string()).find("phase-*.md") != std::string::npos,
+       "mode19: <function name=\"Bash\"> attribute opener recovers the call");
+    // single quotes and extra attributes must not break the name extraction
+    q27::ToolCall t2;
+    ok(q27::parse_native_xml_call(
+           "<function name='Read'>\n<parameter=file_path>\n/w/x.ts\n</parameter>\n</function>", t2) &&
+           t2.ok && t2.name == "Read" &&
+           t2.arguments.value("file_path", std::string()) == "/w/x.ts",
+       "mode19: single-quoted attribute name");
+    // the three openers this branch must NOT swallow
+    q27::ToolCall t3;
+    ok(q27::parse_native_xml_call("<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>", t3) &&
+           t3.name == "Bash",
+       "mode19: native <function= opener still takes the original path");
+    q27::ToolCall t4;
+    ok(!q27::parse_native_xml_call("<function> {\"name\": \"Bash\"} </function>", t4),
+       "mode19: bare <function> (mode 16's shape) is not claimed here");
+    q27::ToolCall t5;
+    ok(!q27::parse_native_xml_call("<function of two variables>\nis not a call\n", t5),
+       "mode19: prose after <function ...> without name= is not a call");
+}
+
+static void test_mode20_nameless_tool_name() {
+    // xhigh/bench-time-tracker trial-1, byte-for-byte: plural opener, EMPTY
+    // <tool_name>, <tool> separators, mismatched closers. The name exists
+    // nowhere in the bytes, so it has to come from the parameter keys.
+    const std::string raw =
+        "Let me look at the remaining config files.\n\n"
+        "<tool_calls>\n<tool_name>\n<parameter=file_path>\n/workspace/vitest.config.ts\n"
+        "</parameter>\n</function>\n<tool>\n<tool_name>\n<parameter=file_path>\n"
+        "/workspace/TASK.md\n</parameter>\n</function>\n</tool_call>";
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+    std::string prefix, remaining;
+    auto calls = q27::parse_bare_tool_calls(raw, &prefix, &tools, true, true, &remaining);
+    ok(calls.size() == 2 && calls[0].name == "Read" && calls[1].name == "Read" &&
+           calls[0].arguments.value("file_path", std::string()) == "/workspace/vitest.config.ts" &&
+           calls[1].arguments.value("file_path", std::string()) == "/workspace/TASK.md",
+       "mode20: nameless <tool_name> batch recovers both calls by inference");
+    ok(prefix.find("remaining config files") != std::string::npos,
+       "mode20: prose before the batch is preserved as prefix");
+
+    // THE negative that matters: hallucinated tool RESULTS wear the same
+    // <tool_calls> opener. Promoting those to calls would feed the model's own
+    // invented output back as if a tool had produced it (mode 16's rule).
+    const std::string hallucinated =
+        "<tool_calls>\n<result>\n<name>Read</name>\n<output>\nfile contents\n</output>\n"
+        "<tool_name>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>";
+    std::string p2;
+    auto none = q27::parse_bare_tool_calls(hallucinated, &p2, &tools);
+    ok(none.empty(), "mode20: hallucinated <result>/<output> block is NOT a call");
+
+    // A named <tool_name> is mode 14's; mode 20 must not race it.
+    const std::string named =
+        "<tool_call>\n<tool_name>Read</tool_name>\n<parameter=file_path>\n/w/y\n</parameter>\n</function>";
+    std::string p3;
+    auto m14 = q27::parse_bare_tool_calls(named, &p3, &tools);
+    ok(m14.size() == 1 && m14[0].name == "Read",
+       "mode20: named <tool_name> still resolves to Read (mode 14 path intact)");
+
+    // Inference must refuse rather than guess when the keys fit nothing.
+    const std::string unknowable =
+        "<tool_calls>\n<tool_name>\n<parameter=zzz_unknown>\nv\n</parameter>\n</function>";
+    std::string p4;
+    auto no = q27::parse_bare_tool_calls(unknowable, &p4, &tools);
+    ok(no.empty(), "mode20: un-inferable parameter keys are left as text");
+}
+
 static void test_mode18_bare_name_opener() {
     q27::ToolCall tc;
     ok(q27::parse_native_xml_call(
@@ -404,6 +491,8 @@ int main() {
     test_reasoning_effort_line();
     test_native_xml_dialect();
     test_mode18_bare_name_opener();
+    test_mode19_attribute_opener();
+    test_mode20_nameless_tool_name();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();

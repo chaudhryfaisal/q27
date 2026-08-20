@@ -13562,3 +13562,164 @@ reports three false FAILs. Both were harness errors, not code.
 just the command line tools). No Metal target's recipe invokes it -- the shader
 is compiled at runtime, confirmed by the gate printing `shader sha1 0761aedd...`
 -- so the CLT-only box is sufficient for every gate above.
+
+## 2026-08-19 (q): two tool-call dialects the parser refused -- and they were killing agentic sessions at turn 1
+
+Went looking for a reasoning-effort effect on Qwen3.8 (Gabe's hypothesis, from
+anecdote: medium/low beats xhigh). Found a parser bug instead, and it is worth
+more than the knob.
+
+**THE A/B.** Three arms, one variable -- `Q27_REASONING_EFFORT` = xhigh (the
+shipped 3.8 default) / medium (template emits no line) / low -- at a fixed 16K
+budget, `--think`, 3.8 default tier. Task set per the protocol verdict banked on
+08-15: n=3 on three volatile tasks (task-queue, time-tracker,
+constraint-scheduler) plus financial-ledger at n=1 as a null rung. 30 runs
+instead of the ~190 a full 21-task campaign would need. Arm reached the process
+verified from `/proc/<pid>/environ`, not assumed.
+
+**WHY THE QUESTION WAS OPEN AT ALL.** The two suite numbers on record confound
+the knob with the budget: 0.511 was effort OFF at 16K, 0.315 was effort xhigh at
+24K. Entry 08-15 says so outright -- "the suite mean for the RECOMMENDED recipe
+(effort + 16K) has NOT been measured". xhigh-vs-medium-vs-low at fixed budget
+had never been run.
+
+**FIRST READ, AND IT WAS WRONG.** Arm means came out xhigh 0.587 / medium 0.431
+/ low 0.295. Reported as-is that is "xhigh wins modestly". Then the per-trial
+distributions showed every task is BIMODAL -- trials score ~0 or ~1, nothing
+between -- so an arm mean of 0.667 describes no trial that actually happened.
+Worse, xhigh's zeros were all ~50K-token 11-second exits, against 0.8-1.3M
+tokens for a real attempt. That is not a model failing a task. That is a model
+not attempting one.
+
+**ROOT CAUSE: the assistant text contained a tool call the parser refused.**
+The FINAL turn carries the malformed call as plain text, so Claude Code sees a
+turn with no `tool_use` block, concludes the task is finished, and exits
+`completed` with the work half-done. Two distinct unhandled dialects, and
+reading the raw transcripts is the only way either was ever going to surface:
+
+CORRECTED 2026-08-19, after the post-fix re-run: an earlier draft of this entry
+said the sessions "died at turn 1". They did not. The canonical example runs
+six turns and makes TWO successful tool calls before the bad emission --
+thinking / text / tool_use / tool_use / thinking / text(malformed) -- and stops
+there. The `< 60K tokens` proxy used to label these was measuring "stopped
+early", not "never started". The right instrument is whether the FINAL turn
+delivered a `tool_use` block; every trial in both runs delivered at least one
+somewhere, so a session-level zero-tool_use count finds nothing.
+
+- **MODE 19, attribute-syntax opener.** `<function name="Bash">` where the
+  trained form is `<function=Bash>`. Everything downstream is byte-identical --
+  same `<parameter=KEY>` bodies, same `</function>` closer. Only the opener
+  drifts, which makes it the narrowest rescue in the catalogue. 3 trials, and
+  all three were the SAME task emitting the SAME call: deterministic, not noise.
+- **MODE 20, nameless batch.** `<tool_calls>` (plural) + an EMPTY `<tool_name>`
+  where the name belongs + `<tool>` separators + closers that do not match their
+  openers. The tool name is absent from the bytes entirely, so recovery has to
+  infer it from the parameter keys -- which `infer_tool_name()` already does for
+  JSON mode 6, refuse-on-tie included. 1 trial, 5 calls in one emission.
+
+**CONTROLLING FOR IT INVERTS THE RESULT:**
+
+| arm | n | parse-dead | mean ALL | mean CLEAN | >=0.9 clean |
+|---|---|---|---|---|---|
+| xhigh | 10 | 4 | 0.587 | **0.979** | **6/6** |
+| medium | 10 | 1 | 0.431 | 0.393 | 3/9 |
+| low | 10 | 1 | 0.295 | 0.328 | 3/9 |
+
+**Every xhigh trial that was not killed by the parser scored >= 0.9. Six for
+six.** medium and low convert 3 of 9. So the anecdote is backwards on this task
+set: xhigh reasons best by a wide margin, and its apparent weakness was entirely
+this bug. The shipped default was chosen on template-fidelity grounds and turns
+out to be right on the merits too.
+
+SCOPE LIMITS, and they are real: n=10 per arm over 4 tasks; 6/6 vs 3/9 is
+p~0.03 by Fisher, so the direction holds on THESE tasks and this is not a suite
+mean. xhigh's clean mean rests on 6 trials against medium/low's 9, and the
+trials it lost were all task-queue -- the hardest task in the set -- so 0.979 is
+an upper bound. Whether the effort line drives the dialect choice is NOT
+established: 4-vs-1 does not carry that.
+
+**THE FIX.** Both modes in `parse_native_xml_call` / `parse_bare_tool_calls`,
+with 10 new assertions in tools/test_tool_drift.cpp whose fixtures are the
+captured transcripts BYTE-FOR-BYTE rather than reconstructions. All six
+previously-dead transcripts now parse to the right tool and arguments (5/5 calls
+recovered from the mangled batch). Negatives pinned: bare `<function>` stays
+mode 16's, native `<function=` keeps the original path, mode 14's named
+`<tool_name>` is untouched (14 and 20 key on presence vs absence of the name, so
+they cannot race), un-inferable parameter keys are left as text, and the
+HALLUCINATED-RESULT shape (`<tool_calls><result><name>X</name><output>`) still
+refuses -- promoting those would feed the model's own invented output back as if
+a tool had produced it.
+
+**WHAT THIS MEANS FOR THE 3.8 "REGRESSION".** The 0.511 was measured at
+effort-off with both dialects unhandled. A share of that number is sessions that
+died at turn 1 to a parse refusal, not capability -- which also explains why it
+read as a CLASS regression concentrated in greenfield/complex tasks: those are
+the ones with enough turns to hit a malformed emission. The suite needs
+re-deriving on a fixed parser before anyone quotes 0.511 again.
+
+**METHOD NOTE.** The arm means were computed correctly and were still
+misleading. What exposed it was the token column next to the score -- 50K vs
+800K separates "attempted and failed" from "never attempted", and those score
+identically. Put a work-done column next to every quality metric.
+
+## 2026-08-19 (r): the fix lands (parse deaths 6/30 -> 0/30) -- and with it gone, the effort knob does nothing
+
+Re-ran the identical 30-run matrix on the fixed parser. Same arms, same tasks,
+same n, same server config, one variable changed: modes 19 and 20 exist.
+
+**THE FIX, on the metric it is judged on:**
+
+| arm | stopped on an unparsed call, PRE | POST |
+|---|---|---|
+| xhigh | 4/10 | **0/10** |
+| medium | 1/10 | **0/10** |
+| low | 1/10 | **0/10** |
+
+Zero, across all three arms. `bench-task-queue` under xhigh is the cleanest
+demonstration: three trials that were byte-identical 50K-token stops now run
+676K mean and work the task through.
+
+**AND THE EFFORT QUESTION ANSWERS ITSELF -- AS A NULL:**
+
+| arm | PRE mean | POST mean |
+|---|---|---|
+| xhigh | 0.639 | 0.545 |
+| medium | 0.488 | 0.453 |
+| low | 0.408 | 0.456 |
+
+Post-fix the three arms sit inside 0.09 of each other on 10 trials apiece, with
+roughly 4/3/3 near-perfect scores. **There is no resolvable difference between
+xhigh, medium and low once the parser stops eating calls.** The original
+hypothesis (medium/low beats xhigh, from anecdote) is not supported. Neither is
+the interim claim in entry (q).
+
+**RETRACTING (q)'s HEADLINE NUMBER.** That entry reported xhigh's clean mean as
+0.979 with 6/6 trials >= 0.9, and projected the post-fix arm would land there.
+It landed at 0.545. The inference was wrong in a way worth naming: those six
+"clean" trials were not a random subsample. The four trials the parser killed
+were ALL bench-task-queue, the hardest task in the set, so excluding them left
+xhigh scored on an easier task mix than medium and low. Conditioning on survival
+selects for easy cases -- the caveat was written down as "0.979 is an upper
+bound" and it was a 0.43 overestimate.
+
+**WHAT bench-task-queue ACTUALLY SAYS.** It scores 0.000-0.040 under every arm
+post-fix, at 231K-676K tokens. That is a genuine capability limit on this
+checkpoint, not an engine defect: the model engages, works, and fails. Before
+the fix it looked like an effort effect because xhigh happened to emit the
+unparsed dialect there three times out of three.
+
+**METHOD, THREE ATTEMPTS TO GET ONE METRIC RIGHT.** Counting parse deaths went
+through two wrong instruments before a correct one:
+
+1. `tokens < 60K` -- measures "stopped early", not "stopped on a parse failure".
+   The canonical pre-fix example ran SIX turns and made TWO successful tool
+   calls before the bad emission.
+2. any tool-dialect markup in the final turn -- flags trials that scored 1.000,
+   because every session ends on a no-tool_use turn and a summary can quote
+   `<parameter=` legitimately.
+3. correct: markup the OLD parser REFUSED, in a final turn that delivered no
+   `tool_use`. Sanity-checked by confirming no trial scoring >= 0.9 is ever
+   flagged.
+
+The fix's headline number is only as good as that third definition, and the
+first two would each have supported a confident wrong claim.
