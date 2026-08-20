@@ -4,13 +4,33 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
 
 ## Why this is interesting
 
-- **Fastest of the four engines tested, on this harness.** 47 s per
-  SWE-bench instance against llama.cpp's 71 s, ninfer's 97 s and vLLM's 84 s,
-  same 12 tasks and one harness (2026-08-17, four engines, table below).
-  n=1 per instance, legs ran sequentially, and sampling was left at each
-  engine's defaults rather than matched -- so read it as a result for this
-  pinned run, not a general ranking. Caveats in
-  [FINDINGS.md](bench/crossengine/FINDINGS.md#6-caveats). The
+- **Fastest of the four engines tested, on this harness -- across two
+  independent runs.** Mean wall per SWE-bench instance, same 12 tasks, one
+  harness, unchanged competitor binaries:
+
+  | leg | 2026-08-17 | 2026-08-19 |
+  |---|--:|--:|
+  | **q27** q5f | 46.8 s | **46.3 s** |
+  | **q27** q4s | 48.5 s | 49.6 s |
+  | llama.cpp | 71.4 s | 59.9 s |
+  | vLLM | 84.5 s | 78.8 s |
+  | ninfer NVFP4 | 96.8 s | 113.8 s |
+  | ninfer int8 | 327.4 s | 266.2 s |
+
+  Two runs is what it takes to see the honest shape: **q27 is the only leg that
+  reproduced** (46.8 -> 46.3 s), while every competitor moved 7-19% on identical
+  binaries. So the ordering is stable but the margins are not -- q27's edge over
+  llama.cpp reads 1.53x one day and 1.29x the next. Quoting either as *the*
+  number overstates the precision. n=1 per instance, trajectories diverge freely
+  (turn counts range 1 to 56), legs ran sequentially, and sampling is each
+  engine's own defaults rather than matched. Caveats in
+  [FINDINGS.md](bench/crossengine/FINDINGS.md#6-caveats).
+
+  q5f leads rather than the q4s canonical tier because q4s lost 3 of 12 instances
+  to turn-1 quits in the 08-19 run (q5f: 0), which makes its mean cheap for the
+  wrong reason. Those quits are model-side degeneration -- q27 logs the intended
+  call it could not rescue, and all three were corrupted JSON rather than a
+  dialect the parser refuses. The
   win is prefix reuse, not raw decode -- ninfer decodes *faster* than q27
   (250-261 t/s vs 215-223) and still takes 2-7x the wall time, because it
   re-prefills every turn. On a 24GB 3090: +19% decode at 2x the context over
@@ -18,9 +38,11 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   default is now turbo5k, ~76% of that window for 43% fewer catastrophic KV
   positions -- `Q27_KV=turbo3` restores it). sglang 0.5.15 cannot load the
   model at all (BUILDLOG 2026-07-12).
-  **Where q27 loses:** ninfer's NVFP4 tier peaks at 790 t/s aggregate at 8
-  concurrent streams against q27's 412.9 -- fp4 MMA engaging at batch width.
-  Logged here at the same rate as the wins.
+  **Where q27 loses:** ninfer's NVFP4 tier peaks at 834 t/s aggregate at 8
+  concurrent streams against q27's 531 (2026-08-19 re-run, both same session) --
+  a 1.57x gap, down from 1.91x. Not an fp4-arithmetic win: their own
+  `text_policy()` grants the batch kernel to NVFP4 only, so their int tier is
+  locked out of it. Logged here at the same rate as the wins.
 - **turbo3 3-bit KV cache** (capacity lever, not a quality-parity format --
   see the 2026-08-01 tail study: 6x fp8's catastrophic-position rate against an
   fp16 reference, at a dPPL of only +0.804%), symmetric K+V: 14.1 KB/token (14400 B,
@@ -428,7 +450,8 @@ whole 08-17 agentic run: 88.7% of prompt tokens reused on q4s, 92.1% on q5f
 24,224 and 31,314 tok/s against a cold 3,300-3,350.
 
 That arithmetic, times every turn of a 30-90-turn trajectory, is the whole
-wall-time story: **q27 47 s/instance vs ninfer 97 s** on identical tasks, where
+wall-time story: **q27 46-50 s/instance vs ninfer 97-114 s** across two runs on
+identical tasks, where
 decode speed explains *none* of the gap -- ninfer decodes faster and still
 loses by 2x. The continuous-batching stack (07-14..16) is independent of this
 machinery and stacks on top: snapshots own prefill, batching owns decode.
@@ -823,18 +846,41 @@ offsets and lists arbitrary longest-common-prefix reuse as an explicit
 non-goal, since Qwen3.6's GDN state cannot be rebuilt from a KV prefix. q27,
 llama.cpp and vLLM all solve that; ninfer is the outlier.
 
-**Concurrency ladder** -- aggregate decode t/s, distinct salted prompts, n=1:
+**Concurrency ladder** -- aggregate decode t/s, distinct salted prompts, n=1.
+Re-run 2026-08-19 on the same harness and the same protocol (8 slots / 16K),
+because q27 gained ~19% at C=8 from work shipped after the original run and
+leaving the old figure up understated its own engine by that much. **Competitor
+binaries are byte-identical to the 08-17 run** -- ninfer built 08-15, llama.cpp
+08-17, the same vLLM nightly image -- so this isolates q27's change rather than
+measuring two moving targets:
 
-| engine | C=1 | C=2 | C=4 | C=8 | slots at 16K |
-|---|--:|--:|--:|--:|--:|
-| **q27** q4s | 135.8 | 218.8 | 307.6 | **412.9** | **8** |
-| **q27** q5f | 127.1 | 194.2 | 290.9 | 385.9 | 8 |
-| ninfer NVFP4 | 159.3 | 277.5 | 494.9 | **790.0** | 8 |
-| ninfer int8 | 138.8 | 160.7 | 218.2 | 349.8 | 8 |
-| vLLM NVFP4 | 67.5 | 110.0 | 216.5 | 398.8 | 6.53 |
-| llama.cpp | 90.1 | 156.1 | 129.1 | 230.3 | **6** |
+| engine | C=1 | C=2 | C=4 | C=8 | 08-17 C=8 | slots at 16K |
+|---|--:|--:|--:|--:|--:|--:|
+| **q27** q4s | 141.3 | 229.7 | 352.3 | **530.6** | 412.9 | **8** |
+| **q27** q5f | 134.7 | 173.8 | 299.9 | 509.7 | 385.9 | 8 |
+| ninfer NVFP4 | 157.2 | 299.7 | 442.3 | **834.3** | 790.0 | 8 |
+| ninfer int8 | 137.0 | 179.5 | 219.5 | 353.6 | 349.8 | 8 |
+| vLLM NVFP4 | 67.4 | 121.4 | 215.7 | 438.7 | 398.8 | 6.53 |
+| llama.cpp | 84.8 | 168.3 | 149.1 | 193.1 | 230.3 | **6** |
 
-**q27 loses this half.** ninfer's NVFP4 peaks at 1.91x q27's best. *An earlier
+**The q27 rows run `Q27_DRAFT_CEIL1=1`, which is opt-in and OFF by default.**
+Stated plainly because it is an asymmetry: q27 is tuned here and the other three
+engines are at their shipped defaults. The flag is worth **+8.6%** at C=8 and
+nothing anywhere else (q4s stock: 142.5 / 226.5 / 360.3 / **488.4**), because it
+only binds where the width trim floors every lane -- so **q27 is +18.3% at C=8
+on defaults alone**, and the tuned number is the ceiling rather than the
+out-of-the-box figure.
+
+Read the competitor deltas as the noise floor: on unchanged binaries they came
+back +1.1%, +5.6%, +10.0% and -16.1%, so single rungs move ~10-16% between
+sessions. Both q27 legs moved +28.5% and +32.1% in the same direction, which is
+what makes them a result rather than a wobble. The one outlier inside q27's own
+rows -- q5f at C=2, down 10.5% while its neighbours rose -- is that same
+rung-level noise; its C=4 and C=8 track q4s.
+
+**q27 still loses this half, by less.** ninfer's NVFP4 peaks at **1.57x**
+q27's best (834.3 vs 530.6, same session), down from the 1.91x the 08-17 run
+recorded -- the gap closed by q27 moving, not by ninfer slipping. *An earlier
 draft of this section read that as a format win -- fp4 MMA engaging at batch
 width -- because ninfer's own int8 tier peaks below q27. That attribution was
 wrong, and their source says so: `text_policy()` hands `AllowA4` to
@@ -851,7 +897,7 @@ engines and to q27's own ladder history.
 llama.cpp keeps recurrent state per slot at ~1047 MiB and OOMs at 8 slots
 (measured ceiling 6). vLLM's KV pool holds 6.53 sequences at 16K. ninfer trades
 reuse away entirely. q27 reaches 8 slots at 16K because M1 record-then-fold cut
-its per-slot GDN cost -- that is what the 412.9 t/s rung is made of.
+its per-slot GDN cost -- that is what the 530.6 t/s rung is made of.
 
 **Quality does not separate them.** benchlocal `--medium`, 5 packs / 75
 deterministic-verifier scenarios, temp 0: q27 q5f **66**, llama.cpp **66**,
@@ -886,15 +932,27 @@ prefill and decode tables regenerate from the committed data with:
 python3 bench/crossengine/harness/analyze.py bench/crossengine
 ```
 
-**The prefix-reuse column does not.** It prints `n/a` for the q27 and ninfer
-legs on a fresh clone, because that number comes from each engine's own
-instrument and only llama.cpp's travels in the committed transcripts
-(`cache_read_input_tokens`, in `agentic.llama.jsonl`). q27's reuse is parsed
-from `[gen] prompt=N prefix_hit=M` server lines and ninfer's from its request
-log, neither of which is in the archive; vLLM emits no such field at all. So
-the headline "the win is prefix reuse" rests on telemetry you have to re-run
-the harness to reproduce, not on the archive. The numbers as measured are in
-[FINDINGS.md](bench/crossengine/FINDINGS.md).
+**In the 08-17 archive the prefix-reuse column did not** -- it printed `n/a`
+for both q27 and both ninfer legs, because that number comes from each engine's
+own instrument and only llama.cpp's rode in the committed tap logs
+(`cache_read_tok`, in `tap.llama.jsonl`). q27's reuse is parsed from
+`[gen] prompt=N prefix_hit=M` server lines and ninfer's from its request log,
+and neither file was archived.
+
+**Fixed for the 08-19 re-run**, whose directory ships those server logs and
+reqlogs (pure counters -- no prompt or completion text), so every leg's reuse
+regenerates from a clone:
+
+| leg | reuse, tok-weighted |
+|---|--:|
+| llama.cpp | 93.47% |
+| **q27** q4s | **91.64%** |
+| **q27** q5f | 89.91% |
+| ninfer int8 / NVFP4 | 0.00% |
+| vLLM | n/a (emits no cache field) |
+
+vLLM stays `n/a` because it reports no per-request cache field at all, which is
+an engine limitation rather than a missing file.
 
 That section also documents the seven harness bugs the run hit, each of which
 produced a plausible and wrong number first -- the worst of them said "ninfer

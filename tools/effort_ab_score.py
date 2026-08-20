@@ -21,10 +21,53 @@ usage: effort_ab_score.py <outdir>   # outdir holds runmap.tsv
 """
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 
 TD = "/mnt/ai/projects/thunderdome/results/runs"
+
+# A session ends when Claude Code gets an assistant turn carrying no tool_use
+# block -- but that is ALSO how every normal completion ends, so it cannot be
+# the discriminator on its own. Two earlier attempts at this metric were wrong:
+#
+#   "< 60K tokens"            measures "stopped early", not "stopped on a parse
+#                             failure". The canonical pre-fix example ran six
+#                             turns and made two successful tool calls first.
+#   any dialect markup        flags trials that scored 1.000 -- a summary turn
+#     in the final turn       can legitimately contain <parameter= or <function.
+#
+# What actually identifies the failure is markup the OLD parser REFUSED, in a
+# final turn that delivered no tool_use: the model issued a call, the parser
+# would not convert it, and the loop fell out. Post-fix those same bytes parse,
+# so they never reach the text channel and the count goes to zero -- which is
+# exactly the prediction the fix is judged on.
+REFUSED = [
+    re.compile(r'<function\s+name\s*='),                 # mode 19: attribute opener
+    re.compile(r'<tool_calls>\s*\n\s*<tool_name>\s*\n\s*<parameter='),  # mode 20: nameless
+]
+
+
+def stopped_on_unparsed(stream_path):
+    """True iff the last assistant turn had no tool_use and shows dialect markup."""
+    if not os.path.exists(stream_path):
+        return False
+    last_kinds, last_text = None, ""
+    for line in open(stream_path, errors="replace"):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        content = d.get("message", {}).get("content", [])
+        last_kinds = [c.get("type") for c in content]
+        last_text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+    if last_kinds is None:
+        return False
+    if "tool_use" in last_kinds:
+        return False
+    return any(r.search(last_text) for r in REFUSED)
 
 
 def hidden_of(meta):
@@ -61,7 +104,9 @@ def main():
             h = hidden_of(m)
             if h is None:
                 continue
-            cells[(arm, task)].append((float(h), int(m.get("total_tokens") or 0)))
+            stream = os.path.join(base, trial, "workspace", ".thunderdome-output.jsonl")
+            cells[(arm, task)].append((float(h), int(m.get("total_tokens") or 0),
+                                       stopped_on_unparsed(stream)))
 
     print(f"{'task':30}" + "".join(f"{a:>22}" for a in arms))
     print(f"{'':30}" + "".join(f"{'hidden   tok   n':>22}" for _ in arms))
@@ -86,13 +131,21 @@ def main():
         row += f"{(sum(m)/len(m) if m else 0):>10.3f}{'':>12}"
     print(row)
 
-    print("\nper-trial detail (hidden, tokens):")
+    # the number the fix is judged on
+    print()
+    for a in arms:
+        tot = sum(len(cells.get((a, t), [])) for t in tasks)
+        bad = sum(1 for t in tasks for x in cells.get((a, t), []) if x[2])
+        print(f"  {a:8} stopped on an unparsed call: {bad}/{tot}")
+
+    print("\nper-trial detail (hidden, tokens, * = stopped on unparsed call):")
     for t in tasks:
         print(f"  {t}")
         for a in arms:
             v = cells.get((a, t), [])
             if v:
-                print(f"    {a:8} " + "  ".join(f"{h:.3f}/{tk//1000}k" for h, tk in v))
+                print(f"    {a:8} " + "  ".join(
+                    f"{h:.3f}/{tk//1000}k{'*' if bad else ''}" for h, tk, bad in v))
 
 
 if __name__ == "__main__":
