@@ -886,6 +886,60 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "[pool] %d slots, floor %.2f GB (half-ctx x slots), pool %.2f GB\n",
                 n_slots, n_slots * ent_bytes / 1e9, pool_b / 1e9);
+
+        // AN EXPLICIT --ctx BIDS AGAINST THE ARCH SLACK (2026-08-20, the #25
+        // follow-up). pool_b above is "whatever free VRAM is left after a
+        // conservative fixed reservation" -- correct for auto-ctx, which is
+        // asking the machine what it can afford. But an operator who NAMED a
+        // ctx is not asking, and silently clamping them to a margin they never
+        // requested is the wrong default: reported on a 24 GB sm_86 card,
+        // `--ctx 151552` booted at 151552 before the pool landed and at 57344
+        // after -- same free VRAM, a 62% cut, one [pool] line of warning.
+        //
+        // So when the ctx is explicit, price it and try to meet it. The slack
+        // is REDUCED to a floor, never removed: it covers the ctx-scaled
+        // instantiate transient that issue #6 established on sm_86, and the
+        // pool is allocated before any capture. If even the floor cannot cover
+        // the request, keep the clamp (a forever-hang is worse) but say what
+        // is needed, what is reachable, and which knob restores the old
+        // behaviour -- Q27_KV_POOL=0 is per-slot KV, which is exactly what the
+        // pre-pool builds did for these operators.
+        if (ctx_explicit && pool_b > 0) {
+            // MUST mirror pages_for() in the clamp below, not approximate it:
+            // 16 attention pairs plus the MTP row, and the MTP row rounds up
+            // SEPARATELY, so 17*ceil(rows/64) is one page short whenever
+            // rows+1 crosses a 64-boundary. Being one page short buys the pool
+            // a size that still cannot entitle the window, and the clamp then
+            // drops a whole 4096-row step -- which is exactly the silent loss
+            // this block exists to prevent.
+            auto rows_bytes = [&](int rows) {
+                const size_t pages =
+                    16 * (size_t)((rows + 63) / 64) + (size_t)((rows + 1 + 63) / 64);
+                return (double)pages * 64.0 * (double)(k_row + v_row);
+            };
+            const double need_b = rows_bytes(ctx);
+            if (need_b > pool_b) {
+                // half the arch margin stays put; only the other half is biddable
+                const double floor_slack = pool_slack * 0.5;
+                const double reachable =
+                    (double)freeb - (fixed_for(n_slots) - (pool_slack - floor_slack));
+                if (reachable >= need_b) {
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB; spending %.2f GB of the %.2f GB "
+                            "arch slack to honor it\n",
+                            ctx, need_b / 1e9, (need_b - pool_b) / 1e9, pool_slack / 1e9);
+                    pool_b = need_b;
+                } else {
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB of pool; at most %.2f GB is "
+                            "reachable here (free %.2f GB, fixed stacks %.2f GB). The window "
+                            "will be clamped below -- Q27_KV_POOL=0 restores per-slot KV and "
+                            "the pre-pool window if you need the full ctx.\n",
+                            ctx, need_b / 1e9, reachable / 1e9, (double)freeb / 1e9,
+                            fixed_for(n_slots) / 1e9);
+                }
+            }
+        }
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
             const double kfrac = (double)k_row / (double)(k_row + v_row);
