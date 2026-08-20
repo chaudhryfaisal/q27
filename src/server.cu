@@ -929,6 +929,23 @@ int main(int argc, char** argv) {
                             "arch slack to honor it\n",
                             ctx, need_b / 1e9, (need_b - pool_b) / 1e9, pool_slack / 1e9);
                     pool_b = need_b;
+                } else if (reachable > pool_b) {
+                    // TAKE WHAT IS REACHABLE, never all-or-nothing. Falling back
+                    // to the un-grown pool turns a rounding-sized shortfall into
+                    // a cliff: reported on an A10 (23028 MiB) where --ctx 100480
+                    // wanted 1.37 GB against 1.32 GB reachable -- 3.6% short --
+                    // and the window collapsed 96384 -> 57344, a 39% loss for a
+                    // 0.05 GB miss. The clamp below still picks the largest
+                    // entitlable window; this just makes sure it is choosing
+                    // from the biggest pool the card can actually back.
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB, only %.2f GB reachable (free "
+                            "%.2f GB, fixed stacks %.2f GB) -- growing the pool to that and "
+                            "clamping the window below. Q27_KV_POOL=0 restores per-slot KV "
+                            "and the pre-pool window if you need the full ctx.\n",
+                            ctx, need_b / 1e9, reachable / 1e9, (double)freeb / 1e9,
+                            fixed_for(n_slots) / 1e9);
+                    pool_b = reachable;
                 } else {
                     fprintf(stderr,
                             "[pool] --ctx %d needs %.2f GB of pool; at most %.2f GB is "
