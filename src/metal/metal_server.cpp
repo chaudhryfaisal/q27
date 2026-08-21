@@ -2512,7 +2512,7 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.guard_engine([&]{
                             return runtime.run(ids,n,sampling,stops,emit,
                                 std::vector<std::string>{},snap_hint,id,nullptr,false,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         // Terminal chunk with a real finish_reason before [DONE]
@@ -2895,7 +2895,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -3395,7 +3395,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,mid,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -4278,7 +4278,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },grammar_tool_names,snap_hint,resp_id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) {
                             runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
