@@ -40,6 +40,11 @@ PORT=8081
 UNIT=q27-eval-effort
 OUT="${1:?usage: effort_ab.sh <outdir>}"
 mkdir -p "$OUT"
+# ABSOLUTE, because the thunderdome invocation below redirects from inside a
+# subshell that has already cd'd to $TD -- a relative $OUT resolves against
+# thunderdome's tree there and every log redirect fails with "No such file or
+# directory" while the arms still appear to run.
+OUT="$(cd "$OUT" && pwd)"
 MAP="$OUT/runmap.tsv"
 : >"$MAP"
 
