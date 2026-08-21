@@ -13932,3 +13932,96 @@ would send the next reader looking for a missing wrapper that was there.
 
 Verified on both backends: `make test-tools` green under gcc on haight and under
 clang on the M4, and `build/q27-metal-server` links clean under `-Werror`.
+
+## 2026-08-20 (d): drift mode 22, and the miss detector that never saw it
+
+chaudhryfaisal reported on issue #24 that tool calls were still arriving as
+plain text, on `84963fb` and again on `0f46684`, with "no rescue logs". First
+thing worth recording: **the routing fix from (c) does not cover this.** His
+bytes, replayed verbatim, recover on NEITHER channel:
+
+```
+#24 two calls (bash+read)     TEXT-channel=0   TOOL-channel=0
+#24 edit (3 params)           TEXT-channel=0   TOOL-channel=0
+#24 single bash               TEXT-channel=0   TOOL-channel=0
+```
+
+**The shape: the tool NAME arrives as the first `<parameter=...>`, unclosed,
+with the real parameters after it.**
+
+```
+<parameter=bash>
+<parameter=command>
+ls /code/docs; grep -rn "INIT_FILE" /code/docs /code/README.md
+</parameter>
+</function>
+```
+
+The corroboration is what makes it a mode rather than one user's client: the
+identical shape sits in this box's own dialect survey from the same night
+(capture 001, second call, `<parameter=Bash>` capitalized) under a different
+client and a different schema.
+
+**Why it died.** The leading tag never closes, so `parse_native_xml_call` fails
+outright on the span mode 21 synthesizes -- measured directly, `parsed=0,
+args={}`. With no arguments, `infer_tool_name()` has nothing to work on and
+refuses. The name was in the bytes the whole time, wearing a parameter's tag.
+
+### Two holes, and the second one is the interesting one
+
+**The miss DETECTOR was blind to it.** The UN-RESCUED warning and the
+`Q27_DRIFT_CORPUS` capture both keyed off `{"name"` / `{"tool_call"` /
+`</content>`. An emission made entirely of XML tags matches none of those, so
+this produced **no log line and no corpus entry**. "No rescue logs" was an
+accurate and complete description of a call being dropped, and it is why the
+shape survived two days of looking straight at it.
+
+That is the same failure as (b)'s pattern list and (c)'s replay schema, for the
+third time in three days: **an instrument that can only report what someone
+already catalogued reads as silence when it meets something new.** Extracted as
+`looks_like_intended_tool_call()` so it is unit-testable rather than buried in a
+conditional, and widened to the XML family, gated on a `</function>` the model
+never opened -- the same evidence mode 21 requires, so prose quoting a tag in a
+markdown table stays quiet.
+
+### The rule
+
+Mode 22 READS the name instead of guessing it: a leading `<parameter=X>` is an
+opener only when X names a DECLARED tool and carries no value (the next
+non-whitespace byte must open the first real parameter). That is strictly less
+guessing than mode 21's key inference, so an undeclared name falls through to
+inference rather than being invented into a call. Batches work -- his first
+example returns both calls, in order.
+
+**It runs AFTER mode 21, deliberately.** A MIXED emission -- survey capture 001
+is a `{"function=Read>` call followed by a `<parameter=Bash>` one -- is rescued
+by mode 21 as the FIRST call. Running mode 22 first would return Bash and drop
+the Read the model asked for first, and generation order is worth more than the
+extra call. Known limit, written down rather than papered over: a mixed
+emission still loses its second call.
+
+Narrow by construction: `<parameter=bash></parameter>` (an explicitly closed
+empty name tag) is NOT recognized. Not observed anywhere, and widening the rule
+costs more than it buys.
+
+### Measured
+
+17 new assertions (10 for the mode, 7 for the detector), all red before the
+change. `test_tool_drift` is now 124 assertions, from 75 at the start of the
+day.
+
+Live regression run on the same survey, same model, same instrument:
+
+| arm | tool_use | text_only | UNPARSED | truncation | genuine misses |
+|---|---:|---:|---:|---:|---:|
+| pre-routing-fix | 48 | 11 | 5 | 1 | 4 |
+| routing fix only | 70 | 14 | 1 | 1 | 0 |
+| + mode 22 | 69 | 14 | 1 | 1 | 0 |
+
+No regression, and **mode 22 fired on live generation** rather than only on
+fixtures: one 84-turn run logged 5 bare native-dialect rescues, 3 mode 17, 3
+mode 21 and 1 mode 22. The catalogue is doing real work on every turn now that
+both channels can reach it.
+
+Both backends green: `make test-tools` under gcc on haight and clang on the M4,
+`q27-metal-server` links clean under `-Werror`.

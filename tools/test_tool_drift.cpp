@@ -988,6 +988,168 @@ static void test_json_fused_opener_shapes() {
     }
 }
 
+
+// DRIFT MODE 22 (2026-08-20, issue #24 comment + survey capture 001): the tool
+// NAME arrives as the first <parameter=...>, unclosed, with the real
+// parameters after it:
+//
+//   <parameter=bash>
+//   <parameter=command>
+//   ls /code/docs; grep -rn "INIT_FILE" /code/docs
+//   </parameter>
+//   </function>
+//
+// Reported twice by chaudhryfaisal on two different commits, and independently
+// captured by the dialect survey here on a different client and schema, so it
+// is the dialect and not one setup.
+//
+// It died SILENTLY: the unclosed <parameter=bash> makes the parameter walk fail
+// outright (measured: parsed=0, args={}), so mode 21 has no arguments to infer
+// from and refuses. And the UN-RESCUED warning keys off {"name" / {"tool_call"
+// / </content>, none of which appear here, so nothing was logged and nothing
+// reached Q27_DRIFT_CORPUS -- "no rescue logs", exactly as reported.
+//
+// The rule reads the name rather than guessing it: a leading <parameter=X>
+// counts as an opener only when X names a DECLARED tool and carries no value
+// (the next non-whitespace must be another <parameter=). That is strictly
+// safer than mode 21's key inference, which is why an undeclared name still
+// falls through to it.
+static void test_mode22_parameter_as_opener() {
+    // Faisal's client: lowercase tool names, camelCase parameter keys.
+    json fx = json::array({tool("bash", {{"command", true}, {"description", false}}),
+                           tool("read", {{"filePath", true}}),
+                           tool("edit", {{"filePath", true}, {"oldString", true},
+                                         {"newString", true}})});
+    auto call = [](const std::string& t, const json& tools) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tools);
+    };
+
+    // verbatim, issue #24 comment 2026-08-21T01:12
+    {
+        auto v = call("<parameter=bash>\n<parameter=command>\n"
+                      "ls /code/docs; grep -rn \"INIT_FILE\" /code/docs /code/README.md "
+                      "2>/dev/null | head -30\n</parameter>\n</function>\n", fx);
+        ok(v.size() == 1 && v[0].name == "bash" &&
+               v[0].arguments.value("command", std::string()).rfind("ls /code/docs", 0) == 0,
+           "mode22: parameter-as-opener recovers the single call");
+    }
+    // verbatim, issue #24 comment 2026-08-21T01:01 -- TWO calls, back to back
+    {
+        auto v = call("<parameter=bash>\n<parameter=command>\n"
+                      "find /code -type f -name \"*.md\" 2>/dev/null | head -20; echo \"---\"; "
+                      "ls -R /code/init/internal\n</parameter>\n</function>\n"
+                      "<parameter=read>\n<parameter=filePath>\n"
+                      "/code/init/internal/config/config.go\n</parameter>\n</function>\n", fx);
+        ok(v.size() == 2 && v[0].name == "bash" && v[1].name == "read" &&
+               v[1].arguments.value("filePath", std::string()) ==
+                   "/code/init/internal/config/config.go",
+           "mode22: a batch of two recovers both, in order");
+    }
+    // verbatim, the edit with three parameters
+    {
+        auto v = call("<parameter=edit>\n<parameter=filePath>\n/code/init/main.go\n</parameter>\n"
+                      "<parameter=newString>\n//\tOLD\n</parameter>\n"
+                      "<parameter=oldString>\n//\tNEW\n</parameter>\n</function>\n", fx);
+        ok(v.size() == 1 && v[0].name == "edit" &&
+               v[0].arguments.value("filePath", std::string()) == "/code/init/main.go" &&
+               v[0].arguments.value("newString", std::string()) == "//\tOLD" &&
+               v[0].arguments.value("oldString", std::string()) == "//\tNEW",
+           "mode22: all three parameters mapped, none eaten by the opener");
+    }
+    // the same shape from the survey here, capitalized names, different schema
+    {
+        json survey = json::array({tool("Bash", {{"command", true}, {"description", false}}),
+                                   tool("Read", {{"file_path", true}})});
+        auto v = call("<parameter=Bash>\n<parameter=command>\n"
+                      "find /workspace -type f | head -50\n</parameter>\n</function>\n", survey);
+        ok(v.size() == 1 && v[0].name == "Bash",
+           "mode22: survey capture 001's second call recovers too");
+    }
+
+    // ---- negatives ----
+
+    // mode 21's own shape must still take mode 21's path: no declared tool name
+    // in the first parameter, so the name comes from key inference.
+    {
+        auto v = call("<parameter=filePath>\n/code/x.go\n</parameter>\n"
+                      "<parameter=newString>\nbody\n</parameter>\n"
+                      "<parameter=oldString>\nold\n</parameter>\n</function>\n", fx);
+        ok(v.size() == 1 && v[0].name == "edit" &&
+               v[0].arguments.value("filePath", std::string()) == "/code/x.go",
+           "mode22: mode 21's openerless list still resolves by inference");
+    }
+    // a declared name that carries a VALUE is a parameter, not an opener. Here
+    // `read` is both a tool name and (pretend) a key with content after it.
+    {
+        json odd = json::array({tool("read", {{"read", true}, {"filePath", false}})});
+        auto v = call("<parameter=read>\n/code/x.go\n</parameter>\n"
+                      "<parameter=filePath>\n/code/y.go\n</parameter>\n</function>\n", odd);
+        ok(v.size() == 1 && v[0].arguments.value("read", std::string()) == "/code/x.go",
+           "mode22: a name-shaped parameter WITH a value stays a parameter");
+    }
+    // no </function> means prose, same guard mode 21 uses
+    {
+        ok(call("the docs say <parameter=bash> is the opener, which reads oddly.", fx).empty(),
+           "mode22: <parameter=NAME> in prose with no </function> is not a call");
+    }
+    // an undeclared name in the opener slot must not be invented into a call
+    {
+        ok(call("<parameter=notatool>\n<parameter=zzz>\nv\n</parameter>\n</function>\n",
+                fx).empty(),
+           "mode22: an undeclared opener name is refused");
+    }
+    // hallucinated tool RESULTS wearing the same tags stay text
+    {
+        ok(call("<result>\n<parameter=bash>\n<parameter=command>\nls\n</parameter>\n"
+                "</function>\n<output>\ntotal 0\n</output>\n", fx).empty(),
+           "mode22: a <result>/<output> block is not promoted to a call");
+    }
+    // and it has to survive the wrapper, live
+    {
+        auto out = resolve_stream("<tool_call>\n<parameter=bash>\n<parameter=command>\n"
+                                  "ls /code\n</parameter>\n</function>\n</tool_call>", &fx);
+        ok(out.calls.size() == 1 && out.calls[0].name == "bash",
+           "mode22: recovered from inside a <tool_call> wrapper");
+    }
+}
+
+
+// The miss DETECTOR, which is a separate hole from the parser (2026-08-20).
+// Mode 22 went unreported for two days partly because nothing recovered it and
+// partly because nothing NOTICED: the UN-RESCUED warning and the
+// Q27_DRIFT_CORPUS capture both keyed off {"name" / {"tool_call" / </content>,
+// so an emission made entirely of XML tags produced no log line and no corpus
+// entry. "No rescue logs" was a true and complete description of a call being
+// dropped.
+//
+// The gate is the same evidence mode 21 uses: a </function> the model never
+// opened is dialect, prose that merely quotes a tag is not.
+static void test_intended_tool_call_detector() {
+    ok(q27::looks_like_intended_tool_call(
+           "<parameter=bash>\n<parameter=command>\nls /code\n</parameter>\n</function>"),
+       "detector: mode 22's shape is now flagged as an intended call");
+    ok(q27::looks_like_intended_tool_call(
+           "<function=Read>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>"),
+       "detector: the native dialect is flagged");
+    ok(q27::looks_like_intended_tool_call(
+           "<tool_name>Read</tool_name>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>"),
+       "detector: mode 14's shape is flagged");
+    ok(q27::looks_like_intended_tool_call("prose.\n\n{\"name\": \"Read\", \"file_path\": \"/x\"}"),
+       "detector: the JSON forms it already knew still flag");
+
+    // survey capture 015: the model writing ABOUT the dialect. Quoting a tag is
+    // not opening one, and there is no </function> anywhere.
+    ok(!q27::looks_like_intended_tool_call(
+           "I verified with probes:\n\n| Grep | `^\\s*<function=[A-Za-z]+>` | Fixed listing |\n"
+           "| Bash | `grep -rEn '<parameter=x>' /workspace` | Fixed listing |\n"),
+       "detector: prose quoting the dialect is NOT flagged");
+    ok(!q27::looks_like_intended_tool_call("the schema uses <parameter=filePath> for the target."),
+       "detector: <parameter= with no </function> is NOT flagged");
+    ok(!q27::looks_like_intended_tool_call("Here is the summary of what I changed."),
+       "detector: ordinary prose is NOT flagged");
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1012,6 +1174,8 @@ int main() {
     test_tool_segment_drift_edges();
     test_survey_captures_wrapped();
     test_json_fused_opener_shapes();
+    test_mode22_parameter_as_opener();
+    test_intended_tool_call_detector();
     test_mode13_truncated_mid_escape();
     test_function_arguments_unterminated();
     test_think_mode_drift();

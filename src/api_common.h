@@ -3152,6 +3152,26 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
     return false;
 }
 
+// Did the model INTEND a tool call that nothing recovered? Used only for the
+// UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
+// costs a silent drop rather than a wrong call -- which is exactly what it cost:
+// this used to test for {"name" / {"tool_call" alone, so drift mode 22, made
+// entirely of XML tags, produced no log line and no corpus entry for two days.
+// A report of "no rescue logs" was accurate and told us nothing.
+//
+// The XML forms are gated on a `</function>` the model never opened, the same
+// evidence mode 21 requires. Prose that merely quotes a tag (a markdown table
+// of probe commands, say) has no closer and stays unflagged.
+inline bool looks_like_intended_tool_call(const std::string& text_in) {
+    if (text_in.find("{\"name\"") != std::string::npos ||
+        text_in.find("{\"tool_call\"") != std::string::npos)
+        return true;
+    if (text_in.find("</function>") == std::string::npos) return false;
+    return text_in.find("<parameter=") != std::string::npos ||
+           text_in.find("<function") != std::string::npos ||
+           text_in.find("<tool_name>") != std::string::npos;
+}
+
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
@@ -3581,6 +3601,69 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         return std::vector<ToolCall>{std::move(tc)};
                     }
                 }
+            }
+        }
+        // (e) DRIFT MODE 22 (2026-08-20, chaudhryfaisal on issue #24,
+        // corroborated the same day by the dialect survey on a different client
+        // and schema): the tool NAME arrives as the first <parameter=...>,
+        // unclosed, with the real parameters after it --
+        //
+        //   <parameter=bash>\n<parameter=command>\nls /code\n</parameter>\n</function>
+        //
+        // Sideways from mode 21 rather than one step further down: the name IS
+        // in the bytes, wearing a parameter's tag. Because that leading tag
+        // never closes, the parameter walk fails outright and mode 21 is left
+        // with zero arguments to infer from -- which is why this died in
+        // SILENCE, with no rescue line and no Q27_DRIFT_CORPUS entry.
+        //
+        // Engages only on a DECLARED tool name in a tag carrying NO value: the
+        // next non-space byte must open the first real parameter. That reads a
+        // name the caller offered instead of inferring one, so an undeclared
+        // name falls through to mode 21 rather than being invented into a call.
+        //
+        // Runs AFTER mode 21 deliberately. A MIXED emission (survey capture
+        // 001: a {"function=Read> call followed by a <parameter=Bash> one) is
+        // rescued by mode 21 as the FIRST call, and generation order is worth
+        // more than the second call -- running this first would return Bash and
+        // drop the Read the model asked for first.
+        {
+            static const std::string PO = "<parameter=";
+            static const std::string FC = "</function>";
+            std::vector<ToolCall> batch;
+            size_t first_begin = std::string::npos, cur = 0;
+            for (;;) {
+                const size_t ps = text_in.find(PO, cur);
+                if (ps == std::string::npos) break;
+                const size_t gt = text_in.find('>', ps + PO.size());
+                if (gt == std::string::npos) break;
+                const std::string nm = text_in.substr(ps + PO.size(), gt - ps - PO.size());
+                const size_t nxt = text_in.find(PO, gt + 1);
+                if (nxt == std::string::npos || !declared(nm) ||
+                    text_in.find_first_not_of(" \t\r\n", gt + 1) != nxt) {
+                    cur = gt + 1;   // a parameter, not an opener
+                    continue;
+                }
+                const size_t fe = text_in.find(FC, nxt);
+                if (fe == std::string::npos) break;
+                ToolCall tc;
+                const std::string span =
+                    "<function=" + nm + ">\n" + text_in.substr(nxt, fe + FC.size() - nxt);
+                if (parse_native_xml_call(span, tc) && !tc.arguments.empty()) {
+                    tc.name = nm;
+                    tc.ok = true;
+                    tc.source_begin = ps;
+                    tc.source_end = fe + FC.size();
+                    if (first_begin == std::string::npos) first_begin = ps;
+                    batch.push_back(std::move(tc));
+                }
+                cur = fe + FC.size();
+            }
+            if (!batch.empty()) {
+                if (prefix) *prefix = text_in.substr(0, first_begin);
+                if (remaining_text) *remaining_text = "";
+                fprintf(stderr, "[q27] drift mode 22: parameter-as-opener -> %zu call(s)\n",
+                        batch.size());
+                return batch;
             }
         }
     }
@@ -4176,8 +4259,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m8) modes[mi++] = '8';
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
-    } else if (text_in.find("{\"name\"") != std::string::npos ||
-               text_in.find("{\"tool_call\"") != std::string::npos) {
+    } else if (looks_like_intended_tool_call(text_in)) {
         // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
         // mode-6 args didn't confidently match any tool). Longer window so the call
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
