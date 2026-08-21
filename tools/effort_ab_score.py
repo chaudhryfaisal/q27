@@ -42,9 +42,21 @@ TD = "/mnt/ai/projects/thunderdome/results/runs"
 # would not convert it, and the loop fell out. Post-fix those same bytes parse,
 # so they never reach the text channel and the count goes to zero -- which is
 # exactly the prediction the fix is judged on.
+# UNDER-COUNTS BY CONSTRUCTION, and the 2026-08-20 dialect survey proved it:
+# this list only knows the shapes someone has already found. It scored the
+# budget-fraction 0.75 arm as 0/10 parse-dead while two of its trials had in
+# fact died on `<function="Bash">`, a spelling not in the list at the time.
+#
+# So read a zero here as "none of the KNOWN shapes", never as "no parse deaths".
+# The survey (tools/tool_dialect_survey.py) is the instrument that finds new
+# ones; this is only the instrument that counts old ones.
 REFUSED = [
-    re.compile(r'<function\s+name\s*='),                 # mode 19: attribute opener
+    re.compile(r'<function\s+name\s*='),                  # mode 19: attribute opener
+    re.compile(r'<function\s*=\s*["\']'),                  # quoted name (e698306)
     re.compile(r'<tool_calls>\s*\n\s*<tool_name>\s*\n\s*<parameter='),  # mode 20: nameless
+    re.compile(r'\{"function\s*='),                        # JSON-brace chimera (survey)
+    re.compile(r'\{"name"\s*:\s*"[^"]+"\}?\s*\n\s*<parameter='),        # mode 17 chimera
+    re.compile(r'<name>\s*\n\s*\w+\s*\n\s*</parameter>'),               # <name> on next line
 ]
 
 

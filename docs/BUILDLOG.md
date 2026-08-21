@@ -13723,3 +13723,107 @@ through two wrong instruments before a correct one:
 
 The fix's headline number is only as good as that third definition, and the
 first two would each have supported a confident wrong claim.
+
+## 2026-08-20 (a): THINK_BUDGET_FRAC measured -- 0.5 is defensible, the hypothesis was backwards, and 0.25 is the only arm that breaks the null rung
+
+`api_common.h` said of the 0.5 thinking-budget fraction: "a judgement call, not
+a measurement", and that the club-3090 #765 agreement it cites compared two
+ABSOLUTE budgets rather than a fraction. It asked outright for a measured
+fraction to replace it. `Q27_THINK_BUDGET_FRAC` makes it settable (read once,
+non-default announced at boot so an arm's own log says which arm it is), and
+this is the measurement.
+
+**THE HYPOTHESIS.** BUILDLOG 2026-08-15 blamed the 24K arm's damage on the
+budget rather than the effort line -- "24K thinking leaves 8K per response, and
+the forced-close-plus-answer machinery reshapes every long-turn trajectory" --
+with the big-write tasks falling hardest. A LOWER fraction should therefore help
+those tasks by leaving more of the cap for the answer.
+
+**IT DOES NOT.** Three arms, n=3 on two big-write failing tasks plus
+monorepo-disaster at n=1 as a null rung (biggest-write task in the suite, and
+already at 1.000, so a merely-disruptive change should break it):
+
+| task | 0.25 | 0.5 | 0.75 |
+|---|---|---|---|
+| plugin-marketplace | 0.000 | 0.000 | 0.274 |
+| task-queue | 0.182 | 0.162 | 0.000 |
+| monorepo-disaster (null) | **0.765** | 1.000 | 1.000 |
+| mean | 0.316 | 0.387 | 0.425 |
+
+Direction is the opposite of the prediction: the mean rises with the fraction,
+and **0.25 is the only arm that breaks the null rung.** It also did LESS work
+while doing worse -- monorepo 847K tokens at 0.25 against 1987K at 0.5 -- so
+cutting the thinking budget did not redirect effort into the answer, it produced
+a shorter, worse run.
+
+**plugin-marketplace is not a budget problem at all.** 0.000 on every trial at
+0.25 and 0.5, with byte-identical token counts within each arm (747K x3, 931K
+x3). A deterministic failure at full engagement, not truncation.
+
+**VERDICT: keep 0.5.** It is not measurably worse than 0.75 on this task set,
+and it is clearly better than 0.25. The comment's request for a measured
+fraction is answered to the extent 3 tasks can answer it: the default survives.
+0.75 edges it on the mean but is CONTAMINATED (below), and neither margin
+survives n=3 on bimodal outcomes.
+
+**SCOPE.** 3 tasks, n=3 on two of them, one arm's numbers contaminated. This
+does not license moving the default; it licenses leaving it alone.
+
+## 2026-08-20 (b): the drift catalogue was unreachable from half the parser -- found by generating tool calls on purpose
+
+Gabe's idea, and it found something no amount of adding modes would have:
+instead of waiting for sessions to die and reading transcripts, drive a lot of
+tool calls at the server and record every dialect that comes back.
+`tools/tool_dialect_survey.py` declares a realistic schema, sends prompts that
+require tool use, and classifies each turn -- `tool_use` block means it parsed,
+dialect markup in the TEXT channel means it did not.
+
+**SINGLE-SHOT PROMPTS FIND NOTHING. 16/16 clean**, including a note whose
+content contains literal `</parameter>` and `<function=Bash>` in a fenced block,
+and a Grep for the dialect's own regex. Every failure found in two days of bug
+reports needed a CONVERSATION. Adding `--turns` (feed a synthetic tool_result
+back and keep going) took the failure rate from 0 to **~7% of assistant turns**,
+reproducible across three separate runs.
+
+**AND THEN THE REAL FINDING.** The captured emissions all recovered when
+replayed through `parse_bare_tool_calls` offline -- same binary, same tool
+schema, every flag combination. Live, the server dropped them and logged no
+mode message at all. Four hypotheses died on measurement before the right one:
+StreamSplitter fragmentation (the splitter path recovers them too), the
+allow_o10/allow_eof_repair flags (all four combinations recover), truncation
+(re-ran at max_tokens 8192, same failures, no max_tokens stops), and the
+hallucinated-result guard (no `<result>`/`<output>` in any capture).
+
+Instrumenting `append_text` answered it. The parser was only ever receiving the
+PROSE PREAMBLES -- `|I'll first check the workspace layout, then write the
+file.\n\n|` and then nothing. The call never arrived, because
+`resolve_ordered_tool_segments` routes by channel:
+
+```
+ToolCall call = parse_tool_call(strip_ws2(segment.second));
+if (call.ok) ... else out.append_visible_text(call.raw);
+```
+
+**A segment the StreamSplitter classifies as TOOL gets the STRICT parser and
+nothing else.** If it fails, the bytes go straight to visible text. The entire
+drift chain -- modes 14 through 21, every rescue built over two months -- is
+reachable only from the TEXT branch. Modes 19, 20, 21 and the quoted-name fix
+all landed this week with passing tests and could not fire on a call the
+splitter had already claimed.
+
+That is why the offline/live split existed, and it means the mode count was
+never the lever. Mode 22 would have been unreachable too.
+
+**FIX NOT ATTEMPTED HERE**, deliberately: routing a failed TOOL segment through
+the same chain is a change to the main serving path and deserves its own gate,
+not a tack-on at the end of a session.
+
+**AND A CORRECTION TO THIS SESSION'S OWN INSTRUMENT.** The parse-dead counter in
+`tools/effort_ab_score.py` scored the budget-fraction 0.75 arm as 0/10 while two
+of its trials had died on `<function="Bash">` -- a spelling that was not in its
+pattern list. Widened to six patterns; the same data now reads 1/7 and 2/7 for
+the 0.25 and 0.75 arms. The lesson is structural, not clerical: **a
+known-pattern counter can only report on shapes someone already found, so a zero
+from it means "none of the known shapes", never "no parse deaths".** The survey
+is the instrument that finds new ones; the counter only counts old ones. Every
+"0 parse-dead" claim in entries 2026-08-19 (q) and (r) carries that caveat.

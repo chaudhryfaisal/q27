@@ -524,6 +524,13 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1,
             getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)");
+    // The thinking budget is a FRACTION of each request's max_tokens, not an
+    // absolute, so an A/B over it leaves no other trace in the log. Announce a
+    // non-default one at boot so a run's own output says which arm it was.
+    if (q27::think_budget_frac() != q27::THINK_BUDGET_FRAC)
+        fprintf(stderr, "reasoning budget: %.2f of max_tokens (Q27_THINK_BUDGET_FRAC, "
+                        "default %.2f)\n",
+                q27::think_budget_frac(), q27::THINK_BUDGET_FRAC);
 
     // Per-engine non-KV reserve, the single source of truth shared by
     // auto-ctx (below) and the multi-slot skip loop. GDN state + graph zoo +
