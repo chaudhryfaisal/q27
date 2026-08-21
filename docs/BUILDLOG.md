@@ -13827,3 +13827,108 @@ known-pattern counter can only report on shapes someone already found, so a zero
 from it means "none of the known shapes", never "no parse deaths".** The survey
 is the instrument that finds new ones; the counter only counts old ones. Every
 "0 parse-dead" claim in entries 2026-08-19 (q) and (r) carries that caveat.
+
+## 2026-08-20 (c): the drift catalogue is reachable from both channels now -- 4 live parse deaths to 0
+
+Entry (b) found the defect and deliberately did not fix it. This is the fix, run
+through the gate (b) asked for.
+
+**THE CHANGE IS CONTROL FLOW, NOT A PARSER.** When `parse_tool_call` refuses a
+TOOL-channel segment, `resolve_ordered_tool_segments` now hands the bytes to the
+same `append_text` the TEXT branch uses -- same drift chain, same eligibility
+callback, same `recovered` counter. Two things it deliberately does NOT do:
+
+- **A parsed-but-ineligible call is not re-offered.** `call.ok && !eligible` still
+  goes to visible text. Running the chain there would resurrect exactly what
+  `tool_choice` / `disable_parallel_tool_use` just refused, which is how a
+  policy knob stops working without anyone noticing.
+- **No EOF repair.** A closed wrapper means drift, not truncation, and an
+  unclosed one was already removed by `take_unclosed_final_tool_segment`. The
+  server still refuses to execute half a `Write`, on purpose.
+
+**25 new assertions in `tools/test_tool_drift.cpp`; 12 of them fail on HEAD and
+9 passed before and after** (those are the guards -- ineligible-stays-text,
+hallucinated-`<result>` refused, un-inferable keys refused, no-tools-declared,
+empty wrapper). They drive the real `StreamSplitter` and the real resolver
+rather than a parser in isolation, because the defect was never in a parser but
+in which parser the live path reaches. One assertion proves the premise instead
+of assuming it: the fixture bytes really do land in the TOOL channel.
+
+`tool_strict()` is a process-lifetime memo, so the strict leg cannot share a run
+with the tolerant ones. New `make test-tools` invokes the binary twice and runs
+the other six CPU suites; there was no aggregate target before, so the strict
+assertions would otherwise never have run.
+
+### The measurement, with a control built for it
+
+The "~7%" in entry (b) is not a usable baseline: it came from a survey revision
+that had neither the truncation guard nor the code-span guard added since. So
+the control was rebuilt from HEAD's `api_common.h` into
+`build/q27-server-w8.prefix` and both arms were run through the CORRECTED
+instrument, same model, same ctx, same greedy sampling, 16 prompts x up to 8
+turns.
+
+| arm     | tool_use | text_only | UNPARSED | of which truncation | turns | genuine misses |
+|---------|---------:|----------:|---------:|--------------------:|------:|---------------:|
+| pre-fix |       48 |        11 |        5 |                   1 |    64 |     4 (6.3%)   |
+| fixed   |       70 |        14 |        1 |                   1 |    85 |     0          |
+
+**4 to 0, and the capture directory for the fixed arm is empty.** The secondary
+number is the more interesting one: **the fixed arm ran 85 assistant turns to
+the control's 64** on identical prompts. A recovered call gets a tool_result and
+the conversation continues; a dropped one ends it. The parse death was never
+costing one call, it was costing the rest of the session -- which is what the
+thunderdome quit-at-turn-1 trials were, seen from the other end.
+
+### Three instrument corrections, two of them mine
+
+**The survey had a false positive.** Capture 015 of the first run was the model
+writing ABOUT the dialect: a markdown table quoting `^\s*<function=[A-Za-z]+>`
+from the prompt, six times, all inside backtick spans. The server was right to
+leave it as text -- it was the one capture of six that had been handled
+correctly all along. `tool_dialect_survey.py` now strips fenced blocks and code
+spans before matching, the same distinction `display_text_context_is_executable`
+makes in the splitter.
+
+**Capture 006 was a max_tokens truncation**, from a revision that predated the
+truncation guard. So the original six were 4 genuine drift misses, 1 truncation
+and 1 false positive -- not six.
+
+**And twice I built a story on a broken harness.** The replay tool used to
+confirm these offline declared its tools with no `required` keys, which silently
+disables `infer_tool_name()`. That made recoverable captures look like parser
+gaps and produced two retracted claims: that `{"function=NAME>` had "no reader",
+and that `file_path` "ties" across Read/Write/Edit. Both wrong. With the real
+schema every live capture recovers, and `infer_tool_name`'s first rule returns
+the first tool whose required set exactly equals the argument keys -- so
+near-twins resolve by declaration order rather than refusing. **The schema is
+part of the instrument**, exactly as the pattern list was in entry (b).
+
+What is true about those shapes is now a fixture: `{"function=Read>` and
+`{"function="Read">` recover by mode 21 inferring from parameter keys, and the
+name the model wrote is never read. Under the real Claude Code schema every
+capture lands correctly, so this is written down rather than changed -- but
+reading a declared name would be strictly less guessing than inferring one, and
+the fixtures are written so they keep passing if someone does that.
+
+### Two things found on the way, neither fixed here
+
+**`Q27_PRINT_WSUM=1` IS INERT ON `q27-server`.** The knob lives in
+`engine.cuh:1374`, behind `own_weights`; the server takes the shared-weights
+path and prints its own "resident: N GB (checksummed)" at `server.cu:611` with
+no wsum handling. Verified directly: the variable is present in
+`/proc/PID/environ`, the model loads, no `wsum:` line appears. **Every
+server-side benchmark that believed it had the 5090 silent-corruption guard was
+running without it**, this A/B included. About six lines to mirror the engine
+path.
+
+**The truncated-wrapper hole is still open, on purpose.** An unfinished
+`<tool_call>` is appended raw as text and never sees a parser. Executing half a
+`Write` is worse than losing the turn, so that stays a separate decision.
+
+Telemetry renamed `bare call(s) recovered` -> `drifted call(s) recovered` at all
+ten sites: recoveries no longer imply the wrapper was absent, and the old word
+would send the next reader looking for a missing wrapper that was there.
+
+Verified on both backends: `make test-tools` green under gcc on haight and under
+clang on the M4, and `build/q27-metal-server` links clean under `-Werror`.

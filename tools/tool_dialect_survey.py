@@ -81,6 +81,22 @@ PROMPTS = [
 
 MARKUP = re.compile(r"<function|<tool_call|<tool_name>|<parameter=|<invoke|<name>")
 
+# Markup inside a fenced block or a backtick span is the model WRITING ABOUT the
+# dialect, not emitting it, and the server is right to leave it as text -- the
+# StreamSplitter makes the same distinction (display_text_context_is_executable).
+# Found the hard way on 2026-08-20: capture 015 of the first survey run was a
+# prose report whose markdown table quoted `^\s*<function=[A-Za-z]+>` from the
+# prompt six times. It was counted as a dialect miss, inflating the failure
+# rate, and it was the ONLY capture of the six that the parser had handled
+# correctly all along. Strip the inert spans before matching.
+FENCE = re.compile(r"```.*?```|~~~.*?~~~", re.S)
+CODESPAN = re.compile(r"`[^`\n]*`")
+
+
+def executable_text(text):
+    """The subset of a response where dialect markup would be a real call."""
+    return CODESPAN.sub("", FENCE.sub("", text))
+
 
 def post(url, body, timeout=600):
     req = urllib.request.Request(url + "/v1/messages",
@@ -137,7 +153,7 @@ def main():
                      "content": "total 12\ndrwxr-xr-x 3 u u 4096 src\n-rw-r--r-- 1 u u 220 index.ts\n"}
                     for c in calls]})
                 continue
-            if MARKUP.search(text):
+            if MARKUP.search(executable_text(text)):
                 stats["UNPARSED"] += 1
                 # A truncated response is a DIFFERENT finding: the server
                 # deliberately refuses to execute a half-written call, so the
@@ -159,6 +175,8 @@ def main():
                                                  "len": len(b.get("text", "") or "")}
                                                 for b in blocks]) +
                                     "\n\n===RESPONSE===\n" + text)
+                # classification used the stripped text; the EXCERPT offset
+                # has to come from the original or the slice below is shifted.
                 m = MARKUP.search(text)
                 print(f"  [{i:3}.{turn}] UNPARSED -> {fn}", flush=True)
                 print(f"        {text[max(0, m.start()-40):m.start()+140]!r}", flush=True)
