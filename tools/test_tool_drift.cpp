@@ -401,6 +401,37 @@ static void test_mode20_nameless_tool_name() {
 // 20: there the name tag was present and empty, here there is no opener at all
 // and the emission starts at the first <parameter=. Fixture is the reporter's
 // bytes.
+// Name normalization (2026-08-20). Found live in a budget-fraction A/B, not in
+// a bug report: two plugin-marketplace trials died at exactly 50K tokens
+// emitting `<function="Bash">`. The dialect is the TRAINED one and parses --
+// the name just arrives wrapped in quote characters, matches no declared tool,
+// and the call is dropped. Structure was never the issue.
+static void test_quoted_name_normalization() {
+    q27::ToolCall tc;
+    ok(q27::parse_native_xml_call(
+           "<function=\"Bash\">\n<parameter=command>\nls -la\n</parameter>\n</function>", tc) &&
+           tc.ok && tc.name == "Bash" &&
+           tc.arguments.value("command", std::string()) == "ls -la",
+       "quoted name: <function=\"Bash\"> resolves to Bash");
+    q27::ToolCall t2;
+    ok(q27::parse_native_xml_call(
+           "<function='Read'>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>", t2) &&
+           t2.name == "Read",
+       "quoted name: single quotes stripped too");
+    // an unbalanced quote is mangling, not a quoted name -- leave it alone
+    q27::ToolCall t3;
+    ok(q27::parse_native_xml_call(
+           "<function=\"Bash>\n<parameter=command>\nls\n</parameter>\n</function>", t3) &&
+           t3.name == "\"Bash",
+       "quoted name: unbalanced quote is left verbatim (undeclared, so refused upstream)");
+    // the ordinary unquoted form must be untouched
+    q27::ToolCall t4;
+    ok(q27::parse_native_xml_call(
+           "<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>", t4) &&
+           t4.name == "Bash",
+       "quoted name: unquoted names unchanged");
+}
+
 static void test_mode21_openerless_params() {
     json tools = json::array({tool("FileAction", {{"filePath", true}, {"oldString", false},
                                                   {"newString", false}}),
@@ -541,6 +572,7 @@ int main() {
     test_mode19_attribute_opener();
     test_mode20_nameless_tool_name();
     test_mode21_openerless_params();
+    test_quoted_name_normalization();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();

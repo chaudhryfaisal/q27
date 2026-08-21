@@ -2201,6 +2201,23 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     } else {
         return false;
     }
+    // NAME NORMALIZATION (2026-08-20). Observed live, killing sessions at
+    // ~50K tokens: `<function="Bash">` -- the trained opener with the name
+    // QUOTED. It matches the `<function=` branch above, so the dialect is
+    // recognised, but the name comes out as the six characters "Bash" WITH the
+    // quotes, matches no declared tool, and the whole call is refused. The
+    // structure was never the problem; two quote characters were.
+    //
+    // Applied to every branch rather than just that one: a name is a tool
+    // identifier, and no declared tool has leading or trailing quotes or
+    // whitespace in it, so stripping them cannot turn a valid name into a
+    // different valid name.
+    while (!tc.name.empty() && isspace((unsigned char)tc.name.front())) tc.name.erase(0, 1);
+    while (!tc.name.empty() && isspace((unsigned char)tc.name.back())) tc.name.pop_back();
+    if (tc.name.size() >= 2 && (tc.name.front() == '"' || tc.name.front() == '\'') &&
+        tc.name.back() == tc.name.front()) {
+        tc.name = tc.name.substr(1, tc.name.size() - 2);
+    }
     if (tc.name.empty()) return false;
     tc.arguments = json::object();
     static const std::string PO = "<parameter=", PC = "</parameter>";
