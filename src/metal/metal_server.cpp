@@ -2661,7 +2661,7 @@ int main(int argc,char** argv) {
                 std::string tx=q27::strip_ws2(ordered.text);
                 std::vector<q27::ToolCall> good=std::move(ordered.calls);
                 if(ordered.recovered) {
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",ordered.recovered);
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (chat nonstream)\n",ordered.recovered);
                     runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",ordered.recovered}});
                 }
                 json tcs=json::array();
@@ -2748,7 +2748,7 @@ int main(int argc,char** argv) {
                                 if(!before && any_call) recovered++;
                             }
                             if(recovered) {
-                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat stream)\n",recovered);
+                                fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (chat stream)\n",recovered);
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},
                                                      {"stream",true},{"count",recovered}});
                             }
@@ -3113,7 +3113,7 @@ int main(int argc,char** argv) {
                     content.push_back({{"type","thinking"},{"thinking",th},{"signature","q27-local"}});
                 std::vector<q27::ToolCall> good=std::move(ordered.calls);
                 if(ordered.recovered) {
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",ordered.recovered);
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (nonstream)\n",ordered.recovered);
                     runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",false},{"count",ordered.recovered}});
                 }
                 const bool any_call=!good.empty();
@@ -3227,7 +3227,7 @@ int main(int argc,char** argv) {
                             if(!before && any_call) recovered++;
                         }
                         if(recovered) {
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",recovered);
+                            fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (stream)\n",recovered);
                             runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},
                                                  {"stream",true},{"count",recovered}});
                         }
@@ -3610,7 +3610,7 @@ int main(int argc,char** argv) {
                     }
                     push_message(tx.substr(cursor),incomplete_item);
                     if(recovered) {
-                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",recovered);
+                        fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp nonstream)\n",recovered);
                         runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
                                              {"stream",false},{"count",recovered}});
                     }
@@ -3972,7 +3972,7 @@ int main(int argc,char** argv) {
                                 recovered=emit_recovered(
                                     bare_pending,bcs,incomplete_item,incomplete_call);
                                 if(recovered) {
-                                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",recovered);
+                                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp stream)\n",recovered);
                                     runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
                                                          {"stream",true},{"count",recovered}});
                                 }

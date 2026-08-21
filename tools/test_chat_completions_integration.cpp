@@ -909,7 +909,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
             if (ordered.recovered)
                 fprintf(stderr,
-                        "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                        "[tool-fallback] %zu drifted call(s) recovered (oai-nonstream)\n",
                         ordered.recovered);
             const bool any_call = !eligible_calls.empty();
             if (q27::forced_tool_choice_missing_is_error(
@@ -1094,7 +1094,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     visible(source.substr(cursor));
                     if (recovered)
                         fprintf(stderr,
-                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                "[tool-fallback] %zu drifted call(s) recovered (oai-stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };

@@ -561,7 +561,457 @@ static void test_mode13_truncated_mid_escape() {
        "mode13: a COMPLETE escape at the cut is not over-trimmed");
 }
 
+// ---------------------------------------------------------------------------
+// TOOL-CHANNEL REACHABILITY (2026-08-20). Every mode above is reached through
+// parse_bare_tool_calls, and resolve_ordered_tool_segments used to call that
+// only on TEXT segments. A segment the splitter claimed as TOOL -- meaning the
+// model DID emit <tool_call>...</tool_call> and then drifted INSIDE it -- got
+// parse_tool_call and nothing else, so modes 10/11/13/14/15/17/20/21 could not
+// fire there at all. Adding a mode fixed the bare case and left the wrapped
+// twin dead, which is why three modes shipped in one week with green tests and
+// no measurable effect.
+//
+// These drive the real StreamSplitter and the real resolver rather than the
+// parser in isolation, because the defect was never in a parser: it was in
+// which parser the live path reaches.
+static q27::OrderedToolOutput resolve_stream(const std::string& raw, const json* tools,
+                                             size_t max_calls = 64) {
+    q27::StreamSplitter sp;
+    std::vector<std::pair<q27::StreamSplitter::Chan, std::string>> segments;
+    // the server's own routing: coalesce like-channel runs, and keep the empty
+    // boundary segment that separates back-to-back tool calls.
+    auto route = [&](q27::StreamSplitter::Chan ch, const std::string& t) {
+        if (t.empty()) {
+            if (ch != q27::StreamSplitter::TOOL && !segments.empty() &&
+                segments.back().first == q27::StreamSplitter::TOOL)
+                segments.emplace_back(ch, std::string());
+            return;
+        }
+        if (!segments.empty() && segments.back().first == ch) segments.back().second += t;
+        else segments.emplace_back(ch, t);
+    };
+    for (auto& p : sp.feed(raw)) route(p.first, p.second);
+    for (auto& p : sp.flush()) route(p.first, p.second);
+    return q27::resolve_ordered_tool_segments(
+        segments, tools, false,
+        [max_calls](const std::string&, size_t accepted) { return accepted < max_calls; });
+}
+
+// Proves the premise rather than assuming it: these bytes really do land in the
+// TOOL channel. If the splitter ever stopped claiming them the reachability
+// tests below would pass for the wrong reason.
+static bool claimed_as_tool(const std::string& raw) {
+    q27::StreamSplitter sp;
+    bool tool = false;
+    for (auto& p : sp.feed(raw)) tool |= (p.first == q27::StreamSplitter::TOOL && !p.second.empty());
+    for (auto& p : sp.flush()) tool |= (p.first == q27::StreamSplitter::TOOL && !p.second.empty());
+    return tool;
+}
+
+static void test_tool_segment_reaches_drift_chain() {
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+
+    // P1 + P6 + P7: mode 14 inside the wrapper, with prose ahead of it.
+    const std::string m14 =
+        "Let me check the test file.\n"
+        "<tool_call>\n"
+        "<tool_name>Read</tool_name>\n"
+        "<parameter=file_path>/workspace/tests/index.test.ts</parameter>\n"
+        "</tool_call>";
+    ok(claimed_as_tool(m14), "wrapped: the payload really is routed to the TOOL channel");
+    {
+        auto out = resolve_stream(m14, &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read" &&
+               out.calls[0].arguments.value("file_path", std::string()) ==
+                   "/workspace/tests/index.test.ts",
+           "wrapped mode14: <tool_name> payload recovered from a TOOL segment");
+        ok(out.recovered >= 1, "wrapped mode14: counted as a recovery");
+        ok(out.parts.size() >= 2 && out.parts[0].kind == q27::OrderedToolPart::Kind::Text &&
+               out.text.substr(out.parts[0].text_begin,
+                               out.parts[0].text_end - out.parts[0].text_begin)
+                       .find("check the test file") != std::string::npos &&
+               out.parts[1].kind == q27::OrderedToolPart::Kind::Call,
+           "wrapped mode14: prose stays ordered before the recovered call");
+    }
+
+    // P2: the two-call mode 14 batch, verbatim bytes, inside one wrapper.
+    {
+        const std::string raw =
+            "<tool_call>\n"
+            "<tool_name>Read</tool_name>\n"
+            "<parameter=file_path>/workspace/tests/index.test.ts</parameter>\n"
+            "<tool_name>Bash</tool_name>\n"
+            "<parameter=arguments>\n"
+            "{\"command\":\"ls /workspace/src\",\"description\":\"List src\"}}\n"
+            "</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 2 && out.calls[0].name == "Read" && out.calls[1].name == "Bash" &&
+               out.calls[1].arguments.value("description", std::string()) == "List src",
+           "wrapped mode14: both concatenated calls recovered from one TOOL segment");
+    }
+
+    // P3: mode 10, the dropped `{"name": "` opener, inside the wrapper.
+    {
+        const std::string raw = "<tool_call>\nRead\", \"file_path\": \"/x/y.py\"}\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read" &&
+               out.calls[0].arguments.value("file_path", std::string()) == "/x/y.py",
+           "wrapped mode10: dropped-opener payload recovered from a TOOL segment");
+    }
+
+    // P4: mode 15, the <name> pseudo-tag with bare arguments.
+    {
+        const std::string raw =
+            "<tool_call>\n<name>Bash, \"arguments\": {\"command\":\"ls\","
+            "\"description\":\"list\"}}\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash" &&
+               out.calls[0].arguments.value("command", std::string()) == "ls",
+           "wrapped mode15: <name> pseudo-tag recovered from a TOOL segment");
+    }
+
+    // P5: mode 21, no opener at all, name inferred from the parameter keys.
+    {
+        json ft = json::array({tool("FileAction", {{"filePath", true}, {"newString", false}}),
+                               tool("Bash", {{"command", true}})});
+        const std::string raw =
+            "<tool_call>\n"
+            "<parameter=filePath>\n/code/fileaction.go\n</parameter>\n"
+            "<parameter=newString>\nimport (\n\t\"bytes\"\n)\n</parameter>\n"
+            "</function>\n</tool_call>";
+        auto out = resolve_stream(raw, &ft);
+        ok(out.calls.size() == 1 && out.calls[0].name == "FileAction" &&
+               out.calls[0].arguments.value("filePath", std::string()) == "/code/fileaction.go",
+           "wrapped mode21: openerless parameter list recovered from a TOOL segment");
+    }
+
+    // ---- negatives: the fallback must not widen what counts as a call ----
+
+    // N1: the well-formed JSON form still takes the strict path, once.
+    {
+        const std::string raw =
+            "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/w/x\"}}\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read" &&
+               out.calls[0].arguments.value("file_path", std::string()) == "/w/x",
+           "wrapped JSON: well-formed call still parses exactly once");
+    }
+    // N2: the trained native XML dialect, unchanged.
+    {
+        const std::string raw =
+            "<tool_call>\n<function=Bash>\n<parameter=command>\nls -la\n</parameter>\n"
+            "</function>\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash" &&
+               out.calls[0].arguments.value("command", std::string()) == "ls -la",
+           "wrapped native XML: still parses exactly once");
+    }
+    // N3: a call that PARSED but is not eligible stays text. Re-running the
+    // drift chain on it would resurrect a call the caller just rejected --
+    // which is how parallel-calls-disabled would silently stop working.
+    {
+        const std::string raw =
+            "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/w/x\"}}\n</tool_call>";
+        auto out = resolve_stream(raw, &tools, /*max_calls=*/0);
+        ok(out.calls.empty() && out.text.find("\"file_path\"") != std::string::npos,
+           "wrapped JSON: an ineligible call stays visible text, not re-rescued");
+    }
+    // N4: keys that fit no declared tool must refuse rather than guess.
+    {
+        const std::string raw =
+            "<tool_call>\n<parameter=zzz_unknown>\nv\n</parameter>\n</function>\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.empty() && out.text.find("zzz_unknown") != std::string::npos,
+           "wrapped: un-inferable parameter keys stay visible text");
+    }
+    // N5: a hallucinated tool RESULT wearing the dialect must not be promoted;
+    // executing the model's own invented output is worse than losing a turn.
+    {
+        const std::string raw =
+            "<tool_call>\n<tool_calls>\n<result>\n<name>Read</name>\n<output>\nfile contents\n"
+            "</output>\n<tool_name>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>\n"
+            "</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.empty(), "wrapped: hallucinated <result>/<output> block is not a call");
+    }
+    // N6: no declared tools means no rescue, same as the TEXT branch.
+    {
+        auto out = resolve_stream(m14, nullptr);
+        ok(out.calls.empty() && out.text.find("<tool_name>") != std::string::npos,
+           "wrapped: with no tools declared the payload stays visible text");
+    }
+}
+
+
+// The loop state the new branch shares with the TEXT branch: one eligibility
+// callback, one running accepted-count, one ordered parts list. A fallback that
+// got any of those wrong would still pass every test above, because each of
+// those uses a single segment.
+static void test_tool_segment_drift_edges() {
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+
+    // Two wrappers, one strict and one drifted, in that order. The accepted
+    // count has to advance across BOTH branches or the second call is indexed
+    // against a stale total.
+    const std::string mixed =
+        "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/w/a\"}}\n</tool_call>\n"
+        "<tool_call>\n<tool_name>Bash</tool_name>\n<parameter=command>ls</parameter>\n</tool_call>";
+    {
+        auto out = resolve_stream(mixed, &tools);
+        ok(out.calls.size() == 2 && out.calls[0].name == "Read" && out.calls[1].name == "Bash" &&
+               out.calls[1].arguments.value("command", std::string()) == "ls",
+           "mixed wrappers: strict call then drifted call, both recovered in order");
+        // The newline BETWEEN the two wrappers is a legitimate text part, so
+        // assert the call order and that nothing but whitespace separates them
+        // rather than pinning a part count.
+        std::vector<size_t> order;
+        std::string between;
+        for (const auto& part : out.parts) {
+            if (part.kind == q27::OrderedToolPart::Kind::Call) order.push_back(part.call_index);
+            else between += out.text.substr(part.text_begin, part.text_end - part.text_begin);
+        }
+        ok(order.size() == 2 && order[0] == 0 && order[1] == 1 &&
+               between.find_first_not_of(" \t\r\n") == std::string::npos,
+           "mixed wrappers: parts stay in generation order, no stray text");
+    }
+    // Same bytes with parallel calls disabled. The drifted second call must be
+    // refused by the SAME policy that governs the strict one -- otherwise the
+    // fallback quietly becomes a way around tool_choice.
+    {
+        auto out = resolve_stream(mixed, &tools, /*max_calls=*/1);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read" &&
+               out.text.find("<tool_name>Bash</tool_name>") != std::string::npos,
+           "mixed wrappers: the call cap applies to the drifted one too");
+    }
+
+    // Prose sharing the wrapper with the call. parse_bare_tool_calls reports
+    // spans, so the commentary has to survive as text rather than being eaten
+    // with the call or duplicated alongside it.
+    {
+        const std::string raw =
+            "<tool_call>\nLet me open it first.\n<tool_name>Read</tool_name>\n"
+            "<parameter=file_path>/w/x.ts</parameter>\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        size_t first = out.text.find("Let me open it first.");
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read" && first != std::string::npos &&
+               out.text.find("Let me open it first.", first + 1) == std::string::npos,
+           "wrapped: prose inside the wrapper survives once, alongside the call");
+    }
+
+    // Reasoning must not be disturbed by the fallback.
+    {
+        const std::string raw =
+            "<think>\nthe file first.\n</think>\nOpening it.\n"
+            "<tool_call>\n<tool_name>Read</tool_name>\n"
+            "<parameter=file_path>/w/x.ts</parameter>\n</tool_call>";
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.size() == 1 && out.reasoning.find("the file first") != std::string::npos &&
+               out.text.find("the file first") == std::string::npos,
+           "wrapped: think block stays in reasoning while the drifted call is recovered");
+    }
+
+    // Degenerate wrappers must stay no-ops, not throw and not invent a call.
+    {
+        auto empty = resolve_stream("a<tool_call></tool_call>b", &tools);
+        ok(empty.calls.empty() && empty.text.find('a') != std::string::npos &&
+               empty.text.find('b') != std::string::npos,
+           "wrapped: an empty wrapper is a no-op and keeps the surrounding text");
+        auto ws = resolve_stream("<tool_call>\n   \n</tool_call>", &tools);
+        ok(ws.calls.empty(), "wrapped: a whitespace-only wrapper is a no-op");
+    }
+}
+
+
+// The four survey captures that were genuine routing casualties, verbatim
+// bytes, wrapped as the TOOL segment the splitter handed the parser. These are
+// the emissions the live server dropped on 2026-08-20 while the same bytes
+// recovered offline -- the discrepancy that exposed the routing bug. Keeping
+// them here means the next parser change is measured against what the model
+// actually emitted, not against what we imagined it emits.
+//
+// (A fifth capture, unparsed.015, is deliberately absent: it was the model
+// writing ABOUT the dialect inside markdown code spans, which the server was
+// right to leave as text. It was the survey's false positive, not a miss.
+// A sixth, unparsed.006, was a max_tokens truncation -- a different hole, and
+// one the server refuses on purpose rather than execute half a Write.)
+static void test_survey_captures_wrapped() {
+    json tools = json::array({tool("Bash", {{"command", true}, {"description", false}}),
+                              tool("Read", {{"file_path", true}}),
+                              tool("Write", {{"file_path", true}, {"content", true}}),
+                              tool("Grep", {{"pattern", true}, {"path", false}})});
+    auto wrapped = [&](const std::string& b) {
+        return resolve_stream("<tool_call>\n" + b + "</tool_call>", &tools);
+    };
+
+    // capture 003: a JSON brace fused onto the XML opener.
+    {
+        auto out = wrapped(
+            "{\"function=Bash>\n"
+            "<parameter=command>\n"
+            "echo \"test-output\"; pwd; which git; git --version\n"
+            "</parameter>\n"
+            "</function>\n");
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash" &&
+               out.calls[0].arguments.value("command", std::string())
+                       .find("which git") != std::string::npos,
+           "capture 003: {\"function=Bash> chimera recovers from a TOOL segment");
+    }
+    // capture 008: same chimera, different turn -- it recurs, so it is a mode.
+    {
+        auto out = wrapped(
+            "{\"function=Bash>\n"
+            "<parameter=command>\n"
+            "find /workspace -type f | head -50; echo \"---\"; ls -la /workspace/src/\n"
+            "</parameter>\n"
+            "</function>\n");
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash",
+           "capture 008: the same chimera on another turn recovers too");
+    }
+    // capture 009: <name> alone on its line, closed by a </parameter> it never
+    // opened -- the tag soup is the evidence, and the name is on the next line.
+    {
+        auto out = wrapped(
+            "<name>\n"
+            "Bash\n"
+            "</parameter>\n"
+            "<parameter=command>\n"
+            "find /workspace -type f 2>&1\n"
+            "</parameter>\n"
+            "</function>\n");
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash" &&
+               out.calls[0].arguments.value("command", std::string()) ==
+                   "find /workspace -type f 2>&1",
+           "capture 009: <name>-on-its-own-line recovers from a TOOL segment");
+    }
+    // capture 011: a proper JSON head, then XML parameters. Both halves are
+    // well-formed and they belong to different dialects.
+    {
+        auto out = wrapped(
+            "{\"name\": \"Bash\",\n"
+            "<parameter=command>\n"
+            "ls -la /workspace/ 2>&1; echo \"---\"\n"
+            "</parameter>\n"
+            "<parameter=description>\n"
+            "List /workspace and check each target path\n"
+            "</parameter>\n"
+            "</function>\n");
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash" &&
+               out.calls[0].arguments.value("description", std::string()) ==
+                   "List /workspace and check each target path",
+           "capture 011: json-head/xml-params chimera recovers from a TOOL segment");
+    }
+}
+
+
+// THE JSON-FUSED OPENER, and what is actually carrying it (2026-08-20, from
+// the survey A/B). The model welds a JSON brace onto the trained XML opener:
+//     {"function=Read>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>
+//     {"function="Read">\n<parameter=file_path>\n...
+// Both recover -- but NOT by reading the name. No parser accepts `{"function=`;
+// what rescues them is drift mode 21 inferring the tool from the parameter
+// keys (the stderr line reads "openerless parameter list -> Read"). The name
+// the model wrote is never consulted.
+//
+// That makes recovery a property of the CALLER'S SCHEMA rather than of the
+// bytes: infer_tool_name() decides, and its first rule returns the first tool
+// whose REQUIRED set exactly equals the argument keys, so genuine near-twins
+// resolve by declaration order. Under the real Claude Code schema every live
+// capture lands correctly, which is why this is written down and not changed.
+// If someone later teaches the parser to read the fused name, these fixtures
+// should keep passing and the mechanism note above becomes stale -- that is
+// the intended direction, since reading a declared name is strictly less
+// guessing than inferring one.
+static void test_json_fused_opener_shapes() {
+    // the survey's schema, required lists included -- they are what makes
+    // inference work, so a test that drops them proves nothing. (An earlier
+    // version of this session's replay harness declared no required keys and
+    // made these captures look like parser gaps.)
+    json real = json::array({tool("Bash", {{"command", true}, {"description", false}}),
+                             tool("Read", {{"file_path", true}, {"limit", false}}),
+                             tool("Write", {{"file_path", true}, {"content", true}}),
+                             tool("Edit", {{"file_path", true}, {"old_string", true},
+                                           {"new_string", true}}),
+                             tool("Grep", {{"pattern", true}, {"path", false}})});
+    auto call = [](const std::string& t, const json& tools) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tools);
+    };
+
+    // verbatim from survey-ab/prefix/unparsed.003.t4
+    {
+        auto v = call("Let me try the file tools.\n\n{\"function=\"Read\">\n"
+                      "<parameter=file_path>\n/workspace/.git/HEAD\n</parameter>\n"
+                      "</function>tool>", real);
+        ok(v.size() == 1 && v[0].name == "Read" &&
+               v[0].arguments.value("file_path", std::string()) == "/workspace/.git/HEAD",
+           "json-fused opener: {\"function=\"Read\"> recovers under the real schema");
+    }
+    // verbatim from survey-ab/prefix/unparsed.001.t2, first call
+    {
+        auto v = call("{\"function=Read>\n<parameter=file_path>\n/workspace/index.ts\n"
+                      "</parameter>\n</function>", real);
+        ok(v.size() == 1 && v[0].name == "Read",
+           "json-fused opener: the unquoted spelling recovers too");
+    }
+    // the same emission with a parameter key no declared tool carries. The
+    // name says Read and Read is declared, but nothing reads the name, so the
+    // call is lost -- this is the fixture that pins the mechanism.
+    {
+        json only_read = json::array({tool("Read", {{"file_path", true}})});
+        ok(call("{\"function=Read>\n<parameter=zzz_unknown>\nv\n</parameter>\n</function>",
+                only_read).empty(),
+           "json-fused opener: an un-inferable key loses it despite a declared name");
+    }
+    // the neighbouring dialects must be untouched
+    {
+        auto w = call("{\"name\": \"Write\",\n<parameter=file_path>\n/w/x\n</parameter>\n"
+                      "<parameter=content>\nbody\n</parameter>\n</function>", real);
+        ok(w.size() == 1 && w[0].name == "Write" &&
+               w[0].arguments.value("content", std::string()) == "body",
+           "json-fused opener: mode 17's {\"name\" chimera is unaffected");
+        ok(call("the query string uses function=Read> as its selector, oddly.", real).empty(),
+           "json-fused opener: bare `function=` in prose is not an opener");
+        auto p = call("<function=Read>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>",
+                      real);
+        ok(p.size() == 1 && p[0].name == "Read",
+           "json-fused opener: the proper spelling still takes the named path");
+    }
+    // and it arrives wrapped, live -- which is the routing fix above.
+    {
+        auto out = resolve_stream(
+            "<tool_call>\n{\"function=\"Read\">\n<parameter=file_path>\n/w/x\n"
+            "</parameter>\n</function>\n</tool_call>", &real);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Read",
+           "json-fused opener: recovered from inside a <tool_call> wrapper");
+    }
+}
+
+// N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
+// a run with the tests above; main() dispatches on the env var and `make
+// test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
+static void test_tool_segment_strict_leg() {
+    json tools = json::array({tool("Read", {{"file_path", true}})});
+    const std::string raw =
+        "<tool_call>\n<tool_name>Read</tool_name>\n"
+        "<parameter=file_path>/w/x.ts</parameter>\n</tool_call>";
+    auto out = resolve_stream(raw, &tools);
+    ok(out.calls.empty() && out.text.find("<tool_name>") != std::string::npos,
+       "strict: a refused TOOL segment is NOT routed through the drift chain");
+}
+
 int main() {
+    if (getenv("Q27_TOOL_STRICT")) {
+        test_tool_segment_strict_leg();
+        printf(failures ? "\ntest_tool_drift(strict): %d FAILURE(S)\n"
+                        : "\ntest_tool_drift(strict): ALL PASS\n", failures);
+        return failures ? 1 : 0;
+    }
+    test_tool_segment_reaches_drift_chain();
+    test_tool_segment_drift_edges();
+    test_survey_captures_wrapped();
+    test_json_fused_opener_shapes();
     test_mode13_truncated_mid_escape();
     test_function_arguments_unterminated();
     test_think_mode_drift();

@@ -4296,10 +4296,29 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
             out.reasoning+=segment.second;
             continue;
         }
-        ToolCall call=parse_tool_call(strip_ws2(segment.second));
-        if(call.ok && eligible(call.name,out.calls.size()))
-            out.append_tool_call(std::move(call));
-        else out.append_visible_text(call.raw);
+        const std::string body=strip_ws2(segment.second);
+        ToolCall call=parse_tool_call(body);
+        if(call.ok) {
+            if(eligible(call.name,out.calls.size())) out.append_tool_call(std::move(call));
+            // A parsed call the caller REJECTED stays text and is not offered a
+            // second chance below: re-running the chain on it would resurrect
+            // exactly what tool_choice/parallel-calls just refused.
+            else out.append_visible_text(call.raw);
+            continue;
+        }
+        // parse_tool_call refused. Everything it knows is the strict JSON form
+        // and the trained XML dialect; the whole drift catalogue (modes 10, 11,
+        // 13, 14, 15, 17, 20, 21) lives in parse_bare_tool_calls and used to be
+        // reachable ONLY from the TEXT branch above. So a model that emitted
+        // the <tool_call> wrapper correctly and then drifted INSIDE it was
+        // unrecoverable no matter how many modes were catalogued -- three modes
+        // shipped in one week with passing tests and could never fire here.
+        // Same chain, same eligibility, same recovered counter as text.
+        //
+        // No EOF repair: the wrapper closed, so this is drift, not truncation.
+        // A wrapper that did NOT close was already removed by
+        // take_unclosed_final_tool_segment before this loop.
+        append_text(body,false);
     }
     flush_pending_text(true);
     return out;

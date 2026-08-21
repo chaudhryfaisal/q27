@@ -49,6 +49,23 @@ build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h s
 build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_stream_split.cpp -o $@
 
+# CPU-only suites: no GPU, no model, no network. tool_strict() is a
+# process-lifetime memo, so the drift suite runs twice -- once tolerant, once
+# strict -- because the strict leg's assertions cannot share a process with the
+# tolerant ones.
+.PHONY: test-tools
+test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
+            build/test_chat_completions_integration build/test_think_resolve \
+            build/test_stream_split build/test_toolconstrain
+	./build/test_tool_drift
+	Q27_TOOL_STRICT=1 ./build/test_tool_drift
+	./build/test_tool_drift_corpus
+	./build/test_openai_bridge
+	./build/test_chat_completions_integration
+	./build/test_think_resolve
+	./build/test_stream_split
+	./build/test_toolconstrain
+
 build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
 

@@ -2128,7 +2128,7 @@ int main(int argc, char** argv) {
             std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
             if (ordered.recovered)
                 fprintf(stderr,
-                        "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                        "[tool-fallback] %zu drifted call(s) recovered (oai-nonstream)\n",
                         ordered.recovered);
             const bool any_call = !eligible_calls.empty();
             if (q27::forced_tool_choice_missing_is_error(
@@ -2313,7 +2313,7 @@ int main(int argc, char** argv) {
                     visible(source.substr(cursor));
                     if (recovered)
                         fprintf(stderr,
-                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                "[tool-fallback] %zu drifted call(s) recovered (oai-stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
@@ -2713,7 +2713,7 @@ int main(int argc, char** argv) {
                 return;
             }
             if (ordered.recovered)
-                fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (nonstream)\n",
+                fprintf(stderr, "[tool-fallback] %zu drifted call(s) recovered (nonstream)\n",
                         ordered.recovered);
             const size_t emitted=q27::append_anthropic_ordered_content(
                 content,ordered,[&](const q27::ToolCall& call,size_t call_number) {
@@ -2859,7 +2859,7 @@ int main(int argc, char** argv) {
                     }
                     visible(source.substr(cursor));
                     if(recovered)
-                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",
+                        fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
@@ -3356,7 +3356,7 @@ int main(int argc, char** argv) {
                 }
                 push_text(source.substr(cursor),incomplete);
                 if(recovered)
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp nonstream)\n",
                             recovered);
             };
             StreamSplitter sp;
@@ -3664,7 +3664,7 @@ int main(int argc, char** argv) {
                     if(!calls.empty()) {
                         recovered=emit_recovered(bare_pending,calls,incomplete_item);
                         if(recovered)
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp)\n",
+                            fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp)\n",
                                     recovered);
                     } else if(defer_failure) {
                         bare_deferred=std::move(bare_pending);
