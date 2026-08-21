@@ -2131,47 +2131,53 @@ inline bool tool_strict() {
 // the cause rather than the symptoms. Value typing follows the template's own
 // serialization: non-strings are written with tojson, so a value that parses
 // as non-string JSON is used parsed, anything else stays a raw string.
+// ONE RECOGNIZER FOR THE `<function...>` OPENER FAMILY (2026-08-20
+// consolidation). Four spellings of the same opener were observed in the wild
+// inside two days, and each one had arrived as its own branch or its own drift
+// mode:
+//
+//   <function=Bash>          the trained form
+//   <function="Bash">        trained, name quoted        (killed sessions at 50K)
+//   <function name="Bash">   HTML-attribute syntax       (drift mode 19)
+//   <function name=Bash>     attribute, unquoted         (not yet seen)
+//
+// Every one of them was a session-killer: the call lands in the text channel,
+// Claude Code sees a final turn with no tool_use, and exits `completed` with
+// the work unfinished. Adding a case per spelling was losing the race -- the
+// model has many ways to write a name and only one of them was trained.
+//
+// So the opener is parsed by GRAMMAR rather than by literal: "<function", an
+// optional `name` key, an `=`, an optionally quoted identifier, then `>`. That
+// covers all four above, including the one nobody has reported yet.
+//
+// `<function>` with no name is deliberately NOT claimed: that is mode 16's
+// JSON-wrapped shape and it has its own recovery.
+inline bool parse_function_opener(const std::string& seg, size_t b, std::string& name,
+                                  size_t& after) {
+    if (seg.compare(b, 9, "<function") != 0) return false;
+    size_t i = b + 9;
+    const size_t gt = seg.find('>', i);
+    if (gt == std::string::npos) return false;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    if (seg.compare(i, 4, "name") == 0) { // optional attribute key
+        i += 4;
+        while (i < gt && isspace((unsigned char)seg[i])) i++;
+    }
+    if (i >= gt || seg[i] != '=') return false; // `<function>` -> mode 16's
+    i++;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    name = seg.substr(i, gt - i);
+    after = gt + 1;
+    return true;
+}
+
 inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     size_t b = seg.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return false;
     size_t p;
-    if (seg.compare(b, 10, "<function=") == 0) {
-        size_t ns = b + 10;
-        size_t ne = seg.find('>', ns);
-        if (ne == std::string::npos) return false;
-        tc.name = seg.substr(ns, ne - ns);
-        p = ne + 1;
-    } else if (seg.compare(b, 9, "<function") == 0 && b + 9 < seg.size() &&
-               isspace((unsigned char)seg[b + 9])) {
-        // XML DRIFT MODE 19 (2026-08-19, found in the Qwen3.8 reasoning-effort
-        // A/B): the model writes the opener in HTML-ATTRIBUTE syntax --
-        //   <function name="Bash">\n<parameter=command>\n...\n</parameter>\n</function>
-        // -- instead of the trained `<function=Bash>`. EVERYTHING downstream is
-        // byte-identical to the native dialect: same <parameter=KEY> bodies,
-        // same </function> closer. Only the opener drifts, which makes this the
-        // narrowest rescue in the catalogue.
-        //
-        // Cost of refusing it, measured: 4 of 20 trials in that A/B emitted this
-        // form, and EVERY ONE died at ~50K tokens with hidden=0 -- Claude Code
-        // sees an assistant turn carrying no tool_use block, concludes the task
-        // is finished, and exits `completed` after 11 seconds. Three of them
-        // were the same task three times over, so it is deterministic, not
-        // trajectory noise.
-        //
-        // `<function=` is matched by the branch above and `<function>` (mode 16)
-        // has '>' at this offset, so the isspace() guard keeps those intact.
-        size_t gt = seg.find('>', b + 9);
-        if (gt == std::string::npos) return false;
-        size_t na = seg.find("name", b + 9);
-        if (na == std::string::npos || na > gt) return false;
-        size_t eq = seg.find('=', na + 4);
-        if (eq == std::string::npos || eq > gt) return false;
-        size_t q1 = seg.find_first_of("\"'", eq);
-        if (q1 == std::string::npos || q1 > gt) return false;
-        size_t q2 = seg.find(seg[q1], q1 + 1);
-        if (q2 == std::string::npos || q2 > gt) return false;
-        tc.name = seg.substr(q1 + 1, q2 - q1 - 1);
-        p = gt + 1;
+    if (parse_function_opener(seg, b, tc.name, p)) {
+        // name normalization below strips the quoting; the grammar above
+        // already absorbed the attribute-vs-equals spelling.
     } else if (seg.compare(b, 6, "<name>") == 0) {
         // XML drift mode 18 (issue #24): the model drops the `<function=`
         // opener and writes the bare trained `<name>` tag --
@@ -3413,16 +3419,16 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     t["function"].value("name", std::string()) == nm) return true;
             return false;
         };
-        // (a) bare <function=NAME>, and its mode-19 attribute-syntax twin
-        // <function name="NAME"> -- both arrive with no <tool_call> wrapper.
-        size_t fb = text_in.find("<function=");
-        if (fb == std::string::npos) {
-            size_t c = text_in.find("<function");
-            while (c != std::string::npos) {
-                if (c + 9 < text_in.size() && isspace((unsigned char)text_in[c + 9]) &&
-                    text_in.find("name", c + 9) != std::string::npos) { fb = c; break; }
-                c = text_in.find("<function", c + 9);
-            }
+        // (a) a bare opener with no <tool_call> wrapper, in ANY of its
+        // spellings. One scan for "<function" and let parse_function_opener
+        // decide -- before the consolidation this was two searches that between
+        // them still missed <function="NAME">.
+        size_t fb = std::string::npos;
+        for (size_t c = text_in.find("<function"); c != std::string::npos;
+             c = text_in.find("<function", c + 9)) {
+            std::string nm_probe;
+            size_t after_probe;
+            if (parse_function_opener(text_in, c, nm_probe, after_probe)) { fb = c; break; }
         }
         if (fb != std::string::npos) {
             ToolCall tc;
