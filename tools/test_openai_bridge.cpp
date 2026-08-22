@@ -982,6 +982,23 @@ static void test_request_effort_and_auto_disable() {
     CHECK(r2.find("Reasoning effort is set to low.") != std::string::npos);
 }
 
+// output_config / reasoning (OpenAI Responses) shapes for effort + budget + disabled.
+static void test_output_config_fields() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+              {"reasoning", {{{"effort","low"}}}},
+              {"output_config", {{"effort","high"},{"budget_tokens",1024},{"disabled",true}}}};
+    auto opts = q27::template_opts_from_body(b);
+    // output_config read after reasoning -> output_config.effort=high wins
+    CHECK(opts.effort == 2);
+    // resolve_think_cfg: disabled -> thinking off; budget 1024 from output_config
+    auto tcfg = q27::resolve_think_cfg(b, /*server_default=*/true, /*allow_request=*/true, -1);
+    CHECK(!tcfg.enabled);              // output_config.disabled
+    CHECK(tcfg.enabled_set);
+    CHECK(tcfg.budget_set);
+    CHECK(tcfg.budget == 1024);        // output_config.budget_tokens
+}
+
 // item 6: XML-dialect assistant tool_calls render as <function=...><parameter=...>
 static void test_xml_tool_call_rendering() {
     q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
@@ -2489,6 +2506,7 @@ int main() {
     test_v223_failure_detection();
     test_unconditional_think_wrap();
     test_request_effort_and_auto_disable();
+    test_output_config_fields();
     test_xml_tool_call_rendering();
     test_truncation_json_dialect_skipped();
     test_chat_message_plain_text_no_calls();

@@ -343,6 +343,15 @@ inline TemplateOpts template_opts_from_body(const json& body) {
     read(body);
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
         read(body["chat_template_kwargs"]);
+    // OpenAI Responses effort shapes: output_config / reasoning blocks.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("effort") && r["effort"].is_string())
+            o.effort = effort_string_level(r["effort"].get<std::string>());
+        if (r.contains("output_effort") && r["output_effort"].is_string())
+            o.effort = effort_string_level(r["output_effort"].get<std::string>());
+    }
     return o;
 }
 
@@ -804,6 +813,23 @@ inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool al
         }
         if (t.contains("budget_tokens")) take_budget(t["budget_tokens"]);
     }
+    // OpenAI Responses: reasoning / output_config blocks. Effort is consumed by
+    // TemplateOpts (prompt line); here we handle disabled/enabled + budget.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("disabled") && r["disabled"].is_boolean()) {
+            c.enabled = !r["disabled"].get<bool>();
+            c.enabled_set = true;
+        } else if (r.contains("enabled") && r["enabled"].is_boolean()) {
+            c.enabled = r["enabled"].get<bool>();
+            c.enabled_set = true;
+        }
+        if (r.contains("budget_tokens")) take_budget(r["budget_tokens"]);
+        if (r.contains("output_budget_tokens")) take_budget(r["output_budget_tokens"]);
+    }
+    // some clients send a flat top-level budget_tokens
+    if (body.contains("budget_tokens")) take_budget(body["budget_tokens"]);
     return c;
 }
 
