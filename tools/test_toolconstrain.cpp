@@ -621,6 +621,169 @@ static void test_required_keys_extractor() {
     CHECK(keys.size() == 2 && keys[0].size() == 2);
 }
 
+// signalnine/q27#35: the live corruption. The 3.8 model opened a spurious
+// second <parameter=edits!! in a <function=edit> call; the schema-aware XML
+// grammar accepts the entire valid prefix and dies deterministically at the
+// FIRST '!' (0x21) of the junk key (byte 133 of the exact logged sequence).
+// Regex-embedded in the suite so the sample-time leak (the '!' reaching the
+// stream at all) is a regression someone has to explain, not rediscover.
+static void test_issue35_key_junk_suffix_rejected() {
+    using q27::ToolGrammarXml;
+    const std::vector<std::string> names = {"edit"};
+    const std::vector<std::vector<std::string>> params = {{"edits", "path"}};
+    const std::vector<std::vector<std::string>> required = {{"path"}};
+    // the valid prefix feeds cleanly...
+    {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        CHECK(g.advance_str("<function=edit>\n<parameter=edits>\n"
+                            "[{\"newText\": \"# Plan\"}]\n</parameter>\n"));
+        // ...then the junk KEY suffix dies at '!', exactly as observed
+        CHECK(!g.advance_str("<parameter=edits!!"));
+    }
+    // byte-level: from KEY with key_pref "edits", '!' is the first illegal
+    // byte -- nothing before it, nothing after it, no recovery
+    {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        CHECK(g.advance_str("<function=edit>\n<parameter=edits>\n"
+                            "[]\n</parameter>\n<parameter=edits"));
+        CHECK(!g.advance('!'));
+        CHECK(!g.advance_str("!\""));
+    }
+}
+
+// signalnine/q27#35: Q27_TG_REENGAGE=1 (XML dialect) re-engages the grammar
+// on a bare <function= opener (wrapper-less drift + post-drop recovery), and
+// the re-engaged stream constrains to completion like the wrapped path.
+static void test_issue35_bare_function_reengage() {
+    FakeEngine eng;
+    // tokenizer whose vocab holds the split stream: the bare <function= call
+    // opened in token 0, closed in token 1
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n<parameter=command>\nls\n</param",
+                "eter>\n</function>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, T_CLOSER);
+    cache_xml.init(&t2.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+
+    // re-engage is DEFAULT ON for the XML dialect (no env needed)
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    std::vector<std::vector<std::string>> rq = {{}};
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+
+    int em[2] = {0, 1};
+    int m = tc.scan_round(em, 2);
+    // re-engage at token 0, truncating the round to 1
+    CHECK(m == 1);
+    CHECK(tc.engaged == 1);
+    CHECK(tc.active);
+    // a mask must have been staged via set_tool_constraint
+    bool staged = false;
+    for (int id : eng.constraint_log)
+        if (id >= 0) staged = true;
+    CHECK(staged);
+    // feed the closing token: grammar reaches </function> (bare calls have no
+    // </tool_call>, so active stays on through DONE_ -- the host disengages
+    // at generation end; the machine must at least report done()). skip_feed
+    // suppresses this round's kept tokens, so clear it as the engine does
+    // once the next round's emission begins.
+    tc.skip_feed = 0;
+    tc.on_id(1);
+    CHECK(!tc.active || tc.tg_xml.done());
+
+    // Q27_TG_REENGAGE=0 restores wrapper-only behaviour: no bare re-engage
+    setenv("Q27_TG_REENGAGE", "0", 1);
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+    int em2[1] = {0};
+    CHECK(tc.scan_round(em2, 1) == -1); // no re-engage, no truncation
+    CHECK(!tc.active);
+    unsetenv("Q27_TG_REENGAGE");
+}
+
+// signalnine/q27#35: default-on re-engage is SELF-LIMITING on prose that
+// merely QUOTES the dialect. A bare <function=bash> in an answer engages the
+// grammar (the <function= completion is real), but the first non-conforming
+// byte that follows must auto-disengage and leave NO lingering tool mask --
+// the constraint must not stick to the stream and steer the rest of a prose
+// answer. This is the blast-radius regression for the default-on decision.
+static void test_issue35_bare_prose_self_limits() {
+    FakeEngine eng;
+    // token 0 opens the quoted call; token 1 is ordinary prose the grammar
+    // rejects (at GT1: 'j' is not the '<' it expects after <function=bash>)
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n", "just an example, not a real call\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, T_CLOSER);
+    cache_xml.init(&t2.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    std::vector<std::vector<std::string>> rq = {{}};
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+
+    // the quoted opener DOES engage (default-on), staging a mask...
+    int em[1] = {0};
+    int m = tc.scan_round(em, 1);
+    CHECK(m == 1);
+    CHECK(tc.active);
+    CHECK(!eng.constraint_log.empty() && eng.constraint_log.back() >= 0);
+    // ...but the following prose must auto-disengage and release the mask:
+    // set_tool_constraint(-1) and active back off -- no lingering constraint
+    tc.skip_feed = 0;
+    tc.on_id(1);
+    CHECK(!tc.active);
+    CHECK(!eng.constraint_log.empty() && eng.constraint_log.back() == -1);
+}
+
+// signalnine/q27#35: on_pending_xml must NOT stage/activate a constraint when
+// the constrainer is inactive -- the missing guards let a pending token whose
+// bytes merely LOOK like <function...> (prose quoting the dialect) arm the
+// mask. Regression: purely by calling on_pending_xml while inactive, no
+// set_tool_constraint call may appear in the engine log.
+static void test_issue35_on_pending_xml_guards() {
+    FakeTok tok = mk_tok();
+    FakeEngine eng;
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&tok.vocab, T_CLOSER);
+    cache_xml.init(&tok.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    tc.begin({"bash"}, pp, /*dialect_xml=*/true);
+    CHECK(!tc.active);
+    eng.constraint_log.clear();
+    // pending token that advances the reset-state grammar into NAME phase
+    tc.on_pending_xml(0);
+    CHECK(eng.constraint_log.empty()); // guarded: no mask staged, no activation
+    CHECK(!tc.active);
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -641,6 +804,10 @@ int main() {
     test_xml_constrainer_dialect_dispatch();
     test_xml_required_args_enforced();
     test_required_keys_extractor();
+    test_issue35_key_junk_suffix_rejected();
+    test_issue35_bare_function_reengage();
+    test_issue35_bare_prose_self_limits();
+    test_issue35_on_pending_xml_guards();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

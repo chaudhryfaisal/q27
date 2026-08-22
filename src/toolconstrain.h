@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,29 @@ struct BasicToolConstrainer {
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
     bool pool_dead = false; // sticky: mask pool filled up this request
+    // Q27_TG_REENGAGE (XML dialect): re-engage the grammar on a bare
+    // <function= opener (no <tool_call> wrapper) during scan_round -- the
+    // wrapper-less 3.8 drift class AND the remainder of a body whose mid-call
+    // reject just dropped the constraint (signalnine/q27#35). DEFAULT ON for
+    // the XML dialect: wrapper-only engagement was the default that let the
+    // observed corruption through. False-positive blast radius is bounded and
+    // self-limiting -- engagement auto-disengages at the first non-conforming
+    // byte and emitted bytes are never rewound, so prose that merely QUOTES
+    // the dialect (<function=...> in an answer) is only ever steered if it
+    // forms a full well-formed call, and simply disengages otherwise. Set
+    // Q27_TG_REENGAGE=0 to restore the old wrapper-only behaviour (the A/B
+    // escape hatch); "1"/unset selects the default. XML-specific by design:
+    // the XML wrapper-less drift form is a distinctive tag, while the JSON
+    // drift form is a bare {...} whose "{" trigger would constrain JSON the
+    // model writes in prose (configs, code samples) -- so JSON wrapper-less
+    // drift is recovered at PARSE time (api_common.h drift modes) instead,
+    // and the JSON path stays wrapper-only here.
+    // NOTE (scope, signalnine/q27#35): this is RECOVERY + correctness only --
+    // it cannot stop a byte that the grammar would reject from being
+    // SELECTED and emitted under a stale/host mask (the '!' sample-time gap).
+    // That gap is tracked separately in #35; re-engage just makes a dropped
+    // bare/wrapper-less call constrain properly once its opener is seen.
+    bool reengage_bare = false;
     ToolGrammar tg;
     ToolGrammar staged_state; // grammar state whose mask is in verify slot 0
     ToolGrammarXml staged_state_xml; // parallel for the XML dialect (P11 on_drafts)
@@ -52,6 +76,7 @@ struct BasicToolConstrainer {
         tail.clear();
         names = std::move(n);
         dialect_xml = false;
+        reengage_bare = false;
         params_per_name.clear();
         required_per_name.clear();
     }
@@ -78,6 +103,9 @@ struct BasicToolConstrainer {
         dialect_xml = dialect_xml_;
         params_per_name = std::move(pp);
         required_per_name = std::move(rq);
+        // default ON for XML; Q27_TG_REENGAGE=0 opts out (A/B hatch)
+        const char* e = getenv("Q27_TG_REENGAGE");
+        reengage_bare = dialect_xml_ && (!e || strcmp(e, "0") != 0);
         if (dialect_xml_) tg_xml.reset(names, params_per_name, required_per_name);
     }
     // pool id for grammar state g's legal-token mask (-1 if pool full)
@@ -208,6 +236,12 @@ struct BasicToolConstrainer {
         apply(peek);
     }
     void on_pending_xml(int id) {
+        // Guards were missing here vs on_pending above (issue #35) -- an
+        // XML-PATH-ONLY bug: the JSON path (on_pending) already had them. The
+        // XML path instead advanced the stale reset-state grammar over a
+        // pending token whose bytes happened to look like a <function...>
+        // opener and could STAGE+ACTIVATE a mask while inactive.
+        if (!enabled || !active || id < 0) return;
         ToolGrammarXml peek = tg_xml;
         for (char c : tok->decode_one(id))
             if (!peek.advance(c)) return;
@@ -237,6 +271,56 @@ struct BasicToolConstrainer {
             std::string bytes = tok->decode_one(em[j]);
             tail += bytes;
             if (tail.size() > 64) tail.erase(0, tail.size() - 64);
+            // Bare-<function= re-engage (XML dialect, default-on; see
+            // reengage_bare). Mirrors the <tool_call> trigger: engage only
+            // when the opener COMPLETES within this token, reset+feed the
+            // remainder (which starts at the '<' so the WS0 grammar sees the
+            // real opener), then stage and truncate exactly like the wrapped
+            // path. Sits BEFORE the <tool_call> branch so a stream that
+            // returns to wrapped form re-engages seamlessly. JSON has no
+            // equivalent arm here: its wrapper-less drift is a bare {...}
+            // recovered at parse time, not constrained in-stream.
+            if (dialect_xml && reengage_bare) {
+                size_t bp = tail.rfind("<function=");
+                // fire when the opener COMPLETES within this token (mirror of
+                // the <tool_call> test: skip only when it ended earlier)
+                if (bp != std::string::npos &&
+                    bp + 9 > tail.size() - bytes.size()) {
+                    std::string rem = tail.substr(bp);
+                    tg_xml.reset(names, params_per_name, required_per_name);
+                    active = true;
+                    engaged++;
+                    fprintf(stderr, "[toolgram] re-engaged (bare <function=, rem=%zu)\n",
+                            rem.size());
+                    bool rem_ok = true;
+                    for (char c : rem)
+                        if (!tg_xml.advance(c)) {
+                            char why[64];
+                            snprintf(why, sizeof why,
+                                     "bare-entry byte 0x%02x rejected",
+                                     (unsigned char)c);
+                            drop(why);
+                            rem_ok = false;
+                            break;
+                        }
+                    if (!rem_ok) {
+                        if (pool_dead) return -1;
+                        continue;
+                    }
+                    if (tg_xml.closed()) {
+                        active = false;
+                        fprintf(stderr, "[toolgram] bare call closed within entry token\n");
+                        continue;
+                    }
+                    apply(tg_xml);
+                    if (!active) {
+                        if (pool_dead) return -1;
+                        continue;
+                    }
+                    skip_feed = j + 1;
+                    return j + 1;
+                }
+            }
             size_t pos = tail.rfind("<tool_call>");
             // engage only when the marker COMPLETES within this token; any
             // remainder bytes after it already belong to the call body
