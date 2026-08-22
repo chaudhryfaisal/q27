@@ -178,7 +178,9 @@ private:
 struct Msg {
     std::string role;      // system | user | assistant
     std::string content;   // flattened text (think blocks already reconstructed)
-    std::string reasoning; // assistant <think> block from history (jinja-compatible)
+    std::string reasoning{}; // assistant <think> block from history (jinja-compatible);
+                             // NSDMI so brace-init sites with 2 fields stay valid under
+                             // -Wmissing-field-initializers (metal_server.cpp, -Werror)
 };
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
