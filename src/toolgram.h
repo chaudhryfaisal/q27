@@ -17,6 +17,21 @@
 
 namespace q27 {
 
+// JSON-dialect body grammar (3.6 format, `{"name":..., "arguments":{...}}`).
+//
+// SCOPE, and a KNOWN GAP recorded deliberately (issue #2, 2026-08-22): this
+// machine constrains SHAPE only. reset() takes tool names and nothing else,
+// and `arguments` is constrained as generic valid JSON, so it will happily
+// sample a call with a REQUIRED key missing, with an UNDECLARED key, or with a
+// DUPLICATE key. ToolGrammarXml enforces all three; this does not.
+//
+// That asymmetry is a decision, not an oversight: the trained 3.8 emission is
+// the XML dialect, which is where the live failures were observed, and closing
+// this hole means constraining object keys at exactly ONE nesting level (the
+// top of `arguments`, leaving nested object keys free) inside a generic JSON
+// FSM with escape/\uXXXX key handling -- more machinery than the JSON path
+// currently earns. server.cu warns at boot when --constrain-tools is enabled
+// on this dialect so the reduced guarantee is visible rather than assumed.
 struct ToolGrammar {
     void reset(const std::vector<std::string>& tool_names) {
         names_ = tool_names;
@@ -389,7 +404,12 @@ struct ToolGrammar {
 // state. Masks are append-only (stable indices -> device-resident pool in
 // phase 2/3). Wiring rules encoded here: the </tool_call> closer id is legal
 // iff done(); EOS is never legal inside the grammar (enforcement disengages
-// after the closer, upstream).
+// after the closer, upstream). Templated on the grammar type so the same
+// caching machinery serves both the JSON dialect (ToolGrammar) and the XML
+// dialect (ToolGrammarXml); both expose signature() + token_ok() so the body
+// is identical. Instantiated explicitly at the call sites (server, metal,
+// tests) since the vocabulary cache is owned per-engine.
+template <class G>
 struct ToolMaskCache {
     // vocab: decoded byte strings per token id (specials included verbatim)
     void init(const std::vector<std::string>* vocab, int closer_id) {
@@ -399,7 +419,7 @@ struct ToolMaskCache {
     }
 
     // returns stable mask index for the grammar's current state
-    int get(const ToolGrammar& g) {
+    int get(const G& g) {
         std::string sig = g.signature();
         auto it = index_.find(sig);
         if (it != index_.end()) return it->second;
@@ -443,6 +463,383 @@ struct ToolMaskCache {
     std::unordered_map<std::string, int> index_;
     std::unordered_map<std::string, int> content_; // bitset bytes -> index
     std::vector<std::vector<uint32_t>> masks_;
+};
+
+// XML-dialect sibling of ToolGrammar. The JSON machine above constrains the
+// body inside <tool_call>...</tool_call> to the 3.6/JSON format
+// (`{"name":..., "arguments":...}`); this one constrains it to the 3.8-
+// trained XML format
+// (`<function=NAME><parameter=KEY>VALUE</parameter>...</function>`), so
+// `--constrain-tools` can be enabled on Qwen3.8 without the grammar fighting
+// the model's trained emission.
+//
+// Schema-aware: when the full tool name matches, the parameter-key allowlist
+// switches to that tool's declared parameters (params_per_name overload of
+// reset). The names-only overload leaves parameter keys unrestricted -- a
+// permissive fallback for callers that don't carry the schema.
+//
+// Values are multi-line free text. `<` inside a value is legal ONLY as the
+// start of `</parameter>` or `</function>`; `</tool_call>` inside a value is
+// rejected (the value must close via `</parameter>` then the function via
+// `</function>` then the body via `</tool_call>`). That is the prevention:
+// a model that tries to write `<result>`, a stray `<function=...>`, or any
+// other nested tag, hits a dead state and the decoder masks it out. This is
+// what stops drift modes like the live chimera `{"name":"bash",</parameter>
+// </function>` at the source rather than leaving the parser to refuse an
+// unrecoverable call.
+//
+// Same external surface as ToolGrammar (reset/advance/advance_str/token_ok/
+// done/closed/signature) so the templated ToolMaskCache<G> works unchanged.
+struct ToolGrammarXml {
+    // names-only reset (no schema): parameter keys unrestricted
+    void reset(const std::vector<std::string>& tool_names) {
+        reset(tool_names, {});
+    }
+    // schema-aware reset: params_per_name aligned with tool_names
+    void reset(const std::vector<std::string>& tool_names,
+               const std::vector<std::vector<std::string>>& params_per_name) {
+        reset(tool_names, params_per_name, {});
+    }
+    // schema-aware reset WITH required-argument enforcement (issue #2).
+    // required_per_name is aligned with tool_names; each entry lists the keys
+    // from the schema's `parameters.required`. Shape-only constraint was never
+    // enough: the grammar happily closed a <function=write> call with ZERO
+    // parameters, so the server emitted schema-invalid tool_calls (missing
+    // `path`), returned 200, logged no drift -- and the agent's client rejected
+    // them, dead-looping the session with no server-side signal at all.
+    void reset(const std::vector<std::string>& tool_names,
+               const std::vector<std::vector<std::string>>& params_per_name,
+               const std::vector<std::vector<std::string>>& required_per_name) {
+        names_ = tool_names;
+        params_per_name_ = params_per_name;
+        required_per_name_ = required_per_name;
+        cur_params_.clear();
+        cur_required_.clear();
+        emitted_.clear();
+        required_key_.clear();
+        std::vector<std::string> sorted = tool_names;
+        std::sort(sorted.begin(), sorted.end());
+        names_key_.clear();
+        for (auto& n : sorted) { names_key_ += n; names_key_ += '\x1f'; }
+        cur_params_key_.clear();
+        cur_name_idx_ = -1;
+        st_ = WS0;
+        name_pref_.clear();
+        key_pref_.clear();
+        lit_word_.clear();
+        lit_ = 0;
+        dead_ = false;
+    }
+
+    bool advance(char c) {
+        if (dead_) return false;
+        if (!step(c)) { dead_ = true; return false; }
+        return true;
+    }
+    bool advance_str(const std::string& s) {
+        for (char c : s)
+            if (!advance(c)) return false;
+        return true;
+    }
+    // body fully consumed (after </function> + ws); </tool_call> sampleable
+    bool done() const {
+        return !dead_ && (st_ == DONE_ || st_ == CT_CLOSE || st_ == CLOSED_);
+    }
+    bool closed() const { return !dead_ && st_ == CLOSED_; }
+    bool token_ok(const std::string& s) const {
+        ToolGrammarXml copy = *this;
+        return copy.advance_str(s);
+    }
+
+  private:
+    enum St {
+        WS0,            // ws before first element; first element MUST be <function
+        FUNC_LT,        // consumed '<', expect 'f' for <function
+        FUNC_LIT,       // matching 'function'
+        FUNC_EQ,        // '='
+        NAME,           // tool name (allowlist prefix), term '>'
+        GT1,            // '>' after name
+        WS1,            // ws after function opener, before next tag
+        PARAM_LT,       // consumed '<', expect 'p' (<parameter) or '/' (closer)
+        PARAM_LIT,      // matching 'parameter'
+        PARAM_EQ,       // '='
+        KEY,            // param key (allowlist vs cur tool params), term '>'
+        GT2,            // '>' after key
+        VAL,            // value body (printable + ws)
+        VAL_LT,         // VAL saw '<'; expect '/' only (closer)
+        SLASH,          // consumed '</', pick closer: 'p'-></parameter>, 'f'-></function>
+        PARAM_CLOSE,    // matching '</parameter>'
+        FUNC_CLOSE,     // matching '</function>'
+        DONE_,          // ws after </function>; </tool_call> sampleable
+        CT_CLOSE,       // matching '</tool_call>'
+        CLOSED_         // past closer
+    };
+
+    // every required parameter emitted? Vacuously true with no schema, which
+    // preserves the permissive names-only behaviour.
+    bool required_satisfied() const {
+        for (size_t j = 0; j < cur_required_.size(); j++)
+            if (cur_required_[j] && !emitted_[j]) return false;
+        return true;
+    }
+
+    static bool is_ws(char c) {
+        return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+    }
+    static bool val_byte(char c) {
+        // value byte: printable (>= 0x20) and not '<' (handled separately)
+        return (unsigned char)c >= 0x20 && c != '<';
+    }
+
+    bool step(char c) {
+        switch (st_) {
+            case WS0:
+                if (is_ws(c)) return true;
+                if (c == '<') { st_ = FUNC_LT; return true; }
+                return false;
+            case FUNC_LT:
+                // first element: only <function legal (empty body handled by
+                // engagement's "call closed within entry token")
+                if (c == 'f') { lit_word_ = "function"; lit_ = 1; st_ = FUNC_LIT; return true; }
+                return false;
+            case FUNC_LIT:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = FUNC_EQ;
+                    return true;
+                }
+                return false;
+            case FUNC_EQ:
+                if (is_ws(c)) return true;
+                if (c == '=') { st_ = NAME; name_pref_.clear(); return true; }
+                return false;
+            case NAME: {
+                if (c == '>') {
+                    for (size_t i = 0; i < names_.size(); i++)
+                        if (names_[i] == name_pref_) {
+                            cur_name_idx_ = (int)i;
+                            cur_params_key_.clear();
+                            required_key_.clear();
+                            cur_params_.clear();
+                            cur_required_.clear();
+                            if (i < params_per_name_.size()) {
+                                auto pk = params_per_name_[i];
+                                std::sort(pk.begin(), pk.end());
+                                cur_params_ = pk;   // sorted -> stable indices
+                                for (auto& k : pk) { cur_params_key_ += k; cur_params_key_ += '\x1f'; }
+                            }
+                            // required flags, aligned with cur_params_
+                            cur_required_.assign(cur_params_.size(), 0);
+                            if (i < required_per_name_.size()) {
+                                auto rq = required_per_name_[i];
+                                std::sort(rq.begin(), rq.end());
+                                for (auto& k : rq) { required_key_ += k; required_key_ += '\x1f'; }
+                                for (size_t j = 0; j < cur_params_.size(); j++)
+                                    for (auto& k : rq)
+                                        if (k == cur_params_[j]) { cur_required_[j] = 1; break; }
+                            }
+                            emitted_.assign(cur_params_.size(), 0);
+                            st_ = GT1;
+                            return true;
+                        }
+                    return false; // undeclared tool name
+                }
+                std::string next = name_pref_ + c;
+                for (auto& n : names_)
+                    if (n.compare(0, next.size(), next) == 0 && next.size() <= n.size()) {
+                        name_pref_ = next;
+                        return true;
+                    }
+                return false;
+            }
+            case GT1:
+                if (is_ws(c)) return true;
+                if (c == '<') { st_ = PARAM_LT; return true; }
+                return false;
+            case WS1:
+                if (is_ws(c)) return true;
+                if (c == '<') { st_ = PARAM_LT; return true; }
+                return false;
+            case PARAM_LT:
+                if (c == 'p') { lit_word_ = "parameter"; lit_ = 1; st_ = PARAM_LIT; return true; }
+                if (c == '/') { st_ = SLASH; return true; }
+                return false;
+            case PARAM_LIT:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = PARAM_EQ;
+                    return true;
+                }
+                return false;
+            case PARAM_EQ:
+                if (is_ws(c)) return true;
+                if (c == '=') { st_ = KEY; key_pref_.clear(); return true; }
+                return false;
+            case KEY: {
+                if (c == '>') {
+                    if (cur_params_key_.empty()) {
+                        // no schema: permissive (accept any exact key)
+                        st_ = GT2;
+                        return true;
+                    }
+                    // schema active: the key must be declared AND not already
+                    // emitted. A duplicate <parameter=content> used to be
+                    // accepted, doubling the value (issue #2) -- the model
+                    // reopened the tag mid-content when the content itself
+                    // quoted the dialect.
+                    for (size_t j = 0; j < cur_params_.size(); j++)
+                        if (cur_params_[j] == key_pref_) {
+                            if (emitted_[j]) return false; // duplicate key
+                            emitted_[j] = 1;
+                            st_ = GT2;
+                            return true;
+                        }
+                    return false;
+                }
+                std::string next = key_pref_ + c;
+                if (cur_params_key_.empty()) {
+                    key_pref_ = next;
+                    return true;
+                }
+                bool ok = false;
+                if (cur_name_idx_ >= 0 && cur_name_idx_ < (int)params_per_name_.size()) {
+                    for (auto& k : params_per_name_[cur_name_idx_])
+                        if (k.compare(0, next.size(), next) == 0 && next.size() <= k.size()) {
+                            ok = true; break;
+                        }
+                }
+                if (!ok) return false;
+                key_pref_ = next;
+                return true;
+            }
+            case GT2:
+                if (is_ws(c)) return true;
+                st_ = VAL;
+                return step(c);
+            case VAL:
+                if (is_ws(c)) return true;
+                if (val_byte(c)) return true;
+                if (c == '<') { st_ = VAL_LT; return true; }
+                return false;
+            case VAL_LT:
+                // inside a value: only closer legal, so '</' only
+                if (c == '/') { st_ = SLASH; return true; }
+                return false;
+            case SLASH:
+                if (c == 'p') { lit_word_ = "</parameter>"; lit_ = 3; st_ = PARAM_CLOSE; return true; }
+                // Closing the call is illegal until every REQUIRED parameter
+                // has been emitted (issue #2). This is the whole point: the
+                // decoder masks </function> out, so the model cannot end a
+                // <function=write> call that never produced <parameter=path>.
+                if (c == 'f') {
+                    if (!required_satisfied()) return false;
+                    lit_word_ = "</function>"; lit_ = 3; st_ = FUNC_CLOSE; return true;
+                }
+                return false;
+            case PARAM_CLOSE:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = WS1;
+                    return true;
+                }
+                return false;
+            case FUNC_CLOSE:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = DONE_;
+                    return true;
+                }
+                return false;
+            case DONE_:
+                if (is_ws(c)) return true;
+                if (c == '<') { lit_word_ = "</tool_call>"; lit_ = 1; st_ = CT_CLOSE; return true; }
+                return false;
+            case CT_CLOSE:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = CLOSED_;
+                    return true;
+                }
+                return false;
+            case CLOSED_:
+                return true;
+        }
+        return false;
+    }
+
+    std::vector<std::string> names_;
+    std::vector<std::vector<std::string>> params_per_name_;
+    std::vector<std::vector<std::string>> required_per_name_;
+    std::vector<std::string> cur_params_;   // sorted; indexes emitted_/cur_required_
+    std::vector<char> cur_required_;
+    std::vector<char> emitted_;
+    std::string required_key_;
+    std::string names_key_;
+    std::string cur_params_key_;
+    std::string name_pref_;
+    std::string key_pref_;
+    std::string lit_word_;
+    int cur_name_idx_ = -1;
+    size_t lit_ = 0;
+    St st_ = WS0;
+    bool dead_ = false;
+
+  public:
+    // Same signature scheme as ToolGrammar: state + lit progress + allowlist
+    // components only where token legality depends on them. NAME depends on
+    // names_key_ + name_pref_; KEY depends on cur_params_key_ + key_pref_;
+    // literal-match states depend on lit_. Argument/closer states never
+    // re-enter the allowlist branches.
+    std::string signature() const {
+        std::string s;
+        s += (char)('a' + (int)st_);
+        s += dead_ ? '!' : '.';
+        // Required-argument enforcement (issue #2) makes token legality depend
+        // on WHICH keys were already emitted, in two places: KEY (a duplicate
+        // is illegal) and SLASH (</function> is illegal until required are
+        // satisfied). Both must therefore be part of the mask cache key, or a
+        // stale mask would let the model close a call it must not close. The
+        // emitted set is monotone within a call, so this adds at most one new
+        // cached state per parameter, not a combinatorial blow-up.
+        auto append_emitted = [&] {
+            s += '|';
+            for (size_t j = 0; j < emitted_.size(); j++) s += emitted_[j] ? '1' : '0';
+            s += '|';
+            s += required_key_;
+        };
+        if (st_ == NAME) {
+            s += '|';
+            s += name_pref_;
+            s += '|';
+            s += names_key_;
+        } else if (st_ == KEY) {
+            s += '|';
+            s += key_pref_;
+            s += '|';
+            s += cur_params_key_;
+            append_emitted();
+        } else if (st_ == SLASH || st_ == VAL_LT || st_ == PARAM_LT ||
+                   st_ == WS1 || st_ == GT1) {
+            // states from which </function> is reachable
+            append_emitted();
+        } else if (st_ == FUNC_LIT || st_ == PARAM_LIT) {
+            s += '|';
+            s += std::to_string(lit_);
+            s += '|';
+            s += lit_word_;
+        } else if (st_ == PARAM_CLOSE || st_ == FUNC_CLOSE || st_ == CT_CLOSE) {
+            s += '|';
+            s += std::to_string(lit_);
+            s += '|';
+            s += lit_word_;
+        }
+        return s;
+    }
 };
 
 } // namespace q27
