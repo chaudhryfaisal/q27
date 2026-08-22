@@ -296,7 +296,12 @@ inline int reasoning_effort_env_level() {
     // froggeric v22.3: the safe default is medium (zero injected tokens) to
     // avoid burning the reasoning budget; xhigh/low must be explicitly set.
     const char* e = getenv("Q27_REASONING_EFFORT");
-    const std::string v = e ? e : "medium";
+    // NOTE (PR #37 review): the froggeric-template default of "medium" was
+    // deliberately NOT inherited -- the effective default stays xhigh/off per
+    // boot dialect until a measured benchmark arm justifies the change.
+    // medium remains reachable explicitly (env, reasoning_effort field,
+    // <|think_medium|> tag).
+    const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
     if (v == "low" || v == "minimal") return 1;
     if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
     return 0; // medium / off / none / unknown

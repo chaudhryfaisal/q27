@@ -761,8 +761,9 @@ static void test_think_toggle_state() {
         std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
         CHECK(r.find("<|think_on|>") == std::string::npos);
         CHECK(r.rfind("<think>\n") == r.size() - std::string("<think>\n").size());
-        // default effort is medium -> no xhigh line (froggeric v22.3)
-        CHECK(r.find("Reasoning effort") == std::string::npos);
+        // default effort stays xhigh (PR #37 review: froggeric "default medium"
+        // dropped) -> the xhigh line is injected
+        CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
     }
     {   // <|think_xhigh|> arms xhigh effort on a no-think base
         json body = {{"messages", json::array({
@@ -999,17 +1000,13 @@ static void test_output_config_fields() {
     CHECK(tcfg.budget == 1024);        // output_config.budget_tokens
 }
 
-// items 1+2: default effort is medium (no line); reasoning_effort none/off disables thinking.
-static void test_medium_default_and_none_off() {
+// item 2: reasoning_effort none/off disables thinking (prompt + engine).
+// NOTE: the companion "default effort = medium" change was dropped per PR #37
+// review -- the effective default stays xhigh/off; medium is reachable
+// explicitly. Only the none/off disable behavior is covered here.
+static void test_none_off_disables_thinking() {
     q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
     unsetenv("Q27_REASONING_EFFORT");
-    {   // default medium: thinking on but no effort line
-        json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})}};
-        auto opts = q27::template_opts_from_body(b);
-        CHECK(opts.effort == -1);      // no request field
-        std::string r = q27::chatml_prompt(q27::openai_msgs(b), json::array(), true);
-        CHECK(r.find("Reasoning effort") == std::string::npos); // medium default
-    }
     {   // reasoning_effort none -> thinking OFF (closed gen prompt, no effort line)
         json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
                   {"reasoning_effort","none"}};
@@ -2538,7 +2535,7 @@ int main() {
     test_unconditional_think_wrap();
     test_request_effort_and_auto_disable();
     test_output_config_fields();
-    test_medium_default_and_none_off();
+    test_none_off_disables_thinking();
     test_xml_tool_call_rendering();
     test_truncation_json_dialect_skipped();
     test_chat_message_plain_text_no_calls();

@@ -316,8 +316,10 @@ static void test_preamble_swaps_with_dialect() {
 }
 
 static void test_reasoning_effort_line() {
-    // froggeric v22.3 (2026-08-22): the default reasoning_effort is medium
-    // (zero injected tokens); xhigh/low must be explicitly requested.
+    // The trained 3.8 template injects the effort line at the HEAD of the
+    // system block when thinking is on, defaulting to xhigh (2026-08-15).
+    // NOTE (PR #37 review): the froggeric "default medium" change was dropped --
+    // the effective default stays xhigh/off; medium is reachable explicitly.
     unsetenv("Q27_REASONING_EFFORT");
     unsetenv("Q27_TOOL_DIALECT");
     auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
@@ -325,15 +327,10 @@ static void test_reasoning_effort_line() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}])");
     const std::string XH = "Reasoning effort is set to xhigh.";
     q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
-    // default = medium -> no effort line even with thinking on
-    ok(q27::chatml_prompt(msgs, tools, /*think=*/true).find("Reasoning effort") == std::string::npos,
-       "effort: default medium emits no line");
-    setenv("Q27_REASONING_EFFORT", "xhigh", 1);
     std::string p = q27::chatml_prompt(msgs, tools, /*think=*/true);
     size_t at = p.find(XH), tools_at = p.find("# Tools");
     ok(at != std::string::npos && tools_at != std::string::npos && at < tools_at,
-       "effort: 3.8+think + xhigh injects xhigh line before # Tools");
-    unsetenv("Q27_REASONING_EFFORT");
+       "effort: 3.8+think injects xhigh line before # Tools");
     ok(q27::chatml_prompt(msgs, tools, /*think=*/false).find(XH) == std::string::npos,
        "effort: no-think render carries no effort line");
     q27::set_tool_dialect_for_model(meta("Qwen3.6-27B"));
@@ -342,7 +339,7 @@ static void test_reasoning_effort_line() {
     q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
     setenv("Q27_REASONING_EFFORT", "off", 1);
     ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort") == std::string::npos,
-       "effort: off emits no line");
+       "effort: off restores legacy rendering");
     setenv("Q27_REASONING_EFFORT", "low", 1);
     ok(q27::chatml_prompt(msgs, tools, true).find("Reasoning effort is set to low.") != std::string::npos,
        "effort: low selects the trained low string");
