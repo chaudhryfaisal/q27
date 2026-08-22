@@ -174,8 +174,9 @@ private:
 };
 
 struct Msg {
-    std::string role;     // system | user | assistant
-    std::string content;  // flattened text (think blocks already reconstructed)
+    std::string role;      // system | user | assistant
+    std::string content;   // flattened text (think blocks already reconstructed)
+    std::string reasoning; // assistant <think> block from history (jinja-compatible)
 };
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
@@ -390,9 +391,15 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_end|>\n";
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
-    for (size_t i = start; i < msgs.size(); i++)
-        p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
-             "<|im_end|>\n";
+    for (size_t i = start; i < msgs.size(); i++) {
+        const Msg& m = msgs[i];
+        p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
+        // assistant history reasoning block, jinja format:
+        //   <think>\n...\n</think>\n\n  then the plain content
+        if (m.role == "assistant" && !m.reasoning.empty())
+            p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
+        p += strip_ctrl(m.content) + "<|im_end|>\n";
+    }
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
     // think=false: the empty CLOSED block signals "reasoning done" so the model
@@ -1493,7 +1500,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 if (b.is_object() && b.value("type", "") == "text") sys += b.value("text", "");
         if (!sys.empty()) {
             normalize_cc_billing_header(sys);
-            msgs.push_back({"system", sys});
+            msgs.push_back({"system", sys, {}});
         }
     }
     if (!body.contains("messages")) return msgs;
@@ -1506,7 +1513,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         std::string role = m.value("role", "user"), think, content;
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
-        if (!m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (!m.contains("content")) { msgs.push_back({role, content, {}}); continue; }
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
@@ -1532,9 +1539,10 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                     content += tool_response_text(rc);
                 }
             }
-        if (role == "assistant" && !think.empty())
-            content = "<think>\n" + think + "\n</think>\n" + content;
-        msgs.push_back({role, content});
+        // reasoning block is emitted by the renderer (chatml_prompt), not
+        // flattened here -- keeps the jinja's format and per-message logic
+        // (preserve_reasoning / <|think_*|> toggles) in one place.
+        msgs.push_back({role, content, think});
     }
     return msgs;
 }
@@ -1591,7 +1599,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
         if (!m.is_object()) continue;
         std::string role = m.value("role", "user");
         if (role == "developer") role = "system";
-        std::string content;
+        std::string content, reasoning;
         if (m.contains("content")) {
             if (m["content"].is_string()) content = m["content"];
             else if (m["content"].is_array())
@@ -1600,7 +1608,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                         content += part.value("text", "");
         }
         if (role == "tool") {
-            msgs.push_back({"user", tool_response_text(content)});
+            msgs.push_back({"user", tool_response_text(content), {}});
             continue;
         }
         if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
@@ -1624,7 +1632,15 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                 content += tool_call_text(name, args);
             }
         }
-        msgs.push_back({role, content});
+        if (role == "assistant" && m.contains("reasoning_content")) {
+            const json& rc = m["reasoning_content"];
+            if (rc.is_string()) reasoning = rc.get<std::string>();
+            else if (rc.is_array())
+                for (auto& part : rc)
+                    if (part.is_object() && part.value("type", "") == "text")
+                        reasoning += part.value("text", "");
+        }
+        msgs.push_back({role, content, reasoning});
     }
     return msgs;
 }

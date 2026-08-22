@@ -321,7 +321,7 @@ static void test_reasoning_effort_line() {
     unsetenv("Q27_REASONING_EFFORT");
     unsetenv("Q27_TOOL_DIALECT");
     auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
-    std::vector<q27::Msg> msgs = {{"system", "Be terse."}, {"user", "hi"}};
+    std::vector<q27::Msg> msgs = {{"system", "Be terse.", {}}, {"user", "hi", {}}};
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}])");
     const std::string XH = "Reasoning effort is set to xhigh.";
     q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));

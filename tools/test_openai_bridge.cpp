@@ -700,6 +700,43 @@ static void test_end_to_end_chatml_prompt() {
     CHECK(forced.substr(0, stable_off) == rendered.substr(0, stable_off));
 }
 
+// P0 (2026-08-22): assistant reasoning must NOT be lost on the OpenAI path and
+// must render as a jinja-style <think> block in chatml_prompt.
+static void test_openai_reasoning_content_roundtrip() {
+    json body = {
+        {"messages", json::array({
+            {{"role","user"},{"content","plan the build"}},
+            {{"role","assistant"},{"content","Done."},{"reasoning_content","Let me check the steps."}},
+            {{"role","user"},{"content","go"}},
+        })}
+    };
+    auto msgs = q27::openai_msgs(body);
+    CHECK(msgs.size() == 3);
+    // assistant reasoning was captured, not dropped
+    CHECK(msgs[1].role == "assistant");
+    CHECK(msgs[1].content == "Done.");
+    CHECK(msgs[1].reasoning == "Let me check the steps.");
+    // no reasoning on the non-assistant turns
+    CHECK(msgs[0].reasoning.empty());
+    CHECK(msgs[2].reasoning.empty());
+    // chatml_prompt renders it as a jinja-style <think> block
+    std::string rendered = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    CHECK(rendered.find("<think>\nLet me check the steps.\n</think>\n\n") != std::string::npos);
+    // order: think block comes before the assistant content
+    CHECK(rendered.find("<think>\nLet me check the steps.\n</think>\n\nDone.") != std::string::npos);
+    // absent reasoning_content -> no <think> block injected (regression guard)
+    json body2 = {{"messages", json::array({
+        {{"role","assistant"},{"content","hi"}},
+    })}};
+    auto msgs2 = q27::openai_msgs(body2);
+    CHECK(msgs2[0].reasoning.empty());
+    std::string r2 = q27::chatml_prompt(msgs2, {}, /*think=*/false);
+    // the only <think> block must be the trailing EMPTY generation prompt
+    // (no history reasoning block was injected)
+    CHECK(r2.rfind("<think>\n\n</think>\n\n") ==
+          r2.size() - std::string("<think>\n\n</think>\n\n").size());
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2162,6 +2199,7 @@ int main() {
     test_responses_tool_choice_shapes();
     test_stream_options_include_usage();
     test_end_to_end_chatml_prompt();
+    test_openai_reasoning_content_roundtrip();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();
