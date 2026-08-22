@@ -534,28 +534,47 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     return p;
 }
 
-inline std::string tool_call_text(const std::string& name, const json& args) {
-    std::string a = args.dump();
-    // P3: Q27_MAX_TOOL_ARG_CHARS truncates a too-long arguments JSON.
-    if (const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS")) {
-        long max = atol(e);
-        if (max > 0 && (long)a.size() > max)
-            a = a.substr(0, (size_t)max) + "\n[TRUNCATED - original length " +
-                std::to_string(a.size()) + " chars]";
+// P3 request-driven truncation: read max_tool_arg_chars / max_tool_response_chars
+// from the request body (top-level or chat_template_kwargs). 0 when absent.
+inline long body_num(const json& v) {
+    if (v.is_number_float()) return (long)v.get<double>();
+    if (v.is_number_integer()) return v.get<long>();
+    if (v.is_number_unsigned()) return (long)v.get<uint64_t>();
+    return 0;
+}
+inline long request_max_chars(const json& body, const char* key) {
+    if (body.contains(key) && body[key].is_number()) return body_num(body[key]);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto& k = body["chat_template_kwargs"];
+        if (k.contains(key) && k[key].is_number()) return body_num(k[key]);
     }
+    return -1; // absent -> text helpers fall back to the env vars
+}
+
+inline std::string tool_call_text(const std::string& name, const json& args,
+                                  long max_arg_chars = -1) {
+    std::string a = args.dump();
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (max_arg_chars > 0 && (long)a.size() > max_arg_chars)
+        a = a.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(a.size()) + " chars]";
     return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + a +
            "}\n</tool_call>";
 }
 
-inline std::string tool_response_text(const std::string& out) {
+inline std::string tool_response_text(const std::string& out,
+                                      long max_response_chars = -1) {
     std::string o = out;
-    // P3: Q27_MAX_TOOL_RESPONSE_CHARS truncates a too-long tool output.
-    if (const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS")) {
-        long max = atol(e);
-        if (max > 0 && (long)o.size() > max)
-            o = o.substr(0, (size_t)max) + "\n[TRUNCATED - original length " +
-                std::to_string(o.size()) + " chars]";
+    if (max_response_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS");
+        max_response_chars = e ? atol(e) : 0;
     }
+    if (max_response_chars > 0 && (long)o.size() > max_response_chars)
+        o = o.substr(0, (size_t)max_response_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(o.size()) + " chars]";
     return "<tool_response>\n" + o + "\n</tool_response>";
 }
 
@@ -1622,6 +1641,9 @@ inline json anthropic_tools_json(const json& body) {
 // model markers, tool_result wrapped in <tool_response>)
 inline std::vector<Msg> anthropic_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (body.contains("system")) {
         std::string sys;
         if (body["system"].is_string()) sys = body["system"];
@@ -1659,7 +1681,8 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_call_text(part.value("name", ""),
                                               part.contains("input") ? part["input"]
-                                                                     : json::object());
+                                                                     : json::object(),
+                                              max_arg);
                 } else if (ty == "tool_result") {
                     std::string rc;
                     if (part.contains("content")) {
@@ -1670,7 +1693,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                                     rc += b.value("text", "");
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_response_text(rc);
+                    content += tool_response_text(rc, max_resp);
                 }
             }
         // reasoning block is emitted by the renderer (chatml_prompt), not
@@ -1728,6 +1751,9 @@ inline json openai_tools_json(const json& body) {
 //     matching the /v1/responses bridge.
 inline std::vector<Msg> openai_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
     for (auto& m : body["messages"]) {
         if (!m.is_object()) continue;
@@ -1742,7 +1768,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                         content += part.value("text", "");
         }
         if (role == "tool") {
-            msgs.push_back({"user", tool_response_text(content), {}});
+            msgs.push_back({"user", tool_response_text(content, max_resp), {}});
             continue;
         }
         if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
@@ -1763,7 +1789,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                     } else args = fn["arguments"];
                 }
                 if (!content.empty() && content.back() != '\n') content += "\n";
-                content += tool_call_text(name, args);
+                content += tool_call_text(name, args, max_arg);
             }
         }
         if (role == "assistant" && m.contains("reasoning_content")) {

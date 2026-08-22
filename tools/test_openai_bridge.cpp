@@ -851,6 +851,27 @@ static void test_tool_truncation() {
     }
 }
 
+// P3 request-driven: limits come from chat_template_kwargs in the body, not env.
+static void test_tool_truncation_request_body() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    std::string big(100, 'x');
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run it"}},
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 20}}}};
+    std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+    // explicit 0 in the body disables truncation even with a huge output
+    json body0 = {{"messages", json::array({
+        {{"role","user"},{"content","run it"}},
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 0}}}};
+    std::string r0 = q27::chatml_prompt(q27::openai_msgs(body0), {}, false);
+    CHECK(r0.find("TRUNCATED") == std::string::npos);
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2318,6 +2339,7 @@ int main() {
     test_tool_failure_warnings();
     test_tool_grouping();
     test_tool_truncation();
+    test_tool_truncation_request_body();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();
