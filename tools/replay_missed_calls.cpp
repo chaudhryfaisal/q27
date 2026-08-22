@@ -32,7 +32,9 @@ int main(int argc,char** argv){
     auto ov=as_tool(body,&tools);
     const char* name=strrchr(argv[i],'/'); name=name?name+1:argv[i];
     bool ok = !tv.empty() || !ov.calls.empty();
-    if(!tv.empty()) text_ok++; if(!ov.calls.empty()) tool_ok++; if(!ok) dead++;
+    if(!tv.empty()) text_ok++;
+    if(!ov.calls.empty()) tool_ok++;
+    if(!ok) dead++;
     printf("  %-16s TEXT=%zu TOOL=%zu %s\n", name, tv.size(), ov.calls.size(), ok?"":"  <-- STILL DEAD");
   }
   printf("\n  recovered via TEXT chain: %d   via TOOL chain: %d   still dead: %d\n", text_ok, tool_ok, dead);

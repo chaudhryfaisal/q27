@@ -2001,6 +2001,90 @@ static void test_json_terminator_in_xml_dialect() {
     }
 }
 
+
+// THE NAME ON THE FOLLOWING LINE, and a case-mismatched name (2026-08-21, from
+// classifying every missed turn across 46 runs).
+//
+// Three spellings, one habit: the opener carries a PLACEHOLDER where the tool
+// name belongs and the real name is the next line.
+//
+//   <function=name>      <name>        <parameter=name>
+//   TaskCreate           Write         Bash
+//   </parameter>         </parameter>  </parameter>
+//
+// Mode 18 already reads `<name>Write` when the name is on the SAME line. This
+// is the next-line variant, and `name`/`tool_name`/`function` as the literal
+// key is the same thing one tag over. Gated on the next line naming a DECLARED
+// tool, so it reads what the model wrote instead of guessing -- the rule mode
+// 22 uses.
+//
+// Separately: `<parameter=task>` where the declared tool is `Task`. A tool name
+// that differs only in case is the model's own name for it, and refusing on
+// case alone loses a call for nothing. Requires a UNIQUE case-insensitive
+// match, so an ambiguous registry still refuses.
+static void test_placeholder_name_on_next_line() {
+    json tools = json::array({tool("TaskCreate", {{"subject", true}, {"description", false}}),
+                              tool("Write", {{"file_path", true}, {"content", true}}),
+                              tool("Bash", {{"command", true}, {"description", false}}),
+                              tool("Task", {{"taskId", true}, {"status", false}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    {
+        auto v = call("<function=name>\nTaskCreate\n</parameter>\n"
+                      "<parameter=subject>\nCore types\n</parameter>\n</function>", tools);
+        ok(v.size() == 1 && v[0].name == "TaskCreate" &&
+               v[0].arguments.value("subject", std::string()) == "Core types",
+           "next-line name: <function=name> takes the following line");
+    }
+    {
+        auto v = call("<name>\nWrite\n</parameter>\n<parameter=file_path>\n/w/x.ts\n"
+                      "</parameter>\n<parameter=content>\nbody\n</parameter>\n</function>",
+                      tools);
+        ok(v.size() == 1 && v[0].name == "Write" &&
+               v[0].arguments.value("file_path", std::string()) == "/w/x.ts",
+           "next-line name: <name> with the name on the next line");
+    }
+    {
+        auto v = call("<parameter=name>\nBash\n</parameter>\n<parameter=command>\n"
+                      "node -e 1\n</parameter>\n</function>", tools);
+        ok(v.size() == 1 && v[0].name == "Bash" &&
+               v[0].arguments.value("command", std::string()) == "node -e 1",
+           "next-line name: <parameter=name> carries the tool name as its value");
+    }
+    {
+        auto v = call("<parameter=task>\n<parameter=taskId>\n2\n</parameter>\n"
+                      "<parameter=status>\nin_progress\n</parameter>\n</function>", tools);
+        // taskId parses as a JSON number here, so compare the dumped value --
+        // .value(key, std::string()) THROWS on a non-string and took the whole
+        // test binary down when this was written the obvious way.
+        ok(v.size() == 1 && v[0].name == "Task" && v[0].arguments.contains("taskId") &&
+               v[0].arguments["taskId"].dump() == "2",
+           "next-line name: a case-mismatched tool name resolves to the declared one");
+    }
+    // ---- refusals ----
+    {
+        ok(call("<function=name>\nNotATool\n</parameter>\n<parameter=subject>\nx\n"
+                "</parameter>\n</function>", tools).empty(),
+           "next-line name: an undeclared following line is refused");
+    }
+    {
+        // mode 18's same-line form must be untouched
+        auto v = call("<name>Write\n</parameter>\n<parameter=file_path>\n/w/y\n</parameter>\n"
+                      "<parameter=content>\nc\n</parameter>\n</function>", tools);
+        ok(v.size() == 1 && v[0].name == "Write",
+           "next-line name: mode 18's same-line spelling still works");
+    }
+    {
+        // and an ordinary parameter literally named "name" on a declared tool
+        // must not be mistaken for an opener when its value is not a tool
+        ok(call("<parameter=name>\nnot a tool at all\n</parameter>\n"
+                "<parameter=command>\nls\n</parameter>\n</function>", tools).size() == 1,
+           "next-line name: a non-tool value falls through to key inference");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -2081,6 +2165,7 @@ int main() {
     test_parameter_attribute_reaches_drift_modes();
     test_value_containing_closer();
     test_json_terminator_in_xml_dialect();
+    test_placeholder_name_on_next_line();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();

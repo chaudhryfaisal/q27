@@ -3464,6 +3464,30 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
     return out;
 }
 
+// A declared tool whose name differs from `nm` only in case. The model's own
+// name for a tool ("task" for Task) is not a different tool, and refusing on
+// case alone loses a call for nothing. UNIQUE match only: an ambiguous registry
+// still refuses, because guessing between two real tools is worse than not
+// calling one.
+inline std::string canonical_declared_name(const json* tools, const std::string& nm) {
+    if (!tools || !tools->is_array() || nm.empty()) return "";
+    auto lower = [](std::string x) {
+        for (auto& ch : x) ch = (char)tolower((unsigned char)ch);
+        return x;
+    };
+    const std::string target = lower(nm);
+    std::string hit;
+    int n = 0;
+    for (const auto& t : *tools) {
+        if (!t.contains("function")) continue;
+        const std::string dn = t["function"].value("name", std::string());
+        if (dn.empty()) continue;
+        if (dn == nm) return dn;              // exact wins outright
+        if (lower(dn) == target) { hit = dn; n++; }
+    }
+    return n == 1 ? hit : std::string();
+}
+
 // Did the model INTEND a tool call that nothing recovered? Used only for the
 // UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
 // costs a silent drop rather than a wrong call -- which is exactly what it cost:
@@ -3910,6 +3934,34 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         alt.erase(alt.begin());
                     while (!alt.empty() && (alt.back() == '"' || alt.back() == '\''))
                         alt.pop_back();
+                    // `<function=name>` with the real name on the FOLLOWING
+                    // line. The opener carries a placeholder where the name
+                    // belongs -- the same habit mode 18 already tolerates for
+                    // `<name>`, one tag over. Only the next line, only when it
+                    // names a declared tool.
+                    if (!declared(alt) && (alt == "name" || alt == "tool_name" ||
+                                           alt == "function")) {
+                        const size_t og = span.find('>');
+                        if (og != std::string::npos) {
+                            size_t ls = span.find_first_not_of(" \t\r\n", og + 1);
+                            if (ls != std::string::npos) {
+                                size_t le = span.find_first_of("\r\n<", ls);
+                                std::string cand = span.substr(
+                                    ls, (le == std::string::npos ? span.size() : le) - ls);
+                                while (!cand.empty() && isspace((unsigned char)cand.back()))
+                                    cand.pop_back();
+                                if (declared(cand)) alt = cand;
+                            }
+                        }
+                    }
+                    // A name that differs only in CASE is the model's own name
+                    // for the tool; refusing on case alone loses a call for
+                    // nothing. Unique match only, so an ambiguous registry
+                    // still refuses.
+                    if (!declared(alt)) {
+                        const std::string canon = canonical_declared_name(tools, alt);
+                        if (!canon.empty()) alt = canon;
+                    }
                     if (alt == tc.name || !declared(alt)) { named_undeclared = true; break; }
                     tc.name = alt;
                 }
@@ -4149,6 +4201,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (ps == std::string::npos) break;
                 const size_t gt = gt1 - 1;   // the '>' itself
                 const size_t nxt = find_parameter_opener(text_in, gt + 1);
+                // `<parameter=task>` against a declared `Task`: same tool, the
+                // model's own casing.
+                if (!declared(nm)) {
+                    const std::string canon = canonical_declared_name(tools, nm);
+                    if (!canon.empty()) nm = canon;
+                }
                 if (nxt == std::string::npos || !declared(nm) ||
                     text_in.find_first_not_of(" \t\r\n", gt + 1) != nxt) {
                     cur = gt + 1;   // a parameter, not an opener
