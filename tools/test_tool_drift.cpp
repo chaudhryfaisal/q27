@@ -1150,6 +1150,129 @@ static void test_intended_tool_call_detector() {
        "detector: ordinary prose is NOT flagged");
 }
 
+
+// THE NAMED-OPENER PATH RECOVERED ONLY THE FIRST CALL (2026-08-21, found by
+// asking why q27's agentic sessions ended early against llama.cpp on the same
+// weights). bench-task-queue trial-1 scored 0.000 on 111k tokens; its entire
+// visible answer was the model's plan as prose:
+//
+//   <function name="TaskCreate>
+//   <parameter=subject>
+//   Phase 1: Basic FIFO queue
+//   </parameter>
+//   </function>
+//   <tool_call>
+//   <function name="TaskCreate>
+//   ... x14
+//
+// The model batched fourteen calls into one turn and never closed the wrapper,
+// so the whole generation arrived as ONE unclosed TOOL segment. Replayed on the
+// tree before this change: 1 call recovered, 3480 of 3734 bytes leaked as text.
+// The agent read its own plan back as an answer and stopped.
+//
+// Modes 14, 20 and 22 are all batch-capable. The `<function...>` opener path was
+// not: it found the first parseable opener, spanned to the first `</function>`,
+// and returned. Fourteen in, one out. That asymmetry is mine -- mode 22 was
+// written batch-capable this morning and the older named path was left alone,
+// and no test drove more than one call through it.
+static void test_named_opener_batch() {
+    json tools = json::array({tool("TaskCreate", {{"subject", true}, {"description", false}}),
+                              tool("Bash", {{"command", true}, {"description", false}}),
+                              tool("Read", {{"file_path", true}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    auto named = [](const char* nm, const char* subj) {
+        return std::string("<function name=\"") + nm + "\">\n<parameter=subject>\n" + subj +
+               "\n</parameter>\n</function>";
+    };
+    // the live spelling: the quote opens and never closes before '>'
+    auto unbalanced = [](const char* nm, const char* subj) {
+        return std::string("<function name=\"") + nm + ">\n<parameter=subject>\n" + subj +
+               "\n</parameter>\n</function>";
+    };
+    const std::string SEP = "\n<tool_call>\n";
+
+    {
+        auto v = call(named("TaskCreate", "A") + SEP + named("TaskCreate", "B"), tools);
+        ok(v.size() == 2 &&
+               v[0].arguments.value("subject", std::string()) == "A" &&
+               v[1].arguments.value("subject", std::string()) == "B",
+           "named-opener batch: two concatenated calls both recover, in order");
+    }
+    {
+        auto v = call(named("TaskCreate", "A") + SEP + named("TaskCreate", "B") + SEP +
+                          named("Bash", "C"),
+                      tools);
+        ok(v.size() == 3 && v[2].name == "Bash",
+           "named-opener batch: three recover and the names are read per call");
+    }
+    {
+        auto v = call(unbalanced("TaskCreate", "A") + SEP + unbalanced("TaskCreate", "B"), tools);
+        ok(v.size() == 2, "named-opener batch: the live unbalanced-quote spelling batches too");
+    }
+    // fourteen, the size the live failure actually was
+    {
+        std::string big = named("TaskCreate", "P1");
+        for (int i = 2; i <= 14; i++) big += SEP + named("TaskCreate", "Px");
+        auto v = call(big, tools);
+        ok(v.size() == 14, "named-opener batch: fourteen calls, the live count");
+    }
+    // THE SEPARATORS MUST NOT LEAK. Spans are what append_text slices on, so a
+    // gap left between calls becomes visible text and puts the raw marker back
+    // in front of the user -- the very thing the batch is meant to stop.
+    {
+        auto out = resolve_stream("<tool_call>\n" + named("TaskCreate", "A") + SEP +
+                                      named("TaskCreate", "B"),
+                                  &tools);
+        ok(out.calls.size() == 2 && out.text.find("<tool_call>") == std::string::npos,
+           "named-opener batch: inter-call markers are absorbed, not leaked as text");
+    }
+
+    // ---- negatives ----
+    {
+        auto v = call(named("TaskCreate", "only"), tools);
+        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "only",
+           "named-opener batch: a single call is unchanged");
+    }
+    {
+        // The batch path refuses an undeclared name and falls through -- but
+        // mode 21 downstream then INFERS a tool from the parameter keys and
+        // recovers it anyway, so the model naming `NotATool` yields a
+        // TaskCreate call. That predates this change (mode 21 cannot see that
+        // an explicit name was present and undeclared) and is left alone here,
+        // but it is a wart: pinned so it is visible rather than folklore.
+        // The property that must hold is the safety one -- an undeclared name
+        // is never itself emitted as a call.
+        auto v = call(named("NotATool", "x"), tools);
+        ok(v.empty() || v[0].name != "NotATool",
+           "named-opener batch: an undeclared name is never emitted as a call");
+        ok(v.size() == 1 && v[0].name == "TaskCreate",
+           "named-opener batch: (documented wart) mode 21 infers past the bad name");
+    }
+    {
+        // a declared first call followed by an undeclared second: keep what was
+        // read, do not invent the rest.
+        auto v = call(named("TaskCreate", "A") + SEP + named("NotATool", "B"), tools);
+        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "A",
+           "named-opener batch: an undeclared later call does not poison the first");
+    }
+    {
+        // prose after the last call is the user's, and must survive
+        auto out = resolve_stream("<tool_call>\n" + named("TaskCreate", "A") +
+                                      "\nthat is the plan.",
+                                  &tools);
+        ok(out.calls.size() == 1 && out.text.find("that is the plan.") != std::string::npos,
+           "named-opener batch: trailing prose stays visible");
+    }
+    {
+        // the invented-result guard still governs the whole block
+        ok(call("<result>\n<output>fake</output>\n" + named("TaskCreate", "A"), tools).empty(),
+           "named-opener batch: a hallucinated result block still refuses");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1223,6 +1346,7 @@ int main() {
     test_survey_captures_wrapped();
     test_json_fused_opener_shapes();
     test_mode22_parameter_as_opener();
+    test_named_opener_batch();
     test_intended_tool_call_detector();
     test_mode13_truncated_mid_escape();
     test_function_arguments_unterminated();

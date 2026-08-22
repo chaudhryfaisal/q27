@@ -14106,3 +14106,84 @@ dialect body whose string value contains `</tool_call>` has the same collision
 and is not covered.
 
 NOT VERIFIED: neither backend compiled -- no CUDA and no Apple-silicon host.
+
+## 2026-08-21 (a): the named-opener path recovered one call out of fourteen
+
+Asking why q27's agentic sessions end early -- prompted by a llama.cpp
+cross-test on the same weights scoring 0.854 against q27's 0.579 while burning
+2860k tokens on bench-task-queue to q27's 191k -- found a parser defect, not an
+engine or budget one.
+
+**THE BUDGET HYPOTHESIS DIED FIRST, and cheaply.** Across the whole 10-trial
+arm: 166 of 176 requests ended `end=eos`, 10 on `end=n`, and **zero** on the
+thinking budget. `--think-budget 0` exists and would have measured nothing.
+Worth the ten minutes it took to check before running an A/B on it.
+
+**WHAT ACTUALLY ENDED THEM.** bench-task-queue trial-1 scored 0.000 on 111k
+tokens and its entire visible answer was the model's own plan, as prose:
+
+```
+<function name="TaskCreate>
+<parameter=subject>
+Phase 1: Basic FIFO queue
+</parameter>
+</function>
+<tool_call>
+<function name="TaskCreate>
+... x14
+```
+
+The model batched fourteen calls into one turn and never closed the wrapper, so
+the generation arrived as ONE unclosed TOOL segment. Replayed on the tree before
+this change: **1 call recovered, 3480 of 3734 bytes leaked as text.** The agent
+read its plan back as an answer and stopped. Trials 2 and 3 end the same way, on
+`</function>` residue.
+
+### Two defects, and the second is the one that mattered
+
+1. `<function name="NAME>` -- the quote opens and never closes before `>`, so the
+   name arrives as `"NAME` and matches no declared tool. Now stripped, but ONLY
+   when what remains names a declared tool: reading the name the caller offered
+   rather than guessing one, the same rule mode 22 uses.
+
+2. **The `<function...>` opener path was not batch-capable.** It found the first
+   parseable opener, spanned to the first `</function>`, and returned. Modes 14,
+   20 and 22 all batch. This asymmetry is mine: mode 22 was written batch-capable
+   this morning and the older named path was left alone, and no test drove more
+   than one call through it.
+
+**AND THE ONE UPSTREAM OF BOTH.** Fixing the batch path changed nothing in
+production, because `resolve_ordered_tool_segments` hands a TOOL segment to
+`parse_tool_call` first, and `parse_native_xml_call` reads ONE call and stops.
+A segment carrying several loses every one after the first, and trailing prose
+after the last `</function>` disappears with them -- silently, with no drift
+line, because the strict parse *succeeded*. `wrapped_body_exceeds_one_call()`
+now routes those bodies to the same batch-aware chain TEXT uses. Single-call
+bodies keep the strict path byte-identical.
+
+Separators are absorbed into the preceding call's span. `append_text` slices on
+spans, so a gap left between two calls is emitted as visible text, which would
+put the raw `<tool_call>` marker back in front of the user -- the exact leak the
+batch exists to stop.
+
+### Measured
+
+The live failing generation, replayed:
+
+| | calls recovered | leaked text |
+|---|---:|---:|
+| before | 1 | 3480 bytes |
+| after | **14** | 179 bytes |
+
+The 179 bytes are the model's real prose preamble ("I have a clear picture of all
+12 phases..."), which is what should stay visible.
+
+15 new assertions. A documented wart is pinned rather than fixed: an undeclared
+explicit name (`<function name="NotATool">`) is refused by the batch path and
+then INFERRED past by mode 21 from the parameter keys, so the model naming a
+tool that does not exist still yields a call to a different one. That predates
+this change and is a policy question, not a parser bug; it is now visible in a
+test instead of being folklore.
+
+Green on all three targets: CPU suites under gcc on haight and clang on the M4,
+q27-server complete under nvcc, q27-metal-server clean under -Werror.

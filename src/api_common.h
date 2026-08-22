@@ -3152,6 +3152,38 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
     return false;
 }
 
+inline bool only_dialect_control_bytes(const std::string& s) {
+    size_t i=0;
+    bool saw_marker=false;
+    while(i<s.size()) {
+        if(isspace((unsigned char)s[i])) { i++; continue; }
+        if(s.compare(i,11,"<tool_call>")==0) { i+=11; saw_marker=true; continue; }
+        if(s.compare(i,12,"</tool_call>")==0) { i+=12; saw_marker=true; continue; }
+        return false;
+    }
+    return saw_marker; // pure whitespace is not this function's business
+}
+
+// Would parse_tool_call() silently discard part of this wrapped body?
+// parse_native_xml_call reads ONE call and stops, so a segment carrying several
+// calls loses every one after the first, and trailing prose after the last
+// </function> disappears with them. Measured 2026-08-21: a 14-call turn came
+// back as 1 call. Where this returns true the segment goes through the same
+// batch-aware chain that TEXT uses instead.
+inline bool wrapped_body_exceeds_one_call(const std::string& body) {
+    size_t openers = 0;
+    for (size_t c = body.find("<function"); c != std::string::npos;
+         c = body.find("<function", c + 9)) {
+        std::string nm;
+        size_t after;
+        if (parse_function_opener(body, c, nm, after) && ++openers > 1) return true;
+    }
+    if (openers == 0) return false;
+    const size_t last = body.rfind("</function>");
+    if (last == std::string::npos) return false;
+    return body.find_first_not_of(" \t\r\n", last + 11) != std::string::npos;
+}
+
 // Did the model INTEND a tool call that nothing recovered? Used only for the
 // UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
 // costs a silent drop rather than a wrong call -- which is exactly what it cost:
@@ -3443,26 +3475,74 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // spellings. One scan for "<function" and let parse_function_opener
         // decide -- before the consolidation this was two searches that between
         // them still missed <function="NAME">.
-        size_t fb = std::string::npos;
-        for (size_t c = text_in.find("<function"); c != std::string::npos;
-             c = text_in.find("<function", c + 9)) {
-            std::string nm_probe;
-            size_t after_probe;
-            if (parse_function_opener(text_in, c, nm_probe, after_probe)) { fb = c; break; }
-        }
-        if (fb != std::string::npos) {
-            ToolCall tc;
-            std::string span = text_in.substr(fb);
-            size_t fe = span.find("</function>");
-            if (fe != std::string::npos) span = span.substr(0, fe + 11);
-            if (parse_native_xml_call(span, tc) && declared(tc.name)) {
+        // BATCHED, because a model that plans emits SEVERAL calls in one turn,
+        // separated by stray <tool_call> markers. Recovering only the first and
+        // returning turned the other thirteen into prose that the agent then
+        // read back as its own answer -- measured 2026-08-21 on
+        // bench-task-queue, where a 14-call turn yielded 1 call and 3480 bytes
+        // of leaked dialect, and the session ended there. Modes 14, 20 and 22
+        // were already batch-capable; this path was the odd one out.
+        {
+            std::vector<ToolCall> batch;
+            size_t cur = 0, first_begin = std::string::npos;
+            for (;;) {
+                size_t fb = std::string::npos;
+                std::string nm_probe;
+                size_t after_probe;
+                for (size_t c = text_in.find("<function", cur); c != std::string::npos;
+                     c = text_in.find("<function", c + 9)) {
+                    if (parse_function_opener(text_in, c, nm_probe, after_probe)) { fb = c; break; }
+                }
+                if (fb == std::string::npos) break;
+                std::string span = text_in.substr(fb);
+                const size_t fe = span.find("</function>");
+                if (fe != std::string::npos) span = span.substr(0, fe + 11);
+                ToolCall tc;
+                // Stop at the first span that will not resolve rather than
+                // skipping it: keep what was actually read, never invent the
+                // rest. An unparseable FIRST span leaves the batch empty and
+                // falls through to the modes below exactly as before.
+                if (!parse_native_xml_call(span, tc)) break;
+                if (!declared(tc.name)) {
+                    // `<function name="NAME>` -- the quote opens and never
+                    // closes before '>', so the name arrives as `"NAME`. Strip
+                    // an unmatched quote ONLY when what remains names a
+                    // DECLARED tool: that reads the name the caller offered
+                    // rather than guessing one, the same rule mode 22 uses.
+                    std::string alt = tc.name;
+                    while (!alt.empty() && (alt.front() == '"' || alt.front() == '\''))
+                        alt.erase(alt.begin());
+                    while (!alt.empty() && (alt.back() == '"' || alt.back() == '\''))
+                        alt.pop_back();
+                    if (alt == tc.name || !declared(alt)) break;
+                    tc.name = alt;
+                }
                 tc.source_begin = fb;
-                tc.source_end = fe != std::string::npos ? fb + fe + 11
-                                                        : text_in.size();
-                if (prefix) *prefix = text_in.substr(0, fb);
+                tc.source_end = fe != std::string::npos ? fb + fe + 11 : text_in.size();
+                if (first_begin == std::string::npos) first_begin = fb;
+                cur = tc.source_end;
+                batch.push_back(std::move(tc));
+                if (cur >= text_in.size()) break;
+            }
+            if (!batch.empty()) {
+                // Absorb a separator that carries no content into the preceding
+                // call's span. append_text slices on these spans, so a gap left
+                // between two calls is emitted as VISIBLE TEXT -- which would
+                // put the raw <tool_call> marker back in front of the user, the
+                // exact leak the batch exists to stop.
+                for (size_t i = 0; i + 1 < batch.size(); i++) {
+                    const size_t gb = batch[i].source_end, ge = batch[i + 1].source_begin;
+                    if (ge <= gb) continue;
+                    const std::string gap = text_in.substr(gb, ge - gb);
+                    if (only_dialect_control_bytes(gap) ||
+                        gap.find_first_not_of(" \t\r\n") == std::string::npos)
+                        batch[i].source_end = ge;
+                }
+                if (prefix) *prefix = text_in.substr(0, first_begin);
                 if (remaining_text) *remaining_text = "";
-                fprintf(stderr, "[q27] bare native-dialect call recovered: %s\n", tc.name.c_str());
-                return std::vector<ToolCall>{std::move(tc)};
+                fprintf(stderr, "[q27] bare native-dialect call(s) recovered: %zu\n",
+                        batch.size());
+                return batch;
             }
         }
         // (b) the chimera
@@ -4346,17 +4426,6 @@ struct OrderedToolOutput {
 //
 // The turn is lost either way; this decides what the user sees, and callers log
 // so the loss is not silent.
-inline bool only_dialect_control_bytes(const std::string& s) {
-    size_t i=0;
-    bool saw_marker=false;
-    while(i<s.size()) {
-        if(isspace((unsigned char)s[i])) { i++; continue; }
-        if(s.compare(i,11,"<tool_call>")==0) { i+=11; saw_marker=true; continue; }
-        if(s.compare(i,12,"</tool_call>")==0) { i+=12; saw_marker=true; continue; }
-        return false;
-    }
-    return saw_marker; // pure whitespace is not this function's business
-}
 
 inline std::string take_unclosed_final_tool_segment(
     std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
@@ -4415,6 +4484,12 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
             continue;
         }
         const std::string body=strip_ws2(segment.second);
+        // A wrapped segment is not guaranteed to hold exactly one call. When it
+        // holds more, or carries text after the last one, the strict parser
+        // would take the first and drop the remainder silently -- which is how
+        // a model's whole 14-call plan became prose it then read back as its
+        // own answer. Hand those to the batch-aware chain instead.
+        if(tools && wrapped_body_exceeds_one_call(body)) { append_text(body,false); continue; }
         ToolCall call=parse_tool_call(body);
         if(call.ok) {
             if(eligible(call.name,out.calls.size())) out.append_tool_call(std::move(call));
