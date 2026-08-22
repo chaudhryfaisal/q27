@@ -2325,10 +2325,18 @@ int main(int argc,char** argv) {
                 const std::string error_id="arrival_metal_"+runtime.boot_id+"_"+
                     std::to_string((long)req_counter++);
                 runtime.trace.event({{"kind","arrival"},{"api",api},{"id",error_id}});
+                // cpp-httplib 0.53.1 renamed Request::is_connection_alive to
+                // is_connection_closed and INVERTED its sense (it defaults to
+                // []{ return true; }, i.e. "closed"). Handlers below take a
+                // LIVENESS predicate, so this negates rather than renames --
+                // a straight rename compiles and reports every live connection
+                // as dead.
+                const std::function<bool()> live=
+                    [&request]{ return !request.is_connection_closed(); };
                 try { handler(json::parse(request.body),response,
                               request.has_header("x-codex-installation-id") ||
                               request.has_header("x-codex-turn-metadata"),
-                              request.is_connection_alive); }
+                              live); }
                 catch(const Runtime::ClientGone&) {
                     response.status=499;
                 }
@@ -2375,7 +2383,15 @@ int main(int argc,char** argv) {
                     response.set_content(q27::anthropic_error_json("invalid_request_error","invalid JSON body"),"application/json");
                     return;
                 }
-                try { handler(body,response,request.is_connection_alive); }
+                // cpp-httplib 0.53.1 renamed Request::is_connection_alive to
+                // is_connection_closed and INVERTED its sense (it defaults to
+                // []{ return true; }, i.e. "closed"). Handlers below take a
+                // LIVENESS predicate, so this negates rather than renames --
+                // a straight rename compiles and reports every live connection
+                // as dead.
+                const std::function<bool()> live=
+                    [&request]{ return !request.is_connection_closed(); };
+                try { handler(body,response,live); }
                 catch(const Runtime::ClientGone&) {
                     response.status=499;
                 }
