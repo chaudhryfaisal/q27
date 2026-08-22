@@ -919,7 +919,6 @@ static void test_v223_reasoning_dedup() {
 // v22.3: failure detection suppresses code output and exit-code-0.
 static void test_v223_failure_detection() {
     q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
-    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
     {   // code output with console.error is suppressed (not a failure)
         json b = {{"messages", json::array({
             {{"role","user"},{"content","run"}},
