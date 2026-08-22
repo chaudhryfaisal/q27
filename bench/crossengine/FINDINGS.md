@@ -386,3 +386,31 @@ section 5 instead. Quality JSONs are committed with the per-scenario transcripts
 stripped (1.1 MB -> 5 KB each); the scores and per-pack breakdowns are intact.
 Captured request bodies are stripped from the tap logs: those are Claude Code's
 own system prompt and tool schemas.
+
+## 2026-08-22 addendum: Qwen3.8 quality legs, q27 vs llama.cpp
+
+A `llama38` leg (Qwen3.8-27B-MTP as Q5_K_M, 19.5 GB, within 0.3 GB of q27's q6
+tier) joins `q38`. Quality arm only, 75 problems, pass@3, greedy, no-think.
+
+| leg | total | toolcall | instruct | structout | dataextract | reasonmath |
+|---|---:|---:|---:|---:|---:|---:|
+| q38 (q27, default tier) | 62/75 | 13 | 13 | 14 | 11 | 11 |
+| llama38 (Q5_K_M, q8_0 KV) | 54/75 | 13 | 13 | 14 | 3 | 11 |
+
+**Read the dataextract column with care.** Re-issuing those prompts at both
+engines directly (no tap proxy, three thinking-field variants) reproduced the
+gap deterministically and showed what it is: llama.cpp emits the correct object
+wrapped in a one-element array (`[ { ... } ]`) on seven of the eight, and q27
+does the same on DE-02 where llama.cpp does not. Both engines flip a near-tie
+`{`/`[` first token; the verifier's top-level shape check scores a
+wrapped-correct answer 0/10. The other four packs are identical to the problem.
+On fixed prompts the two engines are at parity; the 54 is a verifier artifact of
+a coin-flip first token, not an extraction-quality gap.
+
+Also measured the same day, for the record: for a tool-free request the two
+renderers are byte-identical (DE-01, 1898 chars, empty diff); q27's speculative
+greedy path is token-identical to plain greedy (256/256); fp8 KV moves the
+greedy trajectory at token 39 of a continuation and costs +0.04% NLL on 51,000
+predictions; q6 is -1.2% NLL against the default tier. `llama-perplexity`
+segfaults on this GGUF with every flag combination tried, so there is no
+llama.cpp-side NLL here.
