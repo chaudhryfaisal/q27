@@ -3324,6 +3324,21 @@ inline bool only_dialect_control_bytes(const std::string& s) {
         if(isspace((unsigned char)s[i])) { i++; continue; }
         if(s.compare(i,11,"<tool_call>")==0) { i+=11; saw_marker=true; continue; }
         if(s.compare(i,12,"</tool_call>")==0) { i+=12; saw_marker=true; continue; }
+        // A TRUNCATED marker at the very end is residue too: the model emitted
+        // `<tool_call` and stopped, so there is no name, no arguments, nothing
+        // to execute -- but it became the user's whole visible answer, which is
+        // the failure #32 fixed for the complete marker. Only as the FINAL
+        // token, and only long enough to identify (a bare "<t" could begin
+        // anything), so a marker followed by prose is still shown.
+        {
+            const std::string rest = s.substr(i);
+            for (const char* m : {"<tool_call>", "</tool_call>"}) {
+                const size_t n = strlen(m);
+                if (rest.size() >= 4 && rest.size() < n &&
+                    strncmp(m, rest.c_str(), rest.size()) == 0)
+                    return true;
+            }
+        }
         return false;
     }
     return saw_marker; // pure whitespace is not this function's business

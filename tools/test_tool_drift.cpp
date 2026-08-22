@@ -2129,6 +2129,39 @@ static void test_xml_bleed_into_json_key() {
     }
 }
 
+
+// A PARTIAL opener as the whole answer (2026-08-22, the last miss standing in
+// the parity arm). The model emitted `<tool_call` -- no '>', no body -- and
+// stopped. There is no call in that: no name, no arguments, nothing to execute.
+//
+// But it became the user's entire visible message, which is the same failure
+// #32 fixed for the COMPLETE marker: a turn whose whole answer is a raw
+// protocol fragment is worse than an empty one. only_dialect_control_bytes()
+// knew `<tool_call>` and `</tool_call>` and not a truncated prefix of either.
+//
+// TO BE CLEAR ABOUT WHAT THIS IS: suppression, not recovery. The turn is still
+// lost and the call still never happened. It stops the fragment reaching the
+// user and stops it being counted as a parse failure it never was.
+static void test_partial_opener_is_residue() {
+    ok(q27::only_dialect_control_bytes("<tool_call"),
+       "partial opener: a truncated <tool_call is content-free residue");
+    ok(q27::only_dialect_control_bytes("\n<tool_call>\n<tool_ca"),
+       "partial opener: a complete marker plus a truncated one");
+    ok(q27::only_dialect_control_bytes("</tool_cal"),
+       "partial opener: a truncated closer too");
+    // ---- and what must still reach the user ----
+    ok(!q27::only_dialect_control_bytes("<tool_call>\n<function=Bash>"),
+       "partial opener: a body with a payload tag is NOT residue");
+    ok(!q27::only_dialect_control_bytes("here is the answer"),
+       "partial opener: prose is not residue");
+    ok(!q27::only_dialect_control_bytes("<tool_call> and then some words"),
+       "partial opener: a marker followed by prose is not residue");
+    ok(!q27::only_dialect_control_bytes("   "),
+       "partial opener: pure whitespace is still not this function's business");
+    ok(!q27::only_dialect_control_bytes("<t"),
+       "partial opener: a fragment too short to identify is not residue");
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -2211,6 +2244,7 @@ int main() {
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
     test_xml_bleed_into_json_key();
+    test_partial_opener_is_residue();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
