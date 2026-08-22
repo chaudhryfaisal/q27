@@ -75,9 +75,12 @@ boot() { # $1 = effort arm
 for ARM in $ARMS; do
   echo ""; echo "################ ARM effort=$ARM ################"
   boot "$ARM" || continue
-  # prove the arm actually reached the process rather than trusting the launch
-  journalctl --user -u "$UNIT" --no-pager 2>/dev/null | grep -i "^.*wsum:" | tail -1 \
-    | sed "s/^/[$1 WSUM] /"
+  # prove the arm actually reached the process rather than trusting the launch.
+  # $ARM, not $1: at this scope $1 is the script's outdir, and a path full of
+  # slashes inside an s/// replacement is how the first version of this line
+  # died with "unknown option to `s'".
+  journalctl --user -u "$UNIT" --no-pager --since "-10min" 2>/dev/null \
+    | grep -io "wsum:.*" | tail -1 | sed "s|^|[$ARM] |"
   PID=$(pgrep -f "q27-server.*--port $PORT" | head -1)
   echo "[$ARM] server pid=$PID env=$(tr '\0' '\n' < /proc/$PID/environ | grep -c '^Q27_REASONING_EFFORT='"$ARM"'$') (1 = confirmed)"
 
