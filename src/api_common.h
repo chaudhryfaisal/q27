@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -485,13 +486,34 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         if (toolresp) tool_failures = is_tool_response_failure(content)
                                           ? tool_failures + 1 : 0;
         else if (m.role == "user") tool_failures = 0; // plain user resets
+        strip_think_markers(content);
+        // P2: consecutive tool responses group under ONE user turn, each kept
+        // as its own <tool_response> block (mirrors the template's prev_role
+        // grouping -- no <|im_start|>/<|im_end|> between them).
+        if (toolresp) {
+            const bool prev_toolresp = i > start && msgs[i - 1].role == "user" &&
+                                       msgs[i - 1].content.rfind("<tool_response>", 0) == 0;
+            const bool next_toolresp = i + 1 < msgs.size() && msgs[i + 1].role == "user" &&
+                                       msgs[i + 1].content.rfind("<tool_response>", 0) == 0;
+            if (!prev_toolresp) p += "<|im_start|>user\n";
+            if (tool_failures >= 1) {
+                // warning goes INSIDE the response block, before the closer
+                // (the template emits it between content and </tool_response>)
+                std::string warn = tool_response_warning(tool_failures);
+                size_t close = content.rfind("\n</tool_response>");
+                if (close != std::string::npos) content.insert(close, warn);
+                else content += warn;
+            }
+            p += strip_ctrl(content);
+            p += next_toolresp ? "\n" : "<|im_end|>\n";
+            continue;
+        }
+        // normal (non-tool) message
         p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
         // assistant history reasoning block, jinja format:
         //   <think>\n...\n</think>\n\n  then the plain content
         if (m.role == "assistant" && !m.reasoning.empty())
             p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
-        strip_think_markers(content);
-        if (toolresp && tool_failures >= 1) content += tool_response_warning(tool_failures);
         p += strip_ctrl(content) + "<|im_end|>\n";
     }
     if (stable_off) *stable_off = p.size();
@@ -513,12 +535,28 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
 }
 
 inline std::string tool_call_text(const std::string& name, const json& args) {
-    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
+    std::string a = args.dump();
+    // P3: Q27_MAX_TOOL_ARG_CHARS truncates a too-long arguments JSON.
+    if (const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS")) {
+        long max = atol(e);
+        if (max > 0 && (long)a.size() > max)
+            a = a.substr(0, (size_t)max) + "\n[TRUNCATED - original length " +
+                std::to_string(a.size()) + " chars]";
+    }
+    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + a +
            "}\n</tool_call>";
 }
 
 inline std::string tool_response_text(const std::string& out) {
-    return "<tool_response>\n" + out + "\n</tool_response>";
+    std::string o = out;
+    // P3: Q27_MAX_TOOL_RESPONSE_CHARS truncates a too-long tool output.
+    if (const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS")) {
+        long max = atol(e);
+        if (max > 0 && (long)o.size() > max)
+            o = o.substr(0, (size_t)max) + "\n[TRUNCATED - original length " +
+                std::to_string(o.size()) + " chars]";
+    }
+    return "<tool_response>\n" + o + "\n</tool_response>";
 }
 
 // Per-request thinking resolution, GATED behind the server's --request-think

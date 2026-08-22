@@ -801,6 +801,56 @@ static void test_tool_failure_warnings() {
     CHECK(r2.find("The previous tool call returned an error.") != std::string::npos);
 }
 
+// P2: consecutive tool responses group under a single user turn.
+static void test_tool_grouping() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run both"}},
+        {{"role","user"},{"content",tr("out A")}},
+        {{"role","user"},{"content",tr("out B")}},
+        {{"role","user"},{"content","all done"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    // exactly 3 user turns: "run both", the grouped pair, "all done"
+    size_t n = 0;
+    for (size_t p = 0; (p = r.find("<|im_start|>user\n", p)) != std::string::npos; ++n, ++p);
+    CHECK(n == 3);
+    // the pair shares one user turn: grouped marker present, no <|im_end|> between
+    CHECK(r.find("</tool_response>\n<tool_response>") != std::string::npos);
+    CHECK(r.find("out A\n</tool_response><|im_end|>") == std::string::npos);
+}
+
+// P3: Q27_MAX_TOOL_RESPONSE_CHARS / Q27_MAX_TOOL_ARG_CHARS truncate long output.
+static void test_tool_truncation() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    std::string big(100, 'x');
+    {   // response truncation (role "tool" goes through tool_response_text)
+        setenv("Q27_MAX_TOOL_RESPONSE_CHARS", "20", 1);
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","run it"}},
+            {{"role","tool"},{"content",big}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+        unsetenv("Q27_MAX_TOOL_RESPONSE_CHARS");
+        CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+        CHECK(r.find(big) == std::string::npos); // long tail gone
+    }
+    {   // arg truncation (assistant tool_calls go through tool_call_text)
+        setenv("Q27_MAX_TOOL_ARG_CHARS", "30", 1);
+        json body = {{"messages", json::array({
+            {{"role","assistant"},{"content","calling"},{"tool_calls", json::array({
+                {{"id","1"},{"type","function"},{"function",{{"name","ls"},
+                    {"arguments", "{\"path\":\"/" + big + "\"}"}}}}
+            })}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+        unsetenv("Q27_MAX_TOOL_ARG_CHARS");
+        CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+    }
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2266,6 +2316,8 @@ int main() {
     test_openai_reasoning_content_roundtrip();
     test_think_toggle_state();
     test_tool_failure_warnings();
+    test_tool_grouping();
+    test_tool_truncation();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();
