@@ -29,7 +29,10 @@ struct StreamSplitter {
     // been emitted since. The next structural opener may need an empty segment
     // to flush consumers' pending tool buffer.
     bool tool_boundary = false;
-    JsonStringLexState text_string_state;
+    // display() enables the unterminated-string-ends-at-newline rule: this
+    // state only ever answers "is this marker structural?", never "where does
+    // a rescued call begin?"
+    JsonStringLexState text_string_state=JsonStringLexState::display();
     MarkdownFenceLexState text_markdown_state;
 
     static constexpr const char* T_OPEN = "<think>";

@@ -9,6 +9,19 @@ namespace q27 {
 struct JsonStringLexState {
     bool in_string=false;
     bool escaped=false;
+    // Opt-in, DISPLAY-CLASSIFICATION ONLY (see consume()). Off by default
+    // because the drift chain synthesizes newlines while repairing dropped
+    // openers, and closing a string there would widen which repairs the
+    // parser accepts -- a rescue-boundary decision, not a display one.
+    bool close_string_at_newline=false;
+
+    // State for asking "is a marker in VISIBLE text structural?", where an
+    // unterminated quote must not disarm the rest of the turn.
+    static JsonStringLexState display() {
+        JsonStringLexState s;
+        s.close_string_at_newline=true;
+        return s;
+    }
     // Active containers use their opener. A top-level undecided opener uses
     // 'o'/'a' until the first non-space byte proves it is JSON-like.
     std::string containers;
@@ -58,6 +71,30 @@ struct JsonStringLexState {
         if(in_string) {
             if(ch=='\\') escaped=true;
             else if(ch=='"') in_string=false;
+            // A JSON string cannot contain a RAW newline -- RFC 8259 requires
+            // control characters to be escaped, so `\n` inside a string is two
+            // bytes, never one. An unescaped line break therefore proves the
+            // quote was prose (`I ran echo "---`), not the start of a JSON
+            // value, and the string must be closed here.
+            //
+            // Without this, ONE unbalanced double quote anywhere in a
+            // generation left in_string set for every byte that followed, so
+            // display_text_context_is_executable() reported "not executable"
+            // for the rest of the turn. The next genuine <tool_call> marker
+            // was then classified non-structural and emitted as VISIBLE TEXT
+            // by the guard in stream_split.h -- the call was lost and the raw
+            // marker leaked to the user. An apostrophe-free sentence quoting a
+            // shell command was enough to disarm tool calling for a whole turn.
+            //
+            // Gated on close_string_at_newline: the parser shares this lexer,
+            // and its repair paths synthesize newlines (mode 10 reconstructs a
+            // dropped opener as "...;\n{\"name\": ..."). Applying the rule
+            // there made the chain rescue a second same-line call that
+            // test_openai_bridge deliberately refuses, because an invalid call
+            // followed by a valid one on one line has an ambiguous boundary.
+            // Display classification and rescue boundaries are different
+            // questions; only the former opts in.
+            else if(close_string_at_newline && (ch=='\n' || ch=='\r')) reset_string();
             return;
         }
         if(settle_pending(ch)) return;

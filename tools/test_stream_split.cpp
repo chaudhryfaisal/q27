@@ -308,5 +308,35 @@ int main() {
                 split_pieces({"reason", "ing", "</think>", "\n\nans"},
                              Chan::THINK),
                 preseeded_want) && ok;
+
+    // An UNBALANCED double quote in prose used to leave the JSON-string lexer
+    // in_string for every byte that followed, so the next genuine <tool_call>
+    // was classified non-structural and emitted as VISIBLE TEXT: the call was
+    // lost and the raw marker leaked to the user. A JSON string cannot contain
+    // a raw newline (RFC 8259), so the quote is prose and the string ends at
+    // the line break.
+    for(bool bytewise : {false, true}) {
+        const char* how = bytewise ? " (bytewise)" : "";
+        ok = expect((std::string("unbalanced quote does not disarm the opener")+how).c_str(),
+                    compact(split(
+                        "I ran echo \"---\nnow calling.\n<tool_call>{\"a\":1}</tool_call>",
+                        bytewise)),
+                    {{Chan::TEXT, "I ran echo \"---\nnow calling.\n"},
+                     {Chan::TOOL, "{\"a\":1}"}}) && ok;
+    }
+
+    // The rule must NOT reopen the fence-skip hole: a marker quoted inside a
+    // fenced block stays visible text, unbalanced quote or not.
+    ok = expect_visible("fenced marker after an unbalanced quote stays text",
+                        "say \"hi\n```\n<tool_call>{\"a\":1}</tool_call>\n",
+                        false) && ok;
+
+    // KNOWN LIMIT, pinned so a change is deliberate: an UNCLOSED fence runs to
+    // the end of the generation, so a real call after it is still refused. The
+    // conservative direction (never execute an echoed marker) is the right
+    // default, but it does cost the turn.
+    ok = expect_visible("unclosed fence still swallows a later call (known limit)",
+                        "here:\n```\ncode\n<tool_call>{\"a\":1}</tool_call>\n",
+                        false) && ok;
     return ok ? 0 : 1;
 }
