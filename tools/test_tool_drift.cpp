@@ -1913,6 +1913,94 @@ static void test_value_containing_closer() {
     }
 }
 
+
+// THE TERMINATOR WRITTEN IN THE WRONG DIALECT (2026-08-21, from the UN-RESCUED
+// lines of the parity arm):
+//
+//   {"name": "TaskCreate", "arguments": {"subject": "Phase 1", "description": "..."}
+//   </parameter>
+//   </function>
+//   <tool_call>
+//   {"name": "TaskCreate", "arguments": {"subject": "Phase 2", ...
+//
+// The JSON body is complete except for its final `}` -- the model wrote the XML
+// closers where the brace belonged. Nothing is missing; the terminator is in the
+// other dialect.
+//
+// The EOF repair that would close those braces only fires when the candidate is
+// LAST in the text, which is right: bytes after a truncated call mean the model
+// moved on, and repairing then invents content. Measured: the same body with
+// nothing after it recovers, with prose after it does not, and with dialect
+// residue after it did not either -- which is the case that should.
+//
+// Outside a JSON string, `</parameter>`, `</function>` and `</tool_call>` can
+// never be valid JSON, so they are blanked to spaces (in place, so every source
+// offset is preserved and the spans stay valid) and the candidate becomes final.
+// Prose is NOT blanked and still blocks the repair.
+static void test_json_terminator_in_xml_dialect() {
+    json tools = json::array({tool("TaskCreate", {{"subject", true}, {"description", false}}),
+                              tool("Edit", {{"filePath", true}, {"oldString", false}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    auto body = [](const char* subj) {
+        return std::string("{\"name\": \"TaskCreate\", \"arguments\": {\"subject\": \"") + subj +
+               "\", \"description\": \"d\"}";
+    };
+
+    {
+        auto v = call(body("Phase 1") + "\n</parameter>\n</function>\n", tools);
+        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "Phase 1",
+           "xml terminator: unterminated JSON closed by XML residue recovers");
+    }
+    {
+        auto v = call(body("Phase 1") + "\n</parameter>\n</function>\n<tool_call>\n" +
+                          body("Phase 2") + "\n</parameter>\n</function>\n",
+                      tools);
+        ok(v.size() == 2 && v[0].arguments.value("subject", std::string()) == "Phase 1" &&
+               v[1].arguments.value("subject", std::string()) == "Phase 2",
+           "xml terminator: a batch of them recovers in order");
+    }
+    // ---- the refusals this must not weaken ----
+    {
+        ok(call(body("Phase 1") + "\nthat is the plan.", tools).empty(),
+           "xml terminator: PROSE after a truncated call still blocks repair");
+    }
+    {
+        // a value that legitimately contains the closer is inside a JSON
+        // string, so it must be left alone
+        auto v = call("{\"name\": \"Edit\", \"arguments\": {\"filePath\": \"/w/x\", "
+                      "\"oldString\": \"a </parameter> b\"}}",
+                      tools);
+        ok(v.size() == 1 && v[0].arguments.value("oldString", std::string()) ==
+                                "a </parameter> b",
+           "xml terminator: a closer INSIDE a JSON string is untouched");
+    }
+    {
+        // well-formed JSON is unaffected
+        auto v = call("{\"name\": \"TaskCreate\", \"arguments\": {\"subject\": \"ok\"}}", tools);
+        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "ok",
+           "xml terminator: well-formed JSON unchanged");
+    }
+    {
+        // REGRESSION GUARD, and a refusal this nearly broke. Blanking the
+        // `<tool_call>` OPENER unconditionally recovers the batch above -- and
+        // also merges an invalid call and a valid one that are separated by a
+        // bare opener, which test_chat_completions_integration refuses on
+        // purpose: that boundary is ambiguous and merging it executes a call
+        // the model never framed. The opener is only blanked when closer
+        // residue sits immediately before it, which is what tells a batch from
+        // two unrelated emissions.
+        auto v = call("{\"name\": \"first\", \"arguments\": "
+                      "<tool_call>\n{\"name\": \"TaskCreate\", \"arguments\": "
+                      "{\"subject\": \"x\"}}",
+                      tools);
+        ok(v.empty() || v.size() == 1,
+           "xml terminator: a bare opener between two calls is not a batch boundary");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1992,6 +2080,7 @@ int main() {
     test_parameter_attribute_spelling();
     test_parameter_attribute_reaches_drift_modes();
     test_value_containing_closer();
+    test_json_terminator_in_xml_dialect();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();

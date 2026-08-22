@@ -3369,6 +3369,101 @@ inline size_t find_parameter_opener(const std::string& s, size_t from,
     return std::string::npos;
 }
 
+// Blank the XML dialect's markers where they sit OUTSIDE a JSON string.
+//
+// The model sometimes terminates a JSON call body with `</parameter></function>`
+// instead of its final `}` -- the arguments are complete, the terminator is
+// simply in the other dialect. The EOF brace repair only fires when the
+// candidate is last in the text (right: bytes after a truncated call mean the
+// model moved on, and repairing then invents content), so that residue blocked
+// a call that had lost nothing.
+//
+// Outside a JSON string these tokens can never be valid JSON, so replacing them
+// with spaces cannot change any parse that already succeeded. Spaces rather than
+// deletion, so every source offset is preserved and the call spans stay valid --
+// a shifted span is how a mode-20 batch used to throw std::out_of_range out of
+// the request handler. Inside a string they are content and are left alone.
+inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
+    static const char* const kClosers[] = {"</parameter>", "</function>", "</tool_call>"};
+    std::string out = s;
+    size_t blanked_end = std::string::npos;   // end of the last blanked marker
+    bool in_str = false, esc = false;
+    for (size_t i = 0; i < out.size(); i++) {
+        const char c = out[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c != '<') continue;
+        bool hit = false;
+        for (const char* t : kClosers) {
+            const size_t n = strlen(t);
+            if (out.compare(i, n, t) == 0) {
+                for (size_t k = 0; k < n; k++) out[i + k] = ' ';
+                i += n - 1;
+                blanked_end = i + 1;
+                hit = true;
+                break;
+            }
+        }
+        if (hit) continue;
+        // The OPENER, but ONLY when it directly follows closer residue. A
+        // batch reads `...}\n</parameter>\n</function>\n<tool_call>\n{...`, and
+        // leaving the opener stopped the scan at the first call. Blanking it
+        // unconditionally is NOT safe: an invalid call followed by a valid one
+        // with a bare `<tool_call>` between them has an ambiguous boundary, and
+        // test_chat_completions_integration refuses that case ON PURPOSE --
+        // merging them would execute a call the model never framed. Requiring
+        // closer residue immediately before keeps the two apart.
+        if (out.compare(i, 11, "<tool_call>") == 0 && blanked_end != std::string::npos &&
+            out.find_first_not_of(" \t\r\n", blanked_end) == i) {
+            for (size_t k = 0; k < 11; k++) out[i + k] = ' ';
+            i += 10;
+            blanked_end = i + 1;
+        }
+    }
+    // Second pass: put the missing braces back, into the spaces the first pass
+    // just made. Only the LAST unbalanced candidate is eligible for the EOF
+    // brace repair, so a BATCH of these nested instead of separating -- object
+    // two opened inside object one and the scanner saw a single malformed blob.
+    // Writing `}` over a preceding space closes each object where the model
+    // should have, and keeps the length identical so the spans stay valid.
+    int depth = 0;
+    in_str = false;
+    esc = false;
+    for (size_t i = 0; i < out.size(); i++) {
+        const char c = out[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') {
+            // a new top-level call starting while the previous one is still
+            // open is the batch case: close the previous one first
+            if (depth > 0 && out.compare(i, 7, "{\"name\"") == 0) {
+                size_t sp = i;
+                while (sp > 0 && depth > 0 && (out[sp - 1] == ' ' || out[sp - 1] == '\n')) {
+                    if (out[sp - 1] == ' ') { out[sp - 1] = '}'; depth--; }
+                    sp--;
+                }
+            }
+            depth++;
+        } else if (c == '}') {
+            if (depth > 0) depth--;
+        }
+    }
+    // and the final one, into its trailing spaces
+    for (size_t i = out.size(); i > 0 && depth > 0; i--)
+        if (out[i - 1] == ' ') { out[i - 1] = '}'; depth--; }
+    return out;
+}
+
 // Did the model INTEND a tool call that nothing recovered? Used only for the
 // UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
 // costs a silent drop rather than a wrong call -- which is exactly what it cost:
@@ -3455,6 +3550,7 @@ inline bool hallucinated_result_around(const std::string& s, size_t begin, size_
     return false;
 }
 
+inline thread_local bool in_dialect_retry = false;
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
@@ -4680,6 +4776,26 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m8) modes[mi++] = '8';
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
+    }
+    // LAST RESORT, once: the JSON dialect with its terminator written in XML.
+    // Only reached when nothing else recovered, and only when blanking actually
+    // changes the bytes, so it cannot alter a successful parse. The recursion
+    // guard keeps it to a single retry.
+    if (out.empty() && !in_dialect_retry) {
+        const std::string blanked = blank_dialect_closers_outside_strings(text_in);
+        if (blanked != text_in) {
+            in_dialect_retry = true;
+            auto again = parse_bare_tool_calls(blanked, prefix, tools, allow_o10,
+                                               allow_eof_repair, remaining_text);
+            in_dialect_retry = false;
+            if (!again.empty()) {
+                fprintf(stderr, "[q27] drift: JSON call terminated in the XML dialect -> %zu\n",
+                        again.size());
+                return again;
+            }
+        }
+    }
+    if (!out.empty()) {
     } else if (looks_like_intended_tool_call(text_in)) {
         // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
         // mode-6 args didn't confidently match any tool). Longer window so the call
