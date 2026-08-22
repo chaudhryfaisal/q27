@@ -1729,6 +1729,65 @@ static void test_unterminated_batch_no_function_closer() {
     }
 }
 
+
+// THE ATTRIBUTE SPELLING OF A PARAMETER (2026-08-21, from the surviving misses
+// of the parity sweep):
+//
+//   <parameter name="command">ls</parameter>
+//
+// We already absorb both spellings of the FUNCTION opener -- `<function=NAME>`
+// and `<function name="NAME">` were consolidated into one grammar in 0f46684 --
+// but the parameter tag only ever accepted `<parameter=KEY>`. Same model, same
+// turn, same drift habit applied one level down, and it dropped the call.
+static void test_parameter_attribute_spelling() {
+    json tools = json::array({tool("Bash", {{"command", true}, {"description", false}}),
+                              tool("Read", {{"file_path", true}})});
+    auto xml = [](const std::string& body) {
+        q27::ToolCall tc;
+        if (!q27::parse_native_xml_call(body, tc)) return q27::ToolCall{};
+        return tc;
+    };
+    {
+        auto tc = xml("<function=Bash>\n<parameter name=\"command\">\nls -la\n</parameter>\n"
+                      "</function>");
+        ok(tc.ok && tc.name == "Bash" &&
+               tc.arguments.value("command", std::string()) == "ls -la",
+           "parameter attribute: <parameter name=\"KEY\"> resolves");
+    }
+    {
+        auto tc = xml("<function=Bash>\n<parameter name=command>\nls\n</parameter>\n</function>");
+        ok(tc.ok && tc.arguments.value("command", std::string()) == "ls",
+           "parameter attribute: the unquoted attribute form resolves");
+    }
+    {
+        // mixed spellings inside ONE call, which is what drift actually looks like
+        auto tc = xml("<function=Bash>\n<parameter=command>\nls\n</parameter>\n"
+                      "<parameter name=\"description\">\nlist files\n</parameter>\n</function>");
+        ok(tc.ok && tc.arguments.value("command", std::string()) == "ls" &&
+               tc.arguments.value("description", std::string()) == "list files",
+           "parameter attribute: mixed with the plain form in one call");
+    }
+    {
+        // the ordinary spelling must be untouched
+        auto tc = xml("<function=Read>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>");
+        ok(tc.ok && tc.arguments.value("file_path", std::string()) == "/w/x",
+           "parameter attribute: the plain form is unchanged");
+    }
+    {
+        // an empty attribute name is not a parameter
+        auto tc = xml("<function=Bash>\n<parameter name=\"\">\nx\n</parameter>\n</function>");
+        ok(!tc.ok || tc.arguments.empty() || !tc.arguments.contains(""),
+           "parameter attribute: an empty key is refused");
+    }
+    {
+        std::string pre;
+        ok(q27::parse_bare_tool_calls(
+               "the docs mention <parameter name=\"command\"> as the spelling.", &pre, &tools)
+               .empty(),
+           "parameter attribute: prose mentioning it is not a call");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1805,6 +1864,7 @@ int main() {
     test_named_opener_batch();
     test_parameter_value_fidelity();
     test_unterminated_batch_no_function_closer();
+    test_parameter_attribute_spelling();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();

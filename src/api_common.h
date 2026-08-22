@@ -2258,6 +2258,32 @@ inline bool parse_function_opener(const std::string& seg, size_t b, std::string&
     return true;
 }
 
+// Both spellings of the PARAMETER tag, mirroring parse_function_opener above:
+//   <parameter=KEY>         the trained form
+//   <parameter name="KEY">  the attribute form, quoted or not
+// The function opener absorbed both spellings in 0f46684; the parameter tag
+// only ever accepted the first, so the same drift habit one level down dropped
+// the call (2026-08-21, from the surviving misses of the parity sweep).
+inline bool parse_parameter_opener(const std::string& seg, size_t b, std::string& key,
+                                   size_t& after) {
+    if (seg.compare(b, 10, "<parameter") != 0) return false;
+    size_t i = b + 10;
+    const size_t gt = seg.find('>', i);
+    if (gt == std::string::npos) return false;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    if (seg.compare(i, 4, "name") == 0) { i += 4; while (i < gt && isspace((unsigned char)seg[i])) i++; }
+    if (i >= gt || seg[i] != '=') return false;
+    i++;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    key = seg.substr(i, gt - i);
+    while (!key.empty() && isspace((unsigned char)key.back())) key.pop_back();
+    if (key.size() >= 2 && (key.front() == '"' || key.front() == '\'') &&
+        key.back() == key.front())
+        key = key.substr(1, key.size() - 2);
+    after = gt + 1;
+    return true;
+}
+
 inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     size_t b = seg.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return false;
@@ -2320,21 +2346,34 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     }
     if (tc.name.empty()) return false;
     tc.arguments = json::object();
-    static const std::string PO = "<parameter=", PC = "</parameter>";
+    static const std::string PO = "<parameter", PC = "</parameter>";
+    // Next position at or after `from` that opens a parameter in EITHER
+    // spelling. Used for the scan and for the two later-parameter checks, so
+    // all three agree on what counts as a parameter.
+    auto next_param = [&seg](size_t from, std::string* k, size_t* aft) -> size_t {
+        for (size_t c = seg.find(PO, from); c != std::string::npos; c = seg.find(PO, c + 10)) {
+            std::string kk;
+            size_t aa;
+            if (parse_parameter_opener(seg, c, kk, aa)) {
+                if (k) *k = kk;
+                if (aft) *aft = aa;
+                return c;
+            }
+        }
+        return std::string::npos;
+    };
     while (true) {
-        size_t ps = seg.find(PO, p);
+        std::string key;
+        size_t after = 0;
+        size_t ps = next_param(p, &key, &after);
         if (ps == std::string::npos) break;
-        size_t ks = ps + PO.size();
-        size_t ke = seg.find('>', ks);
-        if (ke == std::string::npos) return false;
-        const std::string key = seg.substr(ks, ke - ks);
-        size_t vs = ke + 1;
+        size_t vs = after;
         if (vs < seg.size() && seg[vs] == '\n') vs++;
         size_t ve = seg.find(PC, vs);
         {
             // A closer that belongs to a LATER parameter is not ours: an
             // unterminated mid-stream parameter is genuine mangling, refuse.
-            size_t next_po = seg.find(PO, vs);
+            size_t next_po = next_param(vs, nullptr, nullptr);
             if (ve != std::string::npos && next_po != std::string::npos && next_po < ve)
                 return false;
         }
@@ -2347,7 +2386,7 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
             // first full suite fell through. Close at end-of-span, but only
             // for the LAST parameter: an unterminated one followed by another
             // <parameter= would be genuine mangling and still refuses.
-            if (seg.find(PO, vs) != std::string::npos) return false;
+            if (next_param(vs, nullptr, nullptr) != std::string::npos) return false;
             size_t fe = seg.find("</function>", vs);
             ve = fe == std::string::npos ? seg.size() : fe;
         }
