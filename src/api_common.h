@@ -3386,6 +3386,11 @@ inline size_t find_parameter_opener(const std::string& s, size_t from,
 inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
     static const char* const kClosers[] = {"</parameter>", "</function>", "</tool_call>"};
     std::string out = s;
+    // Only bytes WE blanked may be overwritten by the brace repair below.
+    // Writing a '}' over any convenient space corrupts real content -- it
+    // turned `"content": "hello"` into `"content":}"hello"` the first time
+    // this was written.
+    std::vector<bool> blanked(s.size(), false);
     size_t blanked_end = std::string::npos;   // end of the last blanked marker
     bool in_str = false, esc = false;
     for (size_t i = 0; i < out.size(); i++) {
@@ -3402,7 +3407,7 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
         for (const char* t : kClosers) {
             const size_t n = strlen(t);
             if (out.compare(i, n, t) == 0) {
-                for (size_t k = 0; k < n; k++) out[i + k] = ' ';
+                for (size_t k = 0; k < n; k++) { out[i + k] = ' '; blanked[i + k] = true; }
                 i += n - 1;
                 blanked_end = i + 1;
                 hit = true;
@@ -3420,7 +3425,7 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
         // closer residue immediately before keeps the two apart.
         if (out.compare(i, 11, "<tool_call>") == 0 && blanked_end != std::string::npos &&
             out.find_first_not_of(" \t\r\n", blanked_end) == i) {
-            for (size_t k = 0; k < 11; k++) out[i + k] = ' ';
+            for (size_t k = 0; k < 11; k++) { out[i + k] = ' '; blanked[i + k] = true; }
             i += 10;
             blanked_end = i + 1;
         }
@@ -3447,9 +3452,14 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
             // a new top-level call starting while the previous one is still
             // open is the batch case: close the previous one first
             if (depth > 0 && out.compare(i, 7, "{\"name\"") == 0) {
+                // Walk back over whitespace, but only WRITE into bytes we
+                // blanked: the newlines between the markers are the model's
+                // own and must stay, while the blanked marker bytes are free.
                 size_t sp = i;
-                while (sp > 0 && depth > 0 && (out[sp - 1] == ' ' || out[sp - 1] == '\n')) {
-                    if (out[sp - 1] == ' ') { out[sp - 1] = '}'; depth--; }
+                while (sp > 0 && depth > 0 &&
+                       (blanked[sp - 1] || out[sp - 1] == ' ' || out[sp - 1] == '\n' ||
+                        out[sp - 1] == '\r' || out[sp - 1] == '\t')) {
+                    if (blanked[sp - 1] && out[sp - 1] == ' ') { out[sp - 1] = '}'; depth--; }
                     sp--;
                 }
             }
@@ -3459,8 +3469,41 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
         }
     }
     // and the final one, into its trailing spaces
-    for (size_t i = out.size(); i > 0 && depth > 0; i--)
-        if (out[i - 1] == ' ') { out[i - 1] = '}'; depth--; }
+    for (size_t i = out.size(); i > 0 && depth > 0; i--) {
+        if (blanked[i - 1] && out[i - 1] == ' ') { out[i - 1] = '}'; depth--; continue; }
+        if (out[i - 1] == ' ' || out[i - 1] == '\n' || out[i - 1] == '\r' ||
+            out[i - 1] == '\t')
+            continue;                       // model whitespace: skip, do not use
+        break;                              // real content: stop, never overwrite it
+    }
+
+    // Third pass: the XML tag-closer landing inside a JSON KEY.
+    //     {"name": "Write", "arguments>
+    //     {"file_path": ..., "content": ...}
+    // The model typed `>` where JSON needs `":`, leaving the key's string
+    // unterminated so nothing downstream parses. `>` becomes the closing quote
+    // and the newline after it becomes the colon: two single-character
+    // substitutions, so no byte moves and the spans stay valid.
+    //
+    // Engages only on `"IDENT>` whose next non-space byte opens a value, which
+    // is why a '>' inside a legitimate string value is untouched -- there the
+    // key's quote already closed and we are not at a key boundary.
+    for (size_t i = 0; i + 1 < out.size(); i++) {
+        if (out[i] != '"') continue;
+        size_t j = i + 1;
+        while (j < out.size() && (isalnum((unsigned char)out[j]) || out[j] == '_')) j++;
+        if (j == i + 1 || j >= out.size() || out[j] != '>') continue;
+        const size_t nb = out.find_first_not_of(" \t\r\n", j + 1);
+        if (nb == std::string::npos || (out[nb] != '{' && out[nb] != '[' && out[nb] != '"'))
+            continue;
+        size_t colon = std::string::npos;
+        for (size_t k = j + 1; k < nb; k++)
+            if (out[k] == '\n' || out[k] == ' ') { colon = k; break; }
+        if (colon == std::string::npos) continue;   // nowhere to put the ':'
+        out[j] = '"';
+        out[colon] = ':';
+        i = nb;
+    }
     return out;
 }
 

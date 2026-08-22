@@ -2085,6 +2085,50 @@ static void test_placeholder_name_on_next_line() {
     }
 }
 
+
+// XML BLEEDING INTO THE JSON KEY (2026-08-22, live from the parity arm):
+//
+//   {"name": "Write", "arguments>
+//   {"file_path": "/workspace/src/index.ts", "content": "..."}
+//
+// The model typed `>` where JSON needs `":` -- the XML dialect's tag-closer
+// habit landing inside a JSON key. The string is left unterminated, so nothing
+// downstream parses, and this is a Write with a whole file in it.
+//
+// Repaired without moving a single byte: `>` becomes the closing quote and the
+// newline after it becomes the colon. Two single-character substitutions, so
+// every source offset is preserved and the call spans stay valid -- the same
+// constraint that governs the rest of the last-resort repair.
+static void test_xml_bleed_into_json_key() {
+    json tools = json::array({tool("Write", {{"file_path", true}, {"content", true}}),
+                              tool("Bash", {{"command", true}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    {
+        auto v = call("{\"name\": \"Write\", \"arguments>\n"
+                      "{\"file_path\": \"/w/index.ts\", \"content\": \"hello\"}",
+                      tools);
+        ok(v.size() == 1 && v[0].name == "Write" &&
+               v[0].arguments.value("file_path", std::string()) == "/w/index.ts" &&
+               v[0].arguments.value("content", std::string()) == "hello",
+           "xml bleed: \"arguments> recovers as \"arguments\":");
+    }
+    {
+        // well-formed JSON must be untouched
+        auto v = call("{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls\"}}", tools);
+        ok(v.size() == 1 && v[0].arguments.value("command", std::string()) == "ls",
+           "xml bleed: well-formed JSON unchanged");
+    }
+    {
+        // a '>' inside a legitimate string VALUE must not be rewritten
+        auto v = call("{\"name\": \"Bash\", \"arguments\": {\"command\": \"echo a > b\"}}", tools);
+        ok(v.size() == 1 && v[0].arguments.value("command", std::string()) == "echo a > b",
+           "xml bleed: a '>' inside a value is left alone");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -2166,6 +2210,7 @@ int main() {
     test_value_containing_closer();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
+    test_xml_bleed_into_json_key();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
