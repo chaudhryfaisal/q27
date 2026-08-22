@@ -84,8 +84,57 @@ static void boundaries() {
        "tool_response_text: trailing/leading whitespace trimmed, empty stays empty");
 }
 
+
+// The OpenAI path, same conversation, tools already in the trained shape. The
+// fixture deliberately gives Read's `parameters` as {type, required, properties}
+// -- an order nlohmann::json would rewrite -- so the golden proves the client's
+// order reaches the model.
+static int openai_golden() {
+    const std::string raw = slurp("tools/golden/qwen38_tools_request.openai.json");
+    const std::string want = slurp("tools/golden/qwen38_tools_request.openai.prompt");
+    if (raw.empty() || want.empty()) { fprintf(stderr, "openai fixture missing\n"); return 2; }
+    json body = json::parse(raw);
+    q27::tool_dialect_xml_default() = true;
+    q27::ToolChoice tchoice = q27::parse_tool_choice(body);
+    q27::OpenAIToolSelection selected = q27::select_openai_tools(body, tchoice);
+    q27::TemplateOpts opts = q27::template_opts_from_body(body);
+    opts.tools_decl = q27::openai_tools_decl(raw, &selected.names);
+    const std::string got = q27::chatml_prompt(q27::openai_msgs(body), selected.tools, true,
+                                               nullptr, nullptr, {}, nullptr, &opts);
+    if (got == want) { printf("openai golden: PASS (%zu bytes)\n", got.size()); return 0; }
+    size_t i = 0; while (i < got.size() && i < want.size() && got[i] == want[i]) i++;
+    printf("openai golden: FAIL at byte %zu (got %zu, want %zu)\n", i, got.size(), want.size());
+    return 1;
+}
+
+static void openai_boundaries() {
+    using q27::openai_tools_decl;
+    {   // pass-through: extra keys and client order survive, spacing is minja's
+        const std::string raw = R"({"tools":[{"type":"function","function":{"name":"A","parameters":{"b":1,"a":2},"x-extra":true}}]})";
+        ok(openai_tools_decl(raw) == "\n" R"({"type": "function", "function": {"name": "A", "parameters": {"b": 1, "a": 2}, "x-extra": true}})",
+           "openai decl: entry passed through in client order with extra keys");
+    }
+    {   // malformed entries skipped the way select_openai_tools skips them
+        const std::string raw = R"({"tools":["str",7,{"type":"function"},{"type":"function","function":{"name":""}},{"type":"function","function":{"name":"ok"}}]})";
+        const std::string d = openai_tools_decl(raw);
+        ok(d.find("\"ok\"") != std::string::npos && d.find("\"str\"") == std::string::npos &&
+               d.find("\"name\": \"\"") == std::string::npos,
+           "openai decl: non-objects, nameless and empty-name entries skipped");
+    }
+    {   // keep restricts without reordering
+        const std::string raw = R"({"tools":[{"type":"function","function":{"name":"A"}},{"type":"function","function":{"name":"B"}},{"type":"function","function":{"name":"C"}}]})";
+        std::vector<std::string> keep = {"C", "A"};
+        const std::string d = openai_tools_decl(raw, &keep);
+        ok(d.find("\"B\"") == std::string::npos && d.find("\"A\"") < d.find("\"C\""),
+           "openai decl: keep filters to the selection, client order kept");
+    }
+    ok(openai_tools_decl("nope").empty() && openai_tools_decl(R"({"tools":{}})").empty(),
+       "openai decl: garbage / wrong type -> empty");
+}
+
 int main() {
     boundaries();
+    openai_boundaries();
     if (fails) { printf("template golden: %d boundary FAILURE(S)\n", fails); return 1; }
     const std::string raw = slurp("tools/golden/qwen38_tools_request.anthropic.json");
     const std::string want = slurp("tools/golden/qwen38_tools_request.prompt");
@@ -98,7 +147,7 @@ int main() {
     const json tools = q27::anthropic_tools_json(body);
     const std::string got = q27::chatml_prompt(q27::anthropic_msgs(body), tools, /*think=*/true,
                                                nullptr, nullptr, {}, nullptr, &opts);
-    if (got == want) { printf("template golden: PASS (%zu bytes)\n", got.size()); return 0; }
+    if (got == want) { printf("template golden: PASS (%zu bytes)\n", got.size()); return openai_golden(); }
     // first differing byte, with context, so a failure is diagnosable
     size_t i = 0; while (i < got.size() && i < want.size() && got[i] == want[i]) i++;
     printf("template golden: FAIL at byte %zu (got %zu bytes, want %zu)\n", i, got.size(), want.size());

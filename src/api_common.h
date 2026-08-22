@@ -575,6 +575,36 @@ inline std::string anthropic_tools_decl(const std::string& raw_body,
     return out;
 }
 
+// The <tools> declaration lines for an OpenAI-shaped request. Entries are
+// already in the trained shape, so each accepted one is passed through
+// VERBATIM in the client's key order -- that is what minja's `tool | tojson`
+// renders, extra keys included -- rather than rebuilt the way
+// openai_tools_json() rebuilds them for tool_choice/grammar use. Acceptance is
+// openai_tools_json's rule exactly, so the declaration and `selected.tools`
+// list the same entries in the same order; `keep` applies the tool_choice
+// subset without reordering.
+inline std::string openai_tools_decl(const std::string& raw_body,
+                                     const std::vector<std::string>* keep = nullptr) {
+    nlohmann::ordered_json body;
+    try { body = nlohmann::ordered_json::parse(raw_body); } catch (...) { return ""; }
+    if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array()) return "";
+    std::string out;
+    for (const auto& t : body["tools"]) {
+        if (!t.is_object() || !t.contains("type") || !t["type"].is_string() ||
+            t["type"] != "function") continue;
+        if (!t.contains("function") || !t["function"].is_object()) continue;
+        const auto& fn = t["function"];
+        if (!fn.contains("name") || !fn["name"].is_string() ||
+            fn["name"].get_ref<const std::string&>().empty()) continue;
+        if (fn.contains("description") && !fn["description"].is_string()) continue;
+        if (fn.contains("parameters") && !fn["parameters"].is_object()) continue;
+        const std::string name = fn["name"].get<std::string>();
+        if (keep && std::find(keep->begin(), keep->end(), name) == keep->end()) continue;
+        out += "\n" + strip_ctrl(ordered_dump_spaced(t));
+    }
+    return out;
+}
+
 inline std::string tools_preamble(const json& tools, const std::string& decl = std::string()) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-

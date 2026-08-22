@@ -1907,7 +1907,10 @@ int main(int argc, char** argv) {
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0, sys_off = 0;
-            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            // client key order survives only in the raw text; restrict to the
+            // tool_choice selection so the declaration matches `tools`.
+            topts.tools_decl=q27::openai_tools_decl(req.body,&tool_names_v);
             std::string rendered =
                 q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
             // P16b: token length of the system+tools block. Measured with a
