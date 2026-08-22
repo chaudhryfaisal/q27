@@ -291,8 +291,10 @@ inline bool tool_dialect_xml() {
 // off (legacy pre-2026-08-15 rendering, for A/Bs) -- overrides either way.
 // think-effort level: 0 = medium/off (no instruction line), 1 = low, 2 = xhigh.
 inline int reasoning_effort_env_level() {
+    // froggeric v22.3: the safe default is medium (zero injected tokens) to
+    // avoid burning the reasoning budget; xhigh/low must be explicitly set.
     const char* e = getenv("Q27_REASONING_EFFORT");
-    const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
+    const std::string v = e ? e : "medium";
     if (v == "low" || v == "minimal") return 1;
     if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
     return 0; // medium / off / none / unknown
@@ -321,6 +323,7 @@ struct TemplateOpts {
     int effort = -1;
     bool auto_disable_thinking_with_tools = false;
     int tool_format = -1;
+    bool force_disable_thinking = false; // reasoning_effort = none/off
 };
 inline int effort_string_level(std::string v) {
     for (auto& c : v) c = (char)tolower((unsigned char)c);
@@ -331,8 +334,13 @@ inline int effort_string_level(std::string v) {
 inline TemplateOpts template_opts_from_body(const json& body) {
     TemplateOpts o;
     auto read = [&](const json& b) {
-        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string())
-            o.effort = effort_string_level(b["reasoning_effort"].get<std::string>());
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            const std::string ev = b["reasoning_effort"].get<std::string>();
+            std::string el = ev;
+            for (auto& c : el) c = (char)tolower((unsigned char)c);
+            if (el == "none" || el == "off") o.force_disable_thinking = true; // item 2
+            o.effort = effort_string_level(ev);
+        }
         if (b.contains("auto_disable_thinking_with_tools") && b["auto_disable_thinking_with_tools"].is_boolean())
             o.auto_disable_thinking_with_tools = b["auto_disable_thinking_with_tools"].get<bool>();
         if (b.contains("tool_call_format") && b["tool_call_format"].is_string()) {
@@ -566,6 +574,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     bool base_think = think;
     if (opts && opts->auto_disable_thinking_with_tools && tools.is_array() && !tools.empty())
         base_think = false;
+    if (opts && opts->force_disable_thinking) base_think = false; // reasoning_effort none/off
     const ThinkToggles tt = scan_think_toggles(msgs, base_think, opts ? opts->effort : -1);
     const std::string effort = tt.thinking ? reasoning_effort_line_level(tt.effort)
                                            : std::string();
