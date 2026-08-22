@@ -56,7 +56,7 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 .PHONY: test-tools
 test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
             build/test_chat_completions_integration build/test_think_resolve \
-            build/test_stream_split build/test_toolconstrain
+            build/test_stream_split build/test_toolconstrain build/test_template_golden
 	./build/test_tool_drift
 	Q27_TOOL_STRICT=1 ./build/test_tool_drift
 	./build/test_tool_drift_corpus
@@ -65,6 +65,7 @@ test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai
 	./build/test_think_resolve
 	./build/test_stream_split
 	./build/test_toolconstrain
+	./build/test_template_golden
 
 build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
@@ -74,6 +75,9 @@ build/test_chat_completions_integration: tools/test_chat_completions_integration
 
 build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
+
+build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
 
 build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@

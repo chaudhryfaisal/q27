@@ -350,6 +350,12 @@ struct TemplateOpts {
     // Q27_TOOL_ERROR_WARNINGS=1 flips the boot default on, and the
     // per-request tool_error_warnings field overrides either way.
     bool tool_error_warnings = tool_error_warnings_env_default();
+    // Pre-rendered <tools> declaration lines in the CLIENT's key order with the
+    // template's spacing (see anthropic_tools_decl). nlohmann::json sorts keys,
+    // so without this the model sees {"function":{"description",...,"name"},
+    // "type"} where its training data has {"type": "function", "function":
+    // {"name", "description", "parameters"}}. Empty = legacy sorted dump.
+    std::string tools_decl;
 };
 inline int effort_string_level(std::string v) {
     for (auto& c : v) c = (char)tolower((unsigned char)c);
@@ -515,27 +521,96 @@ inline std::string tool_response_warning(int failures) {
            "error. Diagnose the failure and retry with completely corrected "
            "arguments.";
 }
-inline std::string tools_preamble(const json& tools) {
+// Serialize in insertion order with the chat template's spacing: `": "` and
+// `", "`, no newlines. This is what minja's `tojson` emits (captured from a
+// running llama-server via /apply-template, 2026-08-22, and byte-identical to
+// Python jinja2's). nlohmann's dump() has compact or indented, neither of
+// which is this. Strings go through dump() so escaping matches.
+inline std::string ordered_dump_spaced(const nlohmann::ordered_json& v) {
+    if (v.is_object()) {
+        std::string s = "{"; bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!first) s += ", ";
+            first = false;
+            s += json(it.key()).dump() + ": " + ordered_dump_spaced(it.value());
+        }
+        return s + "}";
+    }
+    if (v.is_array()) {
+        std::string s = "["; bool first = true;
+        for (const auto& e : v) { if (!first) s += ", "; first = false; s += ordered_dump_spaced(e); }
+        return s + "]";
+    }
+    return v.dump();
+}
+
+// The <tools> declaration lines for an Anthropic request, from the RAW body so
+// the client's key order survives (the parsed `json` has already sorted it).
+// Same acceptance rule as anthropic_tools_json: string, non-empty name; missing
+// description -> ""; missing/non-object input_schema -> {}. `keep`, when given,
+// restricts to those names (tool_choice selection) without reordering. Each
+// line is strip_ctrl'd like the legacy dump: descriptions are caller-authored.
+inline std::string anthropic_tools_decl(const std::string& raw_body,
+                                        const std::vector<std::string>* keep = nullptr) {
+    nlohmann::ordered_json body;
+    try { body = nlohmann::ordered_json::parse(raw_body); } catch (...) { return ""; }
+    if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array()) return "";
+    std::string out;
+    for (const auto& t : body["tools"]) {
+        if (!t.is_object() || !t.contains("name") || !t["name"].is_string()) continue;
+        const std::string name = t["name"].get<std::string>();
+        if (name.empty()) continue;
+        if (keep && std::find(keep->begin(), keep->end(), name) == keep->end()) continue;
+        nlohmann::ordered_json fn;
+        fn["name"] = name;
+        fn["description"] = (t.contains("description") && t["description"].is_string())
+                                ? t["description"].get<std::string>() : std::string();
+        fn["parameters"] = (t.contains("input_schema") && t["input_schema"].is_object())
+                               ? t["input_schema"] : nlohmann::ordered_json::object();
+        nlohmann::ordered_json entry;
+        entry["type"] = "function";
+        entry["function"] = fn;
+        out += "\n" + strip_ctrl(ordered_dump_spaced(entry));
+    }
+    return out;
+}
+
+inline std::string tools_preamble(const json& tools, const std::string& decl = std::string()) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-
     // authored) description strings -- same forgery surface as message
-    // content (review 2026-07-09 P1 #5)
-    for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
+    // content (review 2026-07-09 P1 #5). `decl` is the client-ordered,
+    // template-spaced rendering (already strip_ctrl'd); the sorted dump is
+    // the fallback for callers that have no raw body (Metal, OpenAI path).
+    if (!decl.empty()) s += decl;
+    else for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
     s += "\n</tools>\n\n";
-    if (tool_dialect_xml())
-        s += "For each function call, emit it inside <tool_call></tool_call> tags "
-             "using this exact format with NO suffix:\n\n<tool_call>\n"
-             "<function=example_function_name>\n"
+    if (tool_dialect_xml()) {
+        // The template's text, verbatim (tools/golden/qwen38_tools_request.prompt).
+        // The earlier paraphrase dropped the nesting reminder -- the one rule
+        // every drift shape of 2026-08-20/21 violated -- and we parsed around
+        // that downstream for two days without checking the prompt stated it.
+        s += "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+             "<tool_call>\n<function=example_function_name>\n"
              "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-             "<parameter=example_parameter_2>\nmulti-line values are\nallowed\n</parameter>\n"
-             "</function>\n</tool_call>\n\n<IMPORTANT>\n";
-    else
+             "<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+             "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+             "<IMPORTANT>\nReminder:\n"
+             "- Function calls MUST follow the specified format: an inner <function=...></function> "
+             "block must be nested within <tool_call></tool_call> XML tags\n"
+             "- Required parameters MUST be specified\n"
+             "- You may provide optional reasoning for your function call in natural language "
+             "BEFORE the function call, but NOT after\n"
+             "- If there is no function call available, answer the question like normal with your "
+             "current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+    } else {
         s += "For each function call, return a JSON object with the function name "
              "and arguments inside <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": "
-             "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n";
-    s += "- Required parameters MUST be specified.\n- You may provide optional reasoning "
-         "before the function call, but never after it.\n- If no function call is needed, "
-         "answer normally and do not mention the tool interface.\n</IMPORTANT>";
+             "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n"
+             "- Required parameters MUST be specified.\n- You may provide optional reasoning "
+             "before the function call, but never after it.\n- If no function call is needed, "
+             "answer normally and do not mention the tool interface.\n</IMPORTANT>";
+    }
     return s;
 }
 
@@ -618,7 +693,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
             need_separator=true;
         };
         append_system_part(effort);
-        if (has_tools) append_system_part(tools_preamble(tools));
+        if (has_tools) append_system_part(tools_preamble(tools, opts ? opts->tools_decl : std::string()));
         if (has_unavailable)
             append_system_part(unavailable_tools_preamble(*unavailable_tools));
         append_system_part(sys);
@@ -772,6 +847,12 @@ inline std::string tool_response_text(const std::string& out,
     if (tool_dialect_xml() && max_response_chars > 0 && (long)o.size() > max_response_chars)
         o = o.substr(0, (size_t)max_response_chars) + "\n[TRUNCATED - original length " +
             std::to_string(o.size()) + " chars]";
+    // The template runs every message's content through |trim. A tool result
+    // ending in "\n" otherwise renders a blank line inside <tool_response>
+    // that llama.cpp does not (golden test).
+    const size_t a = o.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) o.clear();
+    else o = o.substr(a, o.find_last_not_of(" \t\r\n") - a + 1);
     return "<tool_response>\n" + o + "\n</tool_response>";
 }
 

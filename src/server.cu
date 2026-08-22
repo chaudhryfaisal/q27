@@ -2537,7 +2537,7 @@ int main(int argc, char** argv) {
                                          bool& thinking,
                                          q27::ThinkCfg& tcfg,
                                          size_t* stable_off,
-                                         size_t* sys_off) {
+                                         size_t* sys_off, const std::string* raw_body) {
         tchoice=q27::parse_anthropic_tool_choice(body);
         json all_tools=q27::anthropic_tools_json(body);
         json normalized={{"tools",all_tools}};
@@ -2554,7 +2554,10 @@ int main(int argc, char** argv) {
             thinking=false;
             tcfg=q27::ThinkCfg{false,-1,false,true};
         }
-        const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        // client key order survives only in the raw text (the parsed json is
+        // sorted); restrict to the selected subset so decl matches `tools`.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
             q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
@@ -2584,7 +2587,7 @@ int main(int argc, char** argv) {
         std::string rendered;
         try {
             rendered=prepare_anthropic_prompt(
-                body,tchoice,tools,tool_names,thinking,tcfg,nullptr,nullptr);
+                body,tchoice,tools,tool_names,thinking,tcfg,nullptr,nullptr,&req.body);
         } catch(const std::exception& e) {
             anthropic_400(res,e.what());
             return;
@@ -2609,7 +2612,7 @@ int main(int argc, char** argv) {
         std::string rendered;
         try {
             rendered=prepare_anthropic_prompt(
-                body,tchoice,tools,tool_names_v,thinking,tcfg,&stable_off,&sys_off);
+                body,tchoice,tools,tool_names_v,thinking,tcfg,&stable_off,&sys_off,&req.body);
         } catch(const std::exception& e) {
             anthropic_400(res,e.what());
             return;
