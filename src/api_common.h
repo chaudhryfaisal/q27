@@ -3107,6 +3107,95 @@ inline size_t bare_unresolved_inline_probe_start(
         ?0:std::string::npos;
 }
 
+// A bare native-dialect opener in streamed TEXT. The splitter routes a
+// <tool_call>-wrapped call to TOOL, so any <function= that reaches the text
+// holdback has no wrapper: the model dropped the opener (Qwen3-Coder does
+// this; llama.cpp's grammar comments say so, and its grammar cannot emit the
+// shape, which is why the 2026-08-22 leftover count was 0/293 there and
+// 11/498 here). Same display-context rule as bare_object_position: a fenced
+// or inline-code mention is prose.
+inline const char* const BARE_NATIVE_OPENER="<function=";
+inline size_t bare_native_opener_position(const std::string& text,
+                                          JsonStringLexState string_state={},
+                                          MarkdownFenceLexState fence_state={},
+                                          bool end_is_final=true) {
+    const size_t n=std::char_traits<char>::length(BARE_NATIVE_OPENER);
+    for(size_t i=0;i<text.size();i++) {
+        if(text[i]=='<' && text.compare(i,n,BARE_NATIVE_OPENER)==0 &&
+           bare_context_is_executable(
+               text,i,string_state,fence_state,end_is_final)) return i;
+        consume_bare_text_context(string_state,fence_state,text[i]);
+    }
+    return std::string::npos;
+}
+// Start of the longest suffix that can still become "<function=", so a chunk
+// boundary inside the opener does not leak its head as visible text.
+inline size_t bare_native_opener_probe_start(
+    const std::string& text,JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={}) {
+    const size_t n=std::char_traits<char>::length(BARE_NATIVE_OPENER);
+    const size_t cap=std::min(text.size(),n-1);
+    for(size_t len=cap;len;--len) {
+        const size_t start=text.size()-len;
+        if(text.compare(start,len,BARE_NATIVE_OPENER,len)!=0) continue;
+        if(!bare_text_position_is_executable(
+               text,start,string_state,fence_state,false))
+            return std::string::npos;
+        return start;
+    }
+    return std::string::npos;
+}
+// End of a bare native-dialect candidate: the first </function> that closes
+// a parameter (or an empty call), plus one stray </tool_call> right after it.
+// A </function> inside a value is preceded by value bytes, not </parameter>,
+// so it does not end the call -- the same boundary the parser's value-closer
+// search keeps. npos while the candidate is still open, including while the
+// bytes after the closer could still become </tool_call>.
+struct IncrementalBareNativeEnd {
+    size_t cursor=0;
+    void begin() { cursor=0; }
+    static bool closes_call(const std::string& text,size_t closer) {
+        size_t b=closer;
+        while(b>0 && (text[b-1]==' ' || text[b-1]=='\t' ||
+                      text[b-1]=='\r' || text[b-1]=='\n')) b--;
+        static const std::string PC="</parameter>";
+        if(b>=PC.size() && text.compare(b-PC.size(),PC.size(),PC)==0)
+            return true;
+        const size_t gt=text.find('>');
+        return gt!=std::string::npos && gt+1==b &&
+               text.find("<parameter=")==std::string::npos;
+    }
+    size_t advance(const std::string& text,bool final) {
+        static const std::string FC="</function>",TC="</tool_call>";
+        for(size_t p=text.find(FC,cursor);p!=std::string::npos;
+            p=text.find(FC,p+1)) {
+            if(!closes_call(text,p)) continue;
+            size_t e=p+FC.size();
+            size_t q=e;
+            while(q<text.size() && (text[q]==' ' || text[q]=='\t' ||
+                                    text[q]=='\r' || text[q]=='\n')) q++;
+            const size_t avail=text.size()-q;
+            if(avail>=TC.size()) {
+                if(text.compare(q,TC.size(),TC)==0) e=q+TC.size();
+            } else if(!final && text.compare(q,avail,TC,0,avail)==0) {
+                return std::string::npos;
+            }
+            return e;
+        }
+        cursor=text.size()>=FC.size()?text.size()-FC.size()+1:0;
+        return std::string::npos;
+    }
+};
+// First </function> in [from, end) that closes a call (see
+// IncrementalBareNativeEnd::closes_call); npos when none does. Callers fall
+// back to the first literal closer so a call missing its </parameter> still
+// bounds where it always did; only a closer INSIDE a value moves.
+inline size_t native_function_closer(const std::string& text,size_t from=0) {
+    static const std::string FC="</function>";
+    for(size_t p=text.find(FC,from);p!=std::string::npos;p=text.find(FC,p+1))
+        if(IncrementalBareNativeEnd::closes_call(text,p)) return p;
+    return std::string::npos;
+}
 // Return the byte after the first balanced top-level object, or npos while
 // the candidate is incomplete. Braces inside JSON strings do not count.
 struct IncrementalBareJsonEnd {
@@ -3244,7 +3333,9 @@ struct BareToolTextHoldback {
     bool input_final=false;
     bool input_allow_repair=false;
     bool ordinary_call_seen=false;
+    bool native=false; // holding a wrapper-less <function=...> candidate
     IncrementalBareJsonEnd scan;
+    IncrementalBareNativeEnd native_scan;
     JsonStringLexState string_state;
     MarkdownFenceLexState fence_state;
 
@@ -3275,6 +3366,7 @@ struct BareToolTextHoldback {
         pending.clear();
         holding=false;
         mode10=false;
+        native=false;
         string_state.reset();
         return !result.parsed && defer_failure;
     }
@@ -3299,9 +3391,11 @@ struct BareToolTextHoldback {
                 const size_t mode10_pos=ordinary_call_seen?std::string::npos:
                     bare_mode10_signature_position(
                         remaining,names,string_state,fence_state,input_final);
-                const size_t opener=object_pos==std::string::npos?mode10_pos:
-                    mode10_pos==std::string::npos?object_pos:
-                    std::min(object_pos,mode10_pos);
+                const size_t native_pos=bare_native_opener_position(
+                    remaining,string_state,fence_state,input_final);
+                size_t opener=object_pos;
+                if(mode10_pos<opener) opener=mode10_pos;
+                if(native_pos<opener) opener=native_pos;
                 if(opener==std::string::npos) {
                     size_t keep=input_final || ordinary_call_seen?std::string::npos:
                         bare_mode10_probe_start(
@@ -3312,6 +3406,11 @@ struct BareToolTextHoldback {
                         if(inline_keep!=std::string::npos)
                             keep=keep==std::string::npos?inline_keep:
                                  std::min(keep,inline_keep);
+                        const size_t native_keep=bare_native_opener_probe_start(
+                            remaining,string_state,fence_state);
+                        if(native_keep!=std::string::npos)
+                            keep=keep==std::string::npos?native_keep:
+                                 std::min(keep,native_keep);
                     }
                     if(keep==std::string::npos) emit_visible(remaining,emit_text);
                     else {
@@ -3324,10 +3423,11 @@ struct BareToolTextHoldback {
                 pending=remaining.substr(opener);
                 holding=true;
                 mode10=mode10_pos==opener;
-                scan.begin(mode10);
+                native=!mode10 && object_pos!=opener && native_pos==opener;
+                if(native) native_scan.begin(); else scan.begin(mode10);
                 remaining.clear();
             }
-            if(!mode10 && !plausible_bare_tool_prefix(pending)) {
+            if(!mode10 && !native && !plausible_bare_tool_prefix(pending)) {
                 std::string retry=std::move(pending);
                 pending.clear();
                 holding=false;
@@ -3335,11 +3435,22 @@ struct BareToolTextHoldback {
                 remaining=retry.substr(1);
                 continue;
             }
-            const size_t end=scan.advance(pending);
+            const size_t end=native?native_scan.advance(pending,input_final)
+                                   :scan.advance(pending);
             if(end==std::string::npos) return;
             std::string trailing=pending.substr(end);
             pending.resize(end);
-            const bool defer_failure=!input_final &&
+            if(native) {
+                // the scanner swallowed a stray </tool_call> so it would not
+                // surface as prose; the candidate itself has no wrapper
+                static const std::string TC="</tool_call>";
+                size_t b=pending.size();
+                while(b>0 && (pending[b-1]==' ' || pending[b-1]=='\t' ||
+                              pending[b-1]=='\r' || pending[b-1]=='\n')) b--;
+                if(b>=TC.size() && pending.compare(b-TC.size(),TC.size(),TC)==0)
+                    pending.resize(b-TC.size());
+            }
+            const bool defer_failure=!input_final && !native &&
                 bare_candidate_repair_eligible(pending,names,mode10);
             if(flush_candidate(input_final && input_allow_repair,
                                emit_text,emit_candidate,defer_failure)) {
@@ -4445,7 +4556,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 }
                 if (fb == std::string::npos) break;
                 std::string span = text_in.substr(fb);
-                const size_t fe = span.find("</function>");
+                size_t fe = native_function_closer(span);
+                if (fe == std::string::npos) fe = span.find("</function>");
                 size_t span_end = text_in.size();
                 if (fe != std::string::npos) {
                     span = span.substr(0, fe + 11);
@@ -4631,7 +4743,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (after == std::string::npos ||
                     text_in.compare(after, 11, "<parameter=") != 0)
                     continue;
-                size_t end = text_in.find("</function>", after);
+                size_t end = native_function_closer(text_in, after);
+                if (end == std::string::npos) end = text_in.find("</function>", after);
                 size_t alt = text_in.find(TN, after);
                 if (end == std::string::npos || (alt != std::string::npos && alt < end))
                     end = alt == std::string::npos ? text_in.size() : alt;
@@ -4699,7 +4812,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         {
             size_t ps = find_parameter_opener(text_in, 0);
             size_t fe = ps == std::string::npos ? std::string::npos
-                                                : text_in.find("</function>", ps);
+                                                : native_function_closer(text_in, ps);
+            if (ps != std::string::npos && fe == std::string::npos)
+                fe = text_in.find("</function>", ps);
             if (fe != std::string::npos) {
                 // Scoped hallucinated-result guard (2026-08-21). The span is
                 // [ps, fe+11) -- the parameter list itself. A <result>/<output>

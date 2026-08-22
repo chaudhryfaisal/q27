@@ -78,9 +78,26 @@ boot() { # $1 = effort arm
   echo "[$1] BOOT TIMEOUT" >&2; return 1
 }
 
+# Q27_EXPECT_WSUM: the digest the tier's clean load prints. Set it and a load
+# that prints anything else is torn down and retried (3 loads) instead of being
+# measured -- the 2026-08-22 fp16 arm ran two whole tasks on an af43... load
+# (2^59 off the modal b743...) before anyone read the line the harness had
+# already echoed. Printing the digest is not a gate; this is.
+boot_verified() { # $1 = effort arm
+  local try w
+  for try in 1 2 3; do
+    boot "$1" || return 1
+    [ -z "${Q27_EXPECT_WSUM:-}" ] && return 0
+    w=$(journalctl --user -u "$UNIT" --no-pager --since "-10min" 2>/dev/null         | grep -io "wsum: [0-9a-f]*" | tail -1 | awk '{print $2}')
+    [ "$w" = "$Q27_EXPECT_WSUM" ] && return 0
+    echo "[$1] load $try: wsum=$w != expected $Q27_EXPECT_WSUM -- discarding this load" >&2
+  done
+  echo "[$1] three loads off the expected digest; giving up on this arm" >&2; return 1
+}
+
 for ARM in $ARMS; do
   echo ""; echo "################ ARM effort=$ARM ################"
-  boot "$ARM" || continue
+  boot_verified "$ARM" || continue
   # prove the arm actually reached the process rather than trusting the launch.
   # $ARM, not $1: at this scope $1 is the script's outdir, and a path full of
   # slashes inside an s/// replacement is how the first version of this line

@@ -2159,6 +2159,122 @@ static void test_bare_tool_stream_holdback_bounds() {
     CHECK(named_json_visible==named_json+" tail");
 }
 
+// 2026-08-22: the fp16-KV agentic arm lost 11 calls in 498 messages to ONE
+// shape. The model omits the <tool_call> opener on the last call of a batch
+// (or on a lone call after prose), writes a complete <function=...></function>
+// and stops. The splitter never sees a wrapper, so the bytes reach
+// BareToolTextHoldback as TEXT, and the holdback only knew JSON-object and
+// mode-10 openers: the call streamed to the client verbatim, classify never
+// ran, nothing was logged. The non-stream path recovers the same bytes via
+// mode 17. llama.cpp is grammar-constrained and cannot emit the shape: 0/293
+// messages on the same tasks. 9 of the 11 cost the last call of a batch; the
+// other 2 were the only call in the turn, Claude Code took the text as the
+// final answer, and the trial ended at turn 3.
+static void test_bare_tool_stream_holdback_native_xml() {
+    json body=json::parse(R"({"tools":[
+        {"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}},
+        {"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}}}}]})");
+    const json tools=q27::anthropic_tools_json(body);
+    const std::set<std::string> names={"Read","Bash"};
+    struct Run { std::string visible; std::vector<q27::ToolCall> calls; int classified=0; };
+    auto drive=[&](const std::vector<std::string>& pieces,bool boundary_before) {
+        Run r;
+        q27::BareToolTextHoldback hb;
+        auto emit=[&](const std::string& t) { r.visible+=t; };
+        auto classify=[&](const std::string& source,bool allow_repair,auto&& visible) {
+            r.classified++;
+            std::string prefix,residual;
+            auto calls=q27::parse_bare_tool_calls(
+                source,&prefix,&tools,true,allow_repair,&residual);
+            if(calls.empty()) return q27::BareToolCandidateResult{};
+            size_t cursor=0;
+            for(auto& c:calls) {
+                visible(source.substr(cursor,c.source_begin-cursor));
+                cursor=c.source_end;
+                r.calls.push_back(c);
+            }
+            visible(source.substr(cursor));
+            return q27::BareToolCandidateResult{true,true};
+        };
+        // the server calls finish(false)+reset_context() at every TOOL boundary
+        if(boundary_before) { hb.finish(false,names,emit,classify); hb.reset_context(); }
+        for(auto& p:pieces) hb.route(p,names,emit,classify);
+        hb.finish(true,names,emit,classify);
+        return r;
+    };
+    auto bytes=[](const std::string& s,size_t n) {
+        std::vector<std::string> v;
+        for(size_t i=0;i<s.size();i+=n) v.push_back(s.substr(i,n));
+        return v;
+    };
+    const std::string fifth=
+        "\n<function=Read>\n<parameter=file_path>\n/workspace/TASK.md\n</parameter>\n</function>\n";
+    // (a) the live shape: last call of a batch, right after a wrapped call
+    for(size_t n:{1,4,4096}) {
+        auto r=drive(bytes(fifth,n),true);
+        CHECK(r.calls.size()==1 && r.calls[0].name=="Read" &&
+              r.calls[0].arguments.value("file_path",std::string())=="/workspace/TASK.md");
+        CHECK(q27::strip_ws2(r.visible).empty());
+    }
+    // (b) prose, then a lone bare call: the prose streams, the call executes
+    const std::string bash=
+        "\n\nLet me look at the existing source.\n\n<function=Bash>\n<parameter=command>\n"
+        "ls -la /workspace/src/ && echo \"exit: $?\"\n</parameter>\n<parameter=description>\n"
+        "Check src\n</parameter>\n</function>\n";
+    for(size_t n:{1,7,4096}) {
+        auto r=drive(bytes(bash,n),false);
+        CHECK(r.calls.size()==1 && r.calls[0].name=="Bash");
+        CHECK(r.calls.size()==1 && r.calls[0].arguments.value("command",std::string())==
+              "ls -la /workspace/src/ && echo \"exit: $?\"");
+        CHECK(q27::strip_ws2(r.visible)=="Let me look at the existing source.");
+    }
+    // (c) a fenced example is displayed, never executed
+    const std::string fenced=
+        "Use it like this:\n```\n<function=Read>\n<parameter=file_path>\nx\n</parameter>\n</function>\n```\ndone\n";
+    { auto r=drive(bytes(fenced,3),false); CHECK(r.calls.empty() && r.visible==fenced); }
+    // (d) an inline-code mention is displayed
+    const std::string inlined="call `<function=Read>` to read\n";
+    { auto r=drive(bytes(inlined,2),false); CHECK(r.calls.empty() && r.visible==inlined); }
+    // (e) </function> inside a value does not end the call early
+    const std::string nested=
+        "<function=Bash>\n<parameter=command>\necho '</function>' > f\n</parameter>\n</function>\n";
+    {
+        auto r=drive(bytes(nested,5),false);
+        CHECK(r.calls.size()==1 &&
+              r.calls[0].arguments.value("command",std::string())=="echo '</function>' > f");
+        CHECK(q27::strip_ws2(r.visible).empty());
+    }
+    // (f) prose after the call keeps streaming
+    {
+        auto r=drive(bytes(fifth+"Reading the task next.\n",4),true);
+        CHECK(r.calls.size()==1);
+        CHECK(q27::strip_ws2(r.visible)=="Reading the task next.");
+    }
+    // (g) two bare calls back to back
+    {
+        auto r=drive(bytes(fifth+"<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>\n",4),true);
+        CHECK(r.calls.size()==2 && r.calls[1].name=="Bash");
+        CHECK(q27::strip_ws2(r.visible).empty());
+    }
+    // (h) a stray </tool_call> after a bare call is swallowed with it
+    {
+        auto r=drive(bytes(fifth+"</tool_call>\n",4),true);
+        CHECK(r.calls.size()==1);
+        CHECK(r.visible.find("</tool_call>")==std::string::npos);
+    }
+    // (i) a half-written opener at EOS is shown, not executed
+    {
+        auto r=drive(bytes("\n<function=Re",2),true);
+        CHECK(r.calls.empty() && r.visible=="\n<function=Re");
+    }
+    // (j) JSON bare calls still work exactly as before
+    {
+        auto r=drive(bytes("\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/a\"}}\n",3),false);
+        CHECK(r.calls.size()==1 && r.calls[0].name=="Read");
+        CHECK(q27::strip_ws2(r.visible).empty());
+    }
+}
+
 static void test_ordered_tool_segments_preserve_first_call_and_rejected_text() {
     json tools=json::parse(R"([
       {"type":"function","function":{"name":"first","parameters":{
@@ -2591,6 +2707,7 @@ int main() {
     test_tool_streamer_can_refuse_tail_repair();
     test_bare_tool_parser_can_refuse_eof_repair();
     test_bare_tool_stream_holdback_bounds();
+    test_bare_tool_stream_holdback_native_xml();
     test_ordered_tool_segments_preserve_first_call_and_rejected_text();
     test_tool_streamer_marks_invalid_completed_args();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }

@@ -12,6 +12,9 @@ it is engine-agnostic and needs no server-side cooperation:
     executed   turn carried >=1 tool_use block
     MISSED     turn carried dialect markup in its TEXT and no tool_use --
                the model tried to call something and the bytes reached the user
+    PART       turn carried >=1 tool_use AND dialect markup in its TEXT: the
+               last call of a batch reached the user as text (2026-08-22;
+               not in the success rate, reported beside it)
     prose      neither: an ordinary answer
 
     success = executed / (executed + MISSED)
@@ -104,6 +107,13 @@ def walk_transcript(path, st):
         if rec["calls"]:
             st["executed"] += 1
             st["calls"] += rec["calls"]
+            # 2026-08-22: a turn can execute N calls AND leave one more as
+            # text (the model drops <tool_call> on the last call of a batch
+            # and the stream path let it through). Counting only call-less
+            # turns as misses hid 9 of the 11 losses in the fp16 arm.
+            if MARKUP.search(executable_text(rec["text"])):
+                st["partial"] += 1
+                dump_miss(rec["text"], path)
         elif MARKUP.search(executable_text(rec["text"])):
             # truncation is a different loss from a parse failure
             if rec["stop"] == "max_tokens":
@@ -148,13 +158,13 @@ def main():
         for orch, st in score_run(d).items():
             totals.setdefault(orch, Counter()).update(st)
     print(f"{'orchestrator':34}{'trials':>7}{'turns':>7}{'exec':>7}{'calls':>7}"
-          f"{'MISS':>6}{'trunc':>6}{'prose':>7}{'success':>9}")
+          f"{'MISS':>6}{'PART':>6}{'trunc':>6}{'prose':>7}{'success':>9}")
     print("-" * 90)
     for orch, st in sorted(totals.items()):
         denom = st["executed"] + st["missed"]
         rate = (st["executed"] / denom) if denom else float("nan")
         print(f"{orch:34}{st['trials']:>7}{st['turns']:>7}{st['executed']:>7}{st['calls']:>7}"
-              f"{st['missed']:>6}{st['truncated']:>6}{st['prose']:>7}{rate:>9.4f}")
+              f"{st['missed']:>6}{st['partial']:>6}{st['truncated']:>6}{st['prose']:>7}{rate:>9.4f}")
     if DUMP["dir"]:
         print(f"\n{DUMP['n']} missed turn(s) written to {DUMP['dir']}/ -- replay them with:")
         print(f"  make build/replay_missed_calls && "
