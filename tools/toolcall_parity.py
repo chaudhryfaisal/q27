@@ -26,8 +26,13 @@ A turn that stops on max_tokens mid-call is counted separately. It is a real
 loss but it is truncation, not a parse failure, and folding the two together
 hides which one is moving.
 
-usage: toolcall_parity.py <run-dir> [<run-dir> ...]
-       toolcall_parity.py --orchestrator claude-code-q27-haight <results-root>
+A miss is not automatically a parser gap. Some emissions cannot be recovered by
+anything -- a call truncated mid-value, a `<parameter=` with no name -- and
+executing them would mean inventing content. Pass --dump DIR to write every
+missed turn out, then replay them through the current parser with
+build/replay_missed_calls to split "we could fix this" from "we should not".
+
+usage: toolcall_parity.py <run-dir> [<run-dir> ...] [--dump DIR]
 """
 import json
 import os
@@ -43,6 +48,18 @@ CODESPAN = re.compile(r"`[^`\n]*`")
 def executable_text(text):
     """The subset of a response where dialect markup would be a real call."""
     return CODESPAN.sub("", FENCE.sub("", text))
+
+
+DUMP = {"dir": None, "n": 0}
+
+
+def dump_miss(text, who):
+    if not DUMP["dir"]:
+        return
+    os.makedirs(DUMP["dir"], exist_ok=True)
+    fn = os.path.join(DUMP["dir"], "miss.%03d.txt" % DUMP["n"])
+    open(fn, "w").write(who + "\n===\n" + text)
+    DUMP["n"] += 1
 
 
 def walk_transcript(path, st):
@@ -72,6 +89,7 @@ def walk_transcript(path, st):
                 st["truncated"] += 1
             else:
                 st["missed"] += 1
+                dump_miss(text, path)
         else:
             st["prose"] += 1
 
@@ -96,7 +114,12 @@ def score_run(run_dir):
 
 
 def main():
-    dirs = [a for a in sys.argv[1:] if not a.startswith("-")]
+    argv = sys.argv[1:]
+    if "--dump" in argv:
+        i = argv.index("--dump")
+        DUMP["dir"] = argv[i + 1]
+        del argv[i:i + 2]
+    dirs = [a for a in argv if not a.startswith("-")]
     if not dirs:
         sys.exit(__doc__)
     totals = {}
@@ -111,6 +134,10 @@ def main():
         rate = (st["executed"] / denom) if denom else float("nan")
         print(f"{orch:34}{st['trials']:>7}{st['turns']:>7}{st['executed']:>7}{st['calls']:>7}"
               f"{st['missed']:>6}{st['truncated']:>6}{st['prose']:>7}{rate:>9.4f}")
+    if DUMP["dir"]:
+        print(f"\n{DUMP['n']} missed turn(s) written to {DUMP['dir']}/ -- replay them with:")
+        print(f"  make build/replay_missed_calls && "
+              f"./build/replay_missed_calls <tools.json> {DUMP['dir']}/miss.*.txt")
 
 
 if __name__ == "__main__":

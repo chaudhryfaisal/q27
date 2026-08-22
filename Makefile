@@ -72,6 +72,9 @@ build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stre
 build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_chat_completions_integration.cpp -o $@
 
+build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
+
 build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@
 

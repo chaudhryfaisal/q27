@@ -3327,6 +3327,26 @@ inline bool wrapped_body_exceeds_one_call(const std::string& body) {
     return body.find_first_not_of(" \t\r\n", last + 11) != std::string::npos;
 }
 
+// First position at or after `from` where either spelling of a parameter tag
+// opens. The drift modes below scan for parameters with their own literals, and
+// a mode that only knows `<parameter=` cannot see `<parameter name="KEY">` --
+// which would leave the attribute form working only for calls that ALSO carry a
+// well-formed <function...> opener, i.e. the case least in need of rescue.
+inline size_t find_parameter_opener(const std::string& s, size_t from,
+                                    std::string* key = nullptr, size_t* after = nullptr) {
+    for (size_t c = s.find("<parameter", from); c != std::string::npos;
+         c = s.find("<parameter", c + 10)) {
+        std::string k;
+        size_t a;
+        if (parse_parameter_opener(s, c, k, a)) {
+            if (key) *key = k;
+            if (after) *after = a;
+            return c;
+        }
+    }
+    return std::string::npos;
+}
+
 // Did the model INTEND a tool call that nothing recovered? Used only for the
 // UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
 // costs a silent drop rather than a wrong call -- which is exactly what it cost:
@@ -3936,8 +3956,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // paragraph can mention <parameter= in passing, but a closing tag it
         // never opened is dialect, not English.
         {
-            static const std::string PO = "<parameter=";
-            size_t ps = text_in.find(PO);
+            size_t ps = find_parameter_opener(text_in, 0);
             size_t fe = ps == std::string::npos ? std::string::npos
                                                 : text_in.find("</function>", ps);
             if (fe != std::string::npos) {
@@ -4006,12 +4025,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             std::vector<ToolCall> batch;
             size_t first_begin = std::string::npos, cur = 0;
             for (;;) {
-                const size_t ps = text_in.find(PO, cur);
+                std::string nm;
+                size_t gt1 = 0;
+                const size_t ps = find_parameter_opener(text_in, cur, &nm, &gt1);
                 if (ps == std::string::npos) break;
-                const size_t gt = text_in.find('>', ps + PO.size());
-                if (gt == std::string::npos) break;
-                const std::string nm = text_in.substr(ps + PO.size(), gt - ps - PO.size());
-                const size_t nxt = text_in.find(PO, gt + 1);
+                const size_t gt = gt1 - 1;   // the '>' itself
+                const size_t nxt = find_parameter_opener(text_in, gt + 1);
                 if (nxt == std::string::npos || !declared(nm) ||
                     text_in.find_first_not_of(" \t\r\n", gt + 1) != nxt) {
                     cur = gt + 1;   // a parameter, not an opener

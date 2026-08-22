@@ -1788,6 +1788,54 @@ static void test_parameter_attribute_spelling() {
     }
 }
 
+
+// The attribute spelling has to reach modes 21 and 22 as well. Both scan with
+// their own local `<parameter=` literal, so a call whose parameters use the
+// attribute form was invisible to them even after parse_native_xml_call learned
+// it -- the fix would have covered only calls that also carried a well-formed
+// <function...> opener, which is the case least likely to need rescuing.
+static void test_parameter_attribute_reaches_drift_modes() {
+    json tools = json::array({tool("FileAction", {{"filePath", true}, {"newString", false}}),
+                              tool("bash", {{"command", true}, {"description", false}}),
+                              tool("read", {{"filePath", true}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    {
+        // mode 21: no opener at all, parameters in the attribute spelling
+        auto v = call("<parameter name=\"filePath\">\n/code/x.go\n</parameter>\n"
+                      "<parameter name=\"newString\">\nbody\n</parameter>\n</function>",
+                      tools);
+        ok(v.size() == 1 && v[0].name == "FileAction" &&
+               v[0].arguments.value("filePath", std::string()) == "/code/x.go",
+           "attribute spelling: mode 21 infers from attribute-form keys");
+    }
+    {
+        // mode 22: the tool name as the first parameter, attribute spelling
+        auto v = call("<parameter name=\"bash\">\n<parameter name=\"command\">\n"
+                      "ls /code\n</parameter>\n</function>",
+                      tools);
+        ok(v.size() == 1 && v[0].name == "bash" &&
+               v[0].arguments.value("command", std::string()) == "ls /code",
+           "attribute spelling: mode 22 reads an attribute-form opener");
+    }
+    {
+        // and the plain spellings must be untouched in both
+        auto v = call("<parameter=filePath>\n/code/y.go\n</parameter>\n</function>", tools);
+        ok(v.size() == 1 && v[0].name == "FileAction",
+           "attribute spelling: mode 21's plain form still works");
+        auto w = call("<parameter=bash>\n<parameter=command>\nls\n</parameter>\n</function>",
+                      tools);
+        ok(w.size() == 1 && w[0].name == "bash",
+           "attribute spelling: mode 22's plain form still works");
+    }
+    {
+        ok(call("the schema uses <parameter name=\"filePath\"> for the target.", tools).empty(),
+           "attribute spelling: prose with no </function> is still not a call");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1865,6 +1913,7 @@ int main() {
     test_parameter_value_fidelity();
     test_unterminated_batch_no_function_closer();
     test_parameter_attribute_spelling();
+    test_parameter_attribute_reaches_drift_modes();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
