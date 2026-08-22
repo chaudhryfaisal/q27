@@ -6,9 +6,11 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -174,8 +176,11 @@ private:
 };
 
 struct Msg {
-    std::string role;     // system | user | assistant
-    std::string content;  // flattened text (think blocks already reconstructed)
+    std::string role;      // system | user | assistant
+    std::string content;   // flattened text (think blocks already reconstructed)
+    std::string reasoning{}; // assistant <think> block from history (jinja-compatible);
+                             // NSDMI so brace-init sites with 2 fields stay valid under
+                             // -Wmissing-field-initializers (metal_server.cpp, -Werror)
 };
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
@@ -286,19 +291,229 @@ inline bool tool_dialect_xml() {
 // template has no reasoning_effort, so 3.6-family renders stay untouched.
 // Q27_REASONING_EFFORT: xhigh | low | medium (no line, per the template) |
 // off (legacy pre-2026-08-15 rendering, for A/Bs) -- overrides either way.
-inline std::string reasoning_effort_line() {
+// think-effort level: 0 = medium/off (no instruction line), 1 = low, 2 = xhigh.
+inline int reasoning_effort_env_level() {
+    // froggeric v22.3: the safe default is medium (zero injected tokens) to
+    // avoid burning the reasoning budget; xhigh/low must be explicitly set.
     const char* e = getenv("Q27_REASONING_EFFORT");
+    // NOTE (PR #37 review): the froggeric-template default of "medium" was
+    // deliberately NOT inherited -- the effective default stays xhigh/off per
+    // boot dialect until a measured benchmark arm justifies the change.
+    // medium remains reachable explicitly (env, reasoning_effort field,
+    // <|think_medium|> tag).
     const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
-    if (v == "xhigh")
+    if (v == "low" || v == "minimal") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // medium / off / none / unknown
+}
+inline std::string reasoning_effort_line_level(int level) {
+    if (level == 2)
         return "Reasoning effort is set to xhigh. Please think carefully through "
                "the task, validate key assumptions, consider plausible alternatives, "
                "and prioritize correctness, consistency, and clarity in the final "
                "answer.";
-    if (v == "low")
+    if (level == 1)
         return "Reasoning effort is set to low. Keep your thinking brief and "
                "focused, moving directly to the conclusion without unnecessary "
                "elaboration.";
     return ""; // medium (template emits nothing) / off (legacy) / unknown
+}
+inline std::string reasoning_effort_line() {
+    return reasoning_effort_line_level(reasoning_effort_env_level());
+}
+
+// v22.3 request-driven template options (items 3/4/5).
+// effort: -1 = env/boot default, else 0 medium, 1 low, 2 xhigh.
+// auto_disable_thinking_with_tools: start thinking OFF when tools are present.
+// tool_format: -1 = boot dialect, 0 json, 1 xml.
+// Default for the two-tier tool-error escalation: OFF per PR #37 review --
+// a direct probe of the detector over realistic benign outputs measured 3/12
+// false positives (grep/diff exit code 1, short 'error: none' summaries), and
+// grep returning 1 on no-match is one of the most common tool results in an
+// agentic loop. Template parity stays one flag away:
+// Q27_TOOL_ERROR_WARNINGS=1 re-enables at boot; a measured arm showing the
+// escalation helps would justify flipping the default back.
+inline bool tool_error_warnings_env_default() {
+    const char* e = getenv("Q27_TOOL_ERROR_WARNINGS");
+    if (!e || !*e) return false;
+    std::string v = e;
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    return v == "1" || v == "on" || v == "true" || v == "yes";
+}
+struct TemplateOpts {
+    int effort = -1;
+    bool auto_disable_thinking_with_tools = false;
+    int tool_format = -1;
+    bool force_disable_thinking = false; // reasoning_effort = none/off
+    // P1b escalation warnings (froggeric Tool Error Recovery). OFF by default
+    // per PR #37 review (measured 3/12 FP on benign outputs);
+    // Q27_TOOL_ERROR_WARNINGS=1 flips the boot default on, and the
+    // per-request tool_error_warnings field overrides either way.
+    bool tool_error_warnings = tool_error_warnings_env_default();
+};
+inline int effort_string_level(std::string v) {
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    if (v == "minimal" || v == "low") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // none/off/medium/unknown
+}
+inline TemplateOpts template_opts_from_body(const json& body) {
+    TemplateOpts o;
+    auto read = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            const std::string ev = b["reasoning_effort"].get<std::string>();
+            std::string el = ev;
+            for (auto& c : el) c = (char)tolower((unsigned char)c);
+            if (el == "none" || el == "off") o.force_disable_thinking = true; // item 2
+            o.effort = effort_string_level(ev);
+        }
+        if (b.contains("auto_disable_thinking_with_tools") && b["auto_disable_thinking_with_tools"].is_boolean())
+            o.auto_disable_thinking_with_tools = b["auto_disable_thinking_with_tools"].get<bool>();
+        if (b.contains("tool_error_warnings") && b["tool_error_warnings"].is_boolean())
+            o.tool_error_warnings = b["tool_error_warnings"].get<bool>(); // P1b off switch
+        if (b.contains("tool_call_format") && b["tool_call_format"].is_string()) {
+            const std::string f = b["tool_call_format"].get<std::string>();
+            o.tool_format = (f == "json") ? 0 : (f == "xml" ? 1 : -1);
+        }
+    };
+    read(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        read(body["chat_template_kwargs"]);
+    // OpenAI Responses effort shapes: output_config / reasoning blocks.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("effort") && r["effort"].is_string())
+            o.effort = effort_string_level(r["effort"].get<std::string>());
+        if (r.contains("output_effort") && r["output_effort"].is_string())
+            o.effort = effort_string_level(r["output_effort"].get<std::string>());
+    }
+    return o;
+}
+
+// P1a (2026-08-22): the <|think_*|> toggle markers from the qwen3.8
+// chat_template. Stripping: these are BPE-tokenisable control markers the
+// model is trained to read in user/system content; they must not leak into
+// the rendered prompt, and they MUTATE the thinking/effort state forward.
+inline void strip_think_markers(std::string& s) {
+    static const std::string mk[] = {"<|think_off|>", "<|think_on|>",
+                                     "<|think_xhigh|>", "<|think_high|>",
+                                     "<|think_ultracode|>", "<|think_extreme|>",
+                                     "<|think_max|>", "<|think_medium|>",
+                                     "<|think_low|>", "<|think_minimal|>"};
+    for (const auto& m : mk)
+        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+}
+
+// P1a forward-scan of the (flattened) message list for <|think_*|> toggles;
+// returns the final thinking/effort state. Mirrors the template: only
+// system/developer/user roles are scanned (assistant and tool roles are not),
+// and tool responses (user-role, <tool_response>-wrapped) are skipped.
+struct ThinkToggles {
+    bool thinking = true;
+    int effort = 0; // 0 medium, 1 low, 2 xhigh
+};
+inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_think,
+                                       int base_effort = -1) {
+    ThinkToggles st{base_think, base_effort >= 0 ? base_effort : reasoning_effort_env_level()};
+    for (const Msg& m : msgs) {
+        if (m.role != "system" && m.role != "user") continue;
+        if (m.role == "user" && m.content.rfind("<tool_response>", 0) == 0) continue;
+        const std::string& c = m.content;
+        if (c.find("<|think_off|>") != std::string::npos) st.thinking = false;
+        else if (c.find("<|think_on|>") != std::string::npos) st.thinking = true;
+        else if (c.find("<|think_xhigh|>") != std::string::npos ||
+                 c.find("<|think_high|>") != std::string::npos ||
+                 c.find("<|think_ultracode|>") != std::string::npos ||
+                 c.find("<|think_extreme|>") != std::string::npos ||
+                 c.find("<|think_max|>") != std::string::npos) {
+            st.thinking = true; st.effort = 2;
+        } else if (c.find("<|think_low|>") != std::string::npos ||
+                   c.find("<|think_minimal|>") != std::string::npos) {
+            st.thinking = true; st.effort = 1;
+        } else if (c.find("<|think_medium|>") != std::string::npos) {
+            st.thinking = true; st.effort = 0;
+        }
+    }
+    return st;
+}
+
+// P1b: tool-response failure detection, mirrored from the qwen3.8
+// chat_template (froggeric v22.3). Suppresses code/grep output and
+// exit-code-0, distinguishes strong vs weak error signatures.
+inline bool is_tool_response_failure(const std::string& content) {
+    std::string full = content;
+    for (auto& c : full) c = (char)tolower((unsigned char)c);
+    const std::string head = full.substr(0, 120);
+    const bool is_code_or_grep =
+        full.find("throw new ") != std::string::npos ||
+        full.find("throw error") != std::string::npos ||
+        full.find("console.error") != std::string::npos ||
+        full.find("logger.error") != std::string::npos ||
+        full.find("logging.error") != std::string::npos ||
+        head.find("import ") != std::string::npos ||
+        head.find("def ") != std::string::npos ||
+        head.find("function ") != std::string::npos;
+    const bool exit_zero =
+        head.find("exit code: 0") != std::string::npos ||
+        head.find("process exited with code 0") != std::string::npos;
+    const bool error_field_ok =
+        head.find("\"error\": null") != std::string::npos ||
+        head.find("\"error\":null") != std::string::npos ||
+        head.find("\"error\": false") != std::string::npos ||
+        head.find("\"error\":false") != std::string::npos ||
+        head.find("\"error\": \"\"") != std::string::npos ||
+        head.find("\"error\":\"\"") != std::string::npos;
+    const bool strong_error =
+        (head.find("\"error\":") != std::string::npos && !error_field_ok) ||
+        head.find("\"status\": \"error\"") != std::string::npos ||
+        head.find("\"status\":\"error\"") != std::string::npos ||
+        head.find("traceback (most recent call last):") != std::string::npos ||
+        head.find("command not found") != std::string::npos ||
+        head.find("invalid syntax") != std::string::npos ||
+        head.find("fatal:") != std::string::npos ||
+        ((head.find("exit code: ") != std::string::npos ||
+          head.find("process exited with code") != std::string::npos) && !exit_zero) ||
+        head.find("exception:") == 0 ||
+        head.find("failed to ") == 0;
+    const bool weak_error =
+        head.find("error:") != std::string::npos ||
+        head.find("err!") != std::string::npos;
+    const bool weak_suppressed =
+        head.find("$ ") != std::string::npos ||
+        head.find("took ") != std::string::npos ||
+        content.size() >= 600;
+    return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
+}
+
+// v22.3: strip a leading think block from content when explicit reasoning is
+// present (avoids double-rendering a block the client also sent in text).
+inline void strip_leading_think(std::string& content) {
+    const char* lead_end = nullptr;
+    if (content.rfind("<think>", 0) == 0 && content.find("</think>") != std::string::npos)
+        lead_end = "</think>";
+    else if (content.rfind("<thinking>", 0) == 0 && content.find("</thinking>") != std::string::npos)
+        lead_end = "</thinking>";
+    else if (content.rfind("</think>", 0) == 0) lead_end = "</think>";
+    else if (content.rfind("</thinking>", 0) == 0) lead_end = "</thinking>";
+    if (!lead_end) return;
+    std::string close(lead_end);
+    size_t p = content.find(close);
+    if (p == std::string::npos) return;
+    content = content.substr(p + close.size());
+    size_t i = 0;
+    while (i < content.size() && content[i] == '\n') i++;
+    content = content.substr(i);
+}
+inline std::string tool_response_warning(int failures) {
+    if (failures >= 2)
+        return "\n\n\u26a0\ufe0f SYSTEM WARNING: " + std::to_string(failures) +
+               " consecutive tool errors detected. Your previous approach is "
+               "incorrect. You MUST use a fundamentally different approach or "
+               "corrected arguments.";
+    return "\n\n\u26a0\ufe0f SYSTEM WARNING: The previous tool call returned an "
+           "error. Diagnose the failure and retry with completely corrected "
+           "arguments.";
 }
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
@@ -350,11 +565,21 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
                                  bool think = true, size_t* stable_off = nullptr,
                                  size_t* sys_off = nullptr,
                                  const std::string& tool_instruction = {},
-                                 const json* unavailable_tools = nullptr) {
+                                 const json* unavailable_tools = nullptr,
+                                 const TemplateOpts* opts = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
-    if (!msgs.empty() && msgs[0].role == "system") { sys = strip_ctrl(msgs[0].content); start = 1; }
+    // v22.3: merge ALL consecutive leading system/developer messages into one
+    // system block (joined with a blank line), mirroring the template's head
+    // loop -- not just messages[0].
+    while (start < msgs.size() &&
+           (msgs[start].role == "system" || msgs[start].role == "developer")) {
+        std::string part = strip_ctrl(msgs[start].content);
+        if (!sys.empty()) sys += "\n\n";
+        sys += part;
+        start++;
+    }
     // Over-refusal fix (2026-07-13, external review): under the no-think
     // serving default a bare request WITH NO SYSTEM PROMPT gives the model
     // zero context AND zero reasoning budget, so it falls to a defensive
@@ -367,10 +592,21 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
                                !unavailable_tools->empty();
-    // Template order: reasoning_instructions FIRST, then tools, then the
-    // client system content. Thinking-gated exactly like the template
-    // (enable_thinking undefined-or-true).
-    const std::string effort = think ? reasoning_effort_line() : std::string();
+    // P1a: forward-scan the message list for <|think_*|> toggles. The final
+    // thinking/effort state drives BOTH the reasoning_instructions line at the
+    // system head and the generation prompt below (mirrors the template's
+    // stateful ns_state). Template order: reasoning_instructions FIRST, then
+    // tools, then the client system content. Items 3/4: a request-driven base
+    // effort overrides the env/boot default, and auto_disable_thinking_with_tools
+    // starts thinking OFF when tools are present.
+    bool base_think = think;
+    if (opts && opts->auto_disable_thinking_with_tools && tools.is_array() && !tools.empty())
+        base_think = false;
+    if (opts && opts->force_disable_thinking) base_think = false; // reasoning_effort none/off
+    const ThinkToggles tt = scan_think_toggles(msgs, base_think, opts ? opts->effort : -1);
+    const std::string effort = tt.thinking ? reasoning_effort_line_level(tt.effort)
+                                           : std::string();
+    strip_think_markers(sys);
     if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty() ||
         !effort.empty()) {
         p += "<|im_start|>system\n";
@@ -390,9 +626,57 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_end|>\n";
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
-    for (size_t i = start; i < msgs.size(); i++)
-        p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
-             "<|im_end|>\n";
+    int tool_failures = 0;
+    // P1b switch: env/boot default unless the request carries an explicit
+    // tool_error_warnings field (TemplateOpts default member is env-seeded,
+    // so this covers both the nullptr and the populated-opts paths).
+    const bool warn_on = opts ? opts->tool_error_warnings
+                              : tool_error_warnings_env_default();
+    for (size_t i = start; i < msgs.size(); i++) {
+        const Msg& m = msgs[i];
+        std::string content = m.content;
+        // P1b: consecutive tool-error tracking. Tool responses reach this
+        // renderer already <tool_response>-wrapped in a user turn.
+        const bool toolresp = m.role == "user" &&
+                              content.rfind("<tool_response>", 0) == 0;
+        if (warn_on && toolresp)
+            tool_failures = is_tool_response_failure(content)
+                                          ? tool_failures + 1 : 0;
+        else if (m.role == "user") tool_failures = 0; // plain user resets
+        strip_think_markers(content);
+        // P2: consecutive tool responses group under ONE user turn, each kept
+        // as its own <tool_response> block (mirrors the template's prev_role
+        // grouping -- no <|im_start|>/<|im_end|> between them).
+        if (toolresp) {
+            const bool prev_toolresp = i > start && msgs[i - 1].role == "user" &&
+                                       msgs[i - 1].content.rfind("<tool_response>", 0) == 0;
+            const bool next_toolresp = i + 1 < msgs.size() && msgs[i + 1].role == "user" &&
+                                       msgs[i + 1].content.rfind("<tool_response>", 0) == 0;
+            if (!prev_toolresp) p += "<|im_start|>user\n";
+            if (tool_failures >= 1) {
+                // warning goes INSIDE the response block, before the closer
+                // (the template emits it between content and </tool_response>)
+                std::string warn = tool_response_warning(tool_failures);
+                size_t close = content.rfind("\n</tool_response>");
+                if (close != std::string::npos) content.insert(close, warn);
+                else content += warn;
+            }
+            p += strip_ctrl(content);
+            p += next_toolresp ? "\n" : "<|im_end|>\n";
+            continue;
+        }
+        // normal (non-tool) message
+        p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
+        // v22.3 E: EVERY assistant history turn is wrapped in <think>...</think>
+        // (even when reasoning is empty -> an empty think block). If the
+        // client also sent the think block in text, strip it so the block is
+        // not double-rendered.
+        if (m.role == "assistant") {
+            strip_leading_think(content);
+            p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
+        }
+        p += strip_ctrl(content) + "<|im_end|>\n";
+    }
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
     // think=false: the empty CLOSED block signals "reasoning done" so the model
@@ -404,18 +688,91 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // StreamSplitter to THINK when think=true so the model's first generated
     // token (already inside the block) routes to the think channel -- mirrors the
     // FORCED tool_choice TOOL pre-seed.
-    if (!think) p += "<think>\n\n</think>\n\n";
+    // P1a: the generation prompt follows the final toggle state, not just the
+    // caller's `think` flag. think=false -> empty CLOSED block; true -> OPEN.
+    if (!tt.thinking) p += "<think>\n\n</think>\n\n";
     else p += "<think>\n";
     return p;
 }
 
-inline std::string tool_call_text(const std::string& name, const json& args) {
-    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
+// P3 request-driven truncation: read max_tool_arg_chars / max_tool_response_chars
+// from the request body (top-level or chat_template_kwargs). 0 when absent.
+inline long body_num(const json& v) {
+    if (v.is_number_float()) return (long)v.get<double>();
+    if (v.is_number_integer()) return v.get<long>();
+    if (v.is_number_unsigned()) return (long)v.get<uint64_t>();
+    return 0;
+}
+inline long request_max_chars(const json& body, const char* key) {
+    if (body.contains(key) && body[key].is_number()) return body_num(body[key]);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto& k = body["chat_template_kwargs"];
+        if (k.contains(key) && k[key].is_number()) return body_num(k[key]);
+    }
+    return -1; // absent -> text helpers fall back to the env vars
+}
+
+inline std::string tool_call_text(const std::string& name, const json& args,
+                                  long max_arg_chars = -1) {
+    // v22.3 (item 7): a raw string argument is echoed verbatim (not JSON-encoded),
+    // matching the template's `_args = tc.arguments` when arguments is a string.
+    std::string a = args.is_string() ? args.get<std::string>() : args.dump();
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (max_arg_chars > 0 && (long)a.size() > max_arg_chars)
+        a = a.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(a.size()) + " chars]";
+    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + a +
            "}\n</tool_call>";
 }
 
-inline std::string tool_response_text(const std::string& out) {
-    return "<tool_response>\n" + out + "\n</tool_response>";
+// v22.3 (item 6): render an assistant tool call in the PROMPT using the active
+// tool dialect. For the XML dialect use the per-parameter form the template
+// emits (<function=NAME><parameter=K>v</parameter>...</function>); otherwise
+// fall back to the JSON tool_call_text.
+inline std::string tool_call_text_dialect(const std::string& name, const json& args,
+                                          long max_arg_chars = -1) {
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (!tool_dialect_xml()) return tool_call_text(name, args, max_arg_chars);
+    auto trunc = [&](std::string v) -> std::string {
+        if (max_arg_chars > 0 && (long)v.size() > max_arg_chars)
+            return v.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+                   std::to_string(v.size()) + " chars]";
+        return v;
+    };
+    std::string s = "<tool_call>\n<function=" + name + ">\n";
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            s += "<parameter=" + it.key() + ">\n" +
+                 trunc(it.value().is_string() ? it.value().get<std::string>()
+                                              : it.value().dump()) +
+                 "\n</parameter>\n";
+    } else if (args.is_string()) {
+        s += trunc(args.get<std::string>()) + "\n";
+    } else {
+        s += trunc(args.dump()) + "\n";
+    }
+    s += "</function>\n</tool_call>";
+    return s;
+}
+
+inline std::string tool_response_text(const std::string& out,
+                                      long max_response_chars = -1) {
+    std::string o = out;
+    if (max_response_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS");
+        max_response_chars = e ? atol(e) : 0;
+    }
+    // v22.3 (item 8): truncation applies only when the dialect is NOT json.
+    if (tool_dialect_xml() && max_response_chars > 0 && (long)o.size() > max_response_chars)
+        o = o.substr(0, (size_t)max_response_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(o.size()) + " chars]";
+    return "<tool_response>\n" + o + "\n</tool_response>";
 }
 
 // Per-request thinking resolution, GATED behind the server's --request-think
@@ -499,6 +856,35 @@ inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool al
         }
         if (t.contains("budget_tokens")) take_budget(t["budget_tokens"]);
     }
+    // OpenAI Responses: reasoning / output_config blocks. Effort is consumed by
+    // TemplateOpts (prompt line); here we handle disabled/enabled + budget.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("disabled") && r["disabled"].is_boolean()) {
+            c.enabled = !r["disabled"].get<bool>();
+            c.enabled_set = true;
+        } else if (r.contains("enabled") && r["enabled"].is_boolean()) {
+            c.enabled = r["enabled"].get<bool>();
+            c.enabled_set = true;
+        }
+        if (r.contains("budget_tokens")) take_budget(r["budget_tokens"]);
+        if (r.contains("output_budget_tokens")) take_budget(r["output_budget_tokens"]);
+    }
+    // some clients send a flat top-level budget_tokens
+    if (body.contains("budget_tokens")) take_budget(body["budget_tokens"]);
+    // item 2: reasoning_effort none/off disables thinking end-to-end (engine
+    // think mode, not just the prompt render).
+    auto effort_disable = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            std::string ev = b["reasoning_effort"].get<std::string>();
+            for (auto& ch : ev) ch = (char)tolower((unsigned char)ch);
+            if (ev == "none" || ev == "off") { c.enabled = false; c.enabled_set = true; }
+        }
+    };
+    effort_disable(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        effort_disable(body["chat_template_kwargs"]);
     return c;
 }
 
@@ -1481,6 +1867,9 @@ inline json anthropic_tools_json(const json& body) {
 // model markers, tool_result wrapped in <tool_response>)
 inline std::vector<Msg> anthropic_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (body.contains("system")) {
         std::string sys;
         if (body["system"].is_string()) sys = body["system"];
@@ -1493,7 +1882,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 if (b.is_object() && b.value("type", "") == "text") sys += b.value("text", "");
         if (!sys.empty()) {
             normalize_cc_billing_header(sys);
-            msgs.push_back({"system", sys});
+            msgs.push_back({"system", sys, {}});
         }
     }
     if (!body.contains("messages")) return msgs;
@@ -1506,7 +1895,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         std::string role = m.value("role", "user"), think, content;
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
-        if (!m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (!m.contains("content")) { msgs.push_back({role, content, {}}); continue; }
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
@@ -1516,9 +1905,10 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 else if (ty == "thinking") think += part.value("thinking", "");
                 else if (ty == "tool_use") {
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_call_text(part.value("name", ""),
-                                              part.contains("input") ? part["input"]
-                                                                     : json::object());
+                    content += tool_call_text_dialect(part.value("name", ""),
+                                                      part.contains("input") ? part["input"]
+                                                                             : json::object(),
+                                                      max_arg);
                 } else if (ty == "tool_result") {
                     std::string rc;
                     if (part.contains("content")) {
@@ -1529,12 +1919,13 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                                     rc += b.value("text", "");
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_response_text(rc);
+                    content += tool_response_text(rc, max_resp);
                 }
             }
-        if (role == "assistant" && !think.empty())
-            content = "<think>\n" + think + "\n</think>\n" + content;
-        msgs.push_back({role, content});
+        // reasoning block is emitted by the renderer (chatml_prompt), not
+        // flattened here -- keeps the jinja's format and per-message logic
+        // (preserve_reasoning / <|think_*|> toggles) in one place.
+        msgs.push_back({role, content, think});
     }
     return msgs;
 }
@@ -1586,12 +1977,15 @@ inline json openai_tools_json(const json& body) {
 //     matching the /v1/responses bridge.
 inline std::vector<Msg> openai_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
     for (auto& m : body["messages"]) {
         if (!m.is_object()) continue;
         std::string role = m.value("role", "user");
         if (role == "developer") role = "system";
-        std::string content;
+        std::string content, reasoning;
         if (m.contains("content")) {
             if (m["content"].is_string()) content = m["content"];
             else if (m["content"].is_array())
@@ -1600,7 +1994,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                         content += part.value("text", "");
         }
         if (role == "tool") {
-            msgs.push_back({"user", tool_response_text(content)});
+            msgs.push_back({"user", tool_response_text(content, max_resp), {}});
             continue;
         }
         if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
@@ -1621,10 +2015,18 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                     } else args = fn["arguments"];
                 }
                 if (!content.empty() && content.back() != '\n') content += "\n";
-                content += tool_call_text(name, args);
+                content += tool_call_text_dialect(name, args, max_arg);
             }
         }
-        msgs.push_back({role, content});
+        if (role == "assistant" && m.contains("reasoning_content")) {
+            const json& rc = m["reasoning_content"];
+            if (rc.is_string()) reasoning = rc.get<std::string>();
+            else if (rc.is_array())
+                for (auto& part : rc)
+                    if (part.is_object() && part.value("type", "") == "text")
+                        reasoning += part.value("text", "");
+        }
+        msgs.push_back({role, content, reasoning});
     }
     return msgs;
 }

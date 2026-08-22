@@ -700,6 +700,397 @@ static void test_end_to_end_chatml_prompt() {
     CHECK(forced.substr(0, stable_off) == rendered.substr(0, stable_off));
 }
 
+// P0 (2026-08-22): assistant reasoning must NOT be lost on the OpenAI path and
+// must render as a jinja-style <think> block in chatml_prompt.
+static void test_openai_reasoning_content_roundtrip() {
+    json body = {
+        {"messages", json::array({
+            {{"role","user"},{"content","plan the build"}},
+            {{"role","assistant"},{"content","Done."},{"reasoning_content","Let me check the steps."}},
+            {{"role","user"},{"content","go"}},
+        })}
+    };
+    auto msgs = q27::openai_msgs(body);
+    CHECK(msgs.size() == 3);
+    // assistant reasoning was captured, not dropped
+    CHECK(msgs[1].role == "assistant");
+    CHECK(msgs[1].content == "Done.");
+    CHECK(msgs[1].reasoning == "Let me check the steps.");
+    // no reasoning on the non-assistant turns
+    CHECK(msgs[0].reasoning.empty());
+    CHECK(msgs[2].reasoning.empty());
+    // chatml_prompt renders it as a jinja-style <think> block
+    std::string rendered = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    CHECK(rendered.find("<think>\nLet me check the steps.\n</think>\n\n") != std::string::npos);
+    // order: think block comes before the assistant content
+    CHECK(rendered.find("<think>\nLet me check the steps.\n</think>\n\nDone.") != std::string::npos);
+    // absent reasoning_content -> no <think> block injected (regression guard)
+    json body2 = {{"messages", json::array({
+        {{"role","assistant"},{"content","hi"}},
+    })}};
+    auto msgs2 = q27::openai_msgs(body2);
+    CHECK(msgs2[0].reasoning.empty());
+    std::string r2 = q27::chatml_prompt(msgs2, {}, /*think=*/false);
+    // the only <think> block must be the trailing EMPTY generation prompt
+    // (no history reasoning block was injected)
+    CHECK(r2.rfind("<think>\n\n</think>\n\n") ==
+          r2.size() - std::string("<think>\n\n</think>\n\n").size());
+}
+
+// P1a: <|think_*|> toggles must be stripped and must drive the generation
+// prompt + reasoning-instructions line (stateful, mirroring the template).
+static void test_think_toggle_state() {
+    unsetenv("Q27_REASONING_EFFORT");
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    {   // <|think_off|> -> closed gen block even with think=true param
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_off|>Just answer."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/true);
+        CHECK(r.find("<|think_off|>") == std::string::npos);          // stripped
+        CHECK(r.find("Just answer.") != std::string::npos);
+        CHECK(r.rfind("<think>\n\n</think>\n\n") ==                  // thinking off
+              r.size() - std::string("<think>\n\n</think>\n\n").size());
+    }
+    {   // <|think_on|> with think=false -> OPEN gen block + effort line
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_on|>Think hard."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+        CHECK(r.find("<|think_on|>") == std::string::npos);
+        CHECK(r.rfind("<think>\n") == r.size() - std::string("<think>\n").size());
+        // default effort stays xhigh (PR #37 review: froggeric "default medium"
+        // dropped) -> the xhigh line is injected
+        CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+    }
+    {   // <|think_xhigh|> arms xhigh effort on a no-think base
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_xhigh|>Be careful."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+        CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+    }
+}
+
+// P1b: consecutive tool-error responses accumulate system warnings.
+static void test_tool_failure_warnings() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
+    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run the build"}},
+        {{"role","user"},{"content",tr("error: command not found: make")}},
+        {{"role","user"},{"content",tr("fatal: make: no targets")}},
+    })}};
+    // default is OFF per PR #37 review (measured 3/12 FP on benign outputs):
+    // even two consecutive failures inject no warning when no opts are passed.
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    // env re-enables at boot (template parity is one flag away)
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
+    r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    // 1st failure -> diagnose warning
+    CHECK(r.find("SYSTEM WARNING: The previous tool call returned an error.") != std::string::npos);
+    // 2nd consecutive failure -> change-approach warning with count 2
+    CHECK(r.find("2 consecutive tool errors detected. Your previous approach is incorrect.") != std::string::npos);
+    // a plain user turn after resets the counter (no "1 consecutive" survives)
+    json body2 = {{"messages", json::array({
+        {{"role","user"},{"content",tr("error: boom")}},
+        {{"role","user"},{"content","the error is fixed now"}},
+        {{"role","user"},{"content",tr("error: boom again")}},
+    })}};
+    auto msgs2 = q27::openai_msgs(body2);
+    std::string r2 = q27::chatml_prompt(msgs2, {}, /*think=*/false);
+    // only two separate single-failure warnings, no "2 consecutive"
+    CHECK(r2.find("2 consecutive tool errors") == std::string::npos);
+    CHECK(r2.find("The previous tool call returned an error.") != std::string::npos);
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
+
+    // per-request field (PR #37 review): explicit true wins over the OFF boot
+    // default; explicit false wins over an ON env default.
+    json body3 = {{"messages", body["messages"]}, {"tool_error_warnings", true}};
+    auto opts = q27::template_opts_from_body(body3);
+    CHECK(opts.tool_error_warnings);
+    std::string r3 = q27::chatml_prompt(q27::openai_msgs(body3), {}, /*think=*/false, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r3.find("SYSTEM WARNING") != std::string::npos);   // request overrides boot default
+    // chat_template_kwargs carries the field too
+    json body4 = {{"messages", body["messages"]},
+                  {"chat_template_kwargs",{{"tool_error_warnings",false}}}};
+    CHECK(!q27::template_opts_from_body(body4).tool_error_warnings);
+    // env ON + request false -> request wins
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
+    CHECK(q27::template_opts_from_body(body).tool_error_warnings);    // env on
+    json body5 = {{"messages", body["messages"]}, {"tool_error_warnings", false}};
+    CHECK(!q27::template_opts_from_body(body5).tool_error_warnings);  // request wins
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
+}
+
+// P2: consecutive tool responses group under a single user turn.
+static void test_tool_grouping() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run both"}},
+        {{"role","user"},{"content",tr("out A")}},
+        {{"role","user"},{"content",tr("out B")}},
+        {{"role","user"},{"content","all done"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    // exactly 3 user turns: "run both", the grouped pair, "all done"
+    size_t n = 0;
+    for (size_t p = 0; (p = r.find("<|im_start|>user\n", p)) != std::string::npos; ++n, ++p);
+    CHECK(n == 3);
+    // the pair shares one user turn: grouped marker present, no <|im_end|> between
+    CHECK(r.find("</tool_response>\n<tool_response>") != std::string::npos);
+    CHECK(r.find("out A\n</tool_response><|im_end|>") == std::string::npos);
+}
+
+// P3: Q27_MAX_TOOL_RESPONSE_CHARS / Q27_MAX_TOOL_ARG_CHARS truncate long output.
+static void test_tool_truncation() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    std::string big(100, 'x');
+    {   // response truncation (role "tool" goes through tool_response_text)
+        setenv("Q27_MAX_TOOL_RESPONSE_CHARS", "20", 1);
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","run it"}},
+            {{"role","tool"},{"content",big}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+        unsetenv("Q27_MAX_TOOL_RESPONSE_CHARS");
+        CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+        CHECK(r.find(big) == std::string::npos); // long tail gone
+    }
+    {   // arg truncation (assistant tool_calls go through tool_call_text)
+        setenv("Q27_MAX_TOOL_ARG_CHARS", "30", 1);
+        json body = {{"messages", json::array({
+            {{"role","assistant"},{"content","calling"},{"tool_calls", json::array({
+                {{"id","1"},{"type","function"},{"function",{{"name","ls"},
+                    {"arguments", "{\"path\":\"/" + big + "\"}"}}}}
+            })}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+        unsetenv("Q27_MAX_TOOL_ARG_CHARS");
+        CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+    }
+}
+
+// P3 request-driven: limits come from chat_template_kwargs in the body, not env.
+static void test_tool_truncation_request_body() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    std::string big(100, 'x');
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run it"}},
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 20}}}};
+    std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r.find("TRUNCATED - original length") != std::string::npos);
+    // explicit 0 in the body disables truncation even with a huge output
+    json body0 = {{"messages", json::array({
+        {{"role","user"},{"content","run it"}},
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 0}}}};
+    std::string r0 = q27::chatml_prompt(q27::openai_msgs(body0), {}, false);
+    CHECK(r0.find("TRUNCATED") == std::string::npos);
+}
+
+// v22.3: multiple leading system/developer messages merge into ONE system block.
+static void test_v223_multi_system_merge() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","system"},{"content","sys one"}},
+        {{"role","system"},{"content","sys two"}},
+        {{"role","user"},{"content","hi"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    size_t n = 0;
+    for (size_t p = 0; (p = r.find("<|im_start|>system\n", p)) != std::string::npos; ++n, ++p);
+    CHECK(n == 1);                       // both merged into one block
+    CHECK(r.find("sys one\n\nsys two") != std::string::npos); // joined with blank line
+}
+
+// v22.3: new <|think_ultracode|>/extreme/max markers map to xhigh effort.
+static void test_v223_new_think_markers() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","<|think_ultracode|>deep reasoning"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<|think_ultracode|>") == std::string::npos);  // stripped
+    CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+}
+
+// v22.3: explicit reasoning + a think block already in content -> no double render.
+static void test_v223_reasoning_dedup() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","q"}},
+        {{"role","assistant"},{"content","<think>\ninline thinking\n</think>\nFinal answer."},
+            {"reasoning_content","explicit reasoning"}},
+        {{"role","user"},{"content","what did you reason"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<think>\nexplicit reasoning\n</think>\n\nFinal answer.") != std::string::npos);
+    CHECK(r.find("inline thinking") == std::string::npos); // inline dup removed
+}
+
+// v22.3: failure detection suppresses code output and exit-code-0.
+static void test_v223_failure_detection() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    // detector-under-renderer checks need the escalation ON (default is OFF
+    // per PR #37 review); the detector itself is covered directly by the
+    // positive cases below firing at all.
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
+    {   // code output with console.error is suppressed (not a failure)
+        json b = {{"messages", json::array({
+            {{"role","user"},{"content","run"}},
+            {{"role","tool"},{"content","import os\nconsole.error('boom')\nfunction x() {}"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    }
+    {   // exit code 0 is not a failure
+        json b = {{"messages", json::array({
+            {{"role","tool"},{"content","exit code: 0\nall good"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    }
+    {   // nonzero exit code IS a failure
+        json b = {{"messages", json::array({
+            {{"role","tool"},{"content","exit code: 2\nboom"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") != std::string::npos);
+    }
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
+}
+
+// v22.3 E: every assistant history turn is wrapped in <think>, even empty.
+static void test_unconditional_think_wrap() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    {   // assistant with no reasoning -> empty think block
+        json b = {{"messages", json::array({
+            {{"role","user"},{"content","q"}},
+            {{"role","assistant"},{"content","just an answer"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("<|im_start|>assistant\n<think>\n\n</think>\n\njust an answer<|im_end|>") != std::string::npos);
+    }
+    {   // assistant with reasoning -> its think block
+        json b = {{"messages", json::array({
+            {{"role","assistant"},{"content","answer"},{"reasoning_content","thought"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("<|im_start|>assistant\n<think>\nthought\n</think>\n\nanswer<|im_end|>") != std::string::npos);
+    }
+}
+
+// Items 3/4: request-driven reasoning_effort + auto_disable_thinking_with_tools.
+static void test_request_effort_and_auto_disable() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json tools = json::parse(R"([{"type":"function","function":{"name":"R","parameters":{"type":"object"}}}])");
+    json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+              {"reasoning_effort","low"},
+              {"chat_template_kwargs",{{"auto_disable_thinking_with_tools",true}}}};
+    auto opts = q27::template_opts_from_body(b);
+    CHECK(opts.effort == 1);               // low -> level 1
+    CHECK(opts.auto_disable_thinking_with_tools);
+    auto msgs = q27::openai_msgs(b);
+    // tools present + auto_disable -> thinking off -> no effort line
+    std::string r = q27::chatml_prompt(msgs, tools, /*think=*/true, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r.find("Reasoning effort is set to low.") == std::string::npos);
+    // no tools -> thinking on -> low line
+    std::string r2 = q27::chatml_prompt(msgs, json::array(), /*think=*/true, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r2.find("Reasoning effort is set to low.") != std::string::npos);
+}
+
+// output_config / reasoning (OpenAI Responses) shapes for effort + budget + disabled.
+static void test_output_config_fields() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+              {"reasoning", {{{"effort","low"}}}},
+              {"output_config", {{"effort","high"},{"budget_tokens",1024},{"disabled",true}}}};
+    auto opts = q27::template_opts_from_body(b);
+    // output_config read after reasoning -> output_config.effort=high wins
+    CHECK(opts.effort == 2);
+    // resolve_think_cfg: disabled -> thinking off; budget 1024 from output_config
+    auto tcfg = q27::resolve_think_cfg(b, /*server_default=*/true, /*allow_request=*/true, -1);
+    CHECK(!tcfg.enabled);              // output_config.disabled
+    CHECK(tcfg.enabled_set);
+    CHECK(tcfg.budget_set);
+    CHECK(tcfg.budget == 1024);        // output_config.budget_tokens
+}
+
+// item 2: reasoning_effort none/off disables thinking (prompt + engine).
+// NOTE: the companion "default effort = medium" change was dropped per PR #37
+// review -- the effective default stays xhigh/off; medium is reachable
+// explicitly. Only the none/off disable behavior is covered here.
+static void test_none_off_disables_thinking() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    unsetenv("Q27_REASONING_EFFORT");
+    {   // reasoning_effort none -> thinking OFF (closed gen prompt, no effort line)
+        json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+                  {"reasoning_effort","none"}};
+        auto opts = q27::template_opts_from_body(b);
+        CHECK(opts.force_disable_thinking);
+        // engine think mode must also be off (end-to-end)
+        auto tcfg = q27::resolve_think_cfg(b, /*server_default=*/true, /*allow_request=*/true, -1);
+        CHECK(!tcfg.enabled);
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), json::array(), /*think=*/true, nullptr, nullptr, {}, {}, &opts);
+        // closed generation block (thinking off) despite think=true
+        CHECK(r.rfind("<think>\n\n</think>\n\n") == r.size() - std::string("<think>\n\n</think>\n\n").size());
+    }
+    {   // reasoning_effort off disables thinking too (via chat_template_kwargs)
+        json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+                  {"chat_template_kwargs",{{"reasoning_effort","off"}}}};
+        auto opts = q27::template_opts_from_body(b);
+        CHECK(opts.force_disable_thinking);
+    }
+}
+
+// item 6: XML-dialect assistant tool_calls render as <function=...><parameter=...>
+static void test_xml_tool_call_rendering() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","assistant"},{"content","calling"},{"tool_calls", json::array({
+            {{"id","1"},{"type","function"},{"function",{{"name","edit"},
+                {"arguments","{\"path\":\"/x\",\"newText\":\"hi\"}"}}}}
+        })}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<function=edit>") != std::string::npos);
+    CHECK(r.find("<parameter=path>\n/x\n</parameter>") != std::string::npos);
+    CHECK(r.find("<parameter=newText>\nhi\n</parameter>") != std::string::npos);
+    // JSON dialect keeps the JSON tool_call_text
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen3.6-27B\"}");
+    std::string r2 = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r2.find("<function=edit>") == std::string::npos);
+    CHECK(r2.find("<tool_call>\n{\"name\": \"edit\"") != std::string::npos);
+}
+
+// item 8: tool-response truncation applies only in the XML (non-JSON) dialect.
+static void test_truncation_json_dialect_skipped() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen3.6-27B\"}");
+    std::string big(200, 'x');
+    json body = {{"messages", json::array({
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 20}}}};
+    std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r.find("TRUNCATED") == std::string::npos); // json dialect: no truncation
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2162,6 +2553,22 @@ int main() {
     test_responses_tool_choice_shapes();
     test_stream_options_include_usage();
     test_end_to_end_chatml_prompt();
+    test_openai_reasoning_content_roundtrip();
+    test_think_toggle_state();
+    test_tool_failure_warnings();
+    test_tool_grouping();
+    test_tool_truncation();
+    test_tool_truncation_request_body();
+    test_v223_multi_system_merge();
+    test_v223_new_think_markers();
+    test_v223_reasoning_dedup();
+    test_v223_failure_detection();
+    test_unconditional_think_wrap();
+    test_request_effort_and_auto_disable();
+    test_output_config_fields();
+    test_none_off_disables_thinking();
+    test_xml_tool_call_rendering();
+    test_truncation_json_dialect_skipped();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();

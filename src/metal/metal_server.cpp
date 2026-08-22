@@ -2609,7 +2609,8 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
-            std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req,nullptr,nullptr,{},{},&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Chat),TokenLimitApi::Chat);
@@ -3017,9 +3018,10 @@ int main(int argc,char** argv) {
             q27::validate_anthropic_tool_choice_thinking(tchoice,think_cfg);
             bool think_req=think_cfg.enabled;
             if(tchoice.mode==q27::ToolChoice::FORCED) think_req=false;
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
             std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),selected.tools,think_req,nullptr,nullptr,
-                q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+                q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
@@ -3056,9 +3058,10 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
             std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),tools,think_req,nullptr,nullptr,
-                q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+                q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Messages));
@@ -3539,7 +3542,8 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
-            std::string rendered=q27::chatml_prompt(merged,tools,think_req);
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            std::string rendered=q27::chatml_prompt(merged,tools,think_req,nullptr,nullptr,{},{},&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Responses),TokenLimitApi::Responses);

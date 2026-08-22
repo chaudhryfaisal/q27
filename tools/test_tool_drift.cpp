@@ -318,10 +318,12 @@ static void test_preamble_swaps_with_dialect() {
 static void test_reasoning_effort_line() {
     // The trained 3.8 template injects the effort line at the HEAD of the
     // system block when thinking is on, defaulting to xhigh (2026-08-15).
+    // NOTE (PR #37 review): the froggeric "default medium" change was dropped --
+    // the effective default stays xhigh/off; medium is reachable explicitly.
     unsetenv("Q27_REASONING_EFFORT");
     unsetenv("Q27_TOOL_DIALECT");
     auto meta = [](const char* n) { return std::string("{\"general.name\": \"") + n + "\"}"; };
-    std::vector<q27::Msg> msgs = {{"system", "Be terse."}, {"user", "hi"}};
+    std::vector<q27::Msg> msgs = {{"system", "Be terse.", {}}, {"user", "hi", {}}};
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}])");
     const std::string XH = "Reasoning effort is set to xhigh.";
     q27::set_tool_dialect_for_model(meta("Qwen38 27b Hf"));
