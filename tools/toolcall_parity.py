@@ -26,6 +26,13 @@ A turn that stops on max_tokens mid-call is counted separately. It is a real
 loss but it is truncation, not a parse failure, and folding the two together
 hides which one is moving.
 
+STREAMING FRAGMENTS ARE NOT TURNS. Claude Code's stream-json emits an
+`assistant` line per delta, so one turn appears as many lines sharing a
+`message.id` -- 214 lines for 65 turns in a measured transcript, up to 11 for a
+single turn, none carrying stop_reason. Counting lines scored a turn whose text
+arrived before its tool_use as BOTH a miss and an execution. Lines are grouped
+by message id and each turn classified once.
+
 A miss is not automatically a parser gap. Some emissions cannot be recovered by
 anything -- a call truncated mid-value, a `<parameter=` with no name -- and
 executing them would mean inventing content. Pass --dump DIR to write every
@@ -63,9 +70,12 @@ def dump_miss(text, who):
 
 
 def walk_transcript(path, st):
-    """Classify every assistant turn in one trial."""
+    """Classify every assistant TURN in one trial, grouping streamed deltas."""
     if not os.path.exists(path):
         return
+    # message id -> [tool_use count, text, stop_reason, order]
+    turns = {}
+    order = 0
     for line in open(path, errors="replace"):
         try:
             d = json.loads(line)
@@ -77,19 +87,30 @@ def walk_transcript(path, st):
         content = msg.get("content") or []
         if not isinstance(content, list):
             continue
-        kinds = [c.get("type") for c in content]
-        text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+        # No id means nothing to group on; fall back to a unique key so the
+        # turn is still counted exactly once.
+        mid = msg.get("id") or ("noid-%d" % order)
+        rec = turns.get(mid)
+        if rec is None:
+            order += 1
+            rec = turns[mid] = {"calls": 0, "text": "", "stop": None, "n": order}
+        rec["calls"] += sum(1 for c in content if c.get("type") == "tool_use")
+        rec["text"] += "".join(c.get("text", "") for c in content
+                               if c.get("type") == "text")
+        if msg.get("stop_reason") is not None:
+            rec["stop"] = msg["stop_reason"]
+    for mid, rec in sorted(turns.items(), key=lambda kv: kv[1]["n"]):
         st["turns"] += 1
-        if "tool_use" in kinds:
+        if rec["calls"]:
             st["executed"] += 1
-            st["calls"] += sum(1 for k in kinds if k == "tool_use")
-        elif MARKUP.search(executable_text(text)):
+            st["calls"] += rec["calls"]
+        elif MARKUP.search(executable_text(rec["text"])):
             # truncation is a different loss from a parse failure
-            if msg.get("stop_reason") == "max_tokens":
+            if rec["stop"] == "max_tokens":
                 st["truncated"] += 1
             else:
                 st["missed"] += 1
-                dump_miss(text, path)
+                dump_miss(rec["text"], path)
         else:
             st["prose"] += 1
 
