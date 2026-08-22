@@ -2352,7 +2352,17 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
             ve = fe == std::string::npos ? seg.size() : fe;
         }
         size_t vend = ve;
-        while (vend > vs && (seg[vend - 1] == '\n' || seg[vend - 1] == ' ')) vend--;
+        // Strip EXACTLY the delimiter newline, mirroring the single leading
+        // '\n' consumed above. This was a greedy trim over every trailing '\n'
+        // and ' ', which silently rewrote the value -- invisible to Bash and
+        // Read, fatal to Edit, whose oldString has to match the file byte for
+        // byte. Reported live as "File Edit sometime still acting up": it broke
+        // exactly when the edited region ended in whitespace. Everything
+        // between the delimiters is content.
+        if (vend > vs && seg[vend - 1] == '\n') {
+            vend--;
+            if (vend > vs && seg[vend - 1] == '\r') vend--;  // CRLF: both bytes
+        }
         std::string val = seg.substr(vs, vend - vs);
         if (key.empty()) return false;
         json parsed;

@@ -1583,6 +1583,69 @@ static void test_mode20_multicall_span_stamping() {
        "mode20: trailing gap is either emitted as text or absorbed by the calls");
 }
 
+
+// PARAMETER VALUES MUST SURVIVE BYTE-FOR-BYTE (2026-08-21, reported live by
+// chaudhryfaisal on #33: "File Edit sometime still acting up... lot better but
+// still not 100%").
+//
+// Edit is the only tool that notices. Its oldString has to match the file
+// exactly, so a value the parser trims fails to apply while the same trimming
+// is invisible to Bash and Read. That is what makes it intermittent: it breaks
+// exactly when the edited region happens to end in whitespace.
+//
+// The value extractor stripped ONE leading newline (correct -- the dialect puts
+// the value on its own line) but then ran a GREEDY trailing trim over every
+// '\n' and ' '. The format's contract is one delimiter newline at each end, so
+// the trailing side now matches the leading side and everything between the
+// delimiters is content.
+static void test_parameter_value_fidelity() {
+    json tools = json::array({tool("Edit", {{"filePath", true}, {"oldString", true},
+                                            {"newString", true}}),
+                              tool("Read", {{"file_path", true}})});
+    auto round_trip = [](const std::string& val) {
+        const std::string body =
+            "<function=Edit>\n<parameter=filePath>\n/w/x.go\n</parameter>\n"
+            "<parameter=oldString>\n" + val + "\n</parameter>\n"
+            "<parameter=newString>\nREPLACED\n</parameter>\n</function>";
+        q27::ToolCall tc;
+        if (!q27::parse_native_xml_call(body, tc)) return std::string("<parse failed>");
+        return tc.arguments.value("oldString", std::string());
+    };
+
+    ok(round_trip("hello world") == "hello world", "value fidelity: plain value unchanged");
+    ok(round_trip("    if (x) {\n        return 1;\n    }") ==
+           "    if (x) {\n        return 1;\n    }",
+       "value fidelity: indented multi-line code is exact");
+    // the three that broke Edit
+    ok(round_trip("line1\n") == "line1\n",
+       "value fidelity: a value ending in a blank line keeps it");
+    ok(round_trip("code    ") == "code    ",
+       "value fidelity: trailing spaces are content, not noise");
+    ok(round_trip("   ") == "   ",
+       "value fidelity: a whitespace-only value survives");
+    // and the delimiters themselves are still consumed, exactly one each
+    ok(round_trip("plain") == "plain", "value fidelity: delimiter newlines still stripped");
+    {
+        // CRLF line endings: the closer's delimiter is \r\n, and both bytes go
+        const std::string body =
+            "<function=Read>\n<parameter=file_path>\n/w/x.go\r\n</parameter>\n</function>";
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(body, tc) &&
+               tc.arguments.value("file_path", std::string()) == "/w/x.go",
+           "value fidelity: a CRLF delimiter is consumed whole");
+    }
+    {
+        // a path must not pick up stray bytes -- the case the greedy trim was
+        // protecting, kept honest
+        const std::string body =
+            "<function=Read>\n<parameter=file_path>\n/w/x.go\n</parameter>\n</function>";
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(body, tc) &&
+               tc.arguments.value("file_path", std::string()) == "/w/x.go",
+           "value fidelity: an ordinary path is unaffected");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1657,6 +1720,7 @@ int main() {
     test_json_fused_opener_shapes();
     test_mode22_parameter_as_opener();
     test_named_opener_batch();
+    test_parameter_value_fidelity();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
