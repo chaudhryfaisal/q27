@@ -2369,13 +2369,35 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         if (ps == std::string::npos) break;
         size_t vs = after;
         if (vs < seg.size() && seg[vs] == '\n') vs++;
-        size_t ve = seg.find(PC, vs);
+        // The XML dialect has no escape mechanism, so a value may legitimately
+        // contain `</parameter>` -- editing this parser's own tests, a doc
+        // about tool calling, a prompt template. Taking the FIRST closer
+        // truncated there and silently lost the rest of the value. Take the
+        // LAST closer before this parameter's boundary instead: an earlier one
+        // followed by more of the same value was content. Same collision #31
+        // solved for `</tool_call>` a layer up, resolved the same way -- by
+        // waiting for the evidence rather than guessing at first sight.
+        //
+        // The boundary is the next parameter opener or `</function>`, whichever
+        // comes first, so this cannot reach across into a later parameter's
+        // closer. No closer at all before that boundary still means an
+        // unterminated mid-stream parameter, which the branch below refuses as
+        // genuine mangling exactly as before -- that check is subsumed here
+        // rather than dropped.
+        size_t ve = std::string::npos;
         {
-            // A closer that belongs to a LATER parameter is not ours: an
-            // unterminated mid-stream parameter is genuine mangling, refuse.
-            size_t next_po = next_param(vs, nullptr, nullptr);
-            if (ve != std::string::npos && next_po != std::string::npos && next_po < ve)
-                return false;
+            // The bound is the next PARAMETER OPENER and nothing else. Using
+            // `</function>` as well looked tighter and was wrong: a value
+            // containing `</function>` (editing a template, a doc, this
+            // parser's own tests) bounded the search before its real closer,
+            // and the parameter read as unterminated mid-stream -- refused.
+            // The opener is sufficient, because a later call's `</parameter>`
+            // is always preceded by that call's own `<parameter=`.
+            const size_t next_po = next_param(vs, nullptr, nullptr);
+            const size_t bnd = next_po == std::string::npos ? seg.size() : next_po;
+            for (size_t c = seg.find(PC, vs); c != std::string::npos && c < bnd;
+                 c = seg.find(PC, c + PC.size()))
+                ve = c;
         }
         bool unterminated = ve == std::string::npos;
         if (unterminated) {

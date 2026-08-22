@@ -1836,6 +1836,83 @@ static void test_parameter_attribute_reaches_drift_modes() {
     }
 }
 
+
+// A VALUE CONTAINING `</parameter>` (2026-08-21, found by the Edit fidelity
+// sweep and flagged to the reporter as its own change).
+//
+// The XML dialect has no escape mechanism, so a tool call whose value
+// legitimately contains the protocol's own closer collided with it: the scan
+// took the FIRST `</parameter>` and truncated there. Editing any file that
+// contains the dialect -- this parser's own tests, a doc about tool calling, a
+// prompt template -- silently lost everything after the first occurrence.
+//
+// Same collision #31 solved for `</tool_call>` in the splitter, one layer down.
+// The real closer is the LAST `</parameter>` before the next parameter opener
+// or `</function>`: within one value, an earlier closer that is followed by
+// more of the same value was content.
+static void test_value_containing_closer() {
+    auto val_of = [](const std::string& body, const char* key) {
+        q27::ToolCall tc;
+        if (!q27::parse_native_xml_call(body, tc)) return std::string("<parse failed>");
+        return tc.arguments.value(key, std::string());
+    };
+    {
+        const std::string v = "before\n</parameter>\nafter";
+        ok(val_of("<function=Edit>\n<parameter=oldString>\n" + v +
+                      "\n</parameter>\n</function>", "oldString") == v,
+           "value with closer: survives when it is the only parameter");
+    }
+    {
+        // two parameters, the FIRST one carrying the closer in its value
+        const std::string v = "x\n</parameter>\ny";
+        const std::string body = "<function=Edit>\n<parameter=oldString>\n" + v +
+                                 "\n</parameter>\n<parameter=newString>\nNEW\n</parameter>\n"
+                                 "</function>";
+        ok(val_of(body, "oldString") == v && val_of(body, "newString") == "NEW",
+           "value with closer: the following parameter still resolves");
+    }
+    {
+        // two occurrences inside one value
+        const std::string v = "a\n</parameter>\nb\n</parameter>\nc";
+        ok(val_of("<function=Edit>\n<parameter=oldString>\n" + v +
+                      "\n</parameter>\n</function>", "oldString") == v,
+           "value with closer: more than one occurrence survives");
+    }
+    // ---- the ordinary shapes must be untouched ----
+    {
+        ok(val_of("<function=Edit>\n<parameter=oldString>\nplain\n</parameter>\n"
+                  "<parameter=newString>\nNEW\n</parameter>\n</function>",
+                  "oldString") == "plain",
+           "value with closer: ordinary two-parameter call unchanged");
+    }
+    {
+        // the final-parameter leniency (unterminated last value) still holds
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(
+               "<function=Bash>\n<parameter=command>\nls -la\n", tc) &&
+               tc.arguments.value("command", std::string()) == "ls -la",
+           "value with closer: an unterminated final parameter still recovers");
+    }
+    {
+        // REGRESSION GUARD. The first version of the fix bounded the closer
+        // search at `</function>` as well as the next parameter opener, which
+        // looked tighter and broke a value CONTAINING `</function>`: the bound
+        // landed before the real closer, the parameter read as unterminated
+        // mid-stream, and the whole call was refused. The next opener alone is
+        // sufficient, because a later call's `</parameter>` is always preceded
+        // by that call's own `<parameter=`.
+        const std::string v = "x\n</function>\ny";
+        const std::string body = "<function=Edit>\n<parameter=oldString>\n" + v +
+                                 "\n</parameter>\n<parameter=newString>\nNEW\n</parameter>\n"
+                                 "</function>";
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(body, tc) &&
+               tc.arguments.value("oldString", std::string()) == v &&
+               tc.arguments.value("newString", std::string()) == "NEW",
+           "value with closer: a value containing </function> still parses");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1914,6 +1991,7 @@ int main() {
     test_unterminated_batch_no_function_closer();
     test_parameter_attribute_spelling();
     test_parameter_attribute_reaches_drift_modes();
+    test_value_containing_closer();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
