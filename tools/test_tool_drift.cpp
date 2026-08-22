@@ -2164,6 +2164,77 @@ static void test_partial_opener_is_residue() {
        "partial opener: a fragment too short to identify is not residue");
 }
 
+
+// THE TOOL NAME AS THE VALUE OF A PARAMETER CALLED `name` (2026-08-22, two
+// live misses in the fp16 arm, both this shape):
+//
+//   <parameter=name>
+//   Bash</parameter>
+//   <parameter=command>
+//   npx tsx scripts/perf-check.ts
+//   </parameter>
+//   </function>
+//
+// An earlier test for this spelling passed, and passed for the wrong reason:
+// its toy schema had one tool, so key INFERENCE over {name, command} landed on
+// Bash. Under Claude Code's real registry {command} fits Bash AND Monitor, the
+// foreign `name` key counts equally against both, and infer_tool_name refuses
+// the tie. The model wrote the tool's name; nothing read it.
+//
+// Rule: a parameter literally named `name` whose value names a DECLARED tool
+// is the tool, and is removed from the arguments. Reading a name the model
+// wrote is strictly less guessing than inferring one, and it is the same rule
+// modes 18/22 already apply one tag over.
+static void test_name_parameter_is_the_tool() {
+    json twins = json::array({tool("Bash", {{"command", true}, {"description", false}, {"timeout", false}}),
+                              tool("Monitor", {{"command", true}, {"timeout", false}}),
+                              tool("Read", {{"file_path", true}, {"limit", false}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    {   // live shape 1: closer on the same line as the name
+        auto v = call("<parameter=name>\nBash</parameter>\n<parameter=command>\n"
+                      "npx tsx scripts/perf-check.ts 2>&1 | tail -20\n</parameter>\n</function>", twins);
+        ok(v.size() == 1 && v[0].name == "Bash" &&
+               v[0].arguments.value("command", std::string()).rfind("npx tsx", 0) == 0 &&
+               !v[0].arguments.contains("name"),
+           "name param: Bash read from <parameter=name> despite the Monitor twin, `name` key removed");
+    }
+    {   // live shape 2: name on its own line
+        auto v = call("<parameter=name>\nRead\n</parameter>\n<parameter=file_path>\n"
+                      "/workspace/src/index.ts\n</parameter>\n</function>", twins);
+        ok(v.size() == 1 && v[0].name == "Read" &&
+               v[0].arguments.value("file_path", std::string()) == "/workspace/src/index.ts",
+           "name param: Read read from <parameter=name>");
+    }
+    {   // inside a wrapper, the live delivery
+        auto out = resolve_stream("<tool_call>\n<parameter=name>\nBash</parameter>\n<parameter=command>\nls\n"
+                                  "</parameter>\n</function>\n</tool_call>", &twins);
+        ok(out.calls.size() == 1 && out.calls[0].name == "Bash",
+           "name param: recovered from a TOOL segment");
+    }
+    // ---- refusals ----
+    {   // a `name` value that is not a declared tool stays an ordinary parameter
+        // and the call falls back to inference as before
+        json one = json::array({tool("Bash", {{"command", true}})});
+        auto v = call("<parameter=name>\nnot a tool\n</parameter>\n<parameter=command>\nls\n</parameter>\n</function>", one);
+        ok(v.size() == 1 && v[0].name == "Bash" && v[0].arguments.value("name", std::string()) == "not a tool",
+           "name param: a non-tool value is left as a parameter");
+    }
+    {   // and with the twins present that same case still refuses the tie
+        auto v = call("<parameter=name>\nnot a tool\n</parameter>\n<parameter=command>\nls\n</parameter>\n</function>", twins);
+        ok(v.empty(), "name param: non-tool value + ambiguous keys still refuses");
+    }
+    {   // a declared tool that itself has a `name` parameter must not lose it
+        json named = json::array({tool("Rename", {{"name", true}, {"path", true}}),
+                                  tool("Bash", {{"command", true}})});
+        auto v = call("<function=Rename>\n<parameter=name>\nBash\n</parameter>\n<parameter=path>\n/x\n</parameter>\n</function>", named);
+        ok(v.size() == 1 && v[0].name == "Rename" && v[0].arguments.value("name", std::string()) == "Bash",
+           "name param: an explicit <function=> opener keeps `name` as an argument");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -2247,6 +2318,7 @@ int main() {
     test_placeholder_name_on_next_line();
     test_xml_bleed_into_json_key();
     test_partial_opener_is_residue();
+    test_name_parameter_is_the_tool();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();

@@ -4690,7 +4690,25 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 ToolCall tc;
                 if (!named_undeclared && parse_native_xml_call(span, tc) &&
                     !tc.arguments.empty()) {
-                    const std::string nm = infer_tool_name(*tools, tc.arguments);
+                    // A parameter literally named `name` whose value names a
+                    // DECLARED tool is the tool (2026-08-22, two live misses):
+                    //   <parameter=name>\nBash</parameter>\n<parameter=command>...
+                    // Read it and drop the key, rather than inferring from
+                    // {name, command} -- which ties Bash against Monitor under
+                    // the real registry and refuses. Openerless path only: an
+                    // explicit <function=X> keeps `name` as an ordinary argument.
+                    std::string nm;
+                    auto nit = tc.arguments.find("name");
+                    if (nit != tc.arguments.end() && nit->is_string()) {
+                        std::string cand = nit->get<std::string>();
+                        const size_t a = cand.find_first_not_of(" \t\r\n");
+                        cand = a == std::string::npos ? "" :
+                               cand.substr(a, cand.find_last_not_of(" \t\r\n") - a + 1);
+                        const std::string canon = declared(cand) ? cand
+                                                  : canonical_declared_name(tools, cand);
+                        if (!canon.empty()) { nm = canon; tc.arguments.erase(nit); }
+                    }
+                    if (nm.empty()) nm = infer_tool_name(*tools, tc.arguments);
                     if (!nm.empty() && declared(nm)) {
                         tc.name = nm;
                         tc.ok = true;
