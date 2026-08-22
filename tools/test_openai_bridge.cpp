@@ -737,6 +737,70 @@ static void test_openai_reasoning_content_roundtrip() {
           r2.size() - std::string("<think>\n\n</think>\n\n").size());
 }
 
+// P1a: <|think_*|> toggles must be stripped and must drive the generation
+// prompt + reasoning-instructions line (stateful, mirroring the template).
+static void test_think_toggle_state() {
+    unsetenv("Q27_REASONING_EFFORT");
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    {   // <|think_off|> -> closed gen block even with think=true param
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_off|>Just answer."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/true);
+        CHECK(r.find("<|think_off|>") == std::string::npos);          // stripped
+        CHECK(r.find("Just answer.") != std::string::npos);
+        CHECK(r.rfind("<think>\n\n</think>\n\n") ==                  // thinking off
+              r.size() - std::string("<think>\n\n</think>\n\n").size());
+    }
+    {   // <|think_on|> with think=false -> OPEN gen block + effort line
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_on|>Think hard."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+        CHECK(r.find("<|think_on|>") == std::string::npos);
+        CHECK(r.rfind("<think>\n") == r.size() - std::string("<think>\n").size());
+        CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+    }
+    {   // <|think_xhigh|> arms xhigh effort on a no-think base
+        json body = {{"messages", json::array({
+            {{"role","user"},{"content","<|think_xhigh|>Be careful."}},
+        })}};
+        auto msgs = q27::openai_msgs(body);
+        std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+        CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+    }
+}
+
+// P1b: consecutive tool-error responses accumulate system warnings.
+static void test_tool_failure_warnings() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","run the build"}},
+        {{"role","user"},{"content",tr("error: command not found: make")}},
+        {{"role","user"},{"content",tr("fatal: make: no targets")}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    // 1st failure -> diagnose warning
+    CHECK(r.find("SYSTEM WARNING: The previous tool call returned an error.") != std::string::npos);
+    // 2nd consecutive failure -> change-approach warning with count 2
+    CHECK(r.find("2 consecutive tool errors detected. Your previous approach is incorrect.") != std::string::npos);
+    // a plain user turn after resets the counter (no "1 consecutive" survives)
+    json body2 = {{"messages", json::array({
+        {{"role","user"},{"content",tr("error: boom")}},
+        {{"role","user"},{"content","the error is fixed now"}},
+        {{"role","user"},{"content",tr("error: boom again")}},
+    })}};
+    auto msgs2 = q27::openai_msgs(body2);
+    std::string r2 = q27::chatml_prompt(msgs2, {}, /*think=*/false);
+    // only two separate single-failure warnings, no "2 consecutive"
+    CHECK(r2.find("2 consecutive tool errors") == std::string::npos);
+    CHECK(r2.find("The previous tool call returned an error.") != std::string::npos);
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2200,6 +2264,8 @@ int main() {
     test_stream_options_include_usage();
     test_end_to_end_chatml_prompt();
     test_openai_reasoning_content_roundtrip();
+    test_think_toggle_state();
+    test_tool_failure_warnings();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();

@@ -6,6 +6,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -287,19 +288,96 @@ inline bool tool_dialect_xml() {
 // template has no reasoning_effort, so 3.6-family renders stay untouched.
 // Q27_REASONING_EFFORT: xhigh | low | medium (no line, per the template) |
 // off (legacy pre-2026-08-15 rendering, for A/Bs) -- overrides either way.
-inline std::string reasoning_effort_line() {
+// think-effort level: 0 = medium/off (no instruction line), 1 = low, 2 = xhigh.
+inline int reasoning_effort_env_level() {
     const char* e = getenv("Q27_REASONING_EFFORT");
     const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
-    if (v == "xhigh")
+    return v == "xhigh" ? 2 : (v == "low" ? 1 : 0);
+}
+inline std::string reasoning_effort_line_level(int level) {
+    if (level == 2)
         return "Reasoning effort is set to xhigh. Please think carefully through "
                "the task, validate key assumptions, consider plausible alternatives, "
                "and prioritize correctness, consistency, and clarity in the final "
                "answer.";
-    if (v == "low")
+    if (level == 1)
         return "Reasoning effort is set to low. Keep your thinking brief and "
                "focused, moving directly to the conclusion without unnecessary "
                "elaboration.";
     return ""; // medium (template emits nothing) / off (legacy) / unknown
+}
+inline std::string reasoning_effort_line() {
+    return reasoning_effort_line_level(reasoning_effort_env_level());
+}
+
+// P1a (2026-08-22): the <|think_*|> toggle markers from the qwen3.8
+// chat_template. Stripping: these are BPE-tokenisable control markers the
+// model is trained to read in user/system content; they must not leak into
+// the rendered prompt, and they MUTATE the thinking/effort state forward.
+inline void strip_think_markers(std::string& s) {
+    static const std::string mk[] = {"<|think_off|>", "<|think_on|>",
+                                     "<|think_xhigh|>", "<|think_high|>",
+                                     "<|think_medium|>", "<|think_low|>",
+                                     "<|think_minimal|>"};
+    for (const auto& m : mk)
+        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+}
+
+// P1a forward-scan of the (flattened) message list for <|think_*|> toggles;
+// returns the final thinking/effort state. Mirrors the template: only
+// system/developer/user roles are scanned (assistant and tool roles are not),
+// and tool responses (user-role, <tool_response>-wrapped) are skipped.
+struct ThinkToggles {
+    bool thinking = true;
+    int effort = 0; // 0 medium, 1 low, 2 xhigh
+};
+inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_think) {
+    ThinkToggles st{base_think, reasoning_effort_env_level()};
+    for (const Msg& m : msgs) {
+        if (m.role != "system" && m.role != "user") continue;
+        if (m.role == "user" && m.content.rfind("<tool_response>", 0) == 0) continue;
+        const std::string& c = m.content;
+        if (c.find("<|think_off|>") != std::string::npos) st.thinking = false;
+        else if (c.find("<|think_on|>") != std::string::npos) st.thinking = true;
+        else if (c.find("<|think_xhigh|>") != std::string::npos ||
+                 c.find("<|think_high|>") != std::string::npos) {
+            st.thinking = true; st.effort = 2;
+        } else if (c.find("<|think_low|>") != std::string::npos ||
+                   c.find("<|think_minimal|>") != std::string::npos) {
+            st.thinking = true; st.effort = 1;
+        } else if (c.find("<|think_medium|>") != std::string::npos) {
+            st.thinking = true; st.effort = 0;
+        }
+    }
+    return st;
+}
+
+// P1b: tool-response failure detection, mirrored from the qwen3.8
+// chat_template's consecutive-failure tracking. A short (<500) response whose
+// head (80 chars, lowercased) carries an error signature and no '$ '/'took '
+// counts as a failure.
+inline bool is_tool_response_failure(const std::string& content) {
+    if (content.size() >= 500) return false;
+    std::string lower = content.substr(0, 80);
+    for (auto& c : lower) c = (char)tolower((unsigned char)c);
+    if (content.find("$ ") != std::string::npos) return false;
+    if (lower.find("took ") != std::string::npos) return false;
+    static const char* sig[] = {"\"error:\"", "error:", "err!", "fatal:",
+                                "exception:", "traceback", "command not found",
+                                "invalid syntax", "failed to"};
+    for (const char* s : sig)
+        if (lower.find(s) != std::string::npos) return true;
+    return false;
+}
+inline std::string tool_response_warning(int failures) {
+    if (failures >= 2)
+        return "\n\n\u26a0\ufe0f SYSTEM WARNING: " + std::to_string(failures) +
+               " consecutive tool errors detected. Your previous approach is "
+               "incorrect. You MUST use a fundamentally different approach or "
+               "corrected arguments.";
+    return "\n\n\u26a0\ufe0f SYSTEM WARNING: The previous tool call returned an "
+           "error. Diagnose the failure and retry with completely corrected "
+           "arguments.";
 }
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
@@ -368,10 +446,15 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
                                !unavailable_tools->empty();
-    // Template order: reasoning_instructions FIRST, then tools, then the
-    // client system content. Thinking-gated exactly like the template
-    // (enable_thinking undefined-or-true).
-    const std::string effort = think ? reasoning_effort_line() : std::string();
+    // P1a: forward-scan the message list for <|think_*|> toggles. The final
+    // thinking/effort state drives BOTH the reasoning_instructions line at the
+    // system head and the generation prompt below (mirrors the template's
+    // stateful ns_state). Template order: reasoning_instructions FIRST, then
+    // tools, then the client system content.
+    const ThinkToggles tt = scan_think_toggles(msgs, think);
+    const std::string effort = tt.thinking ? reasoning_effort_line_level(tt.effort)
+                                           : std::string();
+    strip_think_markers(sys);
     if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty() ||
         !effort.empty()) {
         p += "<|im_start|>system\n";
@@ -391,14 +474,25 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_end|>\n";
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
+    int tool_failures = 0;
     for (size_t i = start; i < msgs.size(); i++) {
         const Msg& m = msgs[i];
+        std::string content = m.content;
+        // P1b: consecutive tool-error tracking. Tool responses reach this
+        // renderer already <tool_response>-wrapped in a user turn.
+        const bool toolresp = m.role == "user" &&
+                              content.rfind("<tool_response>", 0) == 0;
+        if (toolresp) tool_failures = is_tool_response_failure(content)
+                                          ? tool_failures + 1 : 0;
+        else if (m.role == "user") tool_failures = 0; // plain user resets
         p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
         // assistant history reasoning block, jinja format:
         //   <think>\n...\n</think>\n\n  then the plain content
         if (m.role == "assistant" && !m.reasoning.empty())
             p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
-        p += strip_ctrl(m.content) + "<|im_end|>\n";
+        strip_think_markers(content);
+        if (toolresp && tool_failures >= 1) content += tool_response_warning(tool_failures);
+        p += strip_ctrl(content) + "<|im_end|>\n";
     }
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
@@ -411,7 +505,9 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // StreamSplitter to THINK when think=true so the model's first generated
     // token (already inside the block) routes to the think channel -- mirrors the
     // FORCED tool_choice TOOL pre-seed.
-    if (!think) p += "<think>\n\n</think>\n\n";
+    // P1a: the generation prompt follows the final toggle state, not just the
+    // caller's `think` flag. think=false -> empty CLOSED block; true -> OPEN.
+    if (!tt.thinking) p += "<think>\n\n</think>\n\n";
     else p += "<think>\n";
     return p;
 }
