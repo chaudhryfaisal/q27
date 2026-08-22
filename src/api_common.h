@@ -3674,14 +3674,48 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (fb == std::string::npos) break;
                 std::string span = text_in.substr(fb);
                 const size_t fe = span.find("</function>");
-                if (fe != std::string::npos) span = span.substr(0, fe + 11);
+                size_t span_end = text_in.size();
+                if (fe != std::string::npos) {
+                    span = span.substr(0, fe + 11);
+                    span_end = fb + fe + 11;
+                } else {
+                    // No </function> at all. Running to end-of-text sweeps the
+                    // NEXT call's parameters into this one, and
+                    // parse_native_xml_call refuses an unterminated final
+                    // parameter when another <parameter= follows -- correctly,
+                    // because within ONE call that is mangling. In a batch the
+                    // next <parameter= belongs to the next call. Bounding the
+                    // span at the next call boundary keeps that refusal
+                    // meaningful: the boundary is what distinguishes "the model
+                    // started another call" from "the model mangled this one".
+                    size_t nb = std::string::npos;
+                    for (size_t c = text_in.find("<function", fb + 9); c != std::string::npos;
+                         c = text_in.find("<function", c + 9)) {
+                        std::string nm2;
+                        size_t a2;
+                        if (parse_function_opener(text_in, c, nm2, a2)) { nb = c; break; }
+                    }
+                    // BOTH markers bound the call. `</tool_call>` is the one
+                    // that matters: a batch separated by `</tool_call>\n<tool_call>`
+                    // ends each call at the CLOSER, and searching only for the
+                    // opener swept the closer into the value (find("<tool_call>")
+                    // does not match inside "</tool_call>").
+                    for (const char* m : {"</tool_call>", "<tool_call>"}) {
+                        const size_t p = text_in.find(m, fb + 1);
+                        if (p != std::string::npos && (nb == std::string::npos || p < nb)) nb = p;
+                    }
+                    if (nb != std::string::npos) {
+                        span = text_in.substr(fb, nb - fb);
+                        span_end = nb;
+                    }
+                }
                 // Hallucinated-result rule (2026-08-21): a <result>/<output>
                 // element enclosing this span -- or inside it -- means the
                 // "call" is part of invented result output. Break the batch
                 // rather than promoting fiction to a call; other modes apply
-                // the same guard to their own spans.
-                const size_t fe_abs = fe != std::string::npos ? fb + fe + 11 : text_in.size();
-                if (hallucinated_result_around(text_in, fb, fe_abs)) break;
+                // the same guard to their own spans. Uses the BOUNDED end, so
+                // the guard inspects this call's span and not its successors'.
+                if (hallucinated_result_around(text_in, fb, span_end)) break;
                 ToolCall tc;
                 // Stop at the first span that will not resolve rather than
                 // skipping it: keep what was actually read, never invent the
@@ -3703,7 +3737,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     tc.name = alt;
                 }
                 tc.source_begin = fb;
-                tc.source_end = fe != std::string::npos ? fb + fe + 11 : text_in.size();
+                tc.source_end = span_end;
                 if (first_begin == std::string::npos) first_begin = fb;
                 cur = tc.source_end;
                 batch.push_back(std::move(tc));

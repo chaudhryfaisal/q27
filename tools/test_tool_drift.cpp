@@ -1646,6 +1646,89 @@ static void test_parameter_value_fidelity() {
     }
 }
 
+
+// A BATCH WITH NO </function> ANYWHERE (2026-08-21, from the UN-RESCUED lines of
+// the batch-fix re-run -- the log found this, not a bug report):
+//
+//   <function=TaskCreate>
+//   <parameter=arguments>
+//   {"subject": "...", "description": "..."}}
+//   </tool_call>
+//   <tool_call>
+//   <function=TaskCreate>
+//   <parameter=arguments>
+//   ...
+//
+// Each call carries its whole argument object in a single <parameter=arguments>
+// and never closes it, and the batch is separated by </tool_call><tool_call>
+// rather than by </function>. A SINGLE call of this shape has always recovered;
+// the batch did not, and this predates the batch work (verified against 6412204,
+// which returns 0 for the batch and 1 for the single, identically).
+//
+// The cause is a good rule misfiring: parse_native_xml_call refuses an
+// unterminated final parameter when another <parameter= follows, because within
+// ONE call that is genuine mangling. In a batch the next <parameter= belongs to
+// the NEXT CALL. So a span with no </function> is bounded at the next call
+// boundary instead of running to end-of-text, which keeps the mangling refusal
+// intact for same-call cases -- the boundary is exactly what tells them apart.
+static void test_unterminated_batch_no_function_closer() {
+    json tools = json::array({tool("TaskCreate", {{"subject", true}, {"description", false},
+                                                  {"activeForm", false}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+    auto call = [](const std::string& t, const json& tl) {
+        std::string pre;
+        return q27::parse_bare_tool_calls(t, &pre, &tl);
+    };
+    auto argcall = [](const char* subj) {
+        return std::string("<function=TaskCreate>\n<parameter=arguments>\n{\"subject\": \"") +
+               subj + "\", \"description\": \"d\"}}\n";
+    };
+    const std::string SEP = "</tool_call>\n<tool_call>\n";
+
+    {
+        auto v = call(argcall("Implement TimeTracker") + SEP + argcall("Write tests"), tools);
+        ok(v.size() == 2 &&
+               v[0].arguments.value("subject", std::string()) == "Implement TimeTracker" &&
+               v[1].arguments.value("subject", std::string()) == "Write tests",
+           "unterminated batch: two <parameter=arguments> calls recover");
+    }
+    {
+        auto v = call(argcall("A") + SEP + argcall("B") + SEP + argcall("C"), tools);
+        ok(v.size() == 3, "unterminated batch: three recover");
+    }
+    {
+        // the single case has always worked and must keep working
+        auto v = call(argcall("only one"), tools);
+        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "only one",
+           "unterminated batch: a single unterminated call is unchanged");
+    }
+    {
+        // mixed: a properly closed call, then an unterminated one
+        auto v = call("<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>\n" +
+                          SEP + argcall("after"),
+                      tools);
+        ok(v.size() == 2 && v[0].name == "Bash" &&
+               v[1].arguments.value("subject", std::string()) == "after",
+           "unterminated batch: a closed call followed by an unterminated one");
+    }
+
+    // ---- the refusal this must NOT weaken ----
+    {
+        // No call boundary here: the second <parameter= belongs to the SAME
+        // call, so an unterminated first parameter is genuine mangling and
+        // still refuses. This is the rule the fix threads around, not through.
+        auto v = call("<function=Bash>\n<parameter=arguments>\n{\"command\":\"ls\"}\n"
+                      "<parameter=command>\nls\n",
+                      tools);
+        ok(v.empty(), "unterminated batch: mid-call mangling still refuses (no boundary)");
+    }
+    {
+        ok(call("<result>\n<output>x</output>\n" + argcall("A") + SEP + argcall("B"),
+                tools).empty(),
+           "unterminated batch: a hallucinated result block still refuses");
+    }
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1721,6 +1804,7 @@ int main() {
     test_mode22_parameter_as_opener();
     test_named_opener_batch();
     test_parameter_value_fidelity();
+    test_unterminated_batch_no_function_closer();
     test_intended_tool_call_detector();
     test_unclosed_tool_tail_recovery();
     test_mode20_multicall_span_stamping();
