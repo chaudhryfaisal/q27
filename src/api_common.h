@@ -293,7 +293,9 @@ inline bool tool_dialect_xml() {
 inline int reasoning_effort_env_level() {
     const char* e = getenv("Q27_REASONING_EFFORT");
     const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
-    return v == "xhigh" ? 2 : (v == "low" ? 1 : 0);
+    if (v == "low" || v == "minimal") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // medium / off / none / unknown
 }
 inline std::string reasoning_effort_line_level(int level) {
     if (level == 2)
@@ -318,8 +320,9 @@ inline std::string reasoning_effort_line() {
 inline void strip_think_markers(std::string& s) {
     static const std::string mk[] = {"<|think_off|>", "<|think_on|>",
                                      "<|think_xhigh|>", "<|think_high|>",
-                                     "<|think_medium|>", "<|think_low|>",
-                                     "<|think_minimal|>"};
+                                     "<|think_ultracode|>", "<|think_extreme|>",
+                                     "<|think_max|>", "<|think_medium|>",
+                                     "<|think_low|>", "<|think_minimal|>"};
     for (const auto& m : mk)
         for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
 }
@@ -341,7 +344,10 @@ inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_t
         if (c.find("<|think_off|>") != std::string::npos) st.thinking = false;
         else if (c.find("<|think_on|>") != std::string::npos) st.thinking = true;
         else if (c.find("<|think_xhigh|>") != std::string::npos ||
-                 c.find("<|think_high|>") != std::string::npos) {
+                 c.find("<|think_high|>") != std::string::npos ||
+                 c.find("<|think_ultracode|>") != std::string::npos ||
+                 c.find("<|think_extreme|>") != std::string::npos ||
+                 c.find("<|think_max|>") != std::string::npos) {
             st.thinking = true; st.effort = 2;
         } else if (c.find("<|think_low|>") != std::string::npos ||
                    c.find("<|think_minimal|>") != std::string::npos) {
@@ -354,21 +360,71 @@ inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_t
 }
 
 // P1b: tool-response failure detection, mirrored from the qwen3.8
-// chat_template's consecutive-failure tracking. A short (<500) response whose
-// head (80 chars, lowercased) carries an error signature and no '$ '/'took '
-// counts as a failure.
+// chat_template (froggeric v22.3). Suppresses code/grep output and
+// exit-code-0, distinguishes strong vs weak error signatures.
 inline bool is_tool_response_failure(const std::string& content) {
-    if (content.size() >= 500) return false;
-    std::string lower = content.substr(0, 80);
-    for (auto& c : lower) c = (char)tolower((unsigned char)c);
-    if (content.find("$ ") != std::string::npos) return false;
-    if (lower.find("took ") != std::string::npos) return false;
-    static const char* sig[] = {"\"error:\"", "error:", "err!", "fatal:",
-                                "exception:", "traceback", "command not found",
-                                "invalid syntax", "failed to"};
-    for (const char* s : sig)
-        if (lower.find(s) != std::string::npos) return true;
-    return false;
+    std::string full = content;
+    for (auto& c : full) c = (char)tolower((unsigned char)c);
+    const std::string head = full.substr(0, 120);
+    const bool is_code_or_grep =
+        full.find("throw new ") != std::string::npos ||
+        full.find("throw error") != std::string::npos ||
+        full.find("console.error") != std::string::npos ||
+        full.find("logger.error") != std::string::npos ||
+        full.find("logging.error") != std::string::npos ||
+        head.find("import ") != std::string::npos ||
+        head.find("def ") != std::string::npos ||
+        head.find("function ") != std::string::npos;
+    const bool exit_zero =
+        head.find("exit code: 0") != std::string::npos ||
+        head.find("process exited with code 0") != std::string::npos;
+    const bool error_field_ok =
+        head.find("\"error\": null") != std::string::npos ||
+        head.find("\"error\":null") != std::string::npos ||
+        head.find("\"error\": false") != std::string::npos ||
+        head.find("\"error\":false") != std::string::npos ||
+        head.find("\"error\": \"\"") != std::string::npos ||
+        head.find("\"error\":\"\"") != std::string::npos;
+    const bool strong_error =
+        (head.find("\"error\":") != std::string::npos && !error_field_ok) ||
+        head.find("\"status\": \"error\"") != std::string::npos ||
+        head.find("\"status\":\"error\"") != std::string::npos ||
+        head.find("traceback (most recent call last):") != std::string::npos ||
+        head.find("command not found") != std::string::npos ||
+        head.find("invalid syntax") != std::string::npos ||
+        head.find("fatal:") != std::string::npos ||
+        ((head.find("exit code: ") != std::string::npos ||
+          head.find("process exited with code") != std::string::npos) && !exit_zero) ||
+        head.find("exception:") == 0 ||
+        head.find("failed to ") == 0;
+    const bool weak_error =
+        head.find("error:") != std::string::npos ||
+        head.find("err!") != std::string::npos;
+    const bool weak_suppressed =
+        head.find("$ ") != std::string::npos ||
+        head.find("took ") != std::string::npos ||
+        content.size() >= 600;
+    return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
+}
+
+// v22.3: strip a leading think block from content when explicit reasoning is
+// present (avoids double-rendering a block the client also sent in text).
+inline void strip_leading_think(std::string& content) {
+    const char* lead_end = nullptr;
+    if (content.rfind("<think>", 0) == 0 && content.find("</think>") != std::string::npos)
+        lead_end = "</think>";
+    else if (content.rfind("<thinking>", 0) == 0 && content.find("</thinking>") != std::string::npos)
+        lead_end = "</thinking>";
+    else if (content.rfind("</think>", 0) == 0) lead_end = "</think>";
+    else if (content.rfind("</thinking>", 0) == 0) lead_end = "</thinking>";
+    if (!lead_end) return;
+    std::string close(lead_end);
+    size_t p = content.find(close);
+    if (p == std::string::npos) return;
+    content = content.substr(p + close.size());
+    size_t i = 0;
+    while (i < content.size() && content[i] == '\n') i++;
+    content = content.substr(i);
 }
 inline std::string tool_response_warning(int failures) {
     if (failures >= 2)
@@ -434,7 +490,16 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     std::string p;
     size_t start = 0;
     std::string sys;
-    if (!msgs.empty() && msgs[0].role == "system") { sys = strip_ctrl(msgs[0].content); start = 1; }
+    // v22.3: merge ALL consecutive leading system/developer messages into one
+    // system block (joined with a blank line), mirroring the template's head
+    // loop -- not just messages[0].
+    while (start < msgs.size() &&
+           (msgs[start].role == "system" || msgs[start].role == "developer")) {
+        std::string part = strip_ctrl(msgs[start].content);
+        if (!sys.empty()) sys += "\n\n";
+        sys += part;
+        start++;
+    }
     // Over-refusal fix (2026-07-13, external review): under the no-think
     // serving default a bare request WITH NO SYSTEM PROMPT gives the model
     // zero context AND zero reasoning budget, so it falls to a defensive
@@ -512,8 +577,12 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
         // assistant history reasoning block, jinja format:
         //   <think>\n...\n</think>\n\n  then the plain content
-        if (m.role == "assistant" && !m.reasoning.empty())
+        if (m.role == "assistant" && !m.reasoning.empty()) {
+            // v22.3: if the client also sent the think block in text, strip it
+            // so the explicit reasoning is not double-rendered
+            strip_leading_think(content);
             p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
+        }
         p += strip_ctrl(content) + "<|im_end|>\n";
     }
     if (stable_off) *stable_off = p.size();

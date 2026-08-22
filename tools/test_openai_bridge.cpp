@@ -872,6 +872,77 @@ static void test_tool_truncation_request_body() {
     CHECK(r0.find("TRUNCATED") == std::string::npos);
 }
 
+// v22.3: multiple leading system/developer messages merge into ONE system block.
+static void test_v223_multi_system_merge() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","system"},{"content","sys one"}},
+        {{"role","system"},{"content","sys two"}},
+        {{"role","user"},{"content","hi"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    size_t n = 0;
+    for (size_t p = 0; (p = r.find("<|im_start|>system\n", p)) != std::string::npos; ++n, ++p);
+    CHECK(n == 1);                       // both merged into one block
+    CHECK(r.find("sys one\n\nsys two") != std::string::npos); // joined with blank line
+}
+
+// v22.3: new <|think_ultracode|>/extreme/max markers map to xhigh effort.
+static void test_v223_new_think_markers() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","<|think_ultracode|>deep reasoning"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<|think_ultracode|>") == std::string::npos);  // stripped
+    CHECK(r.find("Reasoning effort is set to xhigh.") != std::string::npos);
+}
+
+// v22.3: explicit reasoning + a think block already in content -> no double render.
+static void test_v223_reasoning_dedup() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","user"},{"content","q"}},
+        {{"role","assistant"},{"content","<think>\ninline thinking\n</think>\nFinal answer."},
+            {"reasoning_content","explicit reasoning"}},
+        {{"role","user"},{"content","what did you reason"}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<think>\nexplicit reasoning\n</think>\n\nFinal answer.") != std::string::npos);
+    CHECK(r.find("inline thinking") == std::string::npos); // inline dup removed
+}
+
+// v22.3: failure detection suppresses code output and exit-code-0.
+static void test_v223_failure_detection() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
+    {   // code output with console.error is suppressed (not a failure)
+        json b = {{"messages", json::array({
+            {{"role","user"},{"content","run"}},
+            {{"role","tool"},{"content","import os\nconsole.error('boom')\nfunction x() {}"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    }
+    {   // exit code 0 is not a failure
+        json b = {{"messages", json::array({
+            {{"role","tool"},{"content","exit code: 0\nall good"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    }
+    {   // nonzero exit code IS a failure
+        json b = {{"messages", json::array({
+            {{"role","tool"},{"content","exit code: 2\nboom"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("SYSTEM WARNING") != std::string::npos);
+    }
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2340,6 +2411,10 @@ int main() {
     test_tool_grouping();
     test_tool_truncation();
     test_tool_truncation_request_body();
+    test_v223_multi_system_merge();
+    test_v223_new_think_markers();
+    test_v223_reasoning_dedup();
+    test_v223_failure_detection();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();
