@@ -778,14 +778,21 @@ static void test_think_toggle_state() {
 // P1b: consecutive tool-error responses accumulate system warnings.
 static void test_tool_failure_warnings() {
     q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
     auto tr = [&](const std::string& body) { return "<tool_response>\n" + body + "\n</tool_response>"; };
     json body = {{"messages", json::array({
         {{"role","user"},{"content","run the build"}},
         {{"role","user"},{"content",tr("error: command not found: make")}},
         {{"role","user"},{"content",tr("fatal: make: no targets")}},
     })}};
+    // default is OFF per PR #37 review (measured 3/12 FP on benign outputs):
+    // even two consecutive failures inject no warning when no opts are passed.
     auto msgs = q27::openai_msgs(body);
     std::string r = q27::chatml_prompt(msgs, {}, /*think=*/false);
+    CHECK(r.find("SYSTEM WARNING") == std::string::npos);
+    // env re-enables at boot (template parity is one flag away)
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
+    r = q27::chatml_prompt(msgs, {}, /*think=*/false);
     // 1st failure -> diagnose warning
     CHECK(r.find("SYSTEM WARNING: The previous tool call returned an error.") != std::string::npos);
     // 2nd consecutive failure -> change-approach warning with count 2
@@ -801,23 +808,24 @@ static void test_tool_failure_warnings() {
     // only two separate single-failure warnings, no "2 consecutive"
     CHECK(r2.find("2 consecutive tool errors") == std::string::npos);
     CHECK(r2.find("The previous tool call returned an error.") != std::string::npos);
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
 
-    // P1b off switch (PR #37 review): tool_error_warnings=false suppresses the
-    // escalation warnings entirely (detection skipped, no SYSTEM WARNING).
-    json body3 = {{"messages", body["messages"]}, {"tool_error_warnings", false}};
+    // per-request field (PR #37 review): explicit true wins over the OFF boot
+    // default; explicit false wins over an ON env default.
+    json body3 = {{"messages", body["messages"]}, {"tool_error_warnings", true}};
     auto opts = q27::template_opts_from_body(body3);
-    CHECK(!opts.tool_error_warnings);
+    CHECK(opts.tool_error_warnings);
     std::string r3 = q27::chatml_prompt(q27::openai_msgs(body3), {}, /*think=*/false, nullptr, nullptr, {}, {}, &opts);
-    CHECK(r3.find("SYSTEM WARNING") == std::string::npos);
+    CHECK(r3.find("SYSTEM WARNING") != std::string::npos);   // request overrides boot default
     // chat_template_kwargs carries the field too
     json body4 = {{"messages", body["messages"]},
                   {"chat_template_kwargs",{{"tool_error_warnings",false}}}};
     CHECK(!q27::template_opts_from_body(body4).tool_error_warnings);
-    // explicit true in the request overrides the env default
-    setenv("Q27_TOOL_ERROR_WARNINGS", "0", 1);
-    CHECK(!q27::template_opts_from_body(body).tool_error_warnings);   // env off
-    json body5 = {{"messages", body["messages"]}, {"tool_error_warnings", true}};
-    CHECK(q27::template_opts_from_body(body5).tool_error_warnings);   // request wins
+    // env ON + request false -> request wins
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
+    CHECK(q27::template_opts_from_body(body).tool_error_warnings);    // env on
+    json body5 = {{"messages", body["messages"]}, {"tool_error_warnings", false}};
+    CHECK(!q27::template_opts_from_body(body5).tool_error_warnings);  // request wins
     unsetenv("Q27_TOOL_ERROR_WARNINGS");
 }
 
@@ -938,6 +946,10 @@ static void test_v223_reasoning_dedup() {
 // v22.3: failure detection suppresses code output and exit-code-0.
 static void test_v223_failure_detection() {
     q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    // detector-under-renderer checks need the escalation ON (default is OFF
+    // per PR #37 review); the detector itself is covered directly by the
+    // positive cases below firing at all.
+    setenv("Q27_TOOL_ERROR_WARNINGS", "1", 1);
     {   // code output with console.error is suppressed (not a failure)
         json b = {{"messages", json::array({
             {{"role","user"},{"content","run"}},
@@ -960,6 +972,7 @@ static void test_v223_failure_detection() {
         std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
         CHECK(r.find("SYSTEM WARNING") != std::string::npos);
     }
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
 }
 
 // v22.3 E: every assistant history turn is wrapped in <think>, even empty.

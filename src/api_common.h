@@ -326,24 +326,29 @@ inline std::string reasoning_effort_line() {
 // effort: -1 = env/boot default, else 0 medium, 1 low, 2 xhigh.
 // auto_disable_thinking_with_tools: start thinking OFF when tools are present.
 // tool_format: -1 = boot dialect, 0 json, 1 xml.
-// Default for the two-tier tool-error escalation. The detector's FP profile
-// is real (grep/diff exit code 1, short 'error: none' summaries fire -- see
-// PR #37 review), so operators get an off switch without losing the default.
+// Default for the two-tier tool-error escalation: OFF per PR #37 review --
+// a direct probe of the detector over realistic benign outputs measured 3/12
+// false positives (grep/diff exit code 1, short 'error: none' summaries), and
+// grep returning 1 on no-match is one of the most common tool results in an
+// agentic loop. Template parity stays one flag away:
+// Q27_TOOL_ERROR_WARNINGS=1 re-enables at boot; a measured arm showing the
+// escalation helps would justify flipping the default back.
 inline bool tool_error_warnings_env_default() {
     const char* e = getenv("Q27_TOOL_ERROR_WARNINGS");
-    if (!e || !*e) return true;
+    if (!e || !*e) return false;
     std::string v = e;
     for (auto& c : v) c = (char)tolower((unsigned char)c);
-    return !(v == "0" || v == "off" || v == "false" || v == "no");
+    return v == "1" || v == "on" || v == "true" || v == "yes";
 }
 struct TemplateOpts {
     int effort = -1;
     bool auto_disable_thinking_with_tools = false;
     int tool_format = -1;
     bool force_disable_thinking = false; // reasoning_effort = none/off
-    // P1b escalation warnings (froggeric Tool Error Recovery). ON by default
-    // (template parity); Q27_TOOL_ERROR_WARNINGS=0 flips the default off, and
-    // the per-request tool_error_warnings field overrides either way.
+    // P1b escalation warnings (froggeric Tool Error Recovery). OFF by default
+    // per PR #37 review (measured 3/12 FP on benign outputs);
+    // Q27_TOOL_ERROR_WARNINGS=1 flips the boot default on, and the
+    // per-request tool_error_warnings field overrides either way.
     bool tool_error_warnings = tool_error_warnings_env_default();
 };
 inline int effort_string_level(std::string v) {
@@ -622,9 +627,11 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
     int tool_failures = 0;
-    // P1b off switch: env default (Q27_TOOL_ERROR_WARNINGS) unless the request
-    // carries an explicit tool_error_warnings field (see TemplateOpts).
-    const bool warn_on = !opts || opts->tool_error_warnings;
+    // P1b switch: env/boot default unless the request carries an explicit
+    // tool_error_warnings field (TemplateOpts default member is env-seeded,
+    // so this covers both the nullptr and the populated-opts paths).
+    const bool warn_on = opts ? opts->tool_error_warnings
+                              : tool_error_warnings_env_default();
     for (size_t i = start; i < msgs.size(); i++) {
         const Msg& m = msgs[i];
         std::string content = m.content;
