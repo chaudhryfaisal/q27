@@ -31,7 +31,11 @@
 set -uo pipefail
 
 TD=/mnt/ai/projects/thunderdome
-MODEL=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.q27
+# overridable so a tier A/B changes ONE thing; the .tok is shared across tiers.
+# Q27_KV_ARM likewise: fp8 is the measured serving default, but fp8 moves the
+# greedy trajectory at token 39 of a continuation (2026-08-22 identity test)
+# and llama.cpp serves q8_0, so the KV format is a variable worth an arm.
+MODEL="${Q27_MODEL:-/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.q27}"
 TOK=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.tok
 Q27=/mnt/ai/projects/q27/build/q27-server
 # docker bridge only: containers reach it, the LAN does not
@@ -62,7 +66,9 @@ boot() { # $1 = effort arm
   # own_weights in engine.cuh; the server takes the shared-weights path). Every
   # campaign before that ran unguarded. Print it per arm and compare across arms.
   systemd-run --user --unit="$UNIT" --collect \
-    --setenv=Q27_KV=fp8 --setenv=Q27_PRINT_WSUM=1 --setenv=Q27_REASONING_EFFORT="$1" \
+    --setenv=Q27_KV="${Q27_KV_ARM:-fp8}" --setenv=Q27_PRINT_WSUM=1 --setenv=Q27_REASONING_EFFORT="$1" \
+    ${Q27_FORCE_TEMP:+--setenv=Q27_FORCE_TEMP=$Q27_FORCE_TEMP} \
+    ${Q27_FORCE_TOP_P:+--setenv=Q27_FORCE_TOP_P=$Q27_FORCE_TOP_P} \
     -- "$Q27" "$MODEL" "$TOK" --port "$PORT" --host "$HOST" --ctx 131072 --think \
     >/dev/null 2>&1
   for _ in $(seq 1 180); do

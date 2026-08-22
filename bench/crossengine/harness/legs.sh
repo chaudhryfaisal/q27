@@ -28,6 +28,14 @@ MODELS=/mnt/ai/models
 
 LLAMA_BIN=/mnt/ai/projects/llama.cpp/build/bin/llama-server
 LLAMA_GGUF=/mnt/ai/models/qwen36-27b-mtp-gguf/Qwen3.6-27B-MTP-Q5_K_M.gguf
+# llama38: the Qwen3.8 competitor leg. Q5_K_M at 19.5 GB is within 0.3 GB of
+# q27's q6 tier, so it is the size-matched comparison. The 3.8 template raises
+# on any system message that is not first, which Claude Code sends (the skills
+# listing at messages[1]); qwen38_sysinline.jinja is the stock template with
+# that one branch rendering the turn in place instead of raising -- the same
+# file the 2026-08-21 agentic cross-test ran on.
+LLAMA38_GGUF=/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf
+LLAMA38_TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qwen38_sysinline.jinja"
 VLLM_MODEL=unsloth/Qwen3.6-27B-NVFP4
 VLLM_IMAGE=vllm/vllm-openai:nightly
 VLLM_CONTAINER=ab-vllm
@@ -37,7 +45,7 @@ leg_engine() {
   case "$1" in
     q4s|q5f|q38|q38q4s) echo q27 ;;
     nint|nvfp4) echo ninfer ;;
-    llama) echo llama ;;
+    llama|llama38) echo llama ;;
     vllm) echo vllm ;;
     *) echo "?" ;;
   esac
@@ -52,6 +60,7 @@ leg_artifact() {
     nint)  echo $MODELS/ninfer/qwen3_6_27b.ninfer ;;
     nvfp4) echo $MODELS/ninfer/qwen3_6_27b_nvfp4.ninfer ;;
     llama) echo $LLAMA_GGUF ;;
+    llama38) echo $LLAMA38_GGUF ;;
     vllm)  echo "$VLLM_MODEL" ;;   # HF id, resolved from the local cache
   esac
 }
@@ -69,7 +78,7 @@ leg_port() {
   case "$1" in
     q4s) base=8110;; nint) base=8120;; q5f) base=8130;; nvfp4) base=8140;;
     llama) base=8150;; vllm) base=8160;;
-    q38) base=8170;; q38q4s) base=8180;;
+    q38) base=8170;; q38q4s) base=8180;; llama38) base=8190;;
   esac
   case "$2" in agentic) echo $((base+0));; ladder) echo $((base+1));; quality) echo $((base+2));; esac
 }
@@ -131,6 +140,7 @@ leg_start() {
       --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 \
       --spec-type draft-mtp --spec-draft-n-max 6 \
       --reasoning off \
+      $([ "$leg" = llama38 ] && printf -- '--chat-template-file %s' "$LLAMA38_TEMPLATE") \
       --jinja --alias "$leg" >"$log" 2>&1 &
     echo $! >"${log%.log}.pid"
     echo "$port"

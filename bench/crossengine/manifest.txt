@@ -4,3 +4,9 @@ legs: vllm
 q27 commit: 77f46bf
 ninfer commit: 604bdc5
 driver: 580.119.02
+
+run: 2026-08-22T12:48:01-07:00  (3.8 quality legs, added 2026-08-22)
+arms: quality
+legs: q38,llama38
+q27 commit: 95886ec
+llama.cpp: 01818e49 Q5_K_M + qwen38_sysinline.jinja
