@@ -14478,3 +14478,93 @@ a clean build.
 
 NOT VERIFIED: no live re-run of the failing session (needs the GPU host), and
 neither backend compiled -- no CUDA and no Apple-silicon machine available.
+
+## 2026-08-21 (b): tool-call parity with llama.cpp, and a metric worth steering by
+
+Goal set mid-session: match llama.cpp's tool-call success on Qwen3.8-27B. The
+first thing that needed fixing was the measurement.
+
+**HIDDEN-TEST SCORE CANNOT STEER THIS.** bench-task-queue reads 0.000 whether we
+drop fourteen calls or the model simply cannot write a task queue, and at n=3
+with bimodal per-trial outcomes the mean turns on one trial flipping. The
+routing-fix arm and the arm after it differed by 0.034 -- one trial. Steering
+parity by that is steering by noise.
+
+`tools/toolcall_parity.py` counts what the parser actually controls, per
+assistant turn, from the client's own stream-json transcript, so it is
+engine-agnostic and needs no server-side cooperation:
+
+    executed  turn carried >=1 tool_use
+    MISSED    dialect markup in the TEXT channel and no tool_use
+    success = executed / (executed + MISSED)
+
+Markup inside fences and backtick spans does not count -- that is the model
+writing ABOUT the dialect, and skipping that check is what inflated a survey's
+failure rate on 2026-08-20.
+
+| engine | trials | turns | executed | missed | success |
+|---|---:|---:|---:|---:|---:|
+| llama.cpp | 10 | 814 | 367 | 0 | 1.0000 |
+| q27 (routing-fix arm) | 10 | 1539 | 1246 | 16 | 0.9873 |
+
+**AND THE COMPARISON HAS A CATCH WORTH STATING.** q27 executes 1246 calls to
+llama.cpp's 367 over comparable work. llama.cpp is not calling tools more
+reliably, it is calling them far less often and finishing anyway, so its 1.0000
+is partly 3.4x fewer chances to meet a rare shape. Parity here is necessary and
+not sufficient: the 0.579-vs-0.854 task-score gap is mostly NOT tool-call loss.
+
+### The 16 misses, replayed rather than guessed at
+
+`build/replay_missed_calls` runs each missed turn back through the CURRENT
+parser. That distinction is the useful one: **a miss is not automatically a
+parser gap.** Of the 16:
+
+- **11 already recovered** on the batch and boundary fixes from earlier the same day
+- **3** were a bare `<tool_call>` body with nothing in it (#32 suppresses those)
+- **1** a `<parameter=` with an empty name
+- **1** truncated mid-value: `{"name": "TaskCreate", "arguments": {"subject":`
+
+The last two are CORRECT refusals. Recovering them means inventing content, and
+that is the same rule that keeps half a Write from executing.
+
+The tool takes the schema as an argument on purpose: recovery routinely depends
+on key inference, and a schema without `required` silently disables it, which is
+how an earlier replay harness of mine reported two gaps that did not exist.
+
+### What that left, and what got fixed
+
+One real gap in the 16: **`<parameter name="KEY">`**. The FUNCTION opener
+absorbed both spellings in 0f46684; the parameter tag never did. Same drift
+habit one level down. `parse_parameter_opener()` mirrors
+`parse_function_opener()`, and `find_parameter_opener()` is shared with modes 21
+and 22 -- fixing only `parse_native_xml_call` would have covered calls that also
+carry a well-formed `<function...>` opener, i.e. the case least in need of
+rescue.
+
+Closed alongside it, from the Edit fidelity sweep:
+
+- **greedy value trimming.** The extractor consumed one leading newline and then
+  trimmed every trailing `\n` and space. `"line1\n"` -> `"line1"`,
+  `"code    "` -> `"code"`. Invisible to Bash and Read, fatal to Edit, whose
+  oldString must match byte for byte -- and intermittent, because it broke only
+  when the edited region ended in whitespace. Reported live as "File Edit
+  sometime still acting up".
+- **a value containing `</parameter>`.** Took the first closer and truncated.
+  Now the last closer before the next parameter opener, the same
+  wait-for-evidence shape #31 used for `</tool_call>`.
+
+**THE FIRST VERSION OF THAT LAST FIX WAS WRONG AND THE SWEEP CAUGHT IT.**
+Bounding the closer search at `</function>` as well looked tighter and broke a
+value CONTAINING `</function>`: the bound landed before the real closer and the
+call was refused outright. Pinned as a regression guard, because a near miss
+earns a test more than a passing case does.
+
+Edit fidelity: **8/12 this morning, 12/12 now.**
+
+### Instrument, fixed
+
+`Q27_PRINT_WSUM` was inert on `q27-server` -- it lived behind `own_weights` in
+engine.cuh while the server takes the shared-weights path. Every server-side
+campaign before today ran without the 5090 corruption guard it believed it had.
+Now mirrored, and `effort_ab.sh` prints the digest per arm. The parity arms are
+the first to record `wsum: b743d26b1f0562a9` and be comparable on that axis.
