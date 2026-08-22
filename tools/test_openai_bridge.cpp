@@ -1016,6 +1016,9 @@ static void test_medium_default_and_none_off() {
                   {"reasoning_effort","none"}};
         auto opts = q27::template_opts_from_body(b);
         CHECK(opts.force_disable_thinking);
+        // engine think mode must also be off (end-to-end)
+        auto tcfg = q27::resolve_think_cfg(b, /*server_default=*/true, /*allow_request=*/true, -1);
+        CHECK(!tcfg.enabled);
         std::string r = q27::chatml_prompt(q27::openai_msgs(b), json::array(), /*think=*/true, nullptr, nullptr, {}, {}, &opts);
         // closed generation block (thinking off) despite think=true
         CHECK(r.rfind("<think>\n\n</think>\n\n") == r.size() - std::string("<think>\n\n</think>\n\n").size());

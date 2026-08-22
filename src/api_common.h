@@ -839,6 +839,18 @@ inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool al
     }
     // some clients send a flat top-level budget_tokens
     if (body.contains("budget_tokens")) take_budget(body["budget_tokens"]);
+    // item 2: reasoning_effort none/off disables thinking end-to-end (engine
+    // think mode, not just the prompt render).
+    auto effort_disable = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            std::string ev = b["reasoning_effort"].get<std::string>();
+            for (auto& ch : ev) ch = (char)tolower((unsigned char)ch);
+            if (ev == "none" || ev == "off") { c.enabled = false; c.enabled_set = true; }
+        }
+    };
+    effort_disable(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        effort_disable(body["chat_template_kwargs"]);
     return c;
 }
 
