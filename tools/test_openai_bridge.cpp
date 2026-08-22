@@ -801,6 +801,24 @@ static void test_tool_failure_warnings() {
     // only two separate single-failure warnings, no "2 consecutive"
     CHECK(r2.find("2 consecutive tool errors") == std::string::npos);
     CHECK(r2.find("The previous tool call returned an error.") != std::string::npos);
+
+    // P1b off switch (PR #37 review): tool_error_warnings=false suppresses the
+    // escalation warnings entirely (detection skipped, no SYSTEM WARNING).
+    json body3 = {{"messages", body["messages"]}, {"tool_error_warnings", false}};
+    auto opts = q27::template_opts_from_body(body3);
+    CHECK(!opts.tool_error_warnings);
+    std::string r3 = q27::chatml_prompt(q27::openai_msgs(body3), {}, /*think=*/false, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r3.find("SYSTEM WARNING") == std::string::npos);
+    // chat_template_kwargs carries the field too
+    json body4 = {{"messages", body["messages"]},
+                  {"chat_template_kwargs",{{"tool_error_warnings",false}}}};
+    CHECK(!q27::template_opts_from_body(body4).tool_error_warnings);
+    // explicit true in the request overrides the env default
+    setenv("Q27_TOOL_ERROR_WARNINGS", "0", 1);
+    CHECK(!q27::template_opts_from_body(body).tool_error_warnings);   // env off
+    json body5 = {{"messages", body["messages"]}, {"tool_error_warnings", true}};
+    CHECK(q27::template_opts_from_body(body5).tool_error_warnings);   // request wins
+    unsetenv("Q27_TOOL_ERROR_WARNINGS");
 }
 
 // P2: consecutive tool responses group under a single user turn.

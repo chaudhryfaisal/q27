@@ -326,11 +326,25 @@ inline std::string reasoning_effort_line() {
 // effort: -1 = env/boot default, else 0 medium, 1 low, 2 xhigh.
 // auto_disable_thinking_with_tools: start thinking OFF when tools are present.
 // tool_format: -1 = boot dialect, 0 json, 1 xml.
+// Default for the two-tier tool-error escalation. The detector's FP profile
+// is real (grep/diff exit code 1, short 'error: none' summaries fire -- see
+// PR #37 review), so operators get an off switch without losing the default.
+inline bool tool_error_warnings_env_default() {
+    const char* e = getenv("Q27_TOOL_ERROR_WARNINGS");
+    if (!e || !*e) return true;
+    std::string v = e;
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    return !(v == "0" || v == "off" || v == "false" || v == "no");
+}
 struct TemplateOpts {
     int effort = -1;
     bool auto_disable_thinking_with_tools = false;
     int tool_format = -1;
     bool force_disable_thinking = false; // reasoning_effort = none/off
+    // P1b escalation warnings (froggeric Tool Error Recovery). ON by default
+    // (template parity); Q27_TOOL_ERROR_WARNINGS=0 flips the default off, and
+    // the per-request tool_error_warnings field overrides either way.
+    bool tool_error_warnings = tool_error_warnings_env_default();
 };
 inline int effort_string_level(std::string v) {
     for (auto& c : v) c = (char)tolower((unsigned char)c);
@@ -350,6 +364,8 @@ inline TemplateOpts template_opts_from_body(const json& body) {
         }
         if (b.contains("auto_disable_thinking_with_tools") && b["auto_disable_thinking_with_tools"].is_boolean())
             o.auto_disable_thinking_with_tools = b["auto_disable_thinking_with_tools"].get<bool>();
+        if (b.contains("tool_error_warnings") && b["tool_error_warnings"].is_boolean())
+            o.tool_error_warnings = b["tool_error_warnings"].get<bool>(); // P1b off switch
         if (b.contains("tool_call_format") && b["tool_call_format"].is_string()) {
             const std::string f = b["tool_call_format"].get<std::string>();
             o.tool_format = (f == "json") ? 0 : (f == "xml" ? 1 : -1);
@@ -606,6 +622,9 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
     int tool_failures = 0;
+    // P1b off switch: env default (Q27_TOOL_ERROR_WARNINGS) unless the request
+    // carries an explicit tool_error_warnings field (see TemplateOpts).
+    const bool warn_on = !opts || opts->tool_error_warnings;
     for (size_t i = start; i < msgs.size(); i++) {
         const Msg& m = msgs[i];
         std::string content = m.content;
@@ -613,7 +632,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         // renderer already <tool_response>-wrapped in a user turn.
         const bool toolresp = m.role == "user" &&
                               content.rfind("<tool_response>", 0) == 0;
-        if (toolresp) tool_failures = is_tool_response_failure(content)
+        if (warn_on && toolresp)
+            tool_failures = is_tool_response_failure(content)
                                           ? tool_failures + 1 : 0;
         else if (m.role == "user") tool_failures = 0; // plain user resets
         strip_think_markers(content);
