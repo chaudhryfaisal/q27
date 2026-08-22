@@ -14568,3 +14568,86 @@ engine.cuh while the server takes the shared-weights path. Every server-side
 campaign before today ran without the 5090 corruption guard it believed it had.
 Now mirrored, and `effort_ab.sh` prints the digest per arm. The parity arms are
 the first to record `wsum: b743d26b1f0562a9` and be comparable on that axis.
+
+## 2026-08-22 (a): tool-call parity with llama.cpp reached, and the metric that nearly hid it
+
+| engine | trials | turns | executed | calls | missed | success |
+|---|---:|---:|---:|---:|---:|---:|
+| llama.cpp Q5_K_M | 10 | 293 | 281 | 367 | 0 | **1.0000** |
+| q27 (current master) | 10 | 401 | 391 | 527 | 0 | **1.0000** |
+
+Same four tasks, same n, same Qwen3.8-27B weights, weight digest verified clean
+on both q27 arms. q27 executes MORE calls (527 in 391 turns against 367 in 281)
+and misses none.
+
+One UN-RESCUED remains in the engine log and it is a correct refusal:
+
+```
+<parameter=
+</function>
+<parameter=
+</function>
+```
+
+No key, no value, no tool. Executing that means inventing a call. It cost no
+turn -- the real calls in that turn executed.
+
+### The path, from 0.9671
+
+Every shape below came out of the UN-RESCUED log or a classification sweep, not
+a bug report. The detector added on 2026-08-20 (b) is what made them visible;
+before it, an emission made entirely of XML tags produced no log line at all.
+
+- the `<function...>` opener path recovered ONE call and returned, while modes
+  14/20/22 batched. A 14-call turn yielded 1 call and 3480 leaked bytes.
+- `parse_tool_call` on a wrapped segment read one call and silently dropped the
+  rest, so fixing the batch path changed nothing until this was found.
+- a closerless call ran to end-of-text and swallowed its successors' parameters.
+- greedy value trimming rewrote `"line1\n"` to `"line1"` -- invisible to Bash
+  and Read, fatal to Edit.
+- a value containing `</parameter>` truncated at the first closer.
+- `<parameter name="KEY">`, the attribute spelling the function opener had
+  absorbed in 0f46704 and the parameter tag never did.
+- a JSON body terminated with `</parameter></function>` instead of `}`.
+- the XML tag-closer inside a JSON key: `"arguments>`.
+- the name written on the following line, and a name differing only in case.
+- a truncated `<tool_call` becoming the user's whole answer (suppression, not
+  recovery -- the turn is still lost).
+
+### THE MEASUREMENT WAS WRONG THREE TIMES
+
+Worth more than the parser work, because each error produced confident numbers
+and sent real time in the wrong direction:
+
+1. **A pattern list** (08-20) that only knew shapes someone had already found,
+   so a zero meant "none of the known shapes", never "no misses".
+2. **A tool schema** (08-21) built without `required` keys, which silently
+   disables `infer_tool_name()`. Fifteen of thirty-six "parser gaps" were this.
+   Made twice, the second time after writing the lesson down.
+3. **A transcript reader** that mistook streaming deltas for turns. Claude
+   Code emits one `assistant` line per delta sharing a `message.id` -- 214 lines
+   for 65 turns, up to 11 for one turn. A turn whose text arrived before its
+   tool_use scored as BOTH a miss and an execution.
+
+The third was caught by a CONTRADICTION, not by review: the metric reported 4
+misses on an arm where the server logged zero UN-RESCUED. The server was right.
+Every parity number quoted before that fix was wrong in both directions
+(0.9873 -> 0.9671, 0.9913 -> 0.9946).
+
+The habit worth keeping: when two instruments disagree, stop and find out which
+one is lying before acting on either.
+
+### And the corruption guard earned its place
+
+`Q27_PRINT_WSUM` was inert on `q27-server` until this session -- it lived behind
+`own_weights` while the server takes the shared-weights path, so every
+server-side campaign ran without it. Within an hour of the fix it caught a real
+event: an arm booted at `wsum: a743d26b1f0562a9` against the reference `b743...`,
+host digest unchanged, delta exactly 2^60 in byte 7. That arm was discarded and
+relaunched. Both arms above are digest-verified.
+
+### Parity is necessary, not sufficient
+
+q27 scored 0.579 hidden to llama.cpp's 0.854 on these tasks while both now sit
+at 1.0000 tool-call success. The remaining task-score gap is NOT tool-call loss,
+and closing it is a different investigation.
