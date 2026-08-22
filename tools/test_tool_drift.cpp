@@ -1245,11 +1245,20 @@ static void test_named_opener_batch() {
         // but it is a wart: pinned so it is visible rather than folklore.
         // The property that must hold is the safety one -- an undeclared name
         // is never itself emitted as a call.
+        // The model NAMED a tool. If that name is not declared, inference must
+        // not quietly substitute a different one: executing TaskCreate because
+        // the keys happen to fit, when the model asked for NotATool, is calling
+        // something nobody requested. Key inference is for emissions with no
+        // usable name at all (mode 21's whole premise), not for overriding one
+        // that is present and wrong.
         auto v = call(named("NotATool", "x"), tools);
-        ok(v.empty() || v[0].name != "NotATool",
-           "named-opener batch: an undeclared name is never emitted as a call");
-        ok(v.size() == 1 && v[0].name == "TaskCreate",
-           "named-opener batch: (documented wart) mode 21 infers past the bad name");
+        ok(v.empty(),
+           "explicit undeclared name: refused, not inferred past");
+        // ...but an emission with NO opener still infers, which is mode 21
+        // working as designed.
+        auto w = call("<parameter=subject>\nx\n</parameter>\n</function>", tools);
+        ok(w.size() == 1 && w[0].name == "TaskCreate",
+           "explicit undeclared name: a nameless emission still infers");
     }
     {
         // a declared first call followed by an undeclared second: keep what was

@@ -3482,6 +3482,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // bench-task-queue, where a 14-call turn yielded 1 call and 3480 bytes
         // of leaked dialect, and the session ended there. Modes 14, 20 and 22
         // were already batch-capable; this path was the odd one out.
+        // Set when a `<function ...>` opener names a tool that is NOT declared.
+        // Inference downstream must then refuse: mode 21 exists for emissions
+        // with no usable name, not to override one that is present and wrong.
+        // Substituting a tool whose keys happen to fit calls something the
+        // model never asked for.
+        bool named_undeclared = false;
         {
             std::vector<ToolCall> batch;
             size_t cur = 0, first_begin = std::string::npos;
@@ -3514,7 +3520,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         alt.erase(alt.begin());
                     while (!alt.empty() && (alt.back() == '"' || alt.back() == '\''))
                         alt.pop_back();
-                    if (alt == tc.name || !declared(alt)) break;
+                    if (alt == tc.name || !declared(alt)) { named_undeclared = true; break; }
                     tc.name = alt;
                 }
                 tc.source_begin = fb;
@@ -3666,7 +3672,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 std::string span =
                     "<function=q27_unnamed>\n" + text_in.substr(ps, fe + 11 - ps);
                 ToolCall tc;
-                if (parse_native_xml_call(span, tc) && !tc.arguments.empty()) {
+                if (!named_undeclared && parse_native_xml_call(span, tc) &&
+                    !tc.arguments.empty()) {
                     const std::string nm = infer_tool_name(*tools, tc.arguments);
                     if (!nm.empty() && declared(nm)) {
                         tc.name = nm;

@@ -57,8 +57,12 @@ boot() { # $1 = effort arm
   systemctl --user stop "$UNIT" 2>/dev/null
   # the unit is --collect, so the stop above fully reaps it before we rebind
   for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$PORT " || break; sleep 1; done
+  # Q27_PRINT_WSUM: the 5090 silently corrupts a small fraction of model loads,
+  # and this knob was INERT on q27-server until 2026-08-21 (it lived behind
+  # own_weights in engine.cuh; the server takes the shared-weights path). Every
+  # campaign before that ran unguarded. Print it per arm and compare across arms.
   systemd-run --user --unit="$UNIT" --collect \
-    --setenv=Q27_KV=fp8 --setenv=Q27_REASONING_EFFORT="$1" \
+    --setenv=Q27_KV=fp8 --setenv=Q27_PRINT_WSUM=1 --setenv=Q27_REASONING_EFFORT="$1" \
     -- "$Q27" "$MODEL" "$TOK" --port "$PORT" --host "$HOST" --ctx 131072 --think \
     >/dev/null 2>&1
   for _ in $(seq 1 180); do
@@ -72,6 +76,8 @@ for ARM in $ARMS; do
   echo ""; echo "################ ARM effort=$ARM ################"
   boot "$ARM" || continue
   # prove the arm actually reached the process rather than trusting the launch
+  journalctl --user -u "$UNIT" --no-pager 2>/dev/null | grep -i "^.*wsum:" | tail -1 \
+    | sed "s/^/[$1 WSUM] /"
   PID=$(pgrep -f "q27-server.*--port $PORT" | head -1)
   echo "[$ARM] server pid=$PID env=$(tr '\0' '\n' < /proc/$PID/environ | grep -c '^Q27_REASONING_EFFORT='"$ARM"'$') (1 = confirmed)"
 

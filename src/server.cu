@@ -606,9 +606,32 @@ int main(int argc, char** argv) {
     q27::set_tool_dialect_for_model(shared_model.meta_json); // per-model tool dialect (BUILDLOG 2026-08-14)
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
+    // Q27_PRINT_WSUM lived only in engine.cuh, behind own_weights. The SERVER
+    // takes this shared-weights path, so the knob was INERT here: the variable
+    // was present in the environment, the model loaded, and no wsum line ever
+    // appeared. Every server-side campaign that believed it had the 5090
+    // silent-corruption guard was running without it (found 2026-08-21).
+    // Mirrors engine.cuh:1364 so both paths report the same way.
+    if (getenv("Q27_PRINT_WSUM")) shared_dm.enable_host_sum(true);
     shared_dm.upload_all(q27k::pf4_on());
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
+    if (const char* pw = getenv("Q27_PRINT_WSUM")) {
+        // The SAME artifact must print the SAME value on every load; a
+        // difference means the upload itself landed wrong, which
+        // checksum_verify() cannot see because its baseline is taken after the
+        // copy. =3 recomputes twice more from the same resident bytes: a value
+        // that is wrong but STABLE means the data is corrupt, one that varies
+        // means the checksum compute is.
+        fprintf(stderr, "wsum: %016llx hsum: %016llx\n", shared_dm.checksum_aggregate(),
+                shared_dm.host_aggregate());
+        if (atoi(pw) >= 3)
+            for (int r = 0; r < 2; r++) {
+                shared_dm.checksum_baseline();
+                fprintf(stderr, "wsum_recompute%d: %016llx\n", r + 1,
+                        shared_dm.checksum_aggregate());
+            }
+    }
 
     // --ctx auto (single-slot): size the KV budget to MEASURED free VRAM
     // with the weights already resident, so tier size (q4s/v1.4/q6),
