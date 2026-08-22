@@ -1907,8 +1907,9 @@ int main(int argc, char** argv) {
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0, sys_off = 0;
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
             // P16b: token length of the system+tools block. Measured with a
             // THIRD encode used only for its length -- the prompt itself is
             // still built from the same two pieces, so no request's bytes
@@ -2553,9 +2554,10 @@ int main(int argc, char** argv) {
             thinking=false;
             tcfg=q27::ThinkCfg{false,-1,false,true};
         }
+        const q27::TemplateOpts topts=q27::template_opts_from_body(body);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
-            q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+            q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
         if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
         return rendered;
     };
@@ -3297,7 +3299,8 @@ int main(int argc, char** argv) {
             tcfg = q27::ThinkCfg{false, -1, false, true};
         }
         size_t sys_off = 0;
-        std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
+        const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off, {}, {}, &topts);
         if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
         std::vector<int> prompt = tok.encode(rendered);
         // P16b applies here even though P16a does not: this shape computes no

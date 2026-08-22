@@ -943,6 +943,78 @@ static void test_v223_failure_detection() {
     }
 }
 
+// v22.3 E: every assistant history turn is wrapped in <think>, even empty.
+static void test_unconditional_think_wrap() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    {   // assistant with no reasoning -> empty think block
+        json b = {{"messages", json::array({
+            {{"role","user"},{"content","q"}},
+            {{"role","assistant"},{"content","just an answer"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("<|im_start|>assistant\n<think>\n\n</think>\n\njust an answer<|im_end|>") != std::string::npos);
+    }
+    {   // assistant with reasoning -> its think block
+        json b = {{"messages", json::array({
+            {{"role","assistant"},{"content","answer"},{"reasoning_content","thought"}},
+        })}};
+        std::string r = q27::chatml_prompt(q27::openai_msgs(b), {}, false);
+        CHECK(r.find("<|im_start|>assistant\n<think>\nthought\n</think>\n\nanswer<|im_end|>") != std::string::npos);
+    }
+}
+
+// Items 3/4: request-driven reasoning_effort + auto_disable_thinking_with_tools.
+static void test_request_effort_and_auto_disable() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json tools = json::parse(R"([{"type":"function","function":{"name":"R","parameters":{"type":"object"}}}])");
+    json b = {{"messages", json::array({{{"role","user"},{"content","hi"}}})},
+              {"reasoning_effort","low"},
+              {"chat_template_kwargs",{{"auto_disable_thinking_with_tools",true}}}};
+    auto opts = q27::template_opts_from_body(b);
+    CHECK(opts.effort == 1);               // low -> level 1
+    CHECK(opts.auto_disable_thinking_with_tools);
+    auto msgs = q27::openai_msgs(b);
+    // tools present + auto_disable -> thinking off -> no effort line
+    std::string r = q27::chatml_prompt(msgs, tools, /*think=*/true, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r.find("Reasoning effort is set to low.") == std::string::npos);
+    // no tools -> thinking on -> low line
+    std::string r2 = q27::chatml_prompt(msgs, json::array(), /*think=*/true, nullptr, nullptr, {}, {}, &opts);
+    CHECK(r2.find("Reasoning effort is set to low.") != std::string::npos);
+}
+
+// item 6: XML-dialect assistant tool_calls render as <function=...><parameter=...>
+static void test_xml_tool_call_rendering() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen38 27b Hf\"}");
+    json body = {{"messages", json::array({
+        {{"role","assistant"},{"content","calling"},{"tool_calls", json::array({
+            {{"id","1"},{"type","function"},{"function",{{"name","edit"},
+                {"arguments","{\"path\":\"/x\",\"newText\":\"hi\"}"}}}}
+        })}},
+    })}};
+    auto msgs = q27::openai_msgs(body);
+    std::string r = q27::chatml_prompt(msgs, {}, false);
+    CHECK(r.find("<function=edit>") != std::string::npos);
+    CHECK(r.find("<parameter=path>\n/x\n</parameter>") != std::string::npos);
+    CHECK(r.find("<parameter=newText>\nhi\n</parameter>") != std::string::npos);
+    // JSON dialect keeps the JSON tool_call_text
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen3.6-27B\"}");
+    std::string r2 = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r2.find("<function=edit>") == std::string::npos);
+    CHECK(r2.find("<tool_call>\n{\"name\": \"edit\"") != std::string::npos);
+}
+
+// item 8: tool-response truncation applies only in the XML (non-JSON) dialect.
+static void test_truncation_json_dialect_skipped() {
+    q27::set_tool_dialect_for_model("{\"general.name\": \"Qwen3.6-27B\"}");
+    std::string big(200, 'x');
+    json body = {{"messages", json::array({
+        {{"role","tool"},{"content",big}},
+    })},
+        {"chat_template_kwargs", {{"max_tool_response_chars", 20}}}};
+    std::string r = q27::chatml_prompt(q27::openai_msgs(body), {}, false);
+    CHECK(r.find("TRUNCATED") == std::string::npos); // json dialect: no truncation
+}
+
 static void test_chat_message_plain_text_no_calls() {
     json msg = q27::openai_chat_message_json("hello there", {}, 42);
     CHECK(msg["role"] == "assistant");
@@ -2415,6 +2487,10 @@ int main() {
     test_v223_new_think_markers();
     test_v223_reasoning_dedup();
     test_v223_failure_detection();
+    test_unconditional_think_wrap();
+    test_request_effort_and_auto_disable();
+    test_xml_tool_call_rendering();
+    test_truncation_json_dialect_skipped();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
     test_chat_message_call_no_leftover_text_content_null();

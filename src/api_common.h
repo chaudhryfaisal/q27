@@ -313,6 +313,39 @@ inline std::string reasoning_effort_line() {
     return reasoning_effort_line_level(reasoning_effort_env_level());
 }
 
+// v22.3 request-driven template options (items 3/4/5).
+// effort: -1 = env/boot default, else 0 medium, 1 low, 2 xhigh.
+// auto_disable_thinking_with_tools: start thinking OFF when tools are present.
+// tool_format: -1 = boot dialect, 0 json, 1 xml.
+struct TemplateOpts {
+    int effort = -1;
+    bool auto_disable_thinking_with_tools = false;
+    int tool_format = -1;
+};
+inline int effort_string_level(std::string v) {
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    if (v == "minimal" || v == "low") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // none/off/medium/unknown
+}
+inline TemplateOpts template_opts_from_body(const json& body) {
+    TemplateOpts o;
+    auto read = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string())
+            o.effort = effort_string_level(b["reasoning_effort"].get<std::string>());
+        if (b.contains("auto_disable_thinking_with_tools") && b["auto_disable_thinking_with_tools"].is_boolean())
+            o.auto_disable_thinking_with_tools = b["auto_disable_thinking_with_tools"].get<bool>();
+        if (b.contains("tool_call_format") && b["tool_call_format"].is_string()) {
+            const std::string f = b["tool_call_format"].get<std::string>();
+            o.tool_format = (f == "json") ? 0 : (f == "xml" ? 1 : -1);
+        }
+    };
+    read(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        read(body["chat_template_kwargs"]);
+    return o;
+}
+
 // P1a (2026-08-22): the <|think_*|> toggle markers from the qwen3.8
 // chat_template. Stripping: these are BPE-tokenisable control markers the
 // model is trained to read in user/system content; they must not leak into
@@ -335,8 +368,9 @@ struct ThinkToggles {
     bool thinking = true;
     int effort = 0; // 0 medium, 1 low, 2 xhigh
 };
-inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_think) {
-    ThinkToggles st{base_think, reasoning_effort_env_level()};
+inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_think,
+                                       int base_effort = -1) {
+    ThinkToggles st{base_think, base_effort >= 0 ? base_effort : reasoning_effort_env_level()};
     for (const Msg& m : msgs) {
         if (m.role != "system" && m.role != "user") continue;
         if (m.role == "user" && m.content.rfind("<tool_response>", 0) == 0) continue;
@@ -486,7 +520,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
                                  bool think = true, size_t* stable_off = nullptr,
                                  size_t* sys_off = nullptr,
                                  const std::string& tool_instruction = {},
-                                 const json* unavailable_tools = nullptr) {
+                                 const json* unavailable_tools = nullptr,
+                                 const TemplateOpts* opts = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -516,8 +551,13 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // thinking/effort state drives BOTH the reasoning_instructions line at the
     // system head and the generation prompt below (mirrors the template's
     // stateful ns_state). Template order: reasoning_instructions FIRST, then
-    // tools, then the client system content.
-    const ThinkToggles tt = scan_think_toggles(msgs, think);
+    // tools, then the client system content. Items 3/4: a request-driven base
+    // effort overrides the env/boot default, and auto_disable_thinking_with_tools
+    // starts thinking OFF when tools are present.
+    bool base_think = think;
+    if (opts && opts->auto_disable_thinking_with_tools && tools.is_array() && !tools.empty())
+        base_think = false;
+    const ThinkToggles tt = scan_think_toggles(msgs, base_think, opts ? opts->effort : -1);
     const std::string effort = tt.thinking ? reasoning_effort_line_level(tt.effort)
                                            : std::string();
     strip_think_markers(sys);
@@ -575,11 +615,11 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         }
         // normal (non-tool) message
         p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
-        // assistant history reasoning block, jinja format:
-        //   <think>\n...\n</think>\n\n  then the plain content
-        if (m.role == "assistant" && !m.reasoning.empty()) {
-            // v22.3: if the client also sent the think block in text, strip it
-            // so the explicit reasoning is not double-rendered
+        // v22.3 E: EVERY assistant history turn is wrapped in <think>...</think>
+        // (even when reasoning is empty -> an empty think block). If the
+        // client also sent the think block in text, strip it so the block is
+        // not double-rendered.
+        if (m.role == "assistant") {
             strip_leading_think(content);
             p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
         }
@@ -622,7 +662,9 @@ inline long request_max_chars(const json& body, const char* key) {
 
 inline std::string tool_call_text(const std::string& name, const json& args,
                                   long max_arg_chars = -1) {
-    std::string a = args.dump();
+    // v22.3 (item 7): a raw string argument is echoed verbatim (not JSON-encoded),
+    // matching the template's `_args = tc.arguments` when arguments is a string.
+    std::string a = args.is_string() ? args.get<std::string>() : args.dump();
     if (max_arg_chars < 0) { // no explicit request value -> env fallback
         const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
         max_arg_chars = e ? atol(e) : 0;
@@ -634,6 +676,39 @@ inline std::string tool_call_text(const std::string& name, const json& args,
            "}\n</tool_call>";
 }
 
+// v22.3 (item 6): render an assistant tool call in the PROMPT using the active
+// tool dialect. For the XML dialect use the per-parameter form the template
+// emits (<function=NAME><parameter=K>v</parameter>...</function>); otherwise
+// fall back to the JSON tool_call_text.
+inline std::string tool_call_text_dialect(const std::string& name, const json& args,
+                                          long max_arg_chars = -1) {
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (!tool_dialect_xml()) return tool_call_text(name, args, max_arg_chars);
+    auto trunc = [&](std::string v) -> std::string {
+        if (max_arg_chars > 0 && (long)v.size() > max_arg_chars)
+            return v.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+                   std::to_string(v.size()) + " chars]";
+        return v;
+    };
+    std::string s = "<tool_call>\n<function=" + name + ">\n";
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            s += "<parameter=" + it.key() + ">\n" +
+                 trunc(it.value().is_string() ? it.value().get<std::string>()
+                                              : it.value().dump()) +
+                 "\n</parameter>\n";
+    } else if (args.is_string()) {
+        s += trunc(args.get<std::string>()) + "\n";
+    } else {
+        s += trunc(args.dump()) + "\n";
+    }
+    s += "</function>\n</tool_call>";
+    return s;
+}
+
 inline std::string tool_response_text(const std::string& out,
                                       long max_response_chars = -1) {
     std::string o = out;
@@ -641,7 +716,8 @@ inline std::string tool_response_text(const std::string& out,
         const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS");
         max_response_chars = e ? atol(e) : 0;
     }
-    if (max_response_chars > 0 && (long)o.size() > max_response_chars)
+    // v22.3 (item 8): truncation applies only when the dialect is NOT json.
+    if (tool_dialect_xml() && max_response_chars > 0 && (long)o.size() > max_response_chars)
         o = o.substr(0, (size_t)max_response_chars) + "\n[TRUNCATED - original length " +
             std::to_string(o.size()) + " chars]";
     return "<tool_response>\n" + o + "\n</tool_response>";
@@ -1748,10 +1824,10 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 else if (ty == "thinking") think += part.value("thinking", "");
                 else if (ty == "tool_use") {
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_call_text(part.value("name", ""),
-                                              part.contains("input") ? part["input"]
-                                                                     : json::object(),
-                                              max_arg);
+                    content += tool_call_text_dialect(part.value("name", ""),
+                                                      part.contains("input") ? part["input"]
+                                                                             : json::object(),
+                                                      max_arg);
                 } else if (ty == "tool_result") {
                     std::string rc;
                     if (part.contains("content")) {
@@ -1858,7 +1934,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                     } else args = fn["arguments"];
                 }
                 if (!content.empty() && content.back() != '\n') content += "\n";
-                content += tool_call_text(name, args, max_arg);
+                content += tool_call_text_dialect(name, args, max_arg);
             }
         }
         if (role == "assistant" && m.contains("reasoning_content")) {
