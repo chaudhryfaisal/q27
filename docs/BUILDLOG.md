@@ -14651,3 +14651,354 @@ relaunched. Both arms above are digest-verified.
 q27 scored 0.579 hidden to llama.cpp's 0.854 on these tasks while both now sit
 at 1.0000 tool-call success. The remaining task-score gap is NOT tool-call loss,
 and closing it is a different investigation.
+
+
+## 2026-08-22 (b): the task-score gap, taken apart -- and the tools preamble was never the trained text
+
+The premise under the 0.759-vs-0.854 agentic gap was "tool-call loss, temperature
+and quantization are ruled out, so the prompt is what's left". Three of those
+four did not survive inspection, and the order of work was set so the cheap,
+low-noise instrument ran first.
+
+### Step 1: same weights, fixed prompts, no agentic loop
+
+`bench/crossengine` quality leg (75 problems, pass@3, greedy, no-think), with a
+new `llama38` leg: Q5_K_M at 19.5 GB against q27's tiers.
+
+| engine | total | toolcall | instruct | structout | dataextract | reasonmath |
+|---|---:|---:|---:|---:|---:|---:|
+| q27 default tier | **62/75** | 13 | 13 | 14 | **11** | 11 |
+| llama.cpp Q5_K_M | 54/75 | 13 | 13 | 14 | **3** | 11 |
+
+Four packs identical to the problem; the entire difference is dataextract.
+Re-issuing those prompts at both engines directly (no tap, three thinking-field
+variants) reproduced it deterministically and showed what it is: **llama.cpp
+emits the correct object wrapped in a one-element array** (`[ { ... } ]`) on
+seven of the eight, and q27 does the same thing on DE-02 where llama does not.
+Both engines are flipping a near-tie `{`/`[` first token; the verifier's
+top-level shape check scores a wrapped-correct answer 0/10. On fixed prompts
+the engines are at parity. (The tap's `enable_thinking` rewrite was NOT the
+cause: all three variants agree.)
+
+And for a tool-free request **the two renderers are byte-identical** (DE-01:
+1898 chars, empty diff).
+
+### Step 2: the engine variables that were never controlled
+
+Token identity, 3000-token prompt, 256 greedy tokens, digest verified:
+
+| pair | first divergence |
+|---|---|
+| plain vs `--spec` (fp16 KV) | **none, 256/256** |
+| `--spec` + server env (fp8, PMIN 0.5, auto7) vs plain + fp8 | none, 256/256 |
+| plain vs plain + fp8 KV | token 39 |
+
+**Speculation is exact.** PMIN/auto7 gating is exact. The only serving-config
+variable that moves the greedy trajectory is fp8 KV -- and on 51,000 identical
+predictions it costs +0.04% NLL (7.0978 -> 7.1004). A tie-flip, not a loss.
+
+NLL on the same id stream: default 7.098, q6 7.011 (-1.2%). **The q6 number was
+measured twice because the first load was corrupt** -- digest `98f9...` against
+the tier's modal `a0f9...` (three other loads), delta exactly 2^59, and the
+corrupt load's PPL was identical to the clean one. A plausible number is not
+evidence of a clean load. `llama-perplexity` segfaults on this GGUF with every
+flag combination, so there is no llama-side NLL; the quality leg above is the
+cross-engine quality measure instead.
+
+`--kv-fp16 --ctx 131072` fits on the default tier (1.51 GB free at ready), so the
+fp16-vs-fp8 agentic arm is runnable. Its first launch ran two whole tasks on a
+load whose digest was `af43d26b1f0562a9`, 2^59 off the tier's `b743...`: the
+harness printed the line, nothing read it. Discarded (task-queue had scored
+0.000/0.000 on it), and `effort_ab.sh` now takes `Q27_EXPECT_WSUM` and tears
+down any load off the digest before a request reaches it, three loads max.
+That is the fourth corrupted load caught this week and the first that got
+measured. Relaunched behind the gate (`b743...` on the first load):
+
+| arm (xhigh, 10 trials) | task-queue | time-tracker | constraint-sched | ledger | mean hidden |
+|---|---|---|---|---|---|
+| fp8 KV, parity-confirm (08-22 baseline) | 0.232 | 0.840 | 0.965 | 1.000 | **0.759** |
+| fp8 KV, parity-final | 0.091 | 0.987 | 1.000 | 1.000 | 0.769 |
+| **fp16 KV** (this arm) | 0.404 | 0.667 | 0.991 | 1.000 | **0.765** |
+
+KV precision does not move the agentic score. The per-task numbers swing by
+more than the arm difference (task-queue 0.09-0.40 across three fp8/fp16
+arms, per trial 0.00-0.88), so the 0.759 baseline is a noisy estimate of a
+number near 0.76, and the remaining gap to llama.cpp's 0.854 is not in the
+engine's numerics: speculation exact, fp8 KV a tie-flip, q6 not serving.
+
+One caution on the constraint-scheduler column. Two of its three trials on
+this arm scored 1.000 in 12 seconds, having done nothing: the agent read
+four files, its third turn came back as text, and it exited. thunderdome's
+`ParseTestResults` returns 1.0 when vitest exits 0 with no parseable summary,
+and on an untouched workspace the validation suite skips all 38 tests
+because `_discovery.ts` finds nothing to import. The same shape is in the
+fp8 baselines (1.000 at 90k and 135k tokens). The task is a weak signal for
+either engine; the gap lives in task-queue and time-tracker.
+
+### The turn that ended in 12 seconds is a shape the stream path never parsed
+
+Why did the agent exit at turn 3? Its response was
+
+    Let me look at the existing source and test setup.
+
+    <function=Bash>
+    <parameter=command>
+    ls -la /workspace/src/ && ...
+    </parameter>
+    <parameter=description>
+    Check src, tests, and node_modules
+    </parameter>
+    </function>
+
+delivered verbatim as text, no tool_use block, so Claude Code took it as the
+final answer. A complete call, no `<tool_call>` wrapper, natural EOS after
+`</function>`. llama.cpp's chat.cpp has a comment for it: "Qwen3-Coder
+models may occasionally omit the <tool_call> token", and its grammar makes
+the opener optional and the closer mandatory, so the shape cannot reach a
+llama.cpp client at all.
+
+In q27 the splitter only opens a TOOL segment on `<tool_call>`, so these
+bytes arrive at the text side as TEXT, and the streaming text side is
+`BareToolTextHoldback`, which knew exactly two openers: a JSON `{` and the
+mode-10 `name", "` signature. `<function=` was not an opener, so the bytes
+streamed to the client as prose and the recovery chain was never consulted.
+Nothing was logged, because nothing ran. The non-stream handler recovers the
+same bytes through mode 17; Claude Code streams. The replay harness reports
+the shape recovered, because it feeds the parser, not the holdback -- which
+is how a shape that was hitting 2-3% of executed turns stayed invisible.
+
+How much it cost, counted the same way on every arm (the parity tool now
+reports PART: a turn that executed some calls AND left one as text):
+
+| run | turns | MISS | PART | llama.cpp |
+|---|---|---|---|---|
+| parity-final (fp8) | 196 | 1 | 2 | |
+| parity-confirm (fp8, the 0.759 baseline) | 401 | 0 | 11 | |
+| fp16 arm | 498 | 2 | 11 | |
+| llama.cpp 3.8 | 293 | 0 | 0 | 0 |
+
+So the 1.0000 parity of two days ago was the metric, not the engine: the
+success rate counts call-less turns only, and 9 of the 11 losses here sat in
+turns that also executed calls (always the last call of a batch -- the
+model closes `</tool_call>` on the previous call, starts the next with a bare
+`<function=`, and has no opener left to close). Two more were the only call
+of their turn and ended the session. llama.cpp: zero of either, by
+construction.
+
+The fix teaches the holdback the third opener. `bare_native_opener_position`
+finds `<function=` under the same display rule as the JSON opener (fenced or
+inline-code mentions stay prose), `bare_native_opener_probe_start` holds a
+chunk-split opener head, and `IncrementalBareNativeEnd` ends the candidate
+at the first `</function>` that closes a parameter -- a `</function>` inside
+a value is preceded by value bytes, not `</parameter>`, and does not count --
+swallowing one stray `</tool_call>` after it. The candidate then goes through
+the same classify path the JSON shapes use, so the recovery is logged as a
+stream tool-fallback like every other. The parser's own span end for bare
+calls now uses the same closer rule, with the old first-literal fallback, so
+the two agree on where a call ends; the value-containing-`</function>` case
+is pinned. Eleven new holdback cases in `test_openai_bridge`; the whole
+CPU suite and the Metal build pass. Whether it moves the score is the next
+arm's job: serving default plus this fix, queued behind the fidelity arm.
+
+Two earlier conclusions retracted. The "sampling refuted" call was overclaimed:
+llama.cpp's defaults include top_k 40 and min_p 0.05, and q27's SERVED sampler
+cannot express either -- `SampleParams` is `{inv_temp, top_p, seed}`, a
+Gumbel-max draw over a top-p nucleus; the `top_k` in sampling.h is the CPU
+reference path, not what serves. A matched-sampler arm therefore needs kernel
+work, not a knob, and the one that ran sampled a much longer tail than
+llama.cpp did. An earlier
+note in this log said `sample_round` is non-speculative; the served path is
+not -- the arm's own `[req]` lines show 2.5-4.0 tokens per round under
+sampling (the rejection-sampling verify, versus 3.6-6.4 greedy). So that arm
+changed exactly one thing, the tail of the sampling distribution, and one
+thing was enough to take bench-task-queue from 0.232 to 0.000 x3. That is a
+finding about q27's sampler coverage, not about whether decode regime matters. And the quant arm's null
+stands (its load was on the modal digest) but is weaker than it looked at n=3.
+
+### Step 3: the tools preamble
+
+With everything else byte-identical, the only prompt delta between the engines
+in an agentic loop was the tools preamble, and it had three parts:
+
+1. `nlohmann::json` sorts keys. The model saw
+   `{"function":{"description":...,"name":"Bash","parameters":{...}},"type":"function"}`
+   where the template (and the checkpoint's training data) has
+   `{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}`
+   in the client's order with `": "` / `", "` spacing. Every tool, every turn.
+2. The instruction block was a paraphrase that dropped the template's own
+   "an inner `<function=...>` block must be nested within `<tool_call>`"
+   reminder -- the rule every drift shape of 2026-08-20/21 broke. Two days
+   were spent parsing around a rule the prompt never stated.
+3. Tool results kept a trailing newline the template trims.
+
+Fixed: `anthropic_tools_decl()` renders from the RAW request body (key order
+survives only there) via `ordered_json` and a minja-spaced emitter; the
+instruction block is the template's text verbatim; `tool_response_text` trims.
+Pinned by `test_template_golden`, whose golden was captured from a running
+llama-server via `/apply-template` (CPU-only, `-ngl 0`), not from jinja2 -- and
+minja's output turned out byte-identical to jinja2's. **q27 now renders a tools
+request byte-for-byte as llama.cpp does.** `tools/capture_template_golden.sh`
+regenerates it.
+
+Scope: the Anthropic path (Claude Code's) in 054aee3 and the OpenAI chat path
+in 4c4c600, each pinned by its own minja-captured golden; the OpenAI fixture
+orders Read's `parameters` as {type, required, properties} to prove the
+client's order reaches the model. /v1/responses keeps the sorted fallback --
+its tools arrive in the flat Responses shape and are converted, so a verbatim
+pass-through would not be the trained shape -- and so does Metal, whose
+handlers do not carry the raw body. All three commits, plus the
+name-parameter parser fix (fa62bb9), were Metal-verified together once the mac
+woke: links clean under -Werror on Apple clang, suite green there.
+
+
+### And one more parser shape, from the discarded arm's log
+
+Two live misses, both `<parameter=name>\nBash</parameter>\n<parameter=command>...`:
+the tool name as the VALUE of a parameter called `name`. An earlier test for
+this spelling passed for the wrong reason -- its toy schema had one tool, so
+inference over `{name, command}` landed on Bash. Under the real registry
+`{command}` fits Bash and Monitor equally, the foreign `name` key counts against
+both, and the tie refuses. Now read as the tool (declared, or unique by case)
+and removed from the arguments, on the openerless path only. Reproduced at 0
+recovered with the twins declared before the fix. The log they came from is
+the discarded corrupted-load run; the shape is still a real emission and the
+fix is pinned by tests, so it stands, but it is not counted as a 3.8 behavior
+until the clean arms show it.
+
+### Instrument errors this round, so the count stays honest
+
+The replay harness first passed `body["tools"]` raw instead of
+`anthropic_tools_json()` and "found" a schema bug that did not exist (sixth of
+the week). `pkill -f llama-perplexity` matched the calling shell and killed it.
+A `systemd-cgls` grep misread a pid as outside the chain's cgroup and killed the
+chain's own llama-server. The fp16 arm measured two tasks on a corrupted
+load because the harness echoed the digest and nothing compared it. Each was
+caught by a result that made no sense; none by review.
+
+### The prompt-fidelity arm, and the third null
+
+The tools-preamble fix measured on the serving default: **0.762** mean hidden
+(task-queue 0.354, time-tracker 0.720, constraint-scheduler 0.974, ledger
+1.000), against 0.759 and 0.769 on the two fp8 baselines and 0.765 on fp16.
+Parity metric 520 turns, 510 executed, 0 MISS.
+
+That closes all three legs of the task-score chase, and all three are null:
+quality-on-fixed-prompts was already at parity, the engine's numerics are
+exact or near-exact, and the renderer is now byte-identical for nothing.
+
+### A shape the stream path never parsed
+
+Reading the fp16 arm's transcripts for why two trials ended at turn 3 in 12
+seconds: the model had replied with a complete `<function=Bash>...</function>`
+and no `<tool_call>` wrapper, delivered as text, so Claude Code took it as the
+final answer. The splitter only opens a TOOL segment on `<tool_call>`, so
+those bytes reach the streaming text side, and `BareToolTextHoldback` knew two
+openers -- a JSON `{` and the mode-10 signature. `<function=` was not one. The
+call streamed to the client as prose and the recovery chain never ran, which
+is why nothing was logged: nothing executed. The non-stream handler recovers
+the same bytes via mode 17; Claude Code streams. llama.cpp's chat.cpp has a
+comment for this exact habit ("Qwen3-Coder models may occasionally omit the
+<tool_call> token") and makes the closer mandatory in its grammar, so the
+shape cannot reach a llama.cpp client.
+
+The parity metric could not see it either: `success` counts call-less turns,
+and 9 of these 11 losses sat in turns that also executed calls (the model
+closes the previous call, opens the next one bare, and has no opener left to
+close). Added a PART column. Rates: 11/401 on the 0.759 baseline, 11/498 on
+the fp16 arm, 5/520 on the fidelity arm, 12/246 on the q6 arm, 0/293 on
+llama.cpp.
+
+Fixed by teaching the holdback the third opener, under the same display rule
+as the JSON one, with the candidate ending at the first `</function>` that
+closes a parameter (one inside a value does not count) and swallowing a stray
+`</tool_call>`. The parser's own bare-call span end now uses the same rule.
+On the arm that followed: **PART 1/597 (0.17%)**, 23 stream recoveries logged
+where the old build emitted prose, 0 UN-RESCUED.
+
+That arm scored **0.715**, the lowest of the five. I do not read it as causal:
+five arms spanning 0.715-0.769 with per-trial swings of 0.12-1.00 put the
+harness resolution around +-0.05. There is a plausible mechanism in the other
+direction, though -- a recovered call CONTINUES a session that used to end, and
+two of the day's 1.000 scores came from 12-second trials that did nothing --
+so the fix trades cheap early exits for real attempts. It stands on its own
+merits: calls the model intended now execute.
+
+### Adopting thr3e's gate, and what it says
+
+Two level1techs posts (thr3e, 2026-08) teacher-force one transcript through
+different runtimes and compare top-1 agreement and KLD against a reference,
+rather than averaging a corpus. The argument for it is exactly our blind spot:
+our wikitext NLL said fp8 KV costs +0.04% and could not say WHERE.
+
+`build/q27 --flip-dump` captures top-K ids and logits plus a float64
+log-sum-exp at selected positions in one teacher-forced pass;
+`build/render_request` renders a captured /v1/messages body through the
+server's own functions so the corpus carries the real preamble and key order;
+`build/flip_regions` labels every position prompt/out/think/tool;
+`tools/flip_gate.py` reports flips and truncated KLD per region. Control
+passes: the same config twice is bit-identical, 0/11,639 flips.
+
+First matrix, 41,099 tokens of real Claude Code traffic, reference q6k:
+
+| candidate | all | tool | out | KLD p95 |
+|---|---|---|---|---|
+| default tier fp16 KV | 1.014% | 0.955% | 2.976% | 0.020 |
+| default tier fp8 KV | 1.022% | 0.955% | 3.274% | 0.022 |
+| q6 tier | 0.842% | 0.805% | 2.083% | 0.013 |
+| q4s tier | 1.254% | 1.194% | 3.274% | 0.028 |
+| fp16 -> fp8 KV, same weights | 0.335% | 0.301% | 1.488% | 0.003 |
+
+fp8 KV costs 0.335% top-1 flips against its own weights at fp16, and 0.301%
+inside tool calls -- the same order as thr3e's 0.51% for FlashInfer+FP8. Take
+the capacity.
+
+**The premise does not replicate on our traffic.** thr3e reports divergence
+clustering at tool calls; every row here has tool positions flipping at
+0.20-0.39x the rate of ordinary output. The mechanism is not mysterious: tool
+tokens are JSON keys, paths and closing tags the model is nearly certain
+about, while prose has real alternatives. The gate is still the right
+instrument -- it localises divergence instead of averaging it -- but on this
+corpus the tool region is the robust one, not the fragile one. (`out` is 336
+positions; its rate carries about +-1%.)
+
+### The quality gap is one task, and one unspecified API detail
+
+Pooling all five q27 arms (n=15 per task) against llama.cpp (n=3):
+
+| task | q27 | llama.cpp | Welch p |
+|---|---|---|---|
+| bench-time-tracker | 0.779 | 0.973 | 0.026 |
+| bench-constraint-scheduler | 0.974 | 1.000 | 0.003 (effect 0.026) |
+| bench-task-queue | 0.278 | 0.444 | 0.58 |
+| bench-financial-ledger | 1.000 | 1.000 | -- |
+
+Only time-tracker carries a real effect, and q27 is bimodal there: 1.000 or
+~0.50, never in between. 0.520 is 13 of 25 hidden tests. Running the hidden
+suite on a matched pair from the same arm (holdback t1 at 0.520, t3 at 1.000)
+gives 12 failures, all of them state leaking between tests: `getLog` returns
+64 entries where 2 are expected, "creates file on first write" is false.
+
+The cause is the constructor signature. The verifier's discovery shim only
+ever calls `new X(filePath)` with a bare string. An implementation written as
+`constructor(options: TimeTrackerOptions = {})` accepts that string as its
+options object, finds no `filePath`, falls back to a module-level default, and
+every instance in the suite then shares one file. TASK.md says only that "the
+file path should be configurable" -- it never specifies how.
+
+| constructor form | n | mean hidden |
+|---|---|---|
+| accepts a string (bare or `string \| Options`) | 12 | 0.990 |
+| options object only | 6 | 0.453 |
+
+p = 0.0002. **Conditioned on the form, the engines are at parity: q27 0.996,
+llama.cpp 0.973.** q27 drew the losing form 6 times in 15, llama.cpp 0 times
+in 3 -- and P(0 of 3 at a 40% rate) = 0.22, so the draw is unremarkable
+(Fisher p = 0.52). The 0.759-vs-0.854 headline is substantially llama.cpp's
+three trials not having drawn the bad coin.
+
+Six more llama.cpp trials each on time-tracker and task-queue are running to
+take it to n=9 and settle that. Both engines run with thinking enabled at
+similar rates (34% of assistant blocks vs 35%), so that is not the confound;
+q27 sessions do run about twice the turns and 2.8x the thinking text per
+trial, which is where the token-burn difference lives.
+
