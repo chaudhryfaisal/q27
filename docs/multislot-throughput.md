@@ -6,6 +6,19 @@ continuous-batching campaign (P1-P3, BUILDLOG 2026-07-14..16) eliminated
 the limitation that doc recorded. Its analysis and history are preserved
 below -- it predicted the shape of the fix almost exactly.
 
+> **SCOPE (2026-08-23): "extra slots buy fan-out, not tokens" is true for
+> BIG-CONTEXT slots, and false as a general statement.** Everything below was
+> measured at 2x32K/2x48K/2x96K, where union-cap trim binds and aggregate
+> saturates around 250 t/s by two lanes. The C=4/C=8 E-series campaign
+> (BUILDLOG 2026-08-18..19) runs **8 slots at 16K** and scales to **530.6 t/s
+> at C=8 against 141.3 solo** (q4s, `Q27_DRAFT_CEIL1=1`; README cross-engine
+> table) -- 3.75x, well past two lanes. Both hold: aggregate scales with lane
+> count once per-slot context is small enough that the union cap does not
+> trim. The Claude-Code serving shapes of record are still the big-context
+> ones here, so the doctrine stands for agentic serving and needs the
+> qualifier everywhere else. The C=8 ladder is a synthetic concurrency
+> ladder, not one tenant's burst.
+
 ## Current reality (measured, batch_ab REPS=3, w16 2x32K, v0.2.0)
 
 | KV | FIFO (old behavior) | batched + graphs | ratio | solo cost |
