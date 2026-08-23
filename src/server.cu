@@ -10,6 +10,15 @@
 //
 // usage: q27-server model.q27 model.tok [--port 8080] [--host 127.0.0.1]
 //                   [--ctx 8192] [--fast-head] [--slots N] [--slot1-ctx M]
+//                   [--temp T] [--top-p P]
+//
+// --temp/--top-p set the sampler used when a request omits the field (a
+// DEFAULT, not a force -- the client still wins). Default temp 0 = greedy,
+// which is what q27 has always served and what the determinism gates assume.
+// Claude Code sends no sampling fields at all, so agentic serving got greedy
+// argmax while llama.cpp served the same weights at the model card's sampler;
+// on bench-time-tracker that was worth 0.779 vs 0.967 (see docs/BUILDLOG.md
+// 2026-08-22 (c)). For Qwen3.8 agentic serving: --temp 1.0 --top-p 0.95.
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -56,6 +65,21 @@ static std::string jdump(const json& j) {
 // untouched regardless). A forced request with no client seed draws a distinct
 // atomic-counter seed, LOGGED, so each trial is an independent sample yet reproducible
 // by replaying that seed as an explicit request field.
+// Server-side DEFAULT sampler, used only when the request omits the field --
+// exactly what llama-server does with the params baked into a GGUF's metadata.
+// It matters more than it looks: Claude Code sends NO sampling fields at all
+// (0 of 29 captured bodies carry temperature/top_p/top_k), so before these
+// existed q27 served every agentic request at temperature 0, i.e. greedy
+// argmax, while llama.cpp served the same weights at the model card's
+// temp 1.0 / top_k 20 / top_p 0.95 / min_p 0.05. Measured 2026-08-22 on
+// bench-time-tracker: greedy n=15 mean 0.779, sampled n=12 mean 0.967
+// (Welch p=0.027), and q27-sampled vs llama.cpp p=0.82 -- the cross-engine
+// "quality gap" was this, not the engine. Greedy stays the default here so
+// every determinism gate and byte-identity anchor keeps its meaning; serving
+// turns it on with --temp/--top-p.
+static double g_default_temp = 0.0;  // 0 = greedy, the historical behaviour
+static double g_default_top_p = 1.0;
+
 static q27k::SampleParams parse_sample(const json& body) {
     static const double force_temp = []{ const char* e = getenv("Q27_FORCE_TEMP"); return e ? atof(e) : 0.0; }();
     static const double force_tp   = []{ const char* e = getenv("Q27_FORCE_TOP_P"); return e ? atof(e) : 1.0; }();
@@ -65,10 +89,12 @@ static q27k::SampleParams parse_sample(const json& body) {
     // jnum/jint/jbool (api_common.h), not value(): a present-but-null field is
     // how many OpenAI-compatible clients spell "unset", and value() throws on
     // it -> httplib 500. Read null/wrong-typed as absent.
-    double temp = q27::jnum(body, "temperature", force_temp);
+    double temp = q27::jnum(body, "temperature",
+                            force_temp > 0.0 ? force_temp : g_default_temp);
     if (temp > 0.0) {
         s.inv_temp = (float)(1.0 / temp);
-        double tp = q27::jnum(body, "top_p", force_tp);
+        double tp = q27::jnum(body, "top_p",
+                              force_tp < 1.0 ? force_tp : g_default_top_p);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
@@ -329,6 +355,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--think-budget") && i + 1 < argc)
             think_budget_flag = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) g_default_temp = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) g_default_top_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
@@ -513,9 +541,19 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "sampled graphs OFF (Q27_SAMPLED=0): temperature>0 requests get 400\n");
     }
+    // The serving sampler is a first-class fact about a run: greedy and
+    // sampled produce measurably different agentic behaviour (2026-08-22), so
+    // it belongs in the banner every arm's log already captures.
+    char sampler_buf[64];
+    if (g_default_temp > 0.0)
+        snprintf(sampler_buf, sizeof sampler_buf, "temp=%.2f/top_p=%.2f",
+                 g_default_temp, g_default_top_p);
+    else
+        snprintf(sampler_buf, sizeof sampler_buf, "greedy");
+    const std::string sampler_banner(sampler_buf);
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
-            "think=%d batch-gemm=%s\n",
+            "think=%d batch-gemm=%s sampler=%s\n",
             ref_profile ? "ref" : "cc", cc_arch, getenv("Q27_KV") ? getenv("Q27_KV") : "fp16",
             getenv("Q27_FD") ? getenv("Q27_FD") : "fd2",
             getenv("Q27_PMIN") ? getenv("Q27_PMIN") : "off",
@@ -523,7 +561,8 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX") ? getenv("Q27_SUFFIX") : "0",
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1,
-            getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)");
+            getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)",
+            sampler_banner.c_str());
     // The thinking budget is a FRACTION of each request's max_tokens, not an
     // absolute, so an A/B over it leaves no other trace in the log. Announce a
     // non-default one at boot so a run's own output says which arm it was.

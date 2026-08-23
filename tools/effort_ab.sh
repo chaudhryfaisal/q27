@@ -70,6 +70,7 @@ boot() { # $1 = effort arm
     ${Q27_FORCE_TEMP:+--setenv=Q27_FORCE_TEMP=$Q27_FORCE_TEMP} \
     ${Q27_FORCE_TOP_P:+--setenv=Q27_FORCE_TOP_P=$Q27_FORCE_TOP_P} \
     -- "$Q27" "$MODEL" "$TOK" --port "$PORT" --host "$HOST" --ctx 131072 --think \
+    ${Q27_SERVER_EXTRA:-} \
     >/dev/null 2>&1
   for _ in $(seq 1 180); do
     curl -s -m 3 -o /dev/null "http://$HOST:$PORT/health" && return 0
