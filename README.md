@@ -620,7 +620,14 @@ top_p 0.95, min_p 0.05). Measured 2026-08-22 on a 4-task agentic suite, greedy
 hidden-test score. With both matched, no task separates the two engines
 (p=0.199 to 0.898; pooled across 38 trials p=0.824); under the old defaults
 three of four did (p=0.031, 0.031, 0.003). **For agentic serving of Qwen3.8, start the server with
-`--temp 1.0 --top-p 0.95 --think-budget 0`.** The third flag matters as much
+`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0`** -- the
+model card's sampler, which is what llama.cpp applies from GGUF metadata.
+(`--top-k`/`--min-p` added 2026-08-23; before that q27 had top_p only, so a
+"matched sampler" comparison was not actually matched. They compose as logit
+thresholds in llama.cpp's chain order and are gated against the CPU reference
+at zero support mismatches. One documented difference: q27 filters the
+temperature-scaled distribution, llama.cpp filters raw logits and applies
+temperature last -- identical at T=1.0, the card value.) The third flag matters as much
 as the first two: the default think budget is 50% of the client's
 `max_tokens`, and Claude Code sends 64000, so reasoning is force-closed at
 32,000 tokens. When that fires the model can emit EOS with no answer, and an
