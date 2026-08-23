@@ -616,10 +616,19 @@ client which sends no sampling fields gets greedy decoding: Claude Code sends
 none, so agentic serving was greedy until you say otherwise, while llama.cpp
 applies whatever the GGUF metadata carries (for Qwen3.8: temp 1.0, top_k 20,
 top_p 0.95, min_p 0.05). Measured 2026-08-22 on a 4-task agentic suite, greedy
-0.758 vs sampled 0.799 vs llama.cpp 0.852 mean hidden-test score; on the one
-task with a statistically established gap the sampled arm closed it
-(p=0.031 -> p=0.47). **For agentic serving of Qwen3.8, start the server with
-`--temp 1.0 --top-p 0.95`.** The startup banner prints `sampler=greedy` or
+0.758, sampled 0.799, both defaults matched 0.847, llama.cpp 0.878 mean
+hidden-test score. With both matched, no task separates the two engines
+(p=0.199 to 0.898; pooled across 38 trials p=0.824); under the old defaults
+three of four did (p=0.031, 0.031, 0.003). **For agentic serving of Qwen3.8, start the server with
+`--temp 1.0 --top-p 0.95 --think-budget 0`.** The third flag matters as much
+as the first two: the default think budget is 50% of the client's
+`max_tokens`, and Claude Code sends 64000, so reasoning is force-closed at
+32,000 tokens. When that fires the model can emit EOS with no answer, and an
+empty assistant turn ends the session -- measured 2026-08-23, 5 of 6
+task-queue trials wrote no files at all and scored 0.000. `--think-budget 0`
+removes the cap (llama.cpp has none, and its reasoning blocks run larger);
+with it, every trial wrote files and the task mean went 0.334 -> 0.525
+against llama.cpp's 0.549. The startup banner prints `sampler=greedy` or
 `sampler=temp=1.00/top_p=0.95` so a log always records which ran. (`top_k` and
 `min_p` are not implemented; the sampled arms closed the gap without them.)
 

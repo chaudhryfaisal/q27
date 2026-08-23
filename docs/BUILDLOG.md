@@ -15143,3 +15143,73 @@ And then the opposite error, an hour later: on the strength of one task's
 p=0.82 I described the sampler as the explanation for the whole gap. The
 matched-sampler arm put it at 40% of the gap. Both mistakes have the same
 shape -- treating a result from one task as a result about the system.
+
+## 2026-08-23: the second default -- the think budget was killing sessions outright
+
+The task-queue residue from (c) was not a capability difference either. It was
+a second default, and its signature was hiding in plain sight: q27's
+task-queue scores were **exact zeros in 5 of 6 trials**, and llama.cpp had one
+zero in nine. An exact zero is not "worse code"; 0 of 33 hidden tests pass
+when there is no code at all, and `src/` in those workspaces was empty.
+
+The transcript of one: ten turns, all of them reads, then
+`RESULT success turns=10 result=''`. The agent never wrote a file. Server
+side, the last generation of that session was `dec=32001 tokens, end=eos` --
+and 32001 is exactly half of the 64000 `max_tokens` Claude Code sends.
+
+`think_budget_default` returns `THINK_BUDGET_FRAC * n_max`, and
+THINK_BUDGET_FRAC is 0.5. So thinking is force-closed at 32,000 tokens.
+`force_reasoning_close` injects `</think>`, the model -- cut off mid-argument
+after 130,306 characters of reasoning that had gone in circles ("I'm going in
+circles (pun intended). Decision time.") -- emits EOS with no answer, and q27
+returns a message with no visible content. Claude Code takes an empty
+assistant turn as the final response and ends the session.
+
+llama.cpp has no such cap, and its thinking blocks on this task run BIGGER:
+
+| | max thinking block | wrote files | score |
+|---|---|---|---|
+| q27, budget on (6 trials) | 120-130k chars | 0 files in 5 of 6 | 0.000 x5 |
+| llama.cpp (9 trials) | 127-244k chars | 4-7 files in 9 of 9 | 0.42-1.00 in 8 of 9 |
+
+So q27 was cutting reasoning roughly in half relative to llama.cpp, and doing
+it fatally instead of gracefully. With `--think-budget 0` (unbounded, matching
+llama.cpp) and the matched sampler, six task-queue trials: 0.152, 0.121,
+1.000, 0.576, 0.879, 0.424 -- **every one wrote files**, none scored zero, and
+durations moved to 1324-3030s, llama.cpp's range, from q27's previous
+280-920s bail-outs.
+
+### Where that leaves the comparison
+
+| task | q27 greedy | q27 sampled | q27 both fixes | llama.cpp | p (fixed vs llama) |
+|---|---|---|---|---|---|
+| bench-task-queue | 0.278 (15) | 0.334 (6) | 0.525 (6) | 0.549 (9) | 0.898 |
+| bench-time-tracker | 0.779 (15) | 0.907 (6) | 0.907 (6) | 0.964 (9) | 0.471 |
+| bench-constraint-scheduler | 0.974 (15) | 0.956 (3) | 0.956 (3) | 1.000 (3) | 0.199 |
+| bench-financial-ledger | 1.000 (5) | 1.000 (1) | 1.000 (1) | 1.000 (1) | -- |
+| **mean over tasks** | **0.758** | **0.799** | **0.847** | **0.878** | |
+
+Pooled across every trial: q27 0.779 (n=16) vs llama.cpp 0.801 (n=22),
+p=0.824. Under greedy with the budget on, three of four tasks separated the
+two engines (p=0.031, 0.031, 0.003); with both defaults matched, none do, the
+largest per-task delta is 0.044 on n=3, and the aggregate difference is 0.031
+-- inside this harness's own resolution, which five same-config arms put at
+about +-0.05 (they spanned 0.715 to 0.769).
+
+**Parity, to the resolution this harness can measure.** Stated with its
+limits: the budget fix was measured on task-queue only, so the "both fixes"
+column is sampler-everywhere plus budget-on-task-queue; constraint-scheduler
+and ledger rest on n=3 and n=1; and "no significant difference" at these
+sample sizes would not detect an effect below roughly 0.05.
+
+### The shape of both bugs
+
+Neither defect was in a kernel, a parser, or a renderer. Both were in what
+q27 does with parameters the client never sends. Claude Code sends no
+sampling fields and no thinking budget; q27 filled in temperature 0 (greedy)
+and a 32,000-token reasoning cap, llama.cpp filled in the model card's
+sampler and no cap. Three investigations went past both while chasing
+renderer bytes, KV precision and parser shapes. The one question that would
+have found them in an hour: *for every field the client omits, what does each
+engine substitute?*
+
