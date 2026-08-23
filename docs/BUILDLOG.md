@@ -15089,11 +15089,16 @@ weights digest verified):
 
 | task | q27 greedy | q27 sampled | llama.cpp |
 |---|---|---|---|
-| bench-task-queue | 0.278 (15) | 0.334 (6) | 0.444 (3) |
+| bench-task-queue | 0.278 (15) | 0.334 (6) | 0.549 (9) |
 | bench-time-tracker | 0.779 (15) | 0.907 (6) | 0.964 (9) |
 | bench-constraint-scheduler | 0.974 (15) | 0.956 (3) | 1.000 (3) |
 | bench-financial-ledger | 1.000 (5) | 1.000 (1) | 1.000 (1) |
-| **mean over tasks** | **0.758** | **0.799** | **0.852** |
+| **mean over tasks** | **0.758** | **0.799** | **0.878** |
+
+(llama.cpp's task-queue column was 0.444 at n=3 when this entry was first
+written; six more trials moved it to 0.549 at n=9. The extra evidence made
+that gap BIGGER, not smaller -- worth recording, because the replicates were
+run expecting the opposite.)
 
 What that settles and what it does not. time-tracker was the ONLY task with a
 statistically established gap (greedy vs llama.cpp p=0.031). Under matched
@@ -15108,8 +15113,19 @@ gap, and no task now shows a significant difference (all p > 0.14) -- which is
 greedy-vs-sampled the whole story was overreach; it is a real, mechanistically
 confirmed, partial cause.
 
-The residue is bench-task-queue, where both engines mostly fail (5-6 of 33
-hidden tests) and llama.cpp has three trials. Six more are running.
+The residue is bench-task-queue, and it did not dissolve. At n=9 llama.cpp
+sits at 0.549 against q27-sampled's 0.334 (n=6) -- a 0.215 gap, p=0.170.
+
+Final verdict on the goal, stated against what the numbers support rather
+than what the hypothesis wanted. Matching the decoding policy removed every
+statistically significant difference: under greedy, three of four tasks
+separated q27 from llama.cpp (p=0.031, 0.031, 0.003); under matched sampling,
+none do (p=0.170, 0.471, 0.199; pooled across all 38 trials p=0.387). But
+"no significant difference" is weak evidence here, not strong: a 0.215 gap on
+task-queue at n=6 vs 9 is likelier an underpowered real gap than a true null,
+and the means still read 0.799 vs 0.878. **Parity is not demonstrated.** One
+apparent gap was an artifact of decoding policy and is closed; one is real
+and open.
 
 ### What I had wrong
 
