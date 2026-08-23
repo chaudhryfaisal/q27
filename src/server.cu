@@ -79,6 +79,8 @@ static std::string jdump(const json& j) {
 // turns it on with --temp/--top-p.
 static double g_default_temp = 0.0;  // 0 = greedy, the historical behaviour
 static double g_default_top_p = 1.0;
+static int g_default_top_k = 0;      // 0 = off
+static double g_default_min_p = 0.0; // 0 = off
 
 static q27k::SampleParams parse_sample(const json& body) {
     static const double force_temp = []{ const char* e = getenv("Q27_FORCE_TEMP"); return e ? atof(e) : 0.0; }();
@@ -96,6 +98,10 @@ static q27k::SampleParams parse_sample(const json& body) {
         double tp = q27::jnum(body, "top_p",
                               force_tp < 1.0 ? force_tp : g_default_top_p);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
+        const double tk = q27::jnum(body, "top_k", (double)g_default_top_k);
+        s.top_k = (tk > 0.0 && tk < 1e9) ? (int)tk : 0;
+        const double mp = q27::jnum(body, "min_p", g_default_min_p);
+        s.min_p = (float)((mp > 0.0 && mp <= 1.0) ? mp : 0.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
         else if (force_temp > 0.0) {
@@ -357,6 +363,8 @@ int main(int argc, char** argv) {
             think_budget_flag = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) g_default_temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) g_default_top_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) g_default_top_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) g_default_min_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
@@ -544,10 +552,10 @@ int main(int argc, char** argv) {
     // The serving sampler is a first-class fact about a run: greedy and
     // sampled produce measurably different agentic behaviour (2026-08-22), so
     // it belongs in the banner every arm's log already captures.
-    char sampler_buf[64];
+    char sampler_buf[96];
     if (g_default_temp > 0.0)
-        snprintf(sampler_buf, sizeof sampler_buf, "temp=%.2f/top_p=%.2f",
-                 g_default_temp, g_default_top_p);
+        snprintf(sampler_buf, sizeof sampler_buf, "temp=%.2f/top_p=%.2f/top_k=%d/min_p=%.2f",
+                 g_default_temp, g_default_top_p, g_default_top_k, g_default_min_p);
     else
         snprintf(sampler_buf, sizeof sampler_buf, "greedy");
     const std::string sampler_banner(sampler_buf);

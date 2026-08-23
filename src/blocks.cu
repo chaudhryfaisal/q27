@@ -546,6 +546,8 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
                                              const SampleParams* __restrict__ sp,
                                              float* __restrict__ out) {
     const float inv_temp = sp->inv_temp, top_p = sp->top_p;
+    const int top_k = sp->top_k;
+    const float min_p = sp->min_p;
     __shared__ float sh[1024];
     __shared__ float s_M, s_logZ, s_lo, s_hi, s_thresh;
     const int t = threadIdx.x, B = blockDim.x;
@@ -582,12 +584,75 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
     }
     __syncthreads();
     const float logZ = s_logZ;
+    // --- top_k, then min_p, then top_p: llama.cpp's order, as thresholds ----
+    // Each filter only REMOVES tokens, so a chain is an intersection of kept
+    // sets, and an intersection of "x_i >= thr" sets is "x_i >= max(thr)".
+    // top_k and min_p do not depend on which other tokens survive, so they
+    // compose by max() exactly. top_p DOES depend on the surviving mass, so it
+    // is bisected below over the set the first two already left -- computing
+    // it on the full vocab instead would keep too many tokens whenever top_k
+    // binds, which for k=20 on a peaked distribution is almost always.
+    // s_logZp is SEPARATE from s_logZ on purpose: out[2] exports the FULL-vocab
+    // logZ and out[3]'s mass is sum_{kept} softmax_full(i), which the Phase-2
+    // accept test divides by. Overwriting s_logZ here would make mass ~1 and
+    // silently break the accept ratio.
+    __shared__ float s_pre, s_logZp;
+    if (t == 0) { s_pre = -FLT_MAX; s_logZp = s_logZ; }
+    __syncthreads();
+    // min_p: p_i/p_max >= min_p  <=>  inv_temp*(x_i - M) >= log(min_p).
+    // Scale-invariant under renormalisation, so its threshold is the same
+    // whether it runs before or after any other filter -- closed form, no
+    // bisection.
+    if (t == 0 && min_p > 0.f && min_p <= 1.0f && inv_temp > 0.f)
+        s_pre = fmaxf(s_pre, M + __logf(min_p) / inv_temp);
+    __syncthreads();
+    // top_k: bisect for the k-th largest LOGIT (same window and iteration
+    // count as the top_p bisection below, counting instead of summing). The
+    // count is monotone decreasing in thr, so the invariant matches.
+    if (top_k > 0 && top_k < n) {
+        if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
+        __syncthreads();
+        for (int it = 0; it < 24; it++) {
+            const float thr = 0.5f * (s_lo + s_hi);
+            float cnt = 0.f;
+            for (int i = t; i < n; i += B) if (x[i] >= thr) cnt += 1.f;
+            sh[t] = cnt; __syncthreads();
+            for (int s = B / 2; s > 0; s >>= 1) {
+                if (t < s) sh[t] += sh[t + s];
+                __syncthreads();
+            }
+            // keep the largest thr whose count still covers k
+            if (t == 0) { if (sh[0] > (float)top_k) s_lo = thr; else s_hi = thr; }
+            __syncthreads();
+        }
+        if (t == 0) s_pre = fmaxf(s_pre, s_hi); // s_hi keeps <= k tokens
+        __syncthreads();
+    }
+    const float pre = s_pre;
+    // Renormalise the remaining mass so top_p's cumulative is taken over the
+    // set that survived top_k/min_p, exactly as llama.cpp does.
+    if (top_p < 1.0f && pre > -FLT_MAX) {
+        float se2 = 0.f;
+        for (int i = t; i < n; i += B)
+            if (x[i] >= pre) se2 += expf(inv_temp * (x[i] - M));
+        sh[t] = se2; __syncthreads();
+        for (int s = B / 2; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            __syncthreads();
+        }
+        if (t == 0) s_logZp = logf(sh[0]);
+        __syncthreads();
+    }
+    const float logZp = s_logZp;
     if (top_p < 1.0f) {
+        if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
+        __syncthreads();
         for (int it = 0; it < 16; it++) {
             const float thr = 0.5f * (s_lo + s_hi); // s_lo/s_hi settled by prior __syncthreads
             float mass = 0.f;
             for (int i = t; i < n; i += B)
-                if (x[i] >= thr) mass += expf(inv_temp * (x[i] - M) - logZ);
+                if (x[i] >= thr && x[i] >= pre)
+                    mass += expf(inv_temp * (x[i] - M) - logZp);
             sh[t] = mass; __syncthreads();
             for (int s = B / 2; s > 0; s >>= 1) {
                 if (t < s) sh[t] += sh[t + s];
@@ -599,7 +664,8 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
     }
     if (t == 0) {
         float thresh = (top_p >= 1.0f) ? -FLT_MAX : s_lo; // s_lo is now the logit threshold
-        s_thresh = fminf(thresh, M); // argmax token always in nucleus
+        thresh = fmaxf(thresh, pre);  // intersect with top_k/min_p
+        s_thresh = fminf(thresh, M);  // argmax token always in nucleus
     }
     __syncthreads();
     // out[3] = nucleus mass = sum_{x_i >= thresh} softmax_full(i) (Phase 2 accept
