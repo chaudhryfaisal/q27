@@ -607,6 +607,22 @@ make build/q27-server
 ./build/q27-server model.q27 model.tok --port 8080
 ```
 
+**Sampler: greedy by default, and that is a choice you may want to change.**
+`--temp T` / `--top-p P` set the sampler used when a request OMITS the field
+(the client still wins; `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P` still force). The
+default is temperature 0 -- greedy argmax -- which is what every determinism
+gate and byte-identity anchor in this repo assumes. It also means that a
+client which sends no sampling fields gets greedy decoding: Claude Code sends
+none, so agentic serving was greedy until you say otherwise, while llama.cpp
+applies whatever the GGUF metadata carries (for Qwen3.8: temp 1.0, top_k 20,
+top_p 0.95, min_p 0.05). Measured 2026-08-22 on a 4-task agentic suite, greedy
+0.758 vs sampled 0.799 vs llama.cpp 0.852 mean hidden-test score; on the one
+task with a statistically established gap the sampled arm closed it
+(p=0.031 -> p=0.47). **For agentic serving of Qwen3.8, start the server with
+`--temp 1.0 --top-p 0.95`.** The startup banner prints `sampler=greedy` or
+`sampler=temp=1.00/top_p=0.95` so a log always records which ran. (`top_k` and
+`min_p` are not implemented; the sampled arms closed the gap without them.)
+
 **Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV

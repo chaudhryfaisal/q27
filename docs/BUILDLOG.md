@@ -15002,3 +15002,128 @@ similar rates (34% of assistant blocks vs 35%), so that is not the confound;
 q27 sessions do run about twice the turns and 2.8x the thinking text per
 trial, which is where the token-burn difference lives.
 
+
+
+## 2026-08-22 (c): the cross-engine gap was greedy-vs-sampled the whole time
+
+Five q27 arms and one llama.cpp arm had put the agentic gap at 0.759 vs 0.854
+and three separate investigations had come back null (quality at fixed
+prompts, engine numerics, prompt fidelity). The fourth question -- "is the
+0.854 even a stable number?" -- turned out to be the one worth asking.
+
+### Decomposing before replicating
+
+Pooling all five q27 arms per task (n=15) against llama.cpp (n=3):
+
+| task | q27 | llama.cpp | Welch p |
+|---|---|---|---|
+| bench-time-tracker | 0.779 | 0.973 | 0.026 |
+| bench-constraint-scheduler | 0.974 | 1.000 | 0.003 (effect 0.026) |
+| bench-task-queue | 0.278 | 0.444 | 0.58 |
+| bench-financial-ledger | 1.000 | 1.000 | -- |
+
+Only time-tracker carries a real effect. q27 is bimodal there -- 1.000 or
+~0.50, never between -- and 0.520 is 13 of 25 hidden tests. Running the hidden
+suite on a matched pair from the same arm (holdback t1 at 0.520, t3 at 1.000,
+same binary, same config) gives 12 failures, every one of them state leaking
+across tests: `getLog` returns 64 entries where 2 are expected, "creates file
+on first write" is false.
+
+The cause is the constructor signature. The verifier's discovery shim only
+ever calls `new X(filePath)` with a bare string. An implementation written
+`constructor(options: Options = {})` takes that string as its options object,
+finds no `filePath`, falls back to a module-level default, and every instance
+in the suite shares one file. TASK.md says only "the file path should be
+configurable" -- it never specifies how. Conditioned on the form:
+
+| constructor form | n | mean hidden |
+|---|---|---|
+| accepts a string | 12 | 0.990 |
+| options object only | 6 | 0.453 |
+
+p = 0.0002, and conditioned on it the engines matched (q27 0.996, llama 0.973).
+The obvious read was "llama.cpp drew the good coin three times". Six more
+llama.cpp trials say otherwise: **0 of 9**, against q27's 6 of 15.
+
+### The variable was never the engine
+
+q27's `parse_sample` falls back to `temperature = 0` when the request omits
+it, and **Claude Code omits it** -- 0 of 29 captured bodies carry
+temperature, top_p or top_k. So q27 served every agentic request by greedy
+argmax. llama-server, handed the same weights, applies what the GGUF metadata
+carries: the Qwen3.8 card's temp 1.0 / top_k 20 / top_p 0.95 / min_p 0.05.
+
+Regrouped by decoding policy instead of by engine, bench-time-tracker:
+
+| decoding | n | mean hidden | losing ctor form |
+|---|---|---|---|
+| q27 greedy | 15 | 0.779 | 6/15 |
+| q27 sampled (temp 0.8, top_p 0.95) | 3 | 0.973 | 0/3 |
+| llama.cpp sampled | 9 | 0.964 | 0/9 |
+
+greedy vs sampled: score Welch p = 0.027, form Fisher p = 0.020.
+**q27-sampled vs llama.cpp: p = 0.82.**
+
+Greedy decoding is visible in the arms once you look for it: two independent
+time-tracker trials produced 1,068,470 and 1,068,407 tokens with identical
+scores and the identical constructor, and two constraint-scheduler trials
+produced byte-identical 75,760. Independent trials do not do that under
+sampling. It also accounts for the runaway 30k-token generations
+(rounds=9943) and the 2x token burn against llama.cpp: greedy looping on a
+model tuned for sampling.
+
+`--temp` and `--top-p` now set the sampler used when a request omits the
+field. They are DEFAULTS, not forces: the client still wins, `Q27_FORCE_*`
+still overrides, and the default stays greedy so every determinism gate and
+byte-identity anchor keeps its meaning. The banner prints `sampler=greedy` or
+`sampler=temp=1.00/top_p=0.95`, so no future arm is ambiguous about which
+policy produced it. `top_k` and `min_p` are still absent from `SampleParams`;
+the sampled arms reached llama.cpp parity without them, so they are a
+refinement rather than a blocker.
+
+### The matched-sampler arm, and how much it actually explains
+
+Serving default plus `--temp 1.0 --top-p 0.95`, everything else identical to
+the 0.759/0.762/0.715 baselines (banner recorded `sampler=temp=1.00/top_p=0.95`,
+weights digest verified):
+
+| task | q27 greedy | q27 sampled | llama.cpp |
+|---|---|---|---|
+| bench-task-queue | 0.278 (15) | 0.334 (6) | 0.444 (3) |
+| bench-time-tracker | 0.779 (15) | 0.907 (6) | 0.964 (9) |
+| bench-constraint-scheduler | 0.974 (15) | 0.956 (3) | 1.000 (3) |
+| bench-financial-ledger | 1.000 (5) | 1.000 (1) | 1.000 (1) |
+| **mean over tasks** | **0.758** | **0.799** | **0.852** |
+
+What that settles and what it does not. time-tracker was the ONLY task with a
+statistically established gap (greedy vs llama.cpp p=0.031). Under matched
+decoding it is gone: 0.907 vs 0.964, **p=0.47**, and the specific defect --
+the constructor form the verifier cannot discover -- went from 6 of 15 to
+**0 of 6**. The mechanism is confirmed and the one significant difference is
+closed.
+
+The aggregate is not closed. 0.799 against 0.852 is about 40% of the headline
+gap, and no task now shows a significant difference (all p > 0.14) -- which is
+"no measurable gap at this power", not a demonstration of equality. Calling
+greedy-vs-sampled the whole story was overreach; it is a real, mechanistically
+confirmed, partial cause.
+
+The residue is bench-task-queue, where both engines mostly fail (5-6 of 33
+hidden tests) and llama.cpp has three trials. Six more are running.
+
+### What I had wrong
+
+The sampled arm ran on 2026-08-22 morning and I filed it as "overclaimed --
+q27's served sampler lacks top_k/min_p, so this is not a matched comparison",
+and moved matched sampling to a nice-to-have needing kernel work. It was the
+crux, it needed no kernel work, and the evidence for it was already sitting in
+that arm's time-tracker column (1.000/1.000/0.920). Three subsequent
+investigations chased renderer bytes, KV precision and parser shapes while a
+one-line default sat unexamined. The lesson is narrower than "test the
+sampler": when comparing two systems, enumerate what each does with the fields
+the client DOESN'T send. Defaults are configuration too.
+
+And then the opposite error, an hour later: on the strength of one task's
+p=0.82 I described the sampler as the explanation for the whole gap. The
+matched-sampler arm put it at 40% of the gap. Both mistakes have the same
+shape -- treating a result from one task as a result about the system.
