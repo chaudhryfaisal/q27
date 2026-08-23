@@ -79,6 +79,12 @@ build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/st
 build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
 
+build/render_request: tools/render_request.cpp src/api_common.h src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/render_request.cpp src/tokenizer.cpp -o $@
+
+build/flip_regions: tools/flip_regions.cpp src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/flip_regions.cpp src/tokenizer.cpp -o $@
+
 build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@
 
