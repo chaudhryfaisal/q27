@@ -137,7 +137,20 @@ static void test_no_value_bytes_survive_any_channel() {
     }
 }
 
+static void test_shape_hash_ignores_values_not_structure() {
+    const std::string a = "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>";
+    const std::string b = "<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n</function>";
+    const std::string c = "<function=Read>\n<parameter=file_path>\n/a\n</function>";  // closer dropped
+    CHECK(q27::shape_hash(q27::redact_drift(a)) == q27::shape_hash(q27::redact_drift(b)));
+    CHECK(q27::shape_hash(q27::redact_drift(a)) != q27::shape_hash(q27::redact_drift(c)));
+    // stable across runs and builds: a dedup key has to mean the same thing
+    // in tomorrow's corpus_dedup.py as in today's capture
+    CHECK(q27::shape_hash("") == 0xcbf29ce484222325ull);           // FNV-1a offset basis
+    CHECK(q27::shape_hash("a") == 0xaf63dc4c8601ec8cull);          // FNV-1a("a")
+}
+
 int main() {
+    test_shape_hash_ignores_values_not_structure();
     test_no_value_bytes_survive();
     test_no_value_bytes_survive_any_channel();
     test_dropped_opener_keeps_keys();

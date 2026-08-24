@@ -361,4 +361,13 @@ inline std::string redact_drift(const std::string& in, const DriftNames* names =
     return drift_detail::Redactor(in, names)();
 }
 
+// Dedup key for the corpus: FNV-1a over the redacted text. Values are already
+// placeholders, so two turns with the same markup skeleton hash alike and a
+// dropped closer does not. A hash, not a security primitive.
+inline uint64_t shape_hash(const std::string& redacted) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : redacted) { h ^= c; h *= 0x100000001b3ull; }
+    return h;
+}
+
 }  // namespace q27
