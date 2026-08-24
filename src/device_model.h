@@ -71,11 +71,20 @@ class DeviceModel {
     // while device varies => the copy or VRAM is at fault.
     unsigned long long host_aggregate() const { return host_sum_; }
     void enable_host_sum(bool on) { want_host_sum_ = on; }
+    // Q27_WSUM_LOCATE=1 (2026-08-24): per-tensor host-vs-device comparison
+    // after upload. The aggregate digest says A load went wrong; this says
+    // WHICH tensor, at which byte offset, which bit, which direction, and
+    // which tensors sit adjacent in device memory. That is the evidence that
+    // separates an out-of-bounds device write (offset at a buffer edge, a
+    // neighbour's name) from a transfer fault (random offset). Returns the
+    // number of tensors that mismatched.
+    int locate_upload_errors() const;
 
   private:
     const Model& model_;
     std::unordered_map<std::string, DevTensor> dev_;
     std::unordered_map<std::string, unsigned long long> sums_;
+    std::unordered_map<std::string, unsigned long long> host_sums_; // per-tensor, data only
     unsigned long long host_sum_ = 0;
     bool want_host_sum_ = false;
     size_t bytes_ = 0;

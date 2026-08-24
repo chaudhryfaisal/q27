@@ -1374,6 +1374,12 @@ struct Engine {
             if (const char* pw = getenv("Q27_PRINT_WSUM")) {
                 fprintf(stderr, "wsum: %016llx hsum: %016llx\n", dm.checksum_aggregate(),
                         dm.host_aggregate());
+                // Q27_WSUM_LOCATE=1: on ANY host/device disagreement, name the
+                // tensor, offset, bit and neighbours (see DeviceModel).
+                // (wsum mixes the scales in by XOR and hsum adds them, so the two
+                // aggregates never agree by construction -- the per-tensor pass
+                // is the comparison, and it runs on every load under the flag.)
+                if (getenv("Q27_WSUM_LOCATE")) dm.locate_upload_errors();
                 // Q27_PRINT_WSUM=3: recompute the digest twice more from the SAME
                 // resident bytes. A wsum that differs from the canonical value but
                 // is STABLE across recomputes means the DATA is corrupt; one that

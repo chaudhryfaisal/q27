@@ -1,3 +1,4 @@
+#include <vector>
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -41,7 +42,11 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
     CUDA_CHECK(cudaMalloc(&d.data, src.data_size));
     // read the source bytes on the CPU immediately before handing them to the
     // copy engine, so the two totals describe the same load
-    if (want_host_sum_) host_sum_ += host_xsum(src.data, src.data_size);
+    if (want_host_sum_) {
+        const unsigned long long hs = host_xsum(src.data, src.data_size);
+        host_sum_ += hs;
+        host_sums_[name] = hs;
+    }
     CUDA_CHECK(cudaMemcpy(d.data, src.data, src.data_size, cudaMemcpyHostToDevice));
     bytes_ += src.data_size;
     d.data_bytes = src.data_size;
@@ -85,6 +90,64 @@ static unsigned long long xsum_dev(const void* p, uint64_t bytes, unsigned long 
     unsigned long long h = 0;
     CUDA_CHECK(cudaMemcpy(&h, d_out, 8, cudaMemcpyDeviceToHost));
     return h;
+}
+
+int DeviceModel::locate_upload_errors() const {
+    if (host_sums_.empty()) {
+        fprintf(stderr, "[locate] host sums not recorded (needs Q27_PRINT_WSUM=1 at load)\n");
+        return -1;
+    }
+    unsigned long long* d_out;
+    CUDA_CHECK(cudaMalloc(&d_out, 8));
+    // device address order, so a mismatch can name its neighbours
+    std::vector<std::pair<const char*, const DevTensor*>> by_addr;
+    for (const auto& [name, t] : dev_) by_addr.emplace_back(name.c_str(), &t);
+    std::sort(by_addr.begin(), by_addr.end(),
+              [](const auto& a, const auto& b) { return a.second->data < b.second->data; });
+    int bad = 0;
+    for (size_t k = 0; k < by_addr.size(); k++) {
+        const char* name = by_addr[k].first;
+        const DevTensor& t = *by_addr[k].second;
+        auto hit = host_sums_.find(name);
+        if (hit == host_sums_.end()) continue;
+        const unsigned long long ds = xsum_dev(t.data, t.data_bytes, d_out);
+        if (ds == hit->second) continue;
+        bad++;
+        const long long delta = (long long)(ds - hit->second);
+        fprintf(stderr, "[locate] MISMATCH tensor=%s bytes=%zu dev=%p delta=%+lld\n",
+                name, (size_t)t.data_bytes, t.data, delta);
+        if (k) fprintf(stderr, "[locate]   below: %s ends at %p (gap %lld B)\n", by_addr[k-1].first,
+                       (char*)by_addr[k-1].second->data + by_addr[k-1].second->data_bytes,
+                       (long long)((char*)t.data - ((char*)by_addr[k-1].second->data + by_addr[k-1].second->data_bytes)));
+        if (k + 1 < by_addr.size()) fprintf(stderr, "[locate]   above: %s starts at %p (gap %lld B)\n", by_addr[k+1].first,
+                       by_addr[k+1].second->data,
+                       (long long)((char*)by_addr[k+1].second->data - ((char*)t.data + t.data_bytes)));
+        // read back and diff against the SOURCE bytes still mapped on the host
+        const Tensor& src = model_.get(name);
+        std::vector<unsigned char> back(t.data_bytes);
+        CUDA_CHECK(cudaMemcpy(back.data(), t.data, t.data_bytes, cudaMemcpyDeviceToHost));
+        const unsigned char* s = (const unsigned char*)src.data;
+        int shown = 0;
+        for (size_t i = 0; i < t.data_bytes; i++) {
+            if (back[i] == s[i]) continue;
+            const unsigned x = back[i] ^ s[i];
+            for (int b = 0; b < 8; b++) if ((x >> b) & 1) {
+                const size_t bit = i * 8 + b;
+                fprintf(stderr, "[locate]   offset %zu of %zu (word %zu, dword %zu bit %zu, byte-in-word %zu) %s"
+                                "  %s edge\n",
+                        i, (size_t)t.data_bytes, i / 8, i / 4, (size_t)(b + 8 * (i % 4)), i % 8,
+                        ((back[i] >> b) & 1) ? "0->1" : "1->0",
+                        (i < 64 || i + 64 >= t.data_bytes) ? "AT" : "not at");
+            }
+            if (++shown >= 8) { fprintf(stderr, "[locate]   ...\n"); break; }
+        }
+        // is the corruption stable in VRAM? re-sum after the readback
+        const unsigned long long ds2 = xsum_dev(t.data, t.data_bytes, d_out);
+        fprintf(stderr, "[locate]   device re-sum %s\n", ds2 == ds ? "STABLE" : "CHANGED");
+    }
+    CUDA_CHECK(cudaFree(d_out));
+    fprintf(stderr, "[locate] %zu tensors compared, %d mismatched\n", host_sums_.size(), bad);
+    return bad;
 }
 
 void DeviceModel::checksum_baseline() {
