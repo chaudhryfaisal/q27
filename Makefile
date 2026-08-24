@@ -79,6 +79,36 @@ build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/st
 build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
 
+# Fuzzing the tool-call parser. The model chooses every byte this parser sees,
+# so it is attack surface (docs/SECURITY.md). Two builds:
+#   make fuzz       coverage-guided libFuzzer (needs clang) -- far better reach
+#   make fuzz-gcc   standalone mutator under gcc+ASan, no clang needed
+# Both link ASan+UBSan; a hit aborts with a stack trace.
+FUZZ_CLANG ?= clang++-18
+FUZZ_GCC_DIR ?= /usr/lib/gcc/x86_64-linux-gnu/13
+
+build/fuzz_tool_parser: tools/fuzz_tool_parser.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(FUZZ_CLANG) --gcc-install-dir=$(FUZZ_GCC_DIR) -O1 -g -std=c++17 \
+	  -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	  -I src tools/fuzz_tool_parser.cpp -o $@
+
+build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) -O1 -g -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -I src tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp -o $@
+
+# corpus/ is scratch: libFuzzer grows it to thousands of files. Only
+# tools/fuzz_seeds (the shapes the model actually emits) is tracked.
+fuzz: build/fuzz_tool_parser
+	mkdir -p build/fuzz_corpus && cp -n tools/fuzz_seeds/* build/fuzz_corpus/ 2>/dev/null || true
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_tool_parser build/fuzz_corpus \
+	  -max_total_time=$${FUZZ_SECONDS:-300} -max_len=32768 -print_final_stats=1
+
+fuzz-gcc: build/fuzz_tool_parser_gcc
+	ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+	  ./build/fuzz_tool_parser_gcc $${FUZZ_ITERS:-200000} $${FUZZ_SEED:-1}
+
+.PHONY: fuzz fuzz-gcc
+
 build/render_request: tools/render_request.cpp src/api_common.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/render_request.cpp src/tokenizer.cpp -o $@
 

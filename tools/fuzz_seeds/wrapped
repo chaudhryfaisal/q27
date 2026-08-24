@@ -1,0 +1,7 @@
+<tool_call>
+<function=Read>
+<parameter=file_path>
+/etc/passwd
+</parameter>
+</function>
+</tool_call>

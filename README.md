@@ -600,6 +600,16 @@ turbo3 from v0.3.0, turbo5k since 2026-08-01) (--kv-fp16 or Q27_KV=fp16 opts out
   exactly as pre-batching (a default must never kill a
   formerly-working invocation).
 
+## Security
+
+The model chooses every byte q27's tool-call parser sees, so that parser is
+attack surface. `docs/SECURITY.md` documents the trust boundaries (a parser
+bug is GPU-host code execution; a *semantic* parser bug is client-sandbox
+execution), why the vLLM `eval()` class does not reach this codebase (no
+`eval`, no template engine), and the two defences: fuzzing for memory safety
+(`make fuzz`, coverage-guided under ASan+UBSan) and per-shape adversarial
+tests for the case where a model writing *about* a call must not make one.
+
 ## Serving
 
 ```
