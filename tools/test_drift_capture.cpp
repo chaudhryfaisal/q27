@@ -149,7 +149,73 @@ static void test_shape_hash_ignores_values_not_structure() {
     CHECK(q27::shape_hash("a") == 0xaf63dc4c8601ec8cull);          // FNV-1a("a")
 }
 
+static std::string hex16(uint64_t h) {
+    char b[17]; snprintf(b, sizeof b, "%016llx", (unsigned long long)h); return b;
+}
+
+static void test_record_format() {
+    using json = nlohmann::json;
+    const std::string text =
+        "<tool_call>\n<function=Read>\n<parameter=file_path>\n/x/y\n</parameter>\n</function>\n</tool_call>";
+    q27::DriftContext ctx;
+    const std::string line = q27::format_drift_record(text, "recovered:1", ctx, nullptr, 0);
+    CHECK(line.find('\n') == std::string::npos);                 // one JSONL line
+    CHECK(line.find("/x/y") == std::string::npos);               // no raw value on the line
+    json j = json::parse(line);
+    const std::string redacted = q27::redact_drift(text);
+    CHECK(j["redacted"] == redacted);                            // exactly redact_drift's output
+    CHECK(j["id"] == hex16(q27::shape_hash(redacted)));
+    CHECK(j["shape"] == "");                                     // labelled later
+    CHECK(j["outcome"] == "recovered:1");
+    CHECK(j["bytes"] == text.size());
+    CHECK(j["ts"] == "1970-01-01T00:00:00Z");
+    CHECK(j["tags"] == json::array({"xml"}));                    // wrapped, not in think
+    CHECK(json::parse(j.dump()) == j);                           // round-trips
+
+    ctx.in_think = true;
+    json j2 = json::parse(q27::format_drift_record(
+        R"({"name":"Read","arguments":{"file_path":"/a"}})", "unrescued", ctx, nullptr, 0));
+    CHECK(j2["tags"] == json::array({"json", "no_wrapper", "in_think"}));
+
+    // a TOOL-segment body reaches the parser with its wrapper already stripped
+    // by the splitter; the caller says so and it must not read as no_wrapper
+    q27::DriftContext wrapped; wrapped.wrapped = true;
+    json j3 = json::parse(q27::format_drift_record(
+        "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>", "strict", wrapped, nullptr, 0));
+    CHECK(j3["tags"] == json::array({"xml"}));
+
+    // the declared set reaches the redactor
+    const q27::DriftNames names = {"Read"};
+    json j4 = json::parse(q27::format_drift_record(
+        R"({"name":"Alice","arguments":{}})", "unrescued", ctx, &names, 0));
+    CHECK(j4["redacted"].get<std::string>().find("Alice") == std::string::npos);
+}
+
+static void test_write_appends_jsonl() {
+    const char* path = "build/test_drift_capture.jsonl";
+    remove(path);
+    q27::DriftContext ctx;
+    q27::write_drift_record(path, "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>", "recovered:1", ctx, nullptr);
+    q27::write_drift_record(path, R"({"name":"Bash","arguments":{"command":"ls"}})", "strict", ctx, nullptr);
+    q27::write_drift_record(path, "", "strict", ctx, nullptr);   // empty text: no record
+    FILE* f = fopen(path, "rb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::string all; char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
+    fclose(f);
+    size_t lines = 0;
+    for (size_t at = 0; (at = all.find('\n', at)) != std::string::npos; at++) lines++;
+    CHECK(lines == 2);
+    CHECK(all.back() == '\n');
+    const std::string first = all.substr(0, all.find('\n'));
+    CHECK(nlohmann::json::parse(first)["outcome"] == "recovered:1");
+    remove(path);
+}
+
 int main() {
+    test_record_format();
+    test_write_appends_jsonl();
     test_shape_hash_ignores_values_not_structure();
     test_no_value_bytes_survive();
     test_no_value_bytes_survive_any_channel();

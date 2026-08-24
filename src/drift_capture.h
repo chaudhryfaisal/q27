@@ -58,8 +58,11 @@ using DriftNames = std::set<std::string>;
 namespace drift_detail {
 
 inline bool is_ws(char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
+inline bool is_ascii_alnum(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
 inline bool is_name_char(char c) {
-    return std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.' || c == ':';
+    return is_ascii_alnum(c) || c == '_' || c == '-' || c == '.' || c == ':';
 }
 inline std::string lower(std::string s) {
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
@@ -92,8 +95,8 @@ inline bool identifier_like(const std::string& s) {
 // `sk-ant-...` token or a path can never pass as one.
 inline bool key_like(const std::string& s) {
     if (s.empty() || s.size() > 64) return false;
-    if (!(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-    for (char c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+    if (!((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z') || s[0] == '_')) return false;
+    for (char c : s) if (!(is_ascii_alnum(c) || c == '_')) return false;
     return true;
 }
 
@@ -225,9 +228,13 @@ struct Redactor {
             if (tag == "function") {
                 xml_key.clear();
                 if (!ident.empty()) placeholder(ident, "NAME");
-            } else if (closed) {
+            } else if (closed && key_like(ident)) {
                 out += ident;                          // keys are schema
-                xml_key = ident.empty() ? std::string("_") : ident;
+                xml_key = ident;
+                json_key.clear();
+            } else if (closed) {
+                if (!ident.empty()) placeholder(ident, "TEXT");
+                xml_key = "_";
                 json_key.clear();
             } else {
                 // No '>' -- the model was cut off, or never closed the opener.
@@ -368,6 +375,71 @@ inline uint64_t shape_hash(const std::string& redacted) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (unsigned char c : redacted) { h ^= c; h *= 0x100000001b3ull; }
     return h;
+}
+
+// What the capture site knows that the text alone does not.
+struct DriftContext {
+    bool wrapped = false;   // the splitter already consumed the <tool_call> wrapper
+    bool in_think = false;  // the bytes came from the reasoning channel
+};
+
+// Cheap lexical labels for the histogram; not a parse.
+inline std::vector<std::string> drift_tags(const std::string& text, const DriftContext& ctx) {
+    std::vector<std::string> tags;
+    if (text.find("<function=") != std::string::npos || text.find("<parameter=") != std::string::npos ||
+        text.find("<tool_name>") != std::string::npos)
+        tags.push_back("xml");
+    if (text.find("{\"name\"") != std::string::npos || text.find("{\"tool_call\"") != std::string::npos ||
+        text.find("\"arguments\"") != std::string::npos)
+        tags.push_back("json");
+    if (!ctx.wrapped && text.find("<tool_call>") == std::string::npos) tags.push_back("no_wrapper");
+    if (ctx.in_think) tags.push_back("in_think");
+    return tags;
+}
+
+inline std::string drift_hex(uint64_t h) {
+    char b[17];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+// One JSONL record (no trailing newline). `shape` is empty until a human
+// labels it (Phase 2). `ts` is UTC; corpus_dedup.py drops it before anything
+// is committed, so a record's time of day never leaves the capture host.
+inline std::string format_drift_record(const std::string& text, const std::string& outcome,
+                                       const DriftContext& ctx, const DriftNames* names,
+                                       time_t ts) {
+    const std::string redacted = redact_drift(text, names);
+    char when[32] = "1970-01-01T00:00:00Z";
+    struct tm tmv;
+    if (gmtime_r(&ts, &tmv)) std::strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    nlohmann::json rec = {
+        {"id", drift_hex(shape_hash(redacted))},
+        {"shape", ""},
+        {"tags", drift_tags(text, ctx)},
+        {"outcome", outcome},
+        {"redacted", redacted},
+        {"bytes", text.size()},
+        {"ts", when},
+    };
+    // replace, not throw: a kept token is ASCII by construction, but the
+    // request handler must never die on a capture-side surprise
+    return rec.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// Append one record to the Q27_DRIFT_CORPUS file. Serialised: server threads
+// capture concurrently and a torn line is an unreadable corpus.
+inline void write_drift_record(const char* path, const std::string& text, const std::string& outcome,
+                               const DriftContext& ctx, const DriftNames* names) {
+    if (!path || !*path || text.empty()) return;
+    const std::string line = format_drift_record(text, outcome, ctx, names, std::time(nullptr));
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    if (FILE* f = std::fopen(path, "ab")) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fputc('\n', f);
+        std::fclose(f);
+    }
 }
 
 }  // namespace q27
