@@ -2946,6 +2946,16 @@ int main(int argc, char** argv) {
                 budget.start();
                 std::string tool_buf;
                 q27::BareToolTextHoldback bare_text;
+                // Issue #38 (cosmicnag, 2026-08-24): the model sometimes emits a
+                // complete tool call INSIDE its <think> block. The splitter routes
+                // everything between <think> and </think> to THINK, and nothing on
+                // that path ever consulted the tool parser, so the XML streamed to
+                // the client as visible reasoning and the call never fired. Same
+                // bytes in TEXT parse fine -- it was an uncovered channel, not a
+                // parse failure. Reasoning gets its own holdback (never share one
+                // with TEXT: the display-context lexer state is per-channel, and a
+                // fence opened in prose must not silence a call in reasoning).
+                q27::BareToolTextHoldback think_text;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
@@ -2975,6 +2985,12 @@ int main(int argc, char** argv) {
                     open_block(0);
                     ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
                         {"delta", {{"type", "text_delta"}, {"text", t}}}});
+                };
+                auto emit_think = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    open_block(1);
+                    ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
+                        {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
                     if (!c.ok || !q27::tool_choice_allows_call(
@@ -3055,13 +3071,21 @@ int main(int argc, char** argv) {
                         bare_text.finish(false,allowed_tool_names,
                                          emit_text,classify_bare);
                         bare_text.reset_context();
-                        open_block(1);
-                        ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
-                            {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
-                    } else if (has_tools) {
-                        bare_text.route(t,allowed_tool_names,
-                                        emit_text,classify_bare);
-                    } else emit_text(t);
+                        if (has_tools)
+                            think_text.route(t,allowed_tool_names,
+                                             emit_think,classify_bare);
+                        else emit_think(t);
+                    } else {
+                        // leaving reasoning: settle any held candidate as
+                        // thinking before the channel changes
+                        think_text.finish(false,allowed_tool_names,
+                                          emit_think,classify_bare);
+                        think_text.reset_context();
+                        if (has_tools)
+                            bare_text.route(t,allowed_tool_names,
+                                            emit_text,classify_bare);
+                        else emit_text(t);
+                    }
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -3112,9 +3136,14 @@ int main(int argc, char** argv) {
                                     rec);
                     } else emit_tool();
                 }
-                if(!final_tool_incomplete)
+                if(!final_tool_incomplete) {
                     bare_text.finish(produced<nm && !bt.budget_truncated,
                                      allowed_tool_names,emit_text,classify_bare);
+                    // a turn that ended still inside <think> can hold a complete
+                    // call; without this it is lost exactly as issue #38 reported
+                    think_text.finish(produced<nm && !bt.budget_truncated,
+                                      allowed_tool_names,emit_think,classify_bare);
+                }
                 if (idx < 0 && !any) { // nothing at all: empty text block for validity
                     idx = block_counter++;
                     chan_open = 0;

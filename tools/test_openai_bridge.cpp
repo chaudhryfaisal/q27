@@ -2170,6 +2170,85 @@ static void test_bare_tool_stream_holdback_bounds() {
 // messages on the same tasks. 9 of the 11 cost the last call of a batch; the
 // other 2 were the only call in the turn, Claude Code took the text as the
 // final answer, and the trial ended at turn 3.
+// Issue #38 (cosmicnag, 2026-08-24): "I can see the tool call xml in the
+// thinking section here and there ... and then the actual tool call never
+// happens." The model emits a complete <tool_call> inside <think>; the
+// splitter routes everything between <think> and </think> to THINK, and that
+// channel never consulted the tool parser. Identical bytes in TEXT parsed
+// fine, so this was an uncovered channel rather than a parse failure. The
+// doubled </tool_call> in the report is a red herring -- it parses either way.
+static void test_tool_call_inside_reasoning() {
+    json body=json::parse(R"({"tools":[
+        {"name":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}}}}]})");
+    const json tools=q27::anthropic_tools_json(body);
+    const std::string inner=
+        "<function=read>\n<parameter=path>\n/tmp/x.md\n</parameter>\n"
+        "<parameter=limit>\n160\n</parameter>\n</function>\n";
+    // mirror server.cu's route(): adjacent same-channel pieces are MERGED
+    // before the resolver sees them. Feeding raw 7-byte fragments instead
+    // tests a shape the handler never produces.
+    auto resolve=[&](const std::string& gen) {
+        q27::StreamSplitter sp;
+        std::vector<std::pair<q27::StreamSplitter::Chan,std::string>> segs;
+        auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t) {
+            if(t.empty()) return;
+            if(!segs.empty() && segs.back().first==ch) segs.back().second+=t;
+            else segs.emplace_back(ch,t);
+        };
+        for(size_t i=0;i<gen.size();i+=7)
+            for(auto& x:sp.feed(gen.substr(i,7))) route(x.first,x.second);
+        for(auto& x:sp.flush()) route(x.first,x.second);
+        return q27::resolve_ordered_tool_segments(
+            segs,&tools,false,[](const std::string&,size_t){return true;});
+    };
+    // the reported shape, doubled closer and all
+    {
+        auto o=resolve("<think>\nNext, read the temp file.\n<tool_call>\n"+inner+
+                       "</tool_call>\n</tool_call>\n</think>\n");
+        CHECK(o.calls.size()==1);
+        CHECK(o.calls.size()==1 && o.calls[0].name=="read");
+        CHECK(o.calls.size()==1 &&
+              o.calls[0].arguments.value("path",std::string())=="/tmp/x.md");
+        CHECK(o.reasoning.find("<function=read>")==std::string::npos);
+    }
+    // single closer, same result
+    {
+        auto o=resolve("<think>\nplanning\n<tool_call>\n"+inner+"</tool_call>\n</think>\n");
+        CHECK(o.calls.size()==1 && o.calls[0].name=="read");
+    }
+    // bare, no wrapper, inside reasoning
+    {
+        auto o=resolve("<think>\nplanning\n"+inner+"</think>\n");
+        CHECK(o.calls.size()==1 && o.calls[0].name=="read");
+    }
+    // SAFETY: a fenced example inside reasoning is the model writing ABOUT a
+    // call. It must stay reasoning -- this is the in-band-signalling hazard,
+    // and parse_bare_tool_calls alone would execute it.
+    {
+        const std::string fenced="<think>\nlike this:\n```\n<tool_call>\n"+inner+
+                                 "</tool_call>\n```\n</think>\n";
+        auto o=resolve(fenced);
+        CHECK(o.calls.empty());
+        CHECK(o.reasoning.find("<function=read>")!=std::string::npos);
+    }
+    // SAFETY: an inline-code mention stays reasoning
+    {
+        auto o=resolve("<think>\nI could call `<tool_call>` here\n</think>\n");
+        CHECK(o.calls.empty());
+    }
+    // ordinary reasoning is untouched, and still reaches out.reasoning
+    {
+        auto o=resolve("<think>\njust thinking about the problem\n</think>\n");
+        CHECK(o.calls.empty());
+        CHECK(o.reasoning.find("just thinking")!=std::string::npos);
+    }
+    // a call in reasoning FOLLOWED by one in text yields both, in order
+    {
+        auto o=resolve("<think>\nplan\n"+inner+"</think>\nNow doing it.\n"+inner);
+        CHECK(o.calls.size()==2);
+    }
+}
+
 static void test_bare_tool_stream_holdback_native_xml() {
     json body=json::parse(R"({"tools":[
         {"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}},
@@ -2708,6 +2787,7 @@ int main() {
     test_bare_tool_parser_can_refuse_eof_repair();
     test_bare_tool_stream_holdback_bounds();
     test_bare_tool_stream_holdback_native_xml();
+    test_tool_call_inside_reasoning();
     test_ordered_tool_segments_preserve_first_call_and_rejected_text();
     test_tool_streamer_marks_invalid_completed_args();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }
