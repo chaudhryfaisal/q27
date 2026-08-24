@@ -86,6 +86,17 @@ inline bool identifier_like(const std::string& s) {
     return true;
 }
 
+// What may survive as a JSON key: a schema-shaped identifier. Narrower than a
+// tool name on purpose -- a key is kept verbatim with no declared set to check
+// it against, so the shape itself is the only gate. No '-', '.', ':' means a
+// `sk-ant-...` token or a path can never pass as one.
+inline bool key_like(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    if (!(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    for (char c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+    return true;
+}
+
 // A tool name survives only when it is one the request declared (case-
 // insensitive, so a drifted `read` for `Read` still shows as a name). With no
 // declared set, identifier-like is enough -- that is the unit-test contract.
@@ -214,10 +225,17 @@ struct Redactor {
             if (tag == "function") {
                 xml_key.clear();
                 if (!ident.empty()) placeholder(ident, "NAME");
-            } else {
+            } else if (closed) {
                 out += ident;                          // keys are schema
                 xml_key = ident.empty() ? std::string("_") : ident;
                 json_key.clear();
+            } else {
+                // No '>' -- the model was cut off, or never closed the opener.
+                // Whatever follows '=' is not a key we can vouch for, so it is
+                // value bytes: the leak gate has a case for exactly this.
+                xml_key = "_";
+                json_key.clear();
+                run = ident;
             }
             if (closed) { out += '>'; return k + 1 - i; }
             return k - i;
@@ -240,7 +258,7 @@ struct Redactor {
         size_t after = terminated ? j + 1 : j;
         size_t p = after;
         while (p < s.size() && is_ws(s[p])) p++;
-        const bool is_key = terminated && p < s.size() && s[p] == ':' && identifier_like(inner);
+        const bool is_key = terminated && p < s.size() && s[p] == ':' && key_like(inner);
         flush();
         out += '"';
         if (is_key) {
@@ -278,6 +296,7 @@ struct Redactor {
         size_t p = i + 1;
         while (p < s.size() && is_ws(s[p])) p++;
         if (p >= s.size() || (s[p] != ':' && s[p] != ',')) return 0;
+        if (s[p] == ':' && !key_like(core)) return 0;
         out.append(run, 0, b);
         if (s[p] == ':') {
             out += core;

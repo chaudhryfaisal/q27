@@ -76,7 +76,70 @@ static void test_dropped_opener_keeps_keys() {
     CHECK(out3.find("NAME_1\", \"file_path\"") != std::string::npos);
 }
 
+static void test_no_value_bytes_survive() {
+    // every distinctive value token must be absent from the output
+    const char* secrets[] = {"sk-ant-api03-XXXX", "/home/gabe/.ssh/id_ed25519",
+                             "hunter2", "AKIAIOSFODNN7EXAMPLE"};
+    for (const char* s : secrets) {
+        const std::string in = std::string("<function=Bash>\n<parameter=command>\necho ") +
+                               s + "\n</parameter>\n</function>";
+        const std::string out = q27::redact_drift(in);
+        CHECK(out.find(s) == std::string::npos);
+        // and no 8-byte run of it either, in case of partial copy
+        for (size_t i = 0; i + 8 <= strlen(s); i++)
+            CHECK(out.find(std::string(s + i, 8)) == std::string::npos);
+    }
+}
+
+static bool leaks(const std::string& out, const std::string& s) {
+    if (out.find(s) != std::string::npos) return true;
+    for (size_t i = 0; i + 8 <= s.size(); i++)
+        if (out.find(s.substr(i, 8)) != std::string::npos) return true;
+    return false;
+}
+
+// The same property over every channel the redactor knows: JSON values, prose,
+// a mode-11 raw value whose inner quote desyncs the string scanner, tool-name
+// positions (gated on the declared set), reasoning, fences, hallucinated
+// results, and a value with dialect markup inside it.
+static void test_no_value_bytes_survive_any_channel() {
+    const q27::DriftNames names = {"Read", "Write", "Bash"};
+    const char* secrets[] = {"sk-ant-api03-XXXX", "/home/gabe/.ssh/id_ed25519",
+                             "hunter2", "AKIAIOSFODNN7EXAMPLE", "def leak(): pass"};
+    for (const char* sc : secrets) {
+        const std::string s = sc;
+        const std::string shapes[] = {
+            "{\"name\":\"Bash\",\"arguments\":{\"command\":\"echo " + s + "\"}}",
+            "Now I will use " + s + " to authenticate.\n<tool_call>{\"name\":\"Read\","
+                "\"arguments\":{\"file_path\":\"" + s + "\"}}</tool_call>\nDone with " + s,
+            "{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/w/c.json\",\"content\":\"x = \"" +
+                s + "\"\n\"}}",
+            "{\"name\":\"Write\",\"arguments\":{\"content\":\"{\"token\": \"" + s + "\"}\"}}",
+            "{\"name\":\"" + s + "\",\"arguments\":{}}",
+            "<function=" + s + ">\n<parameter=x>\n1\n</parameter>\n</function>",
+            "<tool_name>" + s + "</tool_name>\n<parameter=arguments>\n{\"a\":\"b\"}",
+            s + "\", \"file_path\": \"/a\"}",
+            "<think>\nremember " + s + "\n</think>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/a\"}}",
+            "```\n" + s + "\n```\nuse `" + s + "` now",
+            "<function=Write>\n<parameter=content>\n" + s + " </function> " + s + "\n</parameter>\n</function>",
+            "<result>\n<output>\n" + s + "\n</output>\n</result>",
+            "<parameter=file_path>" + s + "</parameter>",   // no opener at all
+            "<parameter=" + s,                               // truncated opener
+            "\"" + s,                                        // unterminated string
+        };
+        for (const auto& in : shapes) {
+            const std::string out = q27::redact_drift(in, &names);
+            if (leaks(out, s)) {
+                printf("  LEAK of %s in: %s\n    -> %s\n", sc, in.c_str(), out.c_str());
+                fails++;
+            }
+        }
+    }
+}
+
 int main() {
+    test_no_value_bytes_survive();
+    test_no_value_bytes_survive_any_channel();
     test_dropped_opener_keeps_keys();
     test_redacts_xml_values();
     test_preserves_dialect_inside_values();
