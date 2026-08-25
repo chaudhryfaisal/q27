@@ -54,10 +54,14 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 # strict -- because the strict leg's assertions cannot share a process with the
 # tolerant ones.
 .PHONY: test-tools
+# extract_check first: the integration harness embeds server.cu's handle()
+# byte-for-byte, and a stale copy tests logic that no longer ships (it had
+# drifted for ten commits before anything noticed).
 test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
             build/test_chat_completions_integration build/test_think_resolve \
             build/test_stream_split build/test_toolconstrain build/test_template_golden \
             build/test_drift_capture build/test_drift_hook
+	./tools/extract_check.sh
 	./build/test_tool_drift
 	Q27_TOOL_STRICT=1 ./build/test_tool_drift
 	./build/test_tool_drift_corpus

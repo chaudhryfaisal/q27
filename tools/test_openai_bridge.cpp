@@ -2868,6 +2868,34 @@ static void test_stream_router_without_tools_passes_reasoning_through() {
     CHECK(q27::strip_ws2(r.text) == "hi");
 }
 
+// The whole-block helper both /v1/responses legs and the non-stream resolver
+// call: a finished reasoning block with a call in it.
+static void test_recover_calls_from_reasoning() {
+    const json tools = stream_tools();
+    std::vector<q27::ToolCall> got;
+    auto take = [&](q27::ToolCall& c) { got.push_back(std::move(c)); return true; };
+    size_t taken = 0;
+    // wrapped, doubled closer: the call is taken, the prose stays, the wrapper does not
+    std::string kept = q27::recover_calls_from_reasoning(kIssue38Think, &tools, taken, take);
+    CHECK(taken == 1);
+    CHECK(got.size() == 1 && got[0].name == "read");
+    CHECK(kept.find("Next, read the temp file.") != std::string::npos);
+    CHECK(kept.find("<function=") == std::string::npos);
+    CHECK(kept.find("<tool_call>") == std::string::npos);
+    // a fenced example is the model writing about a call: untouched, nothing taken
+    got.clear();
+    const std::string fenced = "like so:\n```\n<tool_call>\n<function=read>\n<parameter=path>\n/x\n</parameter>\n</function>\n</tool_call>\n```\nnot calling it";
+    CHECK(q27::recover_calls_from_reasoning(fenced, &tools, taken, take) == fenced);
+    CHECK(taken == 0 && got.empty());
+    // refused by the acceptor (tool_choice says no): bytes stay reasoning, untouched
+    auto refuse = [&](q27::ToolCall&) { return false; };
+    CHECK(q27::recover_calls_from_reasoning(kIssue38Think, &tools, taken, refuse) == std::string(kIssue38Think));
+    CHECK(taken == 0);
+    // no tools declared: untouched
+    CHECK(q27::recover_calls_from_reasoning(kIssue38Think, nullptr, taken, take) == std::string(kIssue38Think));
+    CHECK(taken == 0);
+}
+
 static void test_think_wrapper_blanker_straddles_chunks() {
     q27::ThinkWrapperBlanker b;
     CHECK(b.feed("ab<tool_c") == "ab");                 // partial token held
@@ -2889,6 +2917,7 @@ int main() {
     test_stream_router_reasoning_call_then_text_call_in_order();
     test_stream_router_without_tools_passes_reasoning_through();
     test_think_wrapper_blanker_straddles_chunks();
+    test_recover_calls_from_reasoning();
     test_tools_passthrough();
     test_tools_absent();
     test_responses_tool_fields_reject_wrong_types();

@@ -3369,20 +3369,6 @@ int main(int argc, char** argv) {
                 bool tool_tail=false;
             };
             auto ctx=std::make_shared<Ctx>();
-            auto flush_think=[&items,ctx,rid]() {
-                std::string th=q27::strip_ws2(ctx->think);
-                ctx->think.clear();
-                if(th.empty()) return json();
-                ctx->tool_tail=false;
-                json item={{"type","reasoning"},
-                           {"id","rs_q27_"+std::to_string(rid)+"_"+
-                                 std::to_string(ctx->reason_counter++)},
-                           {"status","completed"},
-                           {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
-                           {"encrypted_content",nullptr}};
-                items.push_back(item);
-                return item;
-            };
             auto push_text=[&items,rid,ctx](const std::string& tx,bool incomplete=false) {
                 if(tx.empty()) return json();
                 ctx->tool_tail=false;
@@ -3430,6 +3416,40 @@ int main(int argc, char** argv) {
                 auto c=q27::parse_tool_call(q27::strip_ws2(ctx->tool_buf));
                 ctx->tool_buf.clear();
                 return emit_tool(std::move(c));
+            };
+            // Issue #38 (reopened): a complete call inside <think> used to be
+            // emitted as a reasoning item and never fire on this leg too. The
+            // reasoning item keeps its place; the calls follow it.
+            auto flush_think=[&items,ctx,rid,emit_tool,&tools,&response_choice,
+                              &eligible_call_names,&tool_counter]() {
+                std::string raw=std::move(ctx->think);
+                ctx->think.clear();
+                std::vector<q27::ToolCall> calls;
+                size_t taken=0;
+                const std::string kept=q27::recover_calls_from_reasoning(
+                    raw,tools.empty()?nullptr:&tools,taken,[&](q27::ToolCall& call) {
+                        if(!q27::tool_choice_allows_call(response_choice,eligible_call_names,
+                                                         call.name,tool_counter+(int)calls.size()))
+                            return false;
+                        calls.push_back(std::move(call));
+                        return true;
+                    });
+                std::string th=q27::strip_ws2(kept);
+                json item;
+                if(!th.empty()) {
+                    ctx->tool_tail=false;
+                    item={{"type","reasoning"},
+                          {"id","rs_q27_"+std::to_string(rid)+"_"+
+                                std::to_string(ctx->reason_counter++)},
+                          {"status","completed"},
+                          {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                          {"encrypted_content",nullptr}};
+                    items.push_back(item);
+                }
+                for(auto& call:calls) emit_tool(std::move(call));
+                if(taken)
+                    fprintf(stderr,"[tool-fallback] %zu call(s) recovered from reasoning (resp)\n",taken);
+                return item;
             };
             return std::make_tuple(ctx,flush_think,flush_text,flush_tool,
                                    emit_tool,push_text);
@@ -3676,17 +3696,38 @@ int main(int argc, char** argv) {
                         {"item",item}});
                     items.push_back(item);
                 };
+                // Issue #38 (reopened): reasoning is a channel the parser has
+                // to see on this leg too. The reasoning item keeps its place;
+                // recovered calls follow it (emit_call is defined below and
+                // captured by reference, so this closure is only ever invoked
+                // after it exists).
+                std::function<bool(q27::ToolCall)> emit_call_ref;
                 auto flush_think=[&]() {
-                    std::string th=q27::strip_ws2(think);
+                    std::string raw=std::move(think);
                     think.clear();
-                    if(th.empty()) return;
-                    output_tool_tail=false;
-                    item_done({{"type","reasoning"},
-                               {"id","rs_q27_"+std::to_string(rid)+"_"+
-                                     std::to_string(reason_counter++)},
-                               {"status","completed"},
-                               {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
-                               {"encrypted_content",nullptr}});
+                    std::vector<q27::ToolCall> calls;
+                    size_t taken=0;
+                    const std::string kept=q27::recover_calls_from_reasoning(
+                        raw,tools.empty()?nullptr:&tools,taken,[&](q27::ToolCall& call) {
+                            if(!q27::tool_choice_allows_call(response_choice,eligible_call_names,
+                                                             call.name,tool_counter+(int)calls.size()))
+                                return false;
+                            calls.push_back(std::move(call));
+                            return true;
+                        });
+                    std::string th=q27::strip_ws2(kept);
+                    if(!th.empty()) {
+                        output_tool_tail=false;
+                        item_done({{"type","reasoning"},
+                                   {"id","rs_q27_"+std::to_string(rid)+"_"+
+                                         std::to_string(reason_counter++)},
+                                   {"status","completed"},
+                                   {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                                   {"encrypted_content",nullptr}});
+                    }
+                    for(auto& call:calls) emit_call_ref(std::move(call));
+                    if(taken)
+                        fprintf(stderr,"[tool-fallback] %zu call(s) recovered from reasoning (resp-stream)\n",taken);
                 };
                 int msg_index=-1;
                 auto open_text=[&]() {
@@ -3772,6 +3813,7 @@ int main(int argc, char** argv) {
                     output_tool_tail=true;
                     return true;
                 };
+                emit_call_ref=emit_call;
                 auto flush_tool=[&]() {
                     auto call=q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();

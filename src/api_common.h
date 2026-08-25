@@ -6021,6 +6021,64 @@ inline size_t recover_unclosed_tool_tail(const std::string& raw,
     return recovered;
 }
 
+// A finished reasoning block that may hold a complete tool call (issue #38).
+// The whole-block consumers -- the non-stream resolver below and both
+// /v1/responses legs, which accumulate reasoning and emit it once -- call
+// this rather than each carrying the logic (the streaming SSE handlers use
+// StreamToolRouter for the chunked case). The <tool_call> wrapper tokens are
+// blanked, length-preserving, because the display lexer reads a literal one
+// as an inert container and would never arm on the call inside it; fences
+// and inline code are untouched, so a fenced example or an inline-code
+// mention stays reasoning -- calling the parser directly here WOULD execute
+// a fenced example (verified when 152d3a2 landed). accept(call) takes the
+// call or refuses it; refused bytes stay reasoning. Returns the reasoning
+// that remains when something was taken, else the input untouched.
+template<class Accept>
+inline std::string recover_calls_from_reasoning(const std::string& reasoning,
+                                                const json* tools, size_t& taken,
+                                                Accept&& accept) {
+    taken=0;
+    if(!tools || !tools->is_array() || tools->empty() ||
+       !looks_like_intended_tool_call(reasoning)) return reasoning;
+    DriftNames names;
+    declared_tool_names(tools,names);
+    std::string scan=reasoning;
+    for(const char* marker : {"<tool_call>","</tool_call>"}) {
+        const size_t n=std::char_traits<char>::length(marker);
+        for(size_t at=scan.find(marker);at!=std::string::npos;at=scan.find(marker,at+1))
+            scan.replace(at,n,std::string(n,' '));
+    }
+    DriftCtxScope drift_think(false,true,tools);
+    const size_t drift_before=drift_records_written;
+    BareToolTextHoldback hb;
+    std::string kept;
+    auto visible=[&](const std::string& text){ kept+=text; };
+    auto classify=[&](const std::string& source,bool allow_repair,auto&& emit_visible) {
+        std::string prefix,residual;
+        auto calls=parse_bare_tool_calls(source,&prefix,tools,true,allow_repair,&residual);
+        if(calls.empty()) return BareToolCandidateResult{};
+        size_t cursor=0; bool any=false;
+        for(auto& call:calls) {
+            if(call.source_begin==std::string::npos || call.source_begin<cursor) break;
+            const size_t begin=call.source_begin,end=call.source_end;
+            emit_visible(source.substr(cursor,begin-cursor));
+            cursor=end;
+            if(call.ok && accept(call)) { taken++; any=true; }
+            else emit_visible(source.substr(begin,end-begin));
+        }
+        emit_visible(source.substr(cursor));
+        return BareToolCandidateResult{true,any};
+    };
+    hb.route(scan,names,visible,classify);
+    hb.finish(false,names,visible,classify);
+    // The holdback decides whether the parser runs at all; when it found no
+    // candidate the corpus would otherwise never see a reasoning block that
+    // passed the intent check.
+    if(!taken && drift_corpus_path() && drift_records_written==drift_before)
+        capture_drift(reasoning,"unrescued",tools);
+    return taken?kept:reasoning;
+}
+
 // Resolve generated text and wrapped calls in generation order. This matters
 // when parallel calls are disabled: a bare call emitted before a later wrapped
 // call must win, and rejected or malformed bytes must remain visible as text.
@@ -6075,84 +6133,22 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
             // Issue #38: a complete tool call can arrive INSIDE reasoning, and
             // reasoning used to pass straight through to out.reasoning, so the
             // call was never parsed -- it reached the client as visible think
-            // text and never fired. Route it through the same recovery the TEXT
-            // branch uses, which applies the display-context rules (a fenced or
-            // inline-code mention stays prose) rather than executing anything
-            // that merely looks like markup. Bytes that are not a call are
-            // reasoning exactly as before.
-            if(tools && looks_like_intended_tool_call(segment.second)) {
-                // Reuse BareToolTextHoldback rather than calling the parser
-                // directly: it owns the display-context rules (a fenced or
-                // inline-code mention is the model writing ABOUT a call and
-                // must stay reasoning), and it is the same mechanism the
-                // streaming path uses, so the two cannot drift. Calling
-                // parse_bare_tool_calls here instead WOULD execute a fenced
-                // example -- verified, which is why this is not that.
-                std::set<std::string> names;
-                for(const auto& t:*tools) {
-                    if(t.contains("function") && t["function"].contains("name"))
-                        names.insert(t["function"]["name"].get<std::string>());
-                    else if(t.contains("name")) names.insert(t["name"].get<std::string>());
-                }
-                // The splitter always consumes <tool_call> on the TEXT path, so
-                // the display lexer treats a literal one as an INERT CONTAINER
-                // and refuses to arm an opener inside it -- correct there, and
-                // exactly wrong here, because in reasoning the marker survives
-                // as ordinary text. Blank the wrapper tokens (length-preserving,
-                // so offsets and the surrounding reasoning stay put) and let the
-                // holdback see the inner call in clean context. Only these two
-                // dialect tokens are blanked; fences and inline code are
-                // untouched, so the safety rules still decide.
-                std::string scan=segment.second;
-                for(const char* marker : {"<tool_call>","</tool_call>"}) {
-                    const size_t n=std::char_traits<char>::length(marker);
-                    for(size_t at=scan.find(marker);at!=std::string::npos;
-                        at=scan.find(marker,at+1))
-                        scan.replace(at,n,std::string(n,' '));
-                }
-                DriftCtxScope drift_think(false,true,tools);
-                const size_t drift_before=drift_records_written;
-                BareToolTextHoldback hb;
-                std::string kept;
-                size_t taken=0;
-                auto visible=[&](const std::string& text){ kept+=text; };
-                auto classify=[&](const std::string& source,bool allow_repair,
-                                  auto&& emit_visible) {
-                    std::string prefix,residual;
-                    auto calls=parse_bare_tool_calls(source,&prefix,tools,true,
-                                                     allow_repair,&residual);
-                    if(calls.empty()) return BareToolCandidateResult{};
-                    size_t cursor=0; bool any=false;
-                    for(auto& call:calls) {
-                        if(call.source_begin==std::string::npos ||
-                           call.source_begin<cursor) break;
-                        emit_visible(source.substr(cursor,call.source_begin-cursor));
-                        cursor=call.source_end;
-                        if(call.ok && eligible(call.name,out.calls.size())) {
-                            out.append_tool_call(std::move(call));
-                            taken++; any=true;
-                        } else emit_visible(source.substr(call.source_begin,
-                                                          call.source_end-call.source_begin));
-                    }
-                    emit_visible(source.substr(cursor));
-                    return BareToolCandidateResult{true,any};
-                };
-                hb.route(scan,names,visible,classify);
-                hb.finish(false,names,visible,classify);
-                // The holdback decides whether the parser runs at all; when it
-                // found no candidate the corpus would otherwise never see a
-                // reasoning segment that passed the intent check.
-                if(!taken && drift_corpus_path() && drift_records_written==drift_before)
-                    capture_drift(segment.second,"unrescued",tools);
-                if(taken) {
-                    out.reasoning+=kept;
-                    out.recovered+=taken;
-                    fprintf(stderr,"[tool-fallback] %zu call(s) recovered from "
-                                   "reasoning (nonstream)\n",taken);
-                    continue;
-                }
+            // text and never fired. recover_calls_from_reasoning applies the
+            // same display-context rules the TEXT branch uses; bytes that are
+            // not a call are reasoning exactly as before.
+            size_t taken=0;
+            const std::string kept=recover_calls_from_reasoning(
+                segment.second,tools,taken,[&](ToolCall& call) {
+                    if(!eligible(call.name,out.calls.size())) return false;
+                    out.append_tool_call(std::move(call));
+                    return true;
+                });
+            out.reasoning+=kept;
+            if(taken) {
+                out.recovered+=taken;
+                fprintf(stderr,"[tool-fallback] %zu call(s) recovered from "
+                               "reasoning (nonstream)\n",taken);
             }
-            out.reasoning+=segment.second;
             continue;
         }
         const std::string body=strip_ws2(segment.second);
