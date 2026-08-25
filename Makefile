@@ -130,6 +130,15 @@ build/test_drift_capture: tools/test_drift_capture.cpp src/drift_capture.h third
 build/test_drift_hook: tools/test_drift_hook.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_drift_hook.cpp -o $@
 
+# Drift corpus. Serve with Q27_DRIFT_CORPUS=<file> and every dialect-bearing
+# turn is appended as one redacted JSONL record (src/drift_capture.h). This
+# folds that capture into tools/drift_corpus/ -- one exemplar per shape plus a
+# count -- and prints the shape histogram; the seeds it writes feed `make
+# fuzz`. CORPUS defaults to the same variable the server reads.
+CORPUS ?= $(Q27_DRIFT_CORPUS)
+corpus-dedup: tools/corpus_dedup.py
+	@test -n "$(CORPUS)" || { echo "usage: make corpus-dedup CORPUS=/path/to/capture.jsonl (or export Q27_DRIFT_CORPUS)"; exit 2; }
+	python3 tools/corpus_dedup.py --out tools/drift_corpus $(CORPUS)
 
 build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@
