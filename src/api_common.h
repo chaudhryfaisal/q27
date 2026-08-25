@@ -3505,6 +3505,82 @@ inline bool bare_candidate_repair_eligible(
     return object<text.size() && text[object]=='{';
 }
 
+// ---- Dialect residue -------------------------------------------------------
+// The bytes a model leaves around a call that are neither the call nor text:
+// a doubled <tool_call> opener, the closer/opener between two calls it ran
+// together, a stray closer ahead of the wrapper, a truncated closer at the
+// end. Shown to a client they read as garbage -- issue #38, third round:
+// "</function>\n<tool_call>" in the visible content ahead of a call that
+// then worked.
+
+// Length of a residue token at s[i] within [i,end): a complete closer or
+// wrapper token, or a truncated closer (`</functio`) that ends where a token
+// would -- at whitespace, at the next tag, or at `end`. 0 if none.
+inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t end) {
+    for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>"}) {
+        const size_t n = strlen(tk);
+        if (i + n <= end && s.compare(i, n, tk) == 0) return n;
+        size_t l = 0;
+        while (i + l < end && l < n - 1 && s[i + l] == tk[l]) l++;
+        if (l >= 2 && (i + l == end || isspace((unsigned char)s[i + l]) || s[i + l] == '<')) return l;
+    }
+    return 0;
+}
+
+// The maximal suffix of `s` made of whitespace and residue tokens. `start` is
+// where it begins (s.size() if none); `complete` says a whole token is in it;
+// `partial` says it ends in a truncated token, which a later chunk may finish.
+struct DialectResidueSuffix { size_t start; bool complete; bool partial; };
+inline DialectResidueSuffix dialect_residue_suffix(const std::string& s) {
+    DialectResidueSuffix r{0, false, false};
+    size_t i = 0;
+    while (i < s.size()) {
+        if (isspace((unsigned char)s[i])) { i++; continue; }
+        const size_t n = dialect_residue_token_at(s, i, s.size());
+        if (!n) { i++; r.start = i; r.complete = false; r.partial = false; continue; }
+        // a truncated token only counts at the very end
+        const bool whole = i + n < s.size() || s.compare(i, n, "</function>") == 0 ||
+                           s.compare(i, n, "</parameter>") == 0 || s.compare(i, n, "</tool_call>") == 0 ||
+                           s.compare(i, n, "<tool_call>") == 0;
+        if (whole) r.complete = true; else r.partial = true;
+        i += n;
+    }
+    if (r.start == s.size()) { r.complete = false; r.partial = false; }
+    return r;
+}
+
+// Widen each recovered call's span over the residue next to it -- only when
+// at least one token is absorbed, so ordinary whitespace shape stays, and
+// never across a neighbouring call. Text between content and residue stays
+// text; the whitespace between residue and the call goes with the residue.
+inline void absorb_dialect_residue(const std::string& text, std::vector<ToolCall>& calls) {
+    for (size_t k = 0; k < calls.size(); k++) {
+        ToolCall& c = calls[k];
+        if (c.source_begin == std::string::npos || c.source_end == std::string::npos) continue;
+        const size_t ub = k + 1 < calls.size() ? calls[k + 1].source_begin : text.size();
+        size_t i = c.source_end, last_tok_end = c.source_end;
+        bool tok = false;
+        while (i < ub) {
+            if (isspace((unsigned char)text[i])) { i++; continue; }
+            const size_t n = dialect_residue_token_at(text, i, ub);
+            if (!n) break;
+            i += n; last_tok_end = i; tok = true;
+        }
+        if (tok) c.source_end = i == ub ? ub : last_tok_end;
+        const size_t lb = k ? calls[k - 1].source_end : 0;
+        size_t j = lb, content_end = lb, first_tok = std::string::npos;
+        while (j < c.source_begin) {
+            if (isspace((unsigned char)text[j])) { j++; continue; }
+            const size_t n = dialect_residue_token_at(text, j, c.source_begin);
+            if (!n) { j++; content_end = j; first_tok = std::string::npos; continue; }
+            if (first_tok == std::string::npos) first_tok = j;
+            j += n;
+        }
+        if (first_tok != std::string::npos) c.source_begin = content_end == lb ? lb : first_tok;
+        c.raw = text.substr(c.source_begin, c.source_end - c.source_begin);
+    }
+}
+
 // Streaming handlers cannot retract text after it reaches the wire. Hold only
 // plausible wrapper-less call prefixes, classify complete strict candidates,
 // and defer a balanced-but-malformed candidate until final tolerant recovery.
@@ -3528,6 +3604,12 @@ struct BareToolTextHoldback {
     bool input_allow_repair=false;
     bool ordinary_call_seen=false;
     bool native=false; // holding a wrapper-less <function=...> candidate
+    // Dialect residue that sat right before the candidate (a stray
+    // `</function>`, a doubled opener). Not emitted when the candidate is
+    // armed: it is classified together with the candidate, where the parser
+    // folds it into an accepted call's span, and it goes back in front of a
+    // candidate that is released as text. Issue #38, third round.
+    std::string pre_residue;
     IncrementalBareJsonEnd scan;
     IncrementalBareNativeEnd native_scan;
     JsonStringLexState string_state;
@@ -3535,8 +3617,28 @@ struct BareToolTextHoldback {
 
     template<class EmitText>
     void emit_visible(const std::string& text,EmitText&& emit_text) {
+        if(text.empty()) return;
+        // held residue turned out to precede ordinary text: it was the
+        // model's own text after all, so it goes out in front of it
+        if(!pre_residue.empty()) {
+            std::string held;
+            held.swap(pre_residue);
+            consume_bare_text_context(string_state,fence_state,held);
+            emit_text(held);
+        }
         consume_bare_text_context(string_state,fence_state,text);
-        if(!text.empty()) emit_text(text);
+        emit_text(text);
+    }
+    // Emit a head of non-candidate text, keeping its trailing dialect
+    // residue back: what follows decides whether it was garbage ahead of a
+    // call (folded into the call by the parser) or text (re-attached above).
+    template<class EmitText>
+    void emit_head(std::string head,EmitText&& emit_text) {
+        const DialectResidueSuffix r=dialect_residue_suffix(head);
+        std::string tail;
+        if(r.complete || r.partial) { tail=head.substr(r.start); head.erase(r.start); }
+        emit_visible(head,emit_text);
+        pre_residue+=tail;
     }
 
     template<class EmitText,class EmitCandidate>
@@ -3548,13 +3650,16 @@ struct BareToolTextHoldback {
         auto visible=[&](const std::string& text) {
             emit_visible(text,emit_text);
         };
+        std::string source=pre_residue;
+        source+=pending;
+        pre_residue.clear();
         const BareToolCandidateResult result=
-            emit_candidate(pending,allow_repair,visible);
+            emit_candidate(source,allow_repair,visible);
         if(!result.parsed) {
             if(defer_failure) {
-                deferred=std::move(pending);
+                deferred=std::move(source);
                 deferred_mode10=candidate_mode10;
-            } else visible(pending);
+            } else visible(source);
         }
         if(!candidate_mode10 && result.accepted) ordinary_call_seen=true;
         pending.clear();
@@ -3606,14 +3711,14 @@ struct BareToolTextHoldback {
                             keep=keep==std::string::npos?native_keep:
                                  std::min(keep,native_keep);
                     }
-                    if(keep==std::string::npos) emit_visible(remaining,emit_text);
+                    if(keep==std::string::npos) emit_head(remaining,emit_text);
                     else {
-                        emit_visible(remaining.substr(0,keep),emit_text);
+                        emit_head(remaining.substr(0,keep),emit_text);
                         probe=remaining.substr(keep);
                     }
                     return;
                 }
-                if(opener) emit_visible(remaining.substr(0,opener),emit_text);
+                if(opener) emit_head(remaining.substr(0,opener),emit_text);
                 pending=remaining.substr(opener);
                 holding=true;
                 mode10=mode10_pos==opener;
@@ -3690,6 +3795,7 @@ struct BareToolTextHoldback {
         string_state.reset();
         fence_state.reset();
         ordinary_call_seen=false;
+        pre_residue.clear();
     }
 };
 
@@ -3749,8 +3855,20 @@ struct StreamToolRouter {
     BareToolTextHoldback bare_text;
     BareToolTextHoldback think_text;
     ThinkWrapperBlanker think_blank;
+    // A TEXT chunk's trailing dialect residue (a stray `</function>`, a
+    // truncated closer), held until the next segment says what it was:
+    // garbage ahead of a wrapper (dropped), or the model's own text (shown).
+    std::string text_residue;
     std::string tool_buf;
     bool has_tools = false;
+
+    template<class Names, class EmitText, class Classify>
+    void release_text_residue(const Names& names, EmitText&& emit_text, Classify&& classify) {
+        if (text_residue.empty()) return;
+        std::string held;
+        held.swap(text_residue);
+        bare_text.route(held, names, emit_text, classify);
+    }
 
     template<class Names, class EmitThink, class Classify>
     void settle_think(const Names& names, EmitThink&& emit_think, Classify&& classify,
@@ -3775,6 +3893,7 @@ struct StreamToolRouter {
                  EmitTool&& emit_tool, Classify&& classify) {
         if (ch == StreamSplitter::TOOL) {
             if (tool_buf.empty()) {
+                text_residue.clear();   // residue ahead of a wrapper is garbage
                 settle_text(names, emit_text, classify);
                 settle_think(names, emit_think, classify);
             }
@@ -3784,6 +3903,7 @@ struct StreamToolRouter {
         if (!tool_buf.empty()) emit_tool();
         if (t.empty()) return;
         if (ch == StreamSplitter::THINK) {
+            release_text_residue(names, emit_text, classify);
             settle_text(names, emit_text, classify);
             if (has_tools) think_text.route(think_blank.feed(t), names, emit_think, classify);
             else emit_think(t);
@@ -3795,8 +3915,16 @@ struct StreamToolRouter {
         // Only decoder-injected close whitespace is parser control. Ordinary
         // leading whitespace, including after a natural close, is content.
         if (forced_control_token && strip_ws2(t).empty()) return;
-        if (has_tools) bare_text.route(t, names, emit_text, classify);
-        else emit_text(t);
+        if (!has_tools) { emit_text(t); return; }
+        std::string chunk;
+        chunk.swap(text_residue);
+        chunk += t;
+        const DialectResidueSuffix r = dialect_residue_suffix(chunk);
+        if (r.complete || r.partial) {
+            text_residue = chunk.substr(r.start);
+            chunk.erase(r.start);
+        }
+        if (!chunk.empty()) bare_text.route(chunk, names, emit_text, classify);
     }
 
     // Generation end, after the splitter flush and the wrapped-tail handling.
@@ -3806,6 +3934,10 @@ struct StreamToolRouter {
     void finish(bool allow_repair, const Names& names, EmitText&& emit_text,
                 EmitThink&& emit_think, Classify&& classify) {
         settle_think(names, emit_think, classify, allow_repair);
+        // a complete closer with nothing after it is residue; a truncated one
+        // could have been the model's own text, and is shown
+        if (dialect_residue_suffix(text_residue).complete) text_residue.clear();
+        release_text_residue(names, emit_text, classify);
         settle_text(names, emit_text, classify, allow_repair);
     }
 };
@@ -5934,6 +6066,26 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     DriftCtxScope drift_miss(from_strict_miss, false, nullptr);
     auto out = parse_bare_tool_calls_impl(text_in, prefix, tools, allow_o10,
                                           allow_eof_repair, remaining_text);
+    // Every recovery mode returns from the impl at its own site, so the span
+    // widening over adjacent dialect residue -- and the remaining-text that
+    // depends on the spans -- happens here, once, for all of them.
+    if (!out.empty()) {
+        absorb_dialect_residue(text_in, out);
+        if (remaining_text) {
+            std::string remainder;
+            remainder.reserve(text_in.size());
+            size_t cursor = 0;
+            for (const auto& call : out) {
+                if (call.source_begin == std::string::npos || call.source_begin < cursor) { cursor = std::string::npos; break; }
+                remainder.append(text_in, cursor, call.source_begin - cursor);
+                cursor = call.source_end;
+            }
+            if (cursor != std::string::npos) {
+                remainder.append(text_in, cursor, std::string::npos);
+                *remaining_text = std::move(remainder);
+            }
+        }
+    }
     if (drift_parse_depth == 1 && drift_corpus_path()) {
         if (!out.empty())
             capture_drift(text_in, "recovered:" + (drift_mode_hint.empty()
@@ -6174,11 +6326,19 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         append_text(pending_text,final_segment && allow_eof_repair);
         pending_text.clear();
     };
+    // trailing dialect residue ahead of a wrapped segment, or at the end of
+    // the turn, is garbage rather than text (see absorb_dialect_residue)
+    auto drop_trailing_residue=[&]() {
+        if(!tools) return;
+        const DialectResidueSuffix r=dialect_residue_suffix(pending_text);
+        if(r.complete) pending_text.erase(r.start);
+    };
     for(const auto& segment:segments) {
         if(segment.first==StreamSplitter::TEXT) {
             pending_text+=segment.second;
             continue;
         }
+        if(segment.first==StreamSplitter::TOOL) drop_trailing_residue();
         flush_pending_text(false);
         if(segment.first==StreamSplitter::THINK) {
             // Issue #38: a complete tool call can arrive INSIDE reasoning, and
@@ -6241,6 +6401,7 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         }
         append_text(body,false);
     }
+    drop_trailing_residue();
     flush_pending_text(true);
     return out;
 }

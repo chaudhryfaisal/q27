@@ -2868,6 +2868,81 @@ static void test_stream_router_without_tools_passes_reasoning_through() {
     CHECK(q27::strip_ws2(r.text) == "hi");
 }
 
+// Issue #38, third round (cosmicnag, 2026-08-25): calls fire, but
+// "</function>\n<tool_call>" reached the visible content ahead of a call
+// that then worked. Dialect residue next to a call -- a stray closer before
+// the wrapper, a doubled <tool_call> opener whose inner copy was the "text
+// before the call", the closer/opener between two calls the model ran
+// together -- is not text.
+static void test_dialect_residue_is_not_text() {
+    const json tools = stream_tools();
+    std::string pre, remaining;
+    // the doubled-opener body a wrapped segment hands the bare chain
+    auto one = q27::parse_bare_tool_calls(
+        "\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n",
+        &pre, &tools, true, true, &remaining);
+    CHECK(one.size() == 1 && one[0].name == "bash");
+    CHECK(q27::strip_ws2(remaining).empty());
+    CHECK(one.size() == 1 && one[0].source_begin == 0);
+    // two calls run together: </function>\n<tool_call>\n between them
+    auto two = q27::parse_bare_tool_calls(
+        "<function=read>\n<parameter=path>\n/a\n</parameter>\n</function>\n<tool_call>\n"
+        "<function=read>\n<parameter=path>\n/b\n</parameter>\n</function>",
+        &pre, &tools, true, true, &remaining);
+    CHECK(two.size() == 2);
+    CHECK(remaining.find("<tool_call>") == std::string::npos);
+    CHECK(remaining.find("</function>") == std::string::npos);
+    // a truncated closer after the last call
+    auto trunc = q27::parse_bare_tool_calls(
+        "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</functio",
+        &pre, &tools, true, true, &remaining);
+    CHECK(trunc.size() == 1);
+    CHECK(q27::strip_ws2(remaining).empty());
+    // the streaming shape from the report: prose, stray closer, doubled opener
+    const std::string reported =
+        "I found that compat.js has its own registry.\n</function>\n<tool_call>\n<tool_call>\n"
+        "<function=bash>\n<parameter=command>\nsed -n '100,215p' compat.js\n</parameter>\n"
+        "</function>\n</tool_call>";
+    for (size_t chunk : {size_t(1), size_t(5), size_t(64)}) {
+        auto r = stream_turn(reported, false, chunk);
+        CHECK(r.calls.size() == 1);
+        if (!r.calls.empty()) CHECK(r.calls[0].name == "bash");
+        CHECK(q27::strip_ws2(r.text) == "I found that compat.js has its own registry.");
+        CHECK(r.text.find("</function>") == std::string::npos);
+        CHECK(r.text.find("<tool_call>") == std::string::npos);
+    }
+    // a stray closer, then a BARE call in text
+    auto bare = stream_turn("note\n</function>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>", false, 7);
+    CHECK(bare.calls.size() == 1);
+    CHECK(q27::strip_ws2(bare.text) == "note");
+    // residue at the very end of a turn with no call is dropped...
+    auto eos = stream_turn("done.\n</function>", false, 7);
+    CHECK(eos.calls.empty());
+    CHECK(q27::strip_ws2(eos.text) == "done.");
+    // ...but a closer followed by more prose is the model's text, shown as before
+    auto prose = stream_turn("a\n</function>\nb", false, 3);
+    CHECK(prose.text == "a\n</function>\nb");
+    // a wrapper INSIDE a JSON string value is content the splitter keeps in
+    // TEXT and the chain refuses (no call); every byte must come out, in
+    // order, whatever the chunking -- the residue hold only reorders when it
+    // drops, and it must not drop here
+    const std::string nested =
+        "{\"name\":\"first\",\"arguments\":{\"x\":<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>\n          }}";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(41), size_t(200)}) {
+        auto n = stream_turn(nested, false, chunk);
+        CHECK(n.calls.empty());
+        CHECK(n.text == nested);
+    }
+    // the non-stream resolver, same shape
+    auto res = q27::resolve_ordered_tool_segments(
+        {{q27::StreamSplitter::TEXT, "I found it.\n</function>\n"},
+         {q27::StreamSplitter::TOOL, "\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"}},
+        &tools, true, [](const std::string&, size_t) { return true; });
+    CHECK(res.calls.size() == 1);
+    CHECK(q27::strip_ws2(res.text) == "I found it.");
+    CHECK(res.text.find("<tool_call>") == std::string::npos);
+}
+
 // The whole-block helper both /v1/responses legs and the non-stream resolver
 // call: a finished reasoning block with a call in it.
 static void test_recover_calls_from_reasoning() {
@@ -2918,6 +2993,7 @@ int main() {
     test_stream_router_without_tools_passes_reasoning_through();
     test_think_wrapper_blanker_straddles_chunks();
     test_recover_calls_from_reasoning();
+    test_dialect_residue_is_not_text();
     test_tools_passthrough();
     test_tools_absent();
     test_responses_tool_fields_reject_wrong_types();
