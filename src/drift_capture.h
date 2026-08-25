@@ -392,17 +392,42 @@ inline std::string redact_drift(const std::string& in, const DriftNames* names =
 }
 
 // The markup skeleton a record is deduplicated by: the redacted text with
-// placeholder indices dropped (PATH_3 -> PATH), `:big` dropped (size is not
-// structure) and `:ml` kept only on value placeholders, where a raw newline
-// inside a JSON string is the mode-5/11 signature -- a multi-line prose run
-// is not a shape. Whitespace between tokens stays: the XML dialect is
-// newline-delimited and the parser treats those bytes as structure.
+//   - placeholder indices dropped (PATH_3 -> PATH) and `:big` dropped (size
+//     is not structure); `:ml` kept on value placeholders, where a raw
+//     newline inside a value is the mode-5/11 signature (a multi-line prose
+//     run is not a shape);
+//   - runs of spaces/tabs collapsed to one (indentation of a value's first
+//     line is not structure; newlines stay -- the XML dialect is
+//     newline-delimited and the parser treats those as structure);
+//   - inline code spans (one or two backticks) dropped and the placeholders
+//     they split merged, so a README with nine `code` mentions is the same
+//     shape as one with two. Block fences (three or more) stay: the display
+//     lexer reads those, and a call inside one must not fire.
+// Measured on the first Qwen3.8 suite capture (1100 records): 256 shapes as
+// raw redacted text, 172 with these rules, singletons 189 -> 110.
 inline std::string shape_key(const std::string& redacted) {
     static const char* const kTypes[] = {"PATH", "CODE", "TEXT", "PROSE", "NAME"};
+    // one pass: normalise placeholders, collapse horizontal whitespace, drop
+    // inline backtick runs
     std::string key;
     key.reserve(redacted.size());
     size_t i = 0;
     while (i < redacted.size()) {
+        const char c = redacted[i];
+        if (c == ' ' || c == '\t') {
+            size_t j = i;
+            while (j < redacted.size() && (redacted[j] == ' ' || redacted[j] == '\t')) j++;
+            key += ' ';
+            i = j;
+            continue;
+        }
+        if (c == '`') {
+            size_t j = i;
+            while (j < redacted.size() && redacted[j] == '`') j++;
+            if (j - i >= 3) key.append(redacted, i, j - i);
+            i = j;
+            continue;
+        }
         bool matched = false;
         for (const char* t : kTypes) {
             const size_t n = std::strlen(t);
@@ -411,13 +436,29 @@ inline std::string shape_key(const std::string& redacted) {
             size_t j = i + n + 1;
             if (j >= redacted.size() || !std::isdigit((unsigned char)redacted[j])) continue;
             while (j < redacted.size() && std::isdigit((unsigned char)redacted[j])) j++;
-            key += t;
-            if (redacted.compare(j, 3, ":ml") == 0) {
-                if (std::strcmp(t, "PROSE") != 0) key += ":ml";
-                j += 3;
-            } else if (redacted.compare(j, 4, ":big") == 0) {
-                j += 4;
+            bool ml = false;
+            if (redacted.compare(j, 3, ":ml") == 0) { ml = std::strcmp(t, "PROSE") != 0; j += 3; }
+            else if (redacted.compare(j, 4, ":big") == 0) j += 4;
+            // merge with an immediately preceding placeholder of the same
+            // type (only a dropped inline span or collapsed space between)
+            const std::string tail_ml = std::string(t) + ":ml ", tail = std::string(t) + " ";
+            auto ends_with = [&](const std::string& suf) {
+                return key.size() >= suf.size() && key.compare(key.size() - suf.size(), suf.size(), suf) == 0;
+            };
+            auto ends_with_bare = [&](const std::string& s) {
+                return key.size() >= s.size() && key.compare(key.size() - s.size(), s.size(), s) == 0;
+            };
+            bool merged = false;
+            for (const std::string& prev : {tail_ml, tail, std::string(t) + ":ml", std::string(t)}) {
+                if (!(ends_with(prev) || ends_with_bare(prev))) continue;
+                const bool prev_ml = prev.find(":ml") != std::string::npos;
+                key.erase(key.size() - prev.size());
+                key += t;
+                if (ml || prev_ml) key += ":ml";
+                merged = true;
+                break;
             }
+            if (!merged) { key += t; if (ml) key += ":ml"; }
             i = j;
             matched = true;
             break;

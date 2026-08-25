@@ -136,10 +136,16 @@ build/test_drift_hook: tools/test_drift_hook.cpp src/api_common.h src/drift_capt
 # folds that capture into tools/drift_corpus/ -- one exemplar per shape plus a
 # count -- and prints the shape histogram; the seeds it writes feed `make
 # fuzz`. CORPUS defaults to the same variable the server reads.
+# Records are re-keyed first (build/drift_rekey) so a capture made under an
+# older shape_key() folds with today's; the redacted text itself is untouched.
 CORPUS ?= $(Q27_DRIFT_CORPUS)
-corpus-dedup: tools/corpus_dedup.py
+corpus-dedup: tools/corpus_dedup.py build/drift_rekey
 	@test -n "$(CORPUS)" || { echo "usage: make corpus-dedup CORPUS=/path/to/capture.jsonl (or export Q27_DRIFT_CORPUS)"; exit 2; }
-	python3 tools/corpus_dedup.py --out tools/drift_corpus $(CORPUS)
+	./build/drift_rekey < $(CORPUS) > build/corpus_rekeyed.jsonl
+	python3 tools/corpus_dedup.py --out tools/drift_corpus build/corpus_rekeyed.jsonl
+
+build/drift_rekey: tools/drift_rekey.cpp src/drift_capture.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src tools/drift_rekey.cpp -o $@
 
 build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@

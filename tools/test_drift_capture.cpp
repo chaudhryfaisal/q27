@@ -178,6 +178,20 @@ static void test_shape_hash_ignores_values_not_structure() {
     CHECK(q27::shape_hash("PROSE_1\n<tool_call>") != q27::shape_hash("<tool_call>"));
     // an ordinary identifier that merely looks like a placeholder is untouched
     CHECK(q27::shape_key("\"MY_KEY_2\"") == "\"MY_KEY_2\"");
+    // indentation of a value's first line is not shape; the newline is
+    CHECK(q27::shape_hash("<parameter=new_string>\n      CODE_2:ml\n</parameter>") ==
+          q27::shape_hash("<parameter=new_string>\n  CODE_2:ml\n</parameter>"));
+    CHECK(q27::shape_hash("<parameter=new_string>\nCODE_2\n</parameter>") !=
+          q27::shape_hash("<parameter=new_string> CODE_2 </parameter>"));
+    // inline code spans inside a value are content: the placeholders they
+    // split merge, and a README with nine mentions is the shape of one with two
+    CHECK(q27::shape_key("TEXT_1:ml `TEXT_2` TEXT_3 `TEXT_4` TEXT_5:ml") == "TEXT:ml");
+    CHECK(q27::shape_key("CODE_2:ml`CODE_3`CODE_4:ml`CODE_5`CODE_6:ml") == "CODE:ml");
+    CHECK(q27::shape_key("TEXT_1 `TEXT_2` TEXT_3") == "TEXT");
+    // but a block fence is display context and stays
+    CHECK(q27::shape_key("PROSE_1\n```\nTEXT_2\n```\nPROSE_3") == "PROSE\n```\nTEXT\n```\nPROSE");
+    // and different types do not merge
+    CHECK(q27::shape_key("PATH_1 TEXT_2") == "PATH TEXT");
 }
 
 static std::string hex16(uint64_t h) {
