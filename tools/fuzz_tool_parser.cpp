@@ -81,5 +81,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // 5. the unclosed-tail recovery
     q27::recover_unclosed_tool_tail(s, &tools(), [](const std::string&) {},
                                     [](const q27::ToolCall&) { return true; });
+    // 6. the corpus redactor (src/drift_capture.h): a second parser over the
+    // same model-controlled bytes, running inside the request handler whenever
+    // Q27_DRIFT_CORPUS is set. It must neither crash nor let a value byte
+    // through; the second property is the leak gate in test_drift_capture.cpp,
+    // the first is this.
+    {
+        q27::DriftNames names{"Read", "Bash", "Write"};
+        const std::string red = q27::redact_drift(s, &names);
+        // Bounded growth: a placeholder needs a token byte on at least one
+        // side (whitespace joins runs, it does not split them), so at most
+        // n/2 placeholders of <= 14 bytes ("PROSE_99999:ml") plus n token
+        // bytes: under 8n. The +64 covers a single run at counter width.
+        if (red.size() > 8 * s.size() + 64) __builtin_trap();
+        q27::DriftContext ctx;
+        (void)q27::format_drift_record(s, "fuzz", ctx, &names, 0);
+    }
     return 0;
 }

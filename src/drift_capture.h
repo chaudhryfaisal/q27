@@ -1,0 +1,600 @@
+// Drift-corpus capture: redaction, shape hashing and record formatting for
+// Q27_DRIFT_CORPUS. Pure functions, no CUDA, unit-tested by
+// tools/test_drift_capture.cpp. Design: docs/plans/2026-08-24-parser-normalize-then-parse-design.md
+//
+// WHY THIS EXISTS. q27 is a public repo and the corpus is real Claude Code
+// session content: file paths, source, tool arguments, secrets echoed into
+// shell commands. Nothing scrubs the corpus later, so redaction has to happen
+// here, before a byte reaches disk.
+//
+// WHAT SURVIVES. The parser cares about structure, not values, so structure
+// is kept verbatim and everything else becomes a typed placeholder:
+//
+//   kept      dialect framing (<tool_call>, <function=NAME>, <parameter=KEY>,
+//             </parameter>, </function>, <tool_name>, <think>, <result>...),
+//             JSON punctuation and keys, declared tool names, markdown fences
+//             and backticks (the display-context rules hang off them), and the
+//             whitespace around a value (the dialect parser is newline-shaped).
+//   replaced  every other byte run, as TYPE_N where TYPE is PATH / CODE / TEXT
+//             (from the key the value sits under), PROSE (bytes outside any
+//             call structure) or NAME (a tool name that is not declared).
+//             N is 1-based, in order of appearance. `:ml` marks a multi-line
+//             value, `:big` one over 4 KB; neither carries the bytes.
+//
+// The one exception that matters: dialect markup INSIDE a value is structure.
+// A `</function>` sitting in a content value is the exact shape that broke the
+// closer-bounding fix, so it is passed through and the value continues around
+// it. Only a definite boundary (</parameter>, a new <parameter= or <function=,
+// the wrapper tokens) ends a value.
+//
+// Prose is redacted too, even though the plan only names values: a visible
+// turn routinely says "I'll now edit /home/x/y.py", and the definition of done
+// is that no path, code or content byte from the session appears in a record.
+// Over-redaction is the safe direction; nothing the parser needs lives in prose.
+//
+// Residual, by design: JSON *keys* are kept, so a raw unescaped value that is
+// itself JSON (mode 11 writing a config file) shows its keys. Values under
+// those keys are still replaced. Tool names are kept only when declared;
+// when no declared set is supplied (unit tests) any identifier-like name is
+// kept.
+#pragma once
+
+#include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "../third_party/json.hpp"
+
+namespace q27 {
+
+using DriftNames = std::set<std::string>;
+
+namespace drift_detail {
+
+inline bool is_ws(char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
+inline bool is_ascii_alnum(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+inline bool is_name_char(char c) {
+    return is_ascii_alnum(c) || c == '_' || c == '-' || c == '.' || c == ':';
+}
+inline std::string lower(std::string s) {
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+inline bool ends_with(const std::string& s, const char* suf) {
+    const size_t n = std::strlen(suf);
+    return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+}
+
+// Placeholder type from the key a value sits under. Keys are schema, so this
+// is a hint for the labeller, not a security boundary: an unknown key is TEXT.
+inline const char* type_for_key(const std::string& key_in) {
+    const std::string k = lower(key_in);
+    if (k == "path" || ends_with(k, "path") || k == "cwd" || k == "directory") return "PATH";
+    if (k == "command" || k == "cmd" || k == "code" || k == "script" ||
+        k == "old_string" || k == "new_string" || ends_with(k, "_command")) return "CODE";
+    return "TEXT";
+}
+
+inline bool identifier_like(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) if (!is_name_char(c)) return false;
+    return true;
+}
+
+// What may survive as a JSON key: a schema-shaped identifier. Narrower than a
+// tool name on purpose -- a key is kept verbatim with no declared set to check
+// it against, so the shape itself is the only gate. No '-', '.', ':' means a
+// `sk-ant-...` token or a path can never pass as one.
+inline bool key_like(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    if (!((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z') || s[0] == '_')) return false;
+    for (char c : s) if (!(is_ascii_alnum(c) || c == '_')) return false;
+    return true;
+}
+
+// A tool name survives only when it is one the request declared (case-
+// insensitive, so a drifted `read` for `Read` still shows as a name). With no
+// declared set, identifier-like is enough -- that is the unit-test contract.
+inline bool name_allowed(const std::string& s, const DriftNames* names) {
+    if (!identifier_like(s)) return false;
+    if (!names) return true;
+    if (names->count(s)) return true;
+    const std::string ls = lower(s);
+    for (const auto& n : *names) if (lower(n) == ls) return true;
+    return false;
+}
+
+// Tags kept verbatim as <tag> / </tag>. Everything the drift catalogue has
+// ever keyed off, plus the hallucinated-result tags the parser refuses on.
+inline bool known_tag(const std::string& t) {
+    static const char* const kTags[] = {
+        "tool_call", "tool_calls", "function", "parameter", "tool_name", "think",
+        "result", "output", "content", "name", "arguments", "invoke", "tool"};
+    for (const char* k : kTags) if (t == k) return true;
+    return false;
+}
+
+struct Redactor {
+    const std::string& s;
+    const DriftNames* names;
+    std::string out;
+    size_t counter = 0;
+
+    std::string run;          // non-token bytes waiting for a placeholder
+    std::string xml_key;      // non-empty while inside an XML parameter value
+    std::string json_key;     // last JSON key seen; types the value after it
+    bool name_next = false;   // the next value is a tool name
+    bool last_was_string = false;
+    int json_depth = 0;
+
+    Redactor(const std::string& in, const DriftNames* n) : s(in), names(n) {
+        out.reserve(in.size() < 4096 ? in.size() : 4096);
+    }
+
+    bool in_xml_value() const { return !xml_key.empty(); }
+    // JSON structure is recognised outside XML values, and inside the one XML
+    // value that carries JSON by convention (mode 14: <parameter=arguments>).
+    bool json_active() const { return !in_xml_value() || lower(xml_key) == "arguments"; }
+
+    const char* run_type() const {
+        if (name_next) return "NAME";
+        if (in_xml_value() && !(lower(xml_key) == "arguments" && !json_key.empty()))
+            return type_for_key(xml_key);
+        if (!json_key.empty()) return type_for_key(json_key);
+        return json_depth > 0 ? "TEXT" : "PROSE";
+    }
+
+    void placeholder(const std::string& core, const char* type) {
+        if (std::strcmp(type, "NAME") == 0 && name_allowed(core, names)) { out += core; return; }
+        counter++;
+        out += type;
+        out += '_';
+        out += std::to_string(counter);
+        if (core.size() > 4096) out += ":big";
+        else if (core.find('\n') != std::string::npos) out += ":ml";
+    }
+
+    // Emit one run of value bytes: leading/trailing whitespace verbatim (the
+    // value's shape), the core as one placeholder.
+    void emit_run(const std::string& text, const char* type) {
+        size_t b = 0, e = text.size();
+        while (b < e && is_ws(text[b])) b++;
+        while (e > b && is_ws(text[e - 1])) e--;
+        out.append(text, 0, b);
+        if (e > b) {
+            placeholder(text.substr(b, e - b), type);
+            name_next = false;
+            last_was_string = false;
+        }
+        out.append(text, e, std::string::npos);
+    }
+
+    void flush() {
+        if (run.empty()) return;
+        emit_run(run, run_type());
+        run.clear();
+    }
+
+    // A value with markdown fences in it (a README being written): the
+    // fences stay -- the display-context lexer reads them wherever they sit
+    // -- and each stretch between them is its own placeholder.
+    void emit_value_with_fences(const std::string& text, const char* type) {
+        size_t i = 0;
+        while (i < text.size()) {
+            size_t j = text.find('`', i);
+            if (j == std::string::npos) j = text.size();
+            if (j > i) emit_run(text.substr(i, j - i), type);
+            size_t k = j;
+            while (k < text.size() && text[k] == '`') k++;
+            out.append(text, j, k - j);
+            i = k;
+        }
+    }
+
+    void token(const std::string& t) {
+        flush();
+        out += t;
+        last_was_string = false;
+    }
+
+    // Does a dialect token start at i? Used to bound JSON strings so an
+    // unterminated quote cannot swallow the call that follows it. A fence is
+    // not a boundary: a README's content is one string, fences and all.
+    bool hard_boundary_at(size_t i) const {
+        if (s[i] != '<') return false;
+        static const char* const kStarts[] = {"<tool_call", "</tool_call", "<function", "</function",
+                                              "<parameter", "</parameter", "<tool_name", "</tool_name",
+                                              "<think>", "</think>"};
+        for (const char* k : kStarts)
+            if (s.compare(i, std::strlen(k), k) == 0) return true;
+        return false;
+    }
+
+    // <tag>, </tag>, <function=NAME>, <parameter=KEY>. Returns bytes consumed
+    // (0 = not a tag we know; the '<' is ordinary content).
+    size_t try_tag(size_t i) {
+        size_t j = i + 1;
+        const bool closer = j < s.size() && s[j] == '/';
+        if (closer) j++;
+        const size_t name_begin = j;
+        while (j < s.size() && (std::islower((unsigned char)s[j]) || s[j] == '_')) j++;
+        const std::string tag = s.substr(name_begin, j - name_begin);
+        if (tag.empty() || !known_tag(tag)) return 0;
+        if (j < s.size() && s[j] == '>') {
+            token(s.substr(i, j + 1 - i));
+            if (tag == "parameter" && closer) xml_key.clear();
+            else if (tag == "tool_call" || tag == "tool_calls" || tag == "tool_name" ||
+                     tag == "think" || tag == "invoke" || tag == "tool")
+                xml_key.clear();
+            // </function> deliberately leaves xml_key alone: a closer inside a
+            // value is the shape we are here to record, and the value continues.
+            name_next = !closer && (tag == "tool_name" || tag == "name");
+            return j + 1 - i;
+        }
+        if (!closer && s[j] == '=' && (tag == "function" || tag == "parameter")) {
+            size_t k = j + 1;
+            while (k < s.size() && k - (j + 1) < 64 && s[k] != '>' && !is_ws(s[k])) k++;
+            const std::string ident = s.substr(j + 1, k - (j + 1));
+            const bool closed = k < s.size() && s[k] == '>';
+            token(s.substr(i, j + 1 - i));            // "<function=" / "<parameter="
+            if (tag == "function") {
+                xml_key.clear();
+                if (!ident.empty()) placeholder(ident, "NAME");
+            } else if (closed && key_like(ident)) {
+                out += ident;                          // keys are schema
+                xml_key = ident;
+                json_key.clear();
+            } else if (closed) {
+                if (!ident.empty()) placeholder(ident, "TEXT");
+                xml_key = "_";
+                json_key.clear();
+            } else {
+                // No '>' -- the model was cut off, or never closed the opener.
+                // Whatever follows '=' is not a key we can vouch for, so it is
+                // value bytes: the leak gate has a case for exactly this.
+                xml_key = "_";
+                json_key.clear();
+                run = ident;
+            }
+            if (closed) { out += '>'; return k + 1 - i; }
+            return k - i;
+        }
+        return 0;
+    }
+
+    // A JSON string starting at the quote s[i]. Keys (followed by ':') are kept;
+    // values become placeholders; the quotes themselves are structure.
+    size_t scan_string(size_t i) {
+        size_t j = i + 1;
+        bool terminated = false;
+        while (j < s.size()) {
+            if (s[j] == '\\' && j + 1 < s.size()) { j += 2; continue; }
+            if (s[j] == '"') { terminated = true; break; }
+            if (hard_boundary_at(j)) break;
+            j++;
+        }
+        const std::string inner = s.substr(i + 1, j - (i + 1));
+        size_t after = terminated ? j + 1 : j;
+        size_t p = after;
+        while (p < s.size() && is_ws(s[p])) p++;
+        const bool is_key = terminated && p < s.size() && s[p] == ':' && key_like(inner);
+        flush();
+        out += '"';
+        if (is_key) {
+            out += inner;
+            json_key = inner;
+            name_next = lower(inner) == "name";
+        } else {
+            bool all_ws = true;
+            for (char c : inner) if (!is_ws(c)) { all_ws = false; break; }
+            if (all_ws) out += inner;
+            else if (!name_next && inner.find('`') != std::string::npos) {
+                emit_value_with_fences(inner, run_type());
+            } else {
+                placeholder(inner, name_next ? "NAME" : run_type());
+                name_next = false;
+            }
+        }
+        if (terminated) out += '"';
+        last_was_string = true;
+        return after - i;
+    }
+
+    // Mode 10 (dropped opener): the turn starts `Read", "file_path": ...` or
+    // `name": "Read", ...` because the model lost the leading `{"name": "` or
+    // `{"`. Read literally, every quote after that is off by one and the whole
+    // call collapses into prose. An identifier run sitting directly against
+    // `":` is a key missing its opening quote, and one against `",` is the
+    // tool name missing its opening quote; keep them as such, so the shape
+    // that mode exists for stays visible. The name still goes through the
+    // declared-name rule, so an undeclared identifier becomes NAME_n.
+    size_t try_bare_key(size_t i) {
+        if (run.empty() || is_ws(run.back())) return 0;
+        size_t b = 0;
+        while (b < run.size() && is_ws(run[b])) b++;
+        const std::string core = run.substr(b);
+        if (!identifier_like(core)) return 0;
+        size_t p = i + 1;
+        while (p < s.size() && is_ws(s[p])) p++;
+        if (p >= s.size() || (s[p] != ':' && s[p] != ',')) return 0;
+        if (s[p] == ':' && !key_like(core)) return 0;
+        out.append(run, 0, b);
+        if (s[p] == ':') {
+            out += core;
+            json_key = core;
+            name_next = lower(core) == "name";
+        } else {
+            placeholder(core, "NAME");
+            json_key.clear();
+            name_next = false;
+        }
+        run.clear();
+        out += '"';
+        last_was_string = true;
+        return 1;
+    }
+
+    std::string operator()() {
+        size_t i = 0;
+        while (i < s.size()) {
+            const char c = s[i];
+            if (c == '<') {
+                if (size_t n = try_tag(i)) { i += n; continue; }
+            } else if (c == '`') {
+                size_t j = i;
+                while (j < s.size() && s[j] == '`') j++;
+                token(s.substr(i, j - i));
+                i = j;
+                continue;
+            } else if (json_active()) {
+                if (c == '{' || c == '[') { token(std::string(1, c)); json_depth++; i++; continue; }
+                if (c == '}' || c == ']') {
+                    token(std::string(1, c));
+                    if (json_depth > 0) json_depth--;
+                    if (json_depth == 0) json_key.clear();
+                    i++; continue;
+                }
+                if ((c == ':' || c == ',') && (json_depth > 0 || last_was_string)) {
+                    const bool keep_name = name_next && c == ':';
+                    token(std::string(1, c));
+                    name_next = keep_name;
+                    i++; continue;
+                }
+                if (c == '"') {
+                    if (size_t n = try_bare_key(i)) { i += n; continue; }
+                    i += scan_string(i);
+                    continue;
+                }
+            }
+            run += c;
+            i++;
+        }
+        flush();
+        return std::move(out);
+    }
+};
+
+}  // namespace drift_detail
+
+// Redact one model turn for the corpus: framing, keys and declared tool names
+// verbatim, every value/prose run a typed placeholder. See the file comment.
+inline std::string redact_drift(const std::string& in, const DriftNames* names = nullptr) {
+    return drift_detail::Redactor(in, names)();
+}
+
+// The markup skeleton a record is deduplicated by: the redacted text with
+//   - placeholder indices dropped (PATH_3 -> PATH) and `:big` dropped (size
+//     is not structure); `:ml` kept on value placeholders, where a raw
+//     newline inside a value is the mode-5/11 signature (a multi-line prose
+//     run is not a shape);
+//   - runs of spaces/tabs collapsed to one (indentation of a value's first
+//     line is not structure; newlines stay -- the XML dialect is
+//     newline-delimited and the parser treats those as structure);
+//   - inline code spans (one or two backticks) dropped and the placeholders
+//     they split merged, so a README with nine `code` mentions is the same
+//     shape as one with two. Block fences (three or more) stay: the display
+//     lexer reads those, and a call inside one must not fire.
+// Measured on the first Qwen3.8 suite capture (1100 records): 256 shapes as
+// raw redacted text, 172 with these rules, singletons 189 -> 110.
+inline std::string shape_key(const std::string& redacted) {
+    static const char* const kTypes[] = {"PATH", "CODE", "TEXT", "PROSE", "NAME"};
+    // one pass: normalise placeholders, collapse horizontal whitespace, drop
+    // inline backtick runs
+    std::string key;
+    key.reserve(redacted.size());
+    size_t i = 0;
+    while (i < redacted.size()) {
+        const char c = redacted[i];
+        if (c == ' ' || c == '\t') {
+            size_t j = i;
+            while (j < redacted.size() && (redacted[j] == ' ' || redacted[j] == '\t')) j++;
+            key += ' ';
+            i = j;
+            continue;
+        }
+        if (c == '`') {
+            size_t j = i;
+            while (j < redacted.size() && redacted[j] == '`') j++;
+            if (j - i >= 3) key.append(redacted, i, j - i);
+            i = j;
+            continue;
+        }
+        bool matched = false;
+        for (const char* t : kTypes) {
+            const size_t n = std::strlen(t);
+            if (redacted.compare(i, n, t) != 0 || i + n >= redacted.size() || redacted[i + n] != '_')
+                continue;
+            size_t j = i + n + 1;
+            if (j >= redacted.size() || !std::isdigit((unsigned char)redacted[j])) continue;
+            while (j < redacted.size() && std::isdigit((unsigned char)redacted[j])) j++;
+            bool ml = false;
+            if (redacted.compare(j, 3, ":ml") == 0) { ml = std::strcmp(t, "PROSE") != 0; j += 3; }
+            else if (redacted.compare(j, 4, ":big") == 0) j += 4;
+            // merge with an immediately preceding placeholder of the same
+            // type (only a dropped inline span or collapsed space between)
+            const std::string tail_ml = std::string(t) + ":ml ", tail = std::string(t) + " ";
+            auto ends_with = [&](const std::string& suf) {
+                return key.size() >= suf.size() && key.compare(key.size() - suf.size(), suf.size(), suf) == 0;
+            };
+            auto ends_with_bare = [&](const std::string& s) {
+                return key.size() >= s.size() && key.compare(key.size() - s.size(), s.size(), s) == 0;
+            };
+            bool merged = false;
+            for (const std::string& prev : {tail_ml, tail, std::string(t) + ":ml", std::string(t)}) {
+                if (!(ends_with(prev) || ends_with_bare(prev))) continue;
+                const bool prev_ml = prev.find(":ml") != std::string::npos;
+                key.erase(key.size() - prev.size());
+                key += t;
+                if (ml || prev_ml) key += ":ml";
+                merged = true;
+                break;
+            }
+            if (!merged) { key += t; if (ml) key += ":ml"; }
+            i = j;
+            matched = true;
+            break;
+        }
+        if (!matched) key += redacted[i++];
+    }
+    return key;
+}
+
+// Dedup key for the corpus: FNV-1a over shape_key(redacted). Two turns with
+// the same markup skeleton hash alike and a dropped closer does not. A hash,
+// not a security primitive; a 64-bit collision would merge two shapes'
+// counts, which the exemplar's text would make visible.
+inline uint64_t shape_hash(const std::string& redacted) {
+    const std::string key = shape_key(redacted);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : key) { h ^= c; h *= 0x100000001b3ull; }
+    return h;
+}
+
+inline const char* drift_corpus_path() {
+    const char* p = std::getenv("Q27_DRIFT_CORPUS");
+    return (p && *p) ? p : nullptr;
+}
+
+// Process-wide set of tool names some request this process served declared.
+// Fed by the request parsers (anthropic_tools_json / openai_tools_json in
+// api_common.h), so it is complete before the first token is generated; read
+// where the strict parser has no per-request list (the streaming handlers).
+// Bounded so a hostile client cannot grow it without limit.
+struct DriftNameRegistry {
+    std::mutex mu;
+    DriftNames names;
+};
+inline DriftNameRegistry& drift_name_registry() {
+    static DriftNameRegistry r;
+    return r;
+}
+inline void drift_register_names(const DriftNames& add) {
+    auto& r = drift_name_registry();
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (r.names.size() + add.size() <= 4096) r.names.insert(add.begin(), add.end());
+}
+inline DriftNames drift_registered_names() {
+    auto& r = drift_name_registry();
+    std::lock_guard<std::mutex> lock(r.mu);
+    return r.names;
+}
+
+// What the capture site knows that the text alone does not.
+struct DriftContext {
+    bool wrapped = false;   // the splitter already consumed the <tool_call> wrapper
+    bool in_think = false;  // the bytes came from the reasoning channel
+};
+
+// `"key"` followed by optional whitespace and ':' -- a JSON key in any
+// formatting the model uses, compact or pretty-printed.
+inline bool has_json_key(const std::string& text, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        size_t p = at + needle.size();
+        while (p < text.size() && drift_detail::is_ws(text[p])) p++;
+        if (p < text.size() && text[p] == ':') return true;
+    }
+    return false;
+}
+
+// Cheap lexical labels for the histogram; not a parse.
+inline std::vector<std::string> drift_tags(const std::string& text, const DriftContext& ctx) {
+    std::vector<std::string> tags;
+    if (text.find("<function=") != std::string::npos || text.find("<parameter=") != std::string::npos ||
+        text.find("<tool_name>") != std::string::npos)
+        tags.push_back("xml");
+    if (has_json_key(text, "name") || has_json_key(text, "tool_call") || has_json_key(text, "arguments"))
+        tags.push_back("json");
+    if (!ctx.wrapped && text.find("<tool_call>") == std::string::npos) tags.push_back("no_wrapper");
+    if (ctx.in_think) tags.push_back("in_think");
+    return tags;
+}
+
+inline std::string drift_hex(uint64_t h) {
+    char b[17];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+// One JSONL record (no trailing newline). `shape` is empty until a human
+// labels it (Phase 2). `ts` is UTC; corpus_dedup.py drops it before anything
+// is committed, so a record's time of day never leaves the capture host.
+inline std::string format_drift_record(const std::string& text, const std::string& outcome,
+                                       const DriftContext& ctx, const DriftNames* names,
+                                       time_t ts) {
+    const std::string redacted = redact_drift(text, names);
+    char when[32] = "1970-01-01T00:00:00Z";
+    struct tm tmv;
+    if (gmtime_r(&ts, &tmv)) std::strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    nlohmann::json rec = {
+        {"id", drift_hex(shape_hash(redacted))},
+        {"shape", ""},
+        {"tags", drift_tags(text, ctx)},
+        {"outcome", outcome},
+        {"redacted", redacted},
+        {"bytes", text.size()},
+        {"ts", when},
+    };
+    // `replace` rewrites only INVALID UTF-8 sequences (valid multi-byte text
+    // is serialised as-is); the redacted field is ASCII by construction
+    // anyway. The point is that the request handler never dies on a
+    // capture-side surprise.
+    return rec.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// Append one record to the Q27_DRIFT_CORPUS file. Serialised: server threads
+// capture concurrently and a torn line is an unreadable corpus. (A static
+// local in an inline function is one object program-wide, per
+// [dcl.inline]; this is not per-TU.) An unwritable path is reported once --
+// the corpus is this phase's output, so silence would be the worse failure.
+inline void write_drift_record(const char* path, const std::string& text, const std::string& outcome,
+                               const DriftContext& ctx, const DriftNames* names) {
+    if (!path || !*path || text.empty()) return;
+    const std::string line = format_drift_record(text, outcome, ctx, names, std::time(nullptr));
+    static std::mutex mu;
+    static bool warned = false;
+    std::lock_guard<std::mutex> lock(mu);
+    auto fail = [&](const char* what) {
+        if (warned) return;
+        warned = true;
+        std::fprintf(stderr, "[drift-corpus] %s %s: %s (further failures not logged)\n",
+                     what, path, std::strerror(errno));
+    };
+    FILE* f = std::fopen(path, "ab");
+    if (!f) { fail("cannot open"); return; }
+    const bool ok = std::fwrite(line.data(), 1, line.size(), f) == line.size() &&
+                    std::fputc('\n', f) != EOF;
+    const bool closed = std::fclose(f) == 0;
+    if (!ok || !closed) fail("short write to");
+}
+
+}  // namespace q27
