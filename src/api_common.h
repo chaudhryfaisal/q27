@@ -2935,41 +2935,26 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
             const size_t next_po = next_param(vs, nullptr, nullptr);
             const size_t bnd = next_po == std::string::npos ? seg.size() : next_po;
             // For the LAST parameter the bound is end-of-segment, and the
-            // model does not always stop at its closer: the first Qwen3.8
-            // corpus capture had `</parameter>\n</function>\n</functio\n
-            // </parameter>` -- a truncated second closer and a stray
-            // parameter closer -- and the last-closer rule swallowed all of
-            // it into the value. Harmless on a description; on `content` it
-            // writes dialect markup into a file. So, for the last parameter:
-            // a closer that is followed by `</function>` and then by nothing
-            // but closers, wrapper tokens and whitespace up to the next
-            // candidate (or the end) is the real one -- what lies between it
-            // and the next candidate is garbage, not content. A value whose
-            // own last line is `</parameter>` (the #31 collision the
-            // last-closer rule exists for) still reads whole, because its
-            // closer is the one `</function>` follows; a value containing
-            // both closers with content after them reads whole for the same
-            // reason. Only a value whose tail is EXACTLY closers is read as
-            // garbage, and that is the observed shape.
-            auto is_residue = [&](size_t from, size_t to) {
-                while (from < to) {
-                    if (isspace((unsigned char)seg[from])) { from++; continue; }
-                    bool hit = false;
-                    for (const char* tk : {"</function>", "</tool_call>", "<tool_call>", "</parameter>"}) {
-                        const size_t n = strlen(tk);
-                        if (from + n <= to && seg.compare(from, n, tk) == 0) { from += n; hit = true; break; }
-                        // a truncated closer (`</functio`) is residue too, when
-                        // it ends where a token would: at whitespace, at the
-                        // next tag, or at the end
-                        size_t l = 0;
-                        while (from + l < to && l < n - 1 && seg[from + l] == tk[l]) l++;
-                        if (l >= 2 && (from + l == to || isspace((unsigned char)seg[from + l]) ||
-                                       seg[from + l] == '<')) { from += l; hit = true; break; }
-                    }
-                    if (!hit) return false;
-                }
-                return true;
-            };
+            // model does not always stop at its closer. The drift corpus
+            // (2026-08-25, Qwen3.8 suite + SWE-bench captures) has three
+            // shapes of what follows: a truncated second closer and a stray
+            // parameter closer (`</parameter>\n</function>\n</functio\n
+            // </parameter>`), a doubled closer then a stray one, and prose
+            // then a stray closer pair (`</function>\nSome prose\n
+            // </parameter>\n</function>`). Under the last-closer rule every
+            // one of them swallowed the tail into the value -- harmless on a
+            // description, dialect markup written into a file on `content`.
+            //
+            // So for the last parameter: the FIRST closer followed by
+            // `</function>` ended it. A value whose own last line is
+            // `</parameter>` (the #31 collision the last-closer rule exists
+            // for) still reads whole, because its closer is the one
+            // `</function>` follows. What is given up is a value that itself
+            // contains `</parameter>\n</function>` and then MORE content: its
+            // bytes are identical to the observed garble, the garble has been
+            // seen and that value has not, and losing a tail is the safer
+            // failure. Non-last parameters are unchanged: their bound is the
+            // next opener.
             auto starts_with_fn = [&](size_t from, size_t to) {
                 while (from < to && isspace((unsigned char)seg[from])) from++;
                 return from + 11 <= to && seg.compare(from, 11, "</function>") == 0;
@@ -2982,9 +2967,8 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
                 ve = cands.back();
                 if (next_po == std::string::npos) {   // the last parameter
                     for (size_t i = 0; i < cands.size(); i++) {
-                        const size_t from = cands[i] + PC.size();
                         const size_t to = i + 1 < cands.size() ? cands[i + 1] : bnd;
-                        if (starts_with_fn(from, to) && is_residue(from, to)) { ve = cands[i]; break; }
+                        if (starts_with_fn(cands[i] + PC.size(), to)) { ve = cands[i]; break; }
                     }
                 }
             }
@@ -3861,6 +3845,14 @@ struct StreamToolRouter {
     std::string text_residue;
     std::string tool_buf;
     bool has_tools = false;
+    // Drift corpus: the holdback decides whether the parser runs at all, so a
+    // turn whose text carries dialect markup in a shape no opener matches
+    // (`<tool_use>\n<tool>\n<parameter_name>Read...`, seen live 2026-08-25)
+    // would never be recorded. Keep the turn's text, bounded, and record it
+    // at finish when nothing else did. Only with Q27_DRIFT_CORPUS set.
+    std::string text_seen;
+    size_t records_at_start = drift_records_written;
+    static constexpr size_t kTextSeenCap = 64 * 1024;
 
     template<class Names, class EmitText, class Classify>
     void release_text_residue(const Names& names, EmitText&& emit_text, Classify&& classify) {
@@ -3916,6 +3908,7 @@ struct StreamToolRouter {
         // leading whitespace, including after a natural close, is content.
         if (forced_control_token && strip_ws2(t).empty()) return;
         if (!has_tools) { emit_text(t); return; }
+        if (drift_corpus_path() && text_seen.size() < kTextSeenCap) text_seen += t;
         std::string chunk;
         chunk.swap(text_residue);
         chunk += t;
@@ -3939,6 +3932,9 @@ struct StreamToolRouter {
         if (dialect_residue_suffix(text_residue).complete) text_residue.clear();
         release_text_residue(names, emit_text, classify);
         settle_text(names, emit_text, classify, allow_repair);
+        if (drift_corpus_path() && drift_records_written == records_at_start &&
+            drift_bearing(text_seen, nullptr))
+            capture_drift(text_seen, "unrescued", nullptr);
     }
 };
 

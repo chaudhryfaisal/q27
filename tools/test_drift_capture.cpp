@@ -75,6 +75,25 @@ static void test_json_literals_stay_valid_json() {
     CHECK(q27::redact_drift(R"({"name":"Edit","arguments":{"x":secret}})").find("secret") == std::string::npos);
 }
 
+static void test_novel_tags_survive_as_structure() {
+    // the first novel shape real traffic produced: tags the catalogue never
+    // named. The element names are the shape; the value is still redacted
+    // and the tool name is kept only because it is declared.
+    const q27::DriftNames names = {"Read", "Bash"};
+    const std::string in =
+        "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>Read\n</parameter>\n"
+        "<parameter=file_path>\n/workspace/pylint/lint/run.py\n";
+    const std::string out = q27::redact_drift(in, &names);
+    CHECK(out.find("<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>Read\n</parameter>") != std::string::npos);
+    CHECK(out.find("/workspace") == std::string::npos);
+    CHECK(out.find("PATH_") != std::string::npos);
+    // an undeclared name after a name tag is still a placeholder
+    CHECK(q27::redact_drift("<parameter_name>Alice\n</parameter>", &names).find("Alice") == std::string::npos);
+    // a tag with attributes is content, and so is a comparison in code
+    CHECK(q27::redact_drift("<parameter=content>\n<div class=\"secret\">x</div>\n</parameter>", &names).find("secret") == std::string::npos);
+    CHECK(q27::redact_drift("<parameter=command>\nif (a < secret) run\n</parameter>", &names).find("secret") == std::string::npos);
+}
+
 static void test_placeholder_type_from_key() {
     const std::string in =
         "<function=Bash>\n<parameter=command>\nrm -rf /\n</parameter>\n"
@@ -289,6 +308,7 @@ int main() {
     test_preserves_dialect_inside_values();
     test_redacts_json_string_values();
     test_placeholder_type_from_key();
+    test_novel_tags_survive_as_structure();
     test_json_literals_stay_valid_json();
     test_fences_inside_a_string_value_stay_inside_it();
     test_length_class_recorded();

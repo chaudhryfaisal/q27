@@ -22,10 +22,11 @@ sessions and a hand-written `shape` label survives the next fold. `ts` is
 dropped on purpose: a record's time of day is the one field that says
 something about the session rather than the model, and the corpus is public.
 
-A capture file is folded once: <out>/folded.json remembers the content hash of
-every file already counted, and a repeat is skipped (--force overrides). The
-hash is of the bytes, so two files with identical content are one capture by
-design -- a re-copied capture is the mistake this guards against.
+A live capture file only grows, so <out>/folded.json remembers, per file
+name, how many lines were folded and a hash of those lines: a refold of the
+same file counts only the lines after them, a re-copied capture (same head)
+adds nothing, and a file whose head changed is treated as new (or use
+--force to count everything again).
 `count` is captures, not turns -- the streaming holdback can classify one
 candidate twice (deferred, then repaired), which shows up as two outcomes on
 one shape.
@@ -144,15 +145,35 @@ def main(argv=None):
     folded_now = {}
     for path in args.captures:
         with open(path, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-        if digest in ledger and not args.force:
-            print(f"skipping {path}: already folded as {ledger[digest]} (use --force to count it again)",
-                  file=sys.stderr)
+            lines = f.read().split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()
+        key = os.path.basename(path)
+        prev = ledger.get(key) if isinstance(ledger.get(key), dict) else None
+        skip = 0
+        if prev and not args.force:
+            n = prev.get("lines", 0)
+            head = hashlib.sha256(b"\n".join(lines[:n])).hexdigest()
+            if n <= len(lines) and head == prev.get("head_sha"):
+                skip = n
+            else:
+                print(f"note: {path}: head changed since the last fold; counting the whole file", file=sys.stderr)
+        new_lines = lines[skip:]
+        if not new_lines:
+            print(f"skipping {path}: nothing new since the last fold ({skip} line(s) already counted)", file=sys.stderr)
             continue
-        folded_now[digest] = os.path.basename(path)
-        for item in load_records(path):
-            records.append(item)
+        folded_now[key] = {"lines": len(lines), "head_sha": hashlib.sha256(b"\n".join(lines)).hexdigest()}
+        for n_, raw in enumerate(new_lines, skip + 1):
+            try:
+                rec = json.loads(raw.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict) or any(k not in rec for k in REQUIRED):
+                continue
+            records.append((rec, n_))
             total += 1
+        if skip:
+            print(f"{path}: {len(new_lines)} new line(s) after {skip} already folded", file=sys.stderr)
 
     table, new_ids = fold(existing, records)
     rows = sorted(table.values(), key=lambda r: (-r.get("count", 1), r["id"]))

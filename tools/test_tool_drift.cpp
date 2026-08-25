@@ -1950,11 +1950,24 @@ static void test_last_parameter_garbled_tail() {
     ok(val_of("<function=Edit>\n<parameter=old_string>\n" + v + "\n</parameter>\n</function>",
               "old_string") == v,
        "garbled tail: a value ending in a </parameter> line still survives");
-    // and a value containing both closers, followed by the canonical ending
+    // prose between the closers (SWE-bench capture): the call closed, the
+    // model talked, then dropped a stray closer -- the prose is not the value
+    ok(val_of(head + "Some prose about the call.\n</parameter>", "description") == "Inspect usage",
+       "garbled tail: prose after </function> then a stray </parameter> is not the value");
+    ok(val_of(head + "Some prose.\n</parameter>\nmore\n</parameter>", "description") == "Inspect usage",
+       "garbled tail: two stray closers after prose are not the value");
+    // the trade the rule makes, recorded so it is not re-litigated: a LAST
+    // value containing `</parameter>\n</function>` and then more content is
+    // byte-identical to the observed prose-then-stray-closer garble, and the
+    // observed shape wins -- the value reads up to its first closer that
+    // `</function>` follows. As a non-last parameter it still reads whole.
     const std::string w = "x\n</parameter>\n</function>\ny";
     ok(val_of("<function=Edit>\n<parameter=old_string>\n" + w + "\n</parameter>\n</function>",
-              "old_string") == w,
-       "garbled tail: a value containing </parameter> and </function> still survives");
+              "old_string") == "x",
+       "garbled tail: a last value that looks like the garble reads as the garble");
+    ok(val_of("<function=Edit>\n<parameter=old_string>\n" + w + "\n</parameter>\n"
+              "<parameter=new_string>\nNEW\n</parameter>\n</function>", "old_string") == w,
+       "garbled tail: the same value as a non-last parameter still reads whole");
 }
 
 // THE TERMINATOR WRITTEN IN THE WRONG DIALECT (2026-08-21, from the UN-RESCUED

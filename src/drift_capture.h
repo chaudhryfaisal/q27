@@ -113,14 +113,24 @@ inline bool name_allowed(const std::string& s, const DriftNames* names) {
     return false;
 }
 
-// Tags kept verbatim as <tag> / </tag>. Everything the drift catalogue has
-// ever keyed off, plus the hallucinated-result tags the parser refuses on.
+// Tags kept verbatim as <tag> / </tag>: any plain lowercase element name
+// (`<tool_use>`, `<parameter_name>`, `<result>`). A closed allowlist was
+// tried first and lost the first novel shape real traffic produced
+// (`<tool_use>\n<tool>\n<parameter_name>Read`, 2026-08-25) to PROSE_n --
+// the one thing the record was for. An element NAME is structure the way a
+// JSON key is; the bytes between tags are still values. Attributes are not
+// matched, so `<div class="x">` stays content.
 inline bool known_tag(const std::string& t) {
-    static const char* const kTags[] = {
-        "tool_call", "tool_calls", "function", "parameter", "tool_name", "think",
-        "result", "output", "content", "name", "arguments", "invoke", "tool"};
-    for (const char* k : kTags) if (t == k) return true;
-    return false;
+    if (t.empty() || t.size() > 24) return false;
+    if (!(t[0] >= 'a' && t[0] <= 'z')) return false;
+    for (char c : t) if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    return true;
+}
+// A tag whose name says a tool name follows (<name>, <tool_name>,
+// <parameter_name>, <function_name>): the next run is a name, gated on the
+// declared set like every other name.
+inline bool name_tag(const std::string& t) {
+    return t == "name" || t == "tool" || (t.size() >= 5 && t.compare(t.size() - 5, 5, "_name") == 0);
 }
 
 struct Redactor {
@@ -249,7 +259,7 @@ struct Redactor {
                 xml_key.clear();
             // </function> deliberately leaves xml_key alone: a closer inside a
             // value is the shape we are here to record, and the value continues.
-            name_next = !closer && (tag == "tool_name" || tag == "name");
+            name_next = !closer && name_tag(tag);
             return j + 1 - i;
         }
         if (!closer && s[j] == '=' && (tag == "function" || tag == "parameter")) {

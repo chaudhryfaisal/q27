@@ -247,6 +247,55 @@ static void test_request_tool_list_feeds_the_registry() {
     CHECK(after["redacted"].get<std::string>().find("savings") == std::string::npos);  // the argument named `name` is a value
 }
 
+static void test_streaming_text_miss_without_a_candidate_is_recorded() {
+    // seen live (pylint-6903, 2026-08-25): a dialect shape no opener matches,
+    // so the holdback never invokes the parser and the client gets it as
+    // text. The corpus exists to record exactly this; the router must not
+    // depend on the parser having run.
+    const std::string gen =
+        "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>Read\n</parameter>\n"
+        "<parameter=file_path>\n/secret/run.py\n";
+    json t = tools();
+    std::set<std::string> names{"Read", "Bash"};
+    remove(kPath);
+    setenv("Q27_DRIFT_CORPUS", kPath, 1);
+    {
+        q27::StreamSplitter sp;
+        q27::StreamToolRouter r;
+        r.has_tools = true;
+        std::string text, think;
+        std::vector<q27::ToolCall> calls;
+        auto emit_text = [&](const std::string& s) { text += s; };
+        auto emit_think = [&](const std::string& s) { think += s; };
+        auto classify = [&](const std::string& src, bool rep, auto&& visible) {
+            std::string pre, residual;
+            auto cs = q27::parse_bare_tool_calls(src, &pre, &t, true, rep, &residual);
+            if (cs.empty()) return q27::BareToolCandidateResult{};
+            for (auto& c : cs) calls.push_back(c);
+            visible(std::string());
+            return q27::BareToolCandidateResult{true, true};
+        };
+        auto emit_tool = [&]() { r.tool_buf.clear(); };
+        for (size_t i = 0; i < gen.size(); i += 7)
+            for (auto& [ch, s] : sp.feed(gen.substr(i, 7)))
+                r.segment(ch, s, false, names, emit_text, emit_think, emit_tool, classify);
+        for (auto& [ch, s] : sp.flush()) r.segment(ch, s, false, names, emit_text, emit_think, emit_tool, classify);
+        r.finish(true, names, emit_text, emit_think, classify);
+        CHECK(calls.empty());   // the parser does not know this shape (yet)
+    }
+    unsetenv("Q27_DRIFT_CORPUS");
+    std::vector<json> recs;
+    std::ifstream f(kPath);
+    for (std::string line; std::getline(f, line);) if (!line.empty()) recs.push_back(json::parse(line));
+    remove(kPath);
+    CHECK(recs.size() == 1);
+    if (recs.empty()) return;
+    CHECK(recs[0]["outcome"] == "unrescued");
+    CHECK(has_tag(recs[0], "xml"));
+    CHECK(no_secret(recs));
+    CHECK(recs[0]["redacted"].get<std::string>().find("<parameter_name>") != std::string::npos);  // the shape survives
+}
+
 int main(int argc, char** argv) {
     verbose = argc > 1 && std::string(argv[1]) == "-v";
     test_think_branch_tags_in_think();
@@ -260,6 +309,7 @@ int main(int argc, char** argv) {
     test_residue_below_the_warning_bar_is_still_captured();
     test_strict_miss_hint_is_one_shot();
     test_request_tool_list_feeds_the_registry();
+    test_streaming_text_miss_without_a_candidate_is_recorded();
     test_batch_records_once_per_turn();
     test_unset_writes_nothing_and_parses_the_same();
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
