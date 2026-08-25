@@ -1,4 +1,6 @@
 {
- "b696500c9909fcf854044bc1668677b1056683b02f7d389be09b73038b0a3230": "corpus_rekeyed.jsonl",
- "f4c5369589663934074cf8eecccb37ccd8702a5feb98b3f3dbb2942a5ceca464": "corpus_rekeyed.jsonl"
+ "corpus_rekeyed.jsonl": {
+  "head_sha": "2f4712984e34c0a6f7a70e9fafd7171e4ab8ea5c42619b2777cbb178940c30ef",
+  "lines": 319
+ }
 }

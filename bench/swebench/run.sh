@@ -13,6 +13,7 @@ CACHE=${SWEBENCH_CACHE:-/mnt/ai/swebench-cache}   # bare repo mirrors (one-time 
 WORK=${SWEBENCH_WORK:-/mnt/ai/swebench-work}      # per-instance workspaces (ephemeral)
 IMG=${SWEBENCH_IMG:-thunderdome/claude-code:latest}
 PORT=${SWEBENCH_PORT:-8081}
+HOST=${SWEBENCH_HOST:-127.0.0.1}   # where the health probe looks; containers always use host.docker.internal
 MAN="$SP/manifest.json"
 ENGINE=${1:?usage: run.sh <q27|llama> [instance_filter]}
 FILTER=${2:-}
@@ -20,7 +21,7 @@ UNIT=${SWEBENCH_UNIT:-$ENGINE-eval}
 RES="$SP/results.$ENGINE.jsonl"
 : >"$RES"
 
-case "$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" in 200|401) ;; *) echo "engine :$PORT not up" >&2; exit 1;; esac
+case "$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://$HOST:$PORT/health)" in 200|401) ;; *) echo "engine $HOST:$PORT not up" >&2; exit 1;; esac
 echo "=== SWE-bench agentic bench | engine=$ENGINE (:8081, journal $UNIT) | img=$IMG ==="
 RUN_START="$(date '+%Y-%m-%d %H:%M:%S')"
 

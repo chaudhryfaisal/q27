@@ -15332,3 +15332,55 @@ remove the batch-continuation class at the source rather than parse around
 it. That is the measurement the design wanted before betting on it; the
 serving-quality cost is still unmeasured.
 
+## 2026-08-25 (c): twelve SWE-bench instances on 3.8, one shape the catalogue had never seen
+
+**Qwen3.8 default v2, `--think` + card sampler, the 12 pinned SWE-bench
+Verified instances (bench/swebench/run.sh, label `q27-qwen38`): 11/12
+non-empty diffs, 9/12 edited the gold file, 2,441 s total (203 s/instance),
+256 turns, 220k output tokens. Decode 153 t/s aggregate / 165 median over
+337 requests, median prompt 34.8k tokens (max 64k), prefix cache hit on
+279/337.** The 07-15 qwopus run without thinking did the same twelve in 562 s
+with 11/12 gold hits: 3.8 with thinking is about four times slower per
+instance and slightly worse on the file-overlap signal, which is not the
+resolve rate (see Method B in docs/BENCHMARKING.md). `xarray-4094` hit the
+harness's 700 s cap after 64 tool calls in a loop and still produced a
+gold-file diff. Zero UN-RESCUED during the run; 10 mode-22 recoveries.
+
+`pylint-6903` ended after one turn with no tool call. The model emitted
+
+    <tool_use>
+    <tool>
+    <parameter_name>
+    <parameter_name>Read
+    </parameter>
+    <parameter=file_path>
+    /workspace/pylint/lint/run.py
+
+and stopped. No opener the streaming holdback knows, so the parser never
+ran, the bytes went to the client as text, and the agent self-declared
+done. The corpus did not record it either: the capture fires from the
+parser, and on the streaming text path the holdback decides whether the
+parser runs at all. The reasoning path and the non-stream resolver already
+had a fallback for exactly that; StreamToolRouter now keeps the turn's
+text (bounded) and records it at finish when nothing else did. The
+redactor's closed allowlist of tags would then have turned `<tool_use>`
+and `<parameter_name>` into PROSE_n -- the one thing the record is for --
+so any plain lowercase element name is now structure, the way a JSON key
+is, and a `*_name` tag introduces a name (still gated on the declared
+set). The shape is in the corpus (id 220c72b4) and in tools/fuzz_seeds.
+
+The capture also found the third variant of the garbled-tail defect from
+(b): prose between the closers, `</parameter>\n</function>\nSome prose\n
+</parameter>\n</function>`, twice. Byte-for-byte it is also "a value that
+contains both closers and then more content", which is why the earlier
+rule deferred to the last closer. Two observations against none: for the
+last parameter, the first closer that `</function>` follows ends it, and
+that trade is recorded in the fixture rather than left to be re-argued.
+
+Corpus after this capture and a rebuild (the dedup ledger now counts lines
+already folded, so a live file that only grows refolds correctly): 170
+shapes from 1,456 captured turns; `make corpus-check` agrees on 153/159
+shapes (96.2%) and 1,434/1,442 turns (99.45%). The six disagreements are
+the batch-continuation class from (b), the bogus-parameter attribution,
+and the new shape. Nothing else.
+

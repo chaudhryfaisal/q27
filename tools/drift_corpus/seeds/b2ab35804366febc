@@ -1,0 +1,8 @@
+<function=WebFetch>
+<parameter=url>
+TEXT_1
+</parameter>
+<parameter=prompt>
+TEXT_2
+</parameter>
+</function>

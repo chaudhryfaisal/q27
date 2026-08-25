@@ -1,0 +1,13 @@
+<parameter=Bash>
+<parameter=command>
+CODE_1
+</parameter>
+<parameter=description>
+TEXT_2
+</parameter>
+</function>
+PROSE_3
+</invoke>
+
+</parameter>
+</function>
