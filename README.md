@@ -167,18 +167,21 @@ All four are smaller AND lower-PPL than 3.6-recipe builds of the same
 checkpoint. Per-tier canonicals are in the HF model card; note they gate
 change, not identity (nearby tiers can share a 128-token greedy walk).
 
-Serving 3.8 for agentic use: run with `--think` -- with thinking off the
-model runs plausible-looking sessions that self-declare done and fail
-hidden tests. Full 21-task thunderdome suite (one trial per task, BUILDLOG
-2026-08-15 + same-day correction): hidden-tests mean 0.511, composite
-0.507, nine tasks at 1.000. The failures are a class, not a slope: 3.8
-holds 1.000 on bugfix / features / real-repo / recovery work but
-flat-zeros the greenfield/complex and most hard-reasoning tasks that the
-3.6-era serving scored 0.84-1.000 on (3.6-era mean on the same suite:
-0.908). Weigh that against 3.8's throughput and long-context gains before
-picking a default for build-from-scratch workloads. The engine
-auto-selects 3.8's trained XML tool dialect from the artifact's
-`general.name` and carries drift rescues (modes 14-17) for the forms the
+Serving 3.8 for agentic use: run with `--think` and the card sampler,
+`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0`. Full
+19-task thunderdome suite under that recipe, one trial per task,
+digest-verified load (BUILDLOG 2026-08-25): hidden-tests mean 0.928,
+composite 0.895, 13 tasks at 1.000, nothing below 0.80. The 0.511 recorded
+on 2026-08-15 for the same suite was measured with the think budget at its
+16K default and greedy decoding, the two defaults the 08-22/08-23 entries
+later found to be the problem; the tasks that flat-zeroed then
+(task-queue, time-tracker, constraint-scheduler) score 1.000, 1.000 and
+0.974 under the recipe. Single trials carry roughly +-0.1-0.15 of
+trajectory noise on the volatile tasks, so read the per-task numbers as a
+demonstrated ceiling, not a distribution. With thinking off the model runs
+plausible-looking sessions that self-declare done and fail hidden tests.
+The engine auto-selects 3.8's trained XML tool dialect from the artifact's
+`general.name` and carries drift rescues (modes 14-22) for the forms the
 model falls into under thinking.
 
 ```bash
@@ -646,8 +649,10 @@ task-queue trials wrote no files at all and scored 0.000. `--think-budget 0`
 removes the cap (llama.cpp has none, and its reasoning blocks run larger);
 with it, every trial wrote files and the task mean went 0.334 -> 0.525
 against llama.cpp's 0.549. The startup banner prints `sampler=greedy` or
-`sampler=temp=1.00/top_p=0.95` so a log always records which ran. (`top_k` and
-`min_p` are not implemented; the sampled arms closed the gap without them.)
+`sampler=temp=1.00/top_p=0.95/top_k=20/min_p=0.05` so a log always records
+which ran. The full 19-task suite under this recipe (2026-08-25) scored
+0.928 hidden / 0.895 composite, against the 0.511 measured under the old
+defaults.
 
 **Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:

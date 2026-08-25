@@ -15213,3 +15213,59 @@ renderer bytes, KV precision and parser shapes. The one question that would
 have found them in an hour: *for every field the client omits, what does each
 engine substitute?*
 
+## 2026-08-25: the 3.8 suite under the recommended recipe, a drift corpus, and issue #38 reopened
+
+**Full 19-task thunderdome suite, Qwen3.8-27B default v2 tier, `--think
+--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0`,
+digest-verified load (`wsum: b743d26b1f0562a9`), one trial per task:
+hidden-tests mean 0.928, composite 0.895, 13 of 19 at 1.000, nothing below
+0.80.** Run `2026-08-25T02-22-04`. The 08-15 entry's 0.511 was measured with
+the 16K default think budget and greedy decoding, and the 08-22 (c) and
+08-23 entries found both defaults to be the problem without re-running the
+full suite. The tasks that flat-zeroed on 08-15: task-queue 1.000,
+time-tracker 1.000, constraint-scheduler 0.974. Greenfield hidden tests
+stay the weak column at 0.666. n=1, so the 08-15 protocol verdict applies
+(+-0.1-0.15 basin noise on the volatile tasks); 0.511 -> 0.928 is not a
+re-roll. The README paragraph that called the 0.511 a class regression now
+says this instead.
+
+The suite ran as the live test of the drift-corpus capture (Phase 1 of the
+2026-08-24 parser plan). `Q27_DRIFT_CORPUS=<file>` now records every
+dialect-bearing turn as one redacted JSONL line, tagged with what the chain
+did: `recovered:<mode>`, `strict`, `unrescued`, `suppressed`. Redaction
+happens before a byte reaches disk: framing, keys and declared tool names
+survive, every value and every prose run becomes a typed placeholder, and
+dialect markup inside a value passes through because it is structure.
+The 1,100 records from the suite: 1,019 strict, 53 native with the wrapper
+dropped, 28 mode 22, 0 unrescued. Leak gate: every string value from every
+`tool_use` input in the harness transcripts (1,102 blocks, 417k 12-byte
+windows) checked against every redacted field; the only surviving windows
+are dialect framing. First current-vs-intended finding for Phase 2:
+bench-task-queue, a Bash call closed with a doubled, truncated
+`</function>`; the native XML parser accepted it and the `description`
+value came through as `...usage\n</parameter>\n</function>\n</functio`.
+Harmless on a description, would write markup into a file on `content`.
+The fold is `tools/drift_corpus/` (148 shapes, `make corpus-dedup`), and
+its seeds feed `make fuzz`.
+
+Issue #38 reopened with a verified host-only repro from @cosmicnag, and
+both findings held: 152d3a2 gave the /v1/messages SSE handler a reasoning
+holdback and never touched its /v1/chat/completions twin, so on that path
+a call inside `<think>` still streamed out as `reasoning_content`; and
+even the fixed twin never blanked the `<tool_call>` wrapper before
+classifying reasoning, so only the bare shape recovered there. The two
+handlers had hand-copied the same routing and the copies drifted, which is
+the second time this class shipped, so the routing is now one component,
+`q27::StreamToolRouter`, with a blanker that holds a partial wrapper token
+across chunk boundaries (the splitter scans THINK only for `</think>` and
+can emit `<tool_c` + `all>`). Two debts surfaced in the process and were
+paid the same day: `tools/test_chat_completions_integration.cpp` had not
+been re-spliced since 144948f and nothing ran `extract_check.sh`, so ten
+server.cu commits shipped against a copy of `handle()` that no longer
+existed (only one expectation had actually gone stale, Test 13d against
+144948f's deliberate tail recovery; `make test-tools` now runs the check
+first and `tools/extract_sync.py` re-splices); and both /v1/responses legs
+emitted reasoning without the parser, now routed through
+`recover_calls_from_reasoning()`, shared with the non-stream resolver.
+Commits 638008d, 2129d9f, 6a23132, 250103f.
+
