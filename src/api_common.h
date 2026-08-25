@@ -23,6 +23,7 @@
 #include "markdown_lex.h"
 
 #include "stream_split.h"
+#include "drift_capture.h"
 
 namespace q27 {
 using json = nlohmann::json;
@@ -2961,7 +2962,104 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     return true;
 }
 
-inline ToolCall parse_tool_call(const std::string& seg) {
+// ---- Drift-corpus capture (Q27_DRIFT_CORPUS=<file>) ------------------------
+// One redacted JSONL record per dialect-bearing turn, tagged with what the
+// chain did: recovered:<modes>, strict, unrescued, suppressed. The redaction
+// and record format live in src/drift_capture.h; this is the plumbing that
+// knows WHERE a turn is. Everything is behind the env var -- with it unset the
+// parse path is byte-identical to before.
+//
+// depth: parse_bare_tool_calls re-enters itself (the mode-10 probe, the
+// dialect retry) and parse_tool_call runs on segments inside it. Only the
+// outermost call is a turn, so the bare chain captures at depth 1 and the
+// strict parser only at depth 0.
+inline thread_local int drift_parse_depth = 0;
+inline thread_local DriftContext drift_ctx;
+inline thread_local const json* drift_tools = nullptr;
+// The streaming handlers hand a wrapped body that failed the strict parser to
+// the bare chain as the same bytes (server.cu emit_tool). Remembering the last
+// miss lets that record say `wrapped` without server.cu having to say so.
+inline thread_local std::string drift_last_strict_miss;
+// Which recovery produced the result: a mode number, "native", "xmlclose",
+// or the final block's mode flags. Set by the impl at each success site,
+// read by the parse_bare_tool_calls wrapper that writes the record.
+inline thread_local std::string drift_mode_hint;
+// Records written on this thread; lets a caller tell whether the chain it
+// drove produced one (the reasoning holdback may never invoke the parser).
+inline thread_local size_t drift_records_written = 0;
+
+struct DriftParseScope {
+    DriftParseScope() { drift_parse_depth++; }
+    ~DriftParseScope() { drift_parse_depth--; }
+};
+struct DriftCtxScope {
+    DriftContext saved;
+    const json* saved_tools;
+    DriftCtxScope(bool wrapped, bool in_think, const json* tools)
+        : saved(drift_ctx), saved_tools(drift_tools) {
+        drift_ctx.wrapped = saved.wrapped || wrapped;
+        drift_ctx.in_think = saved.in_think || in_think;
+        if (tools) drift_tools = tools;
+    }
+    ~DriftCtxScope() { drift_ctx = saved; drift_tools = saved_tools; }
+};
+
+inline const char* drift_corpus_path() {
+    const char* p = getenv("Q27_DRIFT_CORPUS");
+    return (p && *p) ? p : nullptr;
+}
+
+// Wider than looks_like_intended_tool_call on purpose. That predicate gates a
+// WARNING, so it demands a closer the model never opened; the corpus wants
+// every turn carrying dialect residue, because a dropped-opener turn that
+// nothing recovered (`Read", "file_path": ...`, no {"name", no </function>)
+// is exactly the miss this corpus exists to surface. Over-capture is cheap:
+// the record is redacted and dedup collapses it.
+inline bool drift_bearing(const std::string& text, const json* tools) {
+    static const char* const kMarks[] = {"{\"name\"", "{\"tool_call\"", "\"arguments\"",
+                                         "<tool_call>", "</tool_call>", "<function=", "</function>",
+                                         "<parameter=", "</parameter>", "<tool_name>"};
+    for (const char* m : kMarks)
+        if (text.find(m) != std::string::npos) return true;
+    // the mode-10 signature: a declared tool name with the string's closing
+    // quote still attached (`Read", "file_path": ...`)
+    if (tools && tools->is_array()) {
+        for (const auto& t : *tools) {
+            std::string name;
+            if (t.is_object() && t.contains("function") && t["function"].is_object() &&
+                t["function"].contains("name") && t["function"]["name"].is_string())
+                name = t["function"]["name"].get<std::string>();
+            else if (t.is_object() && t.contains("name") && t["name"].is_string())
+                name = t["name"].get<std::string>();
+            if (!name.empty() && text.find(name + "\"") != std::string::npos) return true;
+        }
+    }
+    return false;
+}
+
+inline void capture_drift(const std::string& text, const std::string& outcome,
+                          const json* tools) {
+    const char* path = drift_corpus_path();
+    if (!path) return;
+    if (!tools) tools = drift_tools;
+    DriftNames names;
+    if (tools && tools->is_array()) {
+        for (const auto& t : *tools) {
+            if (!t.is_object()) continue;
+            if (t.contains("function") && t["function"].is_object() &&
+                t["function"].contains("name") && t["function"]["name"].is_string())
+                names.insert(t["function"]["name"].get<std::string>());
+            else if (t.contains("name") && t["name"].is_string())
+                names.insert(t["name"].get<std::string>());
+        }
+    }
+    DriftContext ctx = drift_ctx;
+    if (!drift_last_strict_miss.empty() && drift_last_strict_miss == text) ctx.wrapped = true;
+    write_drift_record(path, text, outcome, ctx, tools ? &names : nullptr);
+    drift_records_written++;
+}
+
+inline ToolCall parse_tool_call_impl(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
     if (tool_strict()) {
@@ -2998,6 +3096,27 @@ inline ToolCall parse_tool_call(const std::string& seg) {
             tc.arguments = json::parse(tc.arguments.get<std::string>());
         tc.ok = !tc.name.empty() && tc.arguments.is_object();
     } catch (...) { tc.ok = false; }
+    return tc;
+}
+
+// The strict parser only ever sees a wrapped body (the splitter's TOOL
+// segment), from resolve_ordered_tool_segments and the four streaming
+// handlers alike, so this is the one place a `strict` outcome is recorded.
+// A miss is remembered so the bare-chain record for the same bytes can say
+// `wrapped`. No declared-tool set reaches here from the streaming handlers;
+// capture_drift falls back to the thread's context (set by the non-stream
+// resolver) and otherwise keeps identifier-like tool names verbatim.
+inline ToolCall parse_tool_call(const std::string& seg) {
+    ToolCall tc = parse_tool_call_impl(seg);
+    if (drift_parse_depth == 0 && drift_corpus_path()) {
+        if (tc.ok) {
+            DriftCtxScope wrapped(true, false, nullptr);
+            capture_drift(seg, "strict", nullptr);
+            drift_last_strict_miss.clear();
+        } else {
+            drift_last_strict_miss = seg;
+        }
+    }
     return tc;
 }
 
@@ -4262,7 +4381,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    const json* tools = nullptr,
                                                    bool allow_o10 = true,
                                                    bool allow_eof_repair = true,
-                                                   std::string* remaining_text = nullptr) {
+                                                   std::string* remaining_text = nullptr);
+inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_in,
+                                                        std::string* prefix,
+                                                        const json* tools,
+                                                        bool allow_o10,
+                                                        bool allow_eof_repair,
+                                                        std::string* remaining_text) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -4270,9 +4395,10 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // campaign can count suppressed rescues against the tolerant leg.
         if (prefix) *prefix = "";
         if (remaining_text) *remaining_text = text_in;
-        if (text_in.find("{\"name\"") != std::string::npos ||
-            text_in.find("{\"tool_call\"") != std::string::npos ||
-            text_in.find("</content>") != std::string::npos)
+        const bool plausible = text_in.find("{\"name\"") != std::string::npos ||
+                               text_in.find("{\"tool_call\"") != std::string::npos ||
+                               text_in.find("</content>") != std::string::npos;
+        if (plausible)
             fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %.200s\n",
                     text_in.c_str());
         return out;
@@ -4368,6 +4494,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] drift mode 14: recovered %zu <tool_name> call(s)\n",
                         xml_calls.size());
+                drift_mode_hint = "14";
                 return xml_calls;
             }
         }
@@ -4438,6 +4565,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     if (remaining_text) *remaining_text = "";
                     fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
                             nm.c_str());
+                    drift_mode_hint = "15";
                     return std::vector<ToolCall>{std::move(tc)};
                 }
             }
@@ -4492,6 +4620,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 16: recovered <function>-wrapped %s\n",
                                     nm.c_str());
+                            drift_mode_hint = "16";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
                         break;
@@ -4673,6 +4802,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] bare native-dialect call(s) recovered: %zu\n",
                         batch.size());
+                drift_mode_hint = "native";
                 return batch;
             }
         }
@@ -4702,6 +4832,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 17: chimera json-head/xml-params %s\n",
                                     nm.c_str());
+                            drift_mode_hint = "17";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
                     }
@@ -4786,6 +4917,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (remaining_text) *remaining_text = text_in.substr(batch.back().source_end);
                 fprintf(stderr, "[q27] drift mode 20: recovered %zu nameless <tool_name> call(s)\n",
                         batch.size());
+                drift_mode_hint = "20";
                 return batch;
             }
         }
@@ -4864,6 +4996,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         fprintf(stderr,
                                 "[q27] drift mode 21: openerless parameter list -> %s\n",
                                 nm.c_str());
+                        drift_mode_hint = "21";
                         return std::vector<ToolCall>{std::move(tc)};
                     }
                 }
@@ -4942,6 +5075,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] drift mode 22: parameter-as-opener -> %zu call(s)\n",
                         batch.size());
+                drift_mode_hint = "22";
                 return batch;
             }
         }
@@ -5538,6 +5672,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m8) modes[mi++] = '8';
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
+        drift_mode_hint = modes;
     }
     // LAST RESORT, once: the JSON dialect with its terminator written in XML.
     // Only reached when nothing else recovered, and only when blanking actually
@@ -5553,6 +5688,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             if (!again.empty()) {
                 fprintf(stderr, "[q27] drift: JSON call terminated in the XML dialect -> %zu\n",
                         again.size());
+                drift_mode_hint = "xmlclose";
                 return again;
             }
         }
@@ -5564,19 +5700,38 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
         fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
                 tools ? (int)tools->size() : -1, text_in.c_str());
-        // Corpus capture: Q27_DRIFT_CORPUS=<file> appends the FULL untruncated
-        // miss (the stderr line caps at 400 chars, which is why issue #4's
-        // payload wasn't visible). Each miss is a replayable fixture for
-        // tools/test_tool_drift_corpus.cpp -- turns an unknown drift mode into
-        // a permanent regression the next time it recurs. NUL-separated
-        // records so embedded newlines don't confuse the reader.
-        if (const char* cp = getenv("Q27_DRIFT_CORPUS")) {
-            if (FILE* f = fopen(cp, "ab")) {
-                fwrite(text_in.data(), 1, text_in.size(), f);
-                fputc('\0', f);
-                fclose(f);
-            }
-        }
+        // The corpus record for this miss (Q27_DRIFT_CORPUS, full and
+        // redacted, where the stderr line caps at 400 chars -- issue #4's
+        // payload was invisible for that reason) is written by the
+        // parse_bare_tool_calls wrapper below, alongside every success.
+    }
+    return out;
+}
+
+// The capture wrapper. Every recovery mode returns from the impl at its own
+// site, so the record is made here, from the result: recovered:<mode> (the
+// impl leaves the mode in drift_mode_hint), suppressed (the strict leg), or
+// unrescued (dialect residue, nothing recovered -- drift_bearing is wider than
+// the UN-RESCUED warning's bar on purpose; that bar is unchanged). Depth 1
+// only: the mode-10 probe and the dialect retry re-enter through this same
+// wrapper and are not turns. With Q27_DRIFT_CORPUS unset this is the old
+// function with one extra integer increment.
+inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+                                                   std::string* prefix,
+                                                   const json* tools,
+                                                   bool allow_o10,
+                                                   bool allow_eof_repair,
+                                                   std::string* remaining_text) {
+    DriftParseScope drift_scope;
+    if (drift_parse_depth == 1) drift_mode_hint.clear();
+    auto out = parse_bare_tool_calls_impl(text_in, prefix, tools, allow_o10,
+                                          allow_eof_repair, remaining_text);
+    if (drift_parse_depth == 1 && drift_corpus_path()) {
+        if (!out.empty())
+            capture_drift(text_in, "recovered:" + (drift_mode_hint.empty()
+                                                       ? std::string("?") : drift_mode_hint), tools);
+        else if (looks_like_intended_tool_call(text_in) || drift_bearing(text_in, tools))
+            capture_drift(text_in, tool_strict() ? "suppressed" : "unrescued", tools);
     }
     return out;
 }
@@ -5684,6 +5839,7 @@ inline size_t recover_unclosed_tool_tail(const std::string& raw,
         emit_text(raw); return 0;
     }
     std::string pre; // parse_bare_tool_calls writes here; we use cursor/source_begin instead (see comment above)
+    DriftCtxScope drift_wrapped(true,false,tools);
     auto calls=parse_bare_tool_calls(raw,&pre,tools,true,false,nullptr);
     if(calls.empty()){ emit_text(raw); return 0; }
     size_t cursor=0,recovered=0;
@@ -5797,6 +5953,8 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
                         at=scan.find(marker,at+1))
                         scan.replace(at,n,std::string(n,' '));
                 }
+                DriftCtxScope drift_think(false,true,tools);
+                const size_t drift_before=drift_records_written;
                 BareToolTextHoldback hb;
                 std::string kept;
                 size_t taken=0;
@@ -5824,6 +5982,11 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
                 };
                 hb.route(scan,names,visible,classify);
                 hb.finish(false,names,visible,classify);
+                // The holdback decides whether the parser runs at all; when it
+                // found no candidate the corpus would otherwise never see a
+                // reasoning segment that passed the intent check.
+                if(!taken && drift_corpus_path() && drift_records_written==drift_before)
+                    capture_drift(segment.second,"unrescued",tools);
                 if(taken) {
                     out.reasoning+=kept;
                     out.recovered+=taken;
@@ -5836,6 +5999,7 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
             continue;
         }
         const std::string body=strip_ws2(segment.second);
+        DriftCtxScope drift_wrapped(true,false,tools);
         // A wrapped segment is not guaranteed to hold exactly one call. When it
         // holds more, or carries text after the last one, the strict parser
         // would take the first and drop the remainder silently -- which is how
@@ -5868,6 +6032,7 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
                            "(%zu B, e.g. a repeated <tool_call> opener) -- "
                            "turn produced no call; suppressed from visible text\n",
                     body.size());
+            capture_drift(body,"suppressed",tools);
             continue;
         }
         append_text(body,false);

@@ -43,7 +43,7 @@ test-repack-canonical: tools/repack_canonical_gate.sh tools/repack.py
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
-build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
 build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/markdown_lex.h | build
@@ -56,7 +56,8 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 .PHONY: test-tools
 test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
             build/test_chat_completions_integration build/test_think_resolve \
-            build/test_stream_split build/test_toolconstrain build/test_template_golden
+            build/test_stream_split build/test_toolconstrain build/test_template_golden \
+            build/test_drift_capture build/test_drift_hook
 	./build/test_tool_drift
 	Q27_TOOL_STRICT=1 ./build/test_tool_drift
 	./build/test_tool_drift_corpus
@@ -66,17 +67,19 @@ test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai
 	./build/test_stream_split
 	./build/test_toolconstrain
 	./build/test_template_golden
+	./build/test_drift_capture
+	./build/test_drift_hook
 
-build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
 
-build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
+build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/drift_capture.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_chat_completions_integration.cpp -o $@
 
-build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
 
-build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
 
 # Fuzzing the tool-call parser. The model chooses every byte this parser sees,
@@ -87,12 +90,12 @@ build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/
 FUZZ_CLANG ?= clang++-18
 FUZZ_GCC_DIR ?= /usr/lib/gcc/x86_64-linux-gnu/13
 
-build/fuzz_tool_parser: tools/fuzz_tool_parser.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/fuzz_tool_parser: tools/fuzz_tool_parser.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(FUZZ_CLANG) --gcc-install-dir=$(FUZZ_GCC_DIR) -O1 -g -std=c++17 \
 	  -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 	  -I src tools/fuzz_tool_parser.cpp -o $@
 
-build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) -O1 -g -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
 	  -I src tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp -o $@
 
@@ -109,25 +112,32 @@ fuzz-gcc: build/fuzz_tool_parser_gcc
 
 .PHONY: fuzz fuzz-gcc
 
-build/render_request: tools/render_request.cpp src/api_common.h src/tokenizer.cpp src/tokenizer.h | build
+build/render_request: tools/render_request.cpp src/api_common.h src/drift_capture.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/render_request.cpp src/tokenizer.cpp -o $@
 
 build/flip_regions: tools/flip_regions.cpp src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/flip_regions.cpp src/tokenizer.cpp -o $@
 
-build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@
 
-build/test_tool_drift_corpus: tools/test_tool_drift_corpus.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_tool_drift_corpus: tools/test_tool_drift_corpus.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift_corpus.cpp -o $@
 
-build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_drift_capture: tools/test_drift_capture.cpp src/drift_capture.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_drift_capture.cpp -o $@
+
+build/test_drift_hook: tools/test_drift_hook.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_drift_hook.cpp -o $@
+
+
+build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@
 
-build/test_auth: tools/test_auth.cpp src/api_common.h | build
+build/test_auth: tools/test_auth.cpp src/api_common.h src/drift_capture.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_auth.cpp -o $@
 
-build/test_auth_integration: tools/test_auth_integration.cpp src/api_common.h third_party/httplib.h | build
+build/test_auth_integration: tools/test_auth_integration.cpp src/api_common.h src/drift_capture.h third_party/httplib.h | build
 	$(CXX) $(CXXFLAGS) -I src -I third_party -pthread tools/test_auth_integration.cpp -o $@
 
 check-chat-extract: tools/extract_check.sh src/server.cu tools/test_chat_completions_integration.cpp
@@ -174,7 +184,7 @@ build/test_manifest: tools/test_manifest.cu src/engine.cuh src/kv_pool.h src/pre
 
 
 build/q27-server: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -254,7 +264,7 @@ build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 # fits (the historical role-set + 12x-zoo savings are engine-wide now).
 # Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -279,7 +289,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h src/kv_pool.h src/prefill_arena.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -357,7 +367,7 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp \
                         src/metal/metal_backend.h src/metal/stream_format.h \
                         src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
                         src/metal/snapshot_evict.h \
-                        src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                        src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                         src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
                         src/sampling.h src/tokenizer.h src/tokenizer.cpp \
                         third_party/httplib.h third_party/json.hpp | build
@@ -369,7 +379,7 @@ build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.c
                              src/metal/metal_backend.h src/metal/stream_format.h \
                              src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
                              src/metal/snapshot_evict.h \
-                             src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                             src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                              src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
                              src/sampling.h src/tokenizer.h src/tokenizer.cpp \
                              third_party/httplib.h third_party/json.hpp | build
@@ -378,7 +388,7 @@ build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.c
 	        src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
 
 build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h \
-                         src/metal/serving_policy.h src/api_common.h src/stream_split.h \
+                         src/metal/serving_policy.h src/api_common.h src/drift_capture.h src/stream_split.h \
                          third_party/json.hpp | build
 	$(CXX) $(CXXFLAGS) -I src/metal src/metal/test_metal_stream.cpp -o $@
 
