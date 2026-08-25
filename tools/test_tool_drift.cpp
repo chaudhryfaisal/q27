@@ -1916,6 +1916,47 @@ static void test_value_containing_closer() {
 }
 
 
+// THE GARBLED TAIL (2026-08-25, from the first Qwen3.8 drift-corpus capture,
+// bench-task-queue): the model closes the call, then keeps going --
+//
+//   <parameter=description>\nInspect usage\n</parameter>\n</function>\n</functio\n</parameter>
+//
+// a truncated second closer and a stray `</parameter>`. The last-closer rule
+// for the final parameter (its bound is end-of-segment) took that stray
+// closer and the description came through as
+// "Inspect usage\n</parameter>\n</function>\n</functio". Harmless on a
+// description; on a `content` value it writes dialect markup into a file.
+// A closer followed by `</function>` is the parameter's real end; a value
+// that itself ends in a `</parameter>` line (the #31 collision this rule
+// exists for) is still read whole because ITS closer is the one followed by
+// the canonical ending.
+static void test_last_parameter_garbled_tail() {
+    auto val_of = [](const std::string& body, const char* key) {
+        q27::ToolCall tc;
+        if (!q27::parse_native_xml_call(body, tc)) return std::string("<parse failed>");
+        return tc.arguments.value(key, std::string());
+    };
+    const std::string head = "<function=Bash>\n<parameter=command>\nls\n</parameter>\n"
+                             "<parameter=description>\nInspect usage\n</parameter>\n</function>\n";
+    ok(val_of(head + "</functio\n</parameter>", "description") == "Inspect usage",
+       "garbled tail: truncated closer + stray </parameter> is not the value");
+    ok(val_of(head + "</function>\n</parameter>\n</function>", "description") == "Inspect usage",
+       "garbled tail: doubled closer + stray </parameter> is not the value");
+    ok(val_of(head + "</function>", "description") == "Inspect usage",
+       "garbled tail: a merely doubled closer is unchanged");
+    // the collision the last-closer rule was written for still reads whole:
+    // a value whose own last line is `</parameter>`
+    const std::string v = "line one\n</parameter>";
+    ok(val_of("<function=Edit>\n<parameter=old_string>\n" + v + "\n</parameter>\n</function>",
+              "old_string") == v,
+       "garbled tail: a value ending in a </parameter> line still survives");
+    // and a value containing both closers, followed by the canonical ending
+    const std::string w = "x\n</parameter>\n</function>\ny";
+    ok(val_of("<function=Edit>\n<parameter=old_string>\n" + w + "\n</parameter>\n</function>",
+              "old_string") == w,
+       "garbled tail: a value containing </parameter> and </function> still survives");
+}
+
 // THE TERMINATOR WRITTEN IN THE WRONG DIALECT (2026-08-21, from the UN-RESCUED
 // lines of the parity arm):
 //
@@ -2314,6 +2355,7 @@ int main() {
     test_parameter_attribute_spelling();
     test_parameter_attribute_reaches_drift_modes();
     test_value_containing_closer();
+    test_last_parameter_garbled_tail();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
     test_xml_bleed_into_json_key();

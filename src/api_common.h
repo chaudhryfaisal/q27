@@ -2934,9 +2934,60 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
             // is always preceded by that call's own `<parameter=`.
             const size_t next_po = next_param(vs, nullptr, nullptr);
             const size_t bnd = next_po == std::string::npos ? seg.size() : next_po;
+            // For the LAST parameter the bound is end-of-segment, and the
+            // model does not always stop at its closer: the first Qwen3.8
+            // corpus capture had `</parameter>\n</function>\n</functio\n
+            // </parameter>` -- a truncated second closer and a stray
+            // parameter closer -- and the last-closer rule swallowed all of
+            // it into the value. Harmless on a description; on `content` it
+            // writes dialect markup into a file. So, for the last parameter:
+            // a closer that is followed by `</function>` and then by nothing
+            // but closers, wrapper tokens and whitespace up to the next
+            // candidate (or the end) is the real one -- what lies between it
+            // and the next candidate is garbage, not content. A value whose
+            // own last line is `</parameter>` (the #31 collision the
+            // last-closer rule exists for) still reads whole, because its
+            // closer is the one `</function>` follows; a value containing
+            // both closers with content after them reads whole for the same
+            // reason. Only a value whose tail is EXACTLY closers is read as
+            // garbage, and that is the observed shape.
+            auto is_residue = [&](size_t from, size_t to) {
+                while (from < to) {
+                    if (isspace((unsigned char)seg[from])) { from++; continue; }
+                    bool hit = false;
+                    for (const char* tk : {"</function>", "</tool_call>", "<tool_call>", "</parameter>"}) {
+                        const size_t n = strlen(tk);
+                        if (from + n <= to && seg.compare(from, n, tk) == 0) { from += n; hit = true; break; }
+                        // a truncated closer (`</functio`) is residue too, when
+                        // it ends where a token would: at whitespace, at the
+                        // next tag, or at the end
+                        size_t l = 0;
+                        while (from + l < to && l < n - 1 && seg[from + l] == tk[l]) l++;
+                        if (l >= 2 && (from + l == to || isspace((unsigned char)seg[from + l]) ||
+                                       seg[from + l] == '<')) { from += l; hit = true; break; }
+                    }
+                    if (!hit) return false;
+                }
+                return true;
+            };
+            auto starts_with_fn = [&](size_t from, size_t to) {
+                while (from < to && isspace((unsigned char)seg[from])) from++;
+                return from + 11 <= to && seg.compare(from, 11, "</function>") == 0;
+            };
+            std::vector<size_t> cands;
             for (size_t c = seg.find(PC, vs); c != std::string::npos && c < bnd;
                  c = seg.find(PC, c + PC.size()))
-                ve = c;
+                cands.push_back(c);
+            if (!cands.empty()) {
+                ve = cands.back();
+                if (next_po == std::string::npos) {   // the last parameter
+                    for (size_t i = 0; i < cands.size(); i++) {
+                        const size_t from = cands[i] + PC.size();
+                        const size_t to = i + 1 < cands.size() ? cands[i + 1] : bnd;
+                        if (starts_with_fn(from, to) && is_residue(from, to)) { ve = cands[i]; break; }
+                    }
+                }
+            }
         }
         bool unterminated = ve == std::string::npos;
         if (unterminated) {
