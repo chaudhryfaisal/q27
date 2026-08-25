@@ -218,6 +218,35 @@ static void test_unset_writes_nothing_and_parses_the_same() {
     }
 }
 
+static void test_request_tool_list_feeds_the_registry() {
+    // the streaming handlers reach parse_tool_call with no tool list; the
+    // request parser must have registered the declared names by then, or a
+    // well-formed streaming call loses its tool identity (seen live: Bash and
+    // Edit as NAME_1 while a name from an earlier non-stream request survived)
+    auto strict = [](const std::string& body) {
+        remove(kPath);
+        setenv("Q27_DRIFT_CORPUS", kPath, 1);
+        q27::parse_tool_call(body);
+        unsetenv("Q27_DRIFT_CORPUS");
+        std::ifstream f(kPath);
+        std::string line;
+        std::getline(f, line);
+        remove(kPath);
+        return line.empty() ? json::object() : json::parse(line);
+    };
+    const std::string call = R"({"name":"mcp__ledger__open","arguments":{"name":"savings"}})";
+    json before = strict(call);
+    CHECK(before["outcome"] == "strict");
+    CHECK(before["redacted"].get<std::string>().find("mcp__ledger__open") == std::string::npos);
+    setenv("Q27_DRIFT_CORPUS", kPath, 1);
+    q27::anthropic_tools_json(json::parse(R"({"tools":[{"name":"mcp__ledger__open",
+        "input_schema":{"type":"object","properties":{"name":{"type":"string"}}}}]})"));
+    unsetenv("Q27_DRIFT_CORPUS");
+    json after = strict(call);
+    CHECK(after["redacted"].get<std::string>().find("\"name\":\"mcp__ledger__open\"") != std::string::npos);
+    CHECK(after["redacted"].get<std::string>().find("savings") == std::string::npos);  // the argument named `name` is a value
+}
+
 int main(int argc, char** argv) {
     verbose = argc > 1 && std::string(argv[1]) == "-v";
     test_think_branch_tags_in_think();
@@ -230,6 +259,7 @@ int main(int argc, char** argv) {
     test_reentrant_modes_record_once();
     test_residue_below_the_warning_bar_is_still_captured();
     test_strict_miss_hint_is_one_shot();
+    test_request_tool_list_feeds_the_registry();
     test_batch_records_once_per_turn();
     test_unset_writes_nothing_and_parses_the_same();
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }

@@ -39,6 +39,25 @@ static void test_redacts_json_string_values() {
     CHECK(out.find("/etc/shadow") == std::string::npos);          // value does not
 }
 
+static void test_fences_inside_a_string_value_stay_inside_it() {
+    // a README written through a JSON call: fences are kept (the display
+    // lexer reads them anywhere) but the string must not be cut at the first
+    // backtick, or the rest of the content is scanned as loose JSON
+    const std::string in =
+        "{\"name\":\"Write\",\"arguments\":{\"content\":\"# Title\\n```py\\nx = secret\\n```\\nend\",\"file_path\":\"/w/README.md\"}}";
+    const std::string out = q27::redact_drift(in);
+    CHECK(out.find("secret") == std::string::npos);
+    CHECK(out.find("Title") == std::string::npos);
+    CHECK(out.find("```") != std::string::npos);
+    CHECK(out.find("\",\"file_path\":\"PATH_") != std::string::npos);   // the string closed where it should
+    CHECK(out.find("README") == std::string::npos);
+    // and a fence inside an XML value: one run per stretch, no leak
+    const std::string xml = "<parameter=content>\n# T\n```\nx = secret\n```\n</parameter>";
+    const std::string xo = q27::redact_drift(xml);
+    CHECK(xo.find("secret") == std::string::npos);
+    CHECK(xo.find("</parameter>") != std::string::npos);
+}
+
 static void test_placeholder_type_from_key() {
     const std::string in =
         "<function=Bash>\n<parameter=command>\nrm -rf /\n</parameter>\n"
@@ -239,6 +258,7 @@ int main() {
     test_preserves_dialect_inside_values();
     test_redacts_json_string_values();
     test_placeholder_type_from_key();
+    test_fences_inside_a_string_value_stay_inside_it();
     test_length_class_recorded();
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
     printf("DRIFT CAPTURE: all pass\n");

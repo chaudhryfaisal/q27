@@ -163,21 +163,41 @@ struct Redactor {
         else if (core.find('\n') != std::string::npos) out += ":ml";
     }
 
-    // Emit the pending run: leading/trailing whitespace verbatim (the value's
-    // shape), the core as one placeholder.
-    void flush() {
-        if (run.empty()) return;
-        size_t b = 0, e = run.size();
-        while (b < e && is_ws(run[b])) b++;
-        while (e > b && is_ws(run[e - 1])) e--;
-        out.append(run, 0, b);
+    // Emit one run of value bytes: leading/trailing whitespace verbatim (the
+    // value's shape), the core as one placeholder.
+    void emit_run(const std::string& text, const char* type) {
+        size_t b = 0, e = text.size();
+        while (b < e && is_ws(text[b])) b++;
+        while (e > b && is_ws(text[e - 1])) e--;
+        out.append(text, 0, b);
         if (e > b) {
-            placeholder(run.substr(b, e - b), run_type());
+            placeholder(text.substr(b, e - b), type);
             name_next = false;
             last_was_string = false;
         }
-        out.append(run, e, std::string::npos);
+        out.append(text, e, std::string::npos);
+    }
+
+    void flush() {
+        if (run.empty()) return;
+        emit_run(run, run_type());
         run.clear();
+    }
+
+    // A value with markdown fences in it (a README being written): the
+    // fences stay -- the display-context lexer reads them wherever they sit
+    // -- and each stretch between them is its own placeholder.
+    void emit_value_with_fences(const std::string& text, const char* type) {
+        size_t i = 0;
+        while (i < text.size()) {
+            size_t j = text.find('`', i);
+            if (j == std::string::npos) j = text.size();
+            if (j > i) emit_run(text.substr(i, j - i), type);
+            size_t k = j;
+            while (k < text.size() && text[k] == '`') k++;
+            out.append(text, j, k - j);
+            i = k;
+        }
     }
 
     void token(const std::string& t) {
@@ -186,10 +206,10 @@ struct Redactor {
         last_was_string = false;
     }
 
-    // Does a dialect token or fence start at i? Used to bound JSON strings so
-    // an unterminated quote cannot swallow the call that follows it.
+    // Does a dialect token start at i? Used to bound JSON strings so an
+    // unterminated quote cannot swallow the call that follows it. A fence is
+    // not a boundary: a README's content is one string, fences and all.
     bool hard_boundary_at(size_t i) const {
-        if (s[i] == '`') return true;
         if (s[i] != '<') return false;
         static const char* const kStarts[] = {"<tool_call", "</tool_call", "<function", "</function",
                                               "<parameter", "</parameter", "<tool_name", "</tool_name",
@@ -277,7 +297,9 @@ struct Redactor {
             bool all_ws = true;
             for (char c : inner) if (!is_ws(c)) { all_ws = false; break; }
             if (all_ws) out += inner;
-            else {
+            else if (!name_next && inner.find('`') != std::string::npos) {
+                emit_value_with_fences(inner, run_type());
+            } else {
                 placeholder(inner, name_next ? "NAME" : run_type());
                 name_next = false;
             }
@@ -414,6 +436,35 @@ inline uint64_t shape_hash(const std::string& redacted) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (unsigned char c : key) { h ^= c; h *= 0x100000001b3ull; }
     return h;
+}
+
+inline const char* drift_corpus_path() {
+    const char* p = std::getenv("Q27_DRIFT_CORPUS");
+    return (p && *p) ? p : nullptr;
+}
+
+// Process-wide set of tool names some request this process served declared.
+// Fed by the request parsers (anthropic_tools_json / openai_tools_json in
+// api_common.h), so it is complete before the first token is generated; read
+// where the strict parser has no per-request list (the streaming handlers).
+// Bounded so a hostile client cannot grow it without limit.
+struct DriftNameRegistry {
+    std::mutex mu;
+    DriftNames names;
+};
+inline DriftNameRegistry& drift_name_registry() {
+    static DriftNameRegistry r;
+    return r;
+}
+inline void drift_register_names(const DriftNames& add) {
+    auto& r = drift_name_registry();
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (r.names.size() + add.size() <= 4096) r.names.insert(add.begin(), add.end());
+}
+inline DriftNames drift_registered_names() {
+    auto& r = drift_name_registry();
+    std::lock_guard<std::mutex> lock(r.mu);
+    return r.names;
 }
 
 // What the capture site knows that the text alone does not.

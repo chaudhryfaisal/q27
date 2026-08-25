@@ -1954,6 +1954,29 @@ inline std::string ctx_limit_error_message(int n_prompt, int n_max_prompt) {
 
 // Anthropic tools -> qwen tools json for the system preamble (the
 // /v1/messages request mapping; count_tokens must count the same bytes).
+// Both tool-list shapes the server hands the parser (OpenAI function
+// entries and bare Anthropic entries).
+inline void declared_tool_names(const json* tools, DriftNames& names) {
+    if (!tools || !tools->is_array()) return;
+    for (const auto& t : *tools) {
+        if (!t.is_object()) continue;
+        if (t.contains("function") && t["function"].is_object() &&
+            t["function"].contains("name") && t["function"]["name"].is_string())
+            names.insert(t["function"]["name"].get<std::string>());
+        else if (t.contains("name") && t["name"].is_string())
+            names.insert(t["name"].get<std::string>());
+    }
+}
+
+// Drift corpus: remember what this request declared (see drift_capture.h).
+// No-op unless Q27_DRIFT_CORPUS is set.
+inline void drift_register_tools(const json& tools) {
+    if (!drift_corpus_path()) return;
+    DriftNames names;
+    declared_tool_names(&tools, names);
+    drift_register_names(names);
+}
+
 inline json anthropic_tools_json(const json& body) {
     json out = json::array();
     if (body.contains("tools") && body["tools"].is_array())
@@ -1972,6 +1995,7 @@ inline json anthropic_tools_json(const json& body) {
                                          {"description", description},
                                          {"parameters", parameters}}}});
         }
+    drift_register_tools(out);
     return out;
 }
 
@@ -2069,6 +2093,7 @@ inline json openai_tools_json(const json& body) {
                                                             ? fn["parameters"]
                                                             : json::object()}}}});
         }
+    drift_register_tools(out);
     return out;
 }
 
@@ -3007,25 +3032,6 @@ struct DriftCtxScope {
     ~DriftCtxScope() { drift_ctx = saved; drift_tools = saved_tools; }
 };
 
-inline const char* drift_corpus_path() {
-    const char* p = getenv("Q27_DRIFT_CORPUS");
-    return (p && *p) ? p : nullptr;
-}
-
-// Both tool-list shapes the server hands the parser (OpenAI function
-// entries and bare Anthropic entries).
-inline void declared_tool_names(const json* tools, DriftNames& names) {
-    if (!tools || !tools->is_array()) return;
-    for (const auto& t : *tools) {
-        if (!t.is_object()) continue;
-        if (t.contains("function") && t["function"].is_object() &&
-            t["function"].contains("name") && t["function"]["name"].is_string())
-            names.insert(t["function"]["name"].get<std::string>());
-        else if (t.contains("name") && t["name"].is_string())
-            names.insert(t["name"].get<std::string>());
-    }
-}
-
 // Wider than looks_like_intended_tool_call on purpose. That predicate gates a
 // WARNING, so it demands a closer the model never opened; the corpus wants
 // every turn carrying dialect residue, because a dropped-opener turn that
@@ -3057,28 +3063,21 @@ inline bool drift_bearing(const std::string& text, const json* tools) {
 }
 
 // A tool name survives redaction only when declared. The strict parser is
-// called from the streaming handlers without the request's tool list, so
-// every declared set that does pass through here is remembered
-// process-wide and used as the fallback: a name is kept only if SOME request
-// this process served declared it. Before the first such request, names are
-// placeholders -- the safe direction. Bounded so a hostile client cannot grow
-// it without limit.
+// called from the streaming handlers without the request's tool list; there
+// the process-wide registry (fed by the request parsers above) stands in: a
+// name is kept only if some request this process served declared it. Before
+// the first such request, names are placeholders -- the safe direction.
 inline void capture_drift(const std::string& text, const std::string& outcome,
                           const json* tools) {
     const char* path = drift_corpus_path();
     if (!path) return;
     if (!tools) tools = drift_tools;
-    static std::mutex reg_mu;
-    static DriftNames registry;
     DriftNames names;
-    declared_tool_names(tools, names);
-    {
-        std::lock_guard<std::mutex> lock(reg_mu);
-        if (tools) {
-            if (registry.size() + names.size() <= 4096) registry.insert(names.begin(), names.end());
-        } else {
-            names = registry;
-        }
+    if (tools) {
+        declared_tool_names(tools, names);
+        drift_register_names(names);
+    } else {
+        names = drift_registered_names();
     }
     write_drift_record(path, text, outcome, drift_ctx, &names);
     drift_records_written++;
