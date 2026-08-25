@@ -151,6 +151,16 @@ corpus-dedup: tools/corpus_dedup.py build/drift_rekey
 build/drift_rekey: tools/drift_rekey.cpp src/drift_capture.h third_party/json.hpp | build
 	$(CXX) $(CXXFLAGS) -I src tools/drift_rekey.cpp -o $@
 
+# Phase 2: replay every corpus shape through the parser, diff against the
+# human `intended` label (tools/corpus_label.py), print the agreement number,
+# and record `current` + `constrained` into the rows. Exit 1 if a
+# human-confirmed label disagrees.
+build/corpus_check: tools/corpus_check.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/corpus_check.cpp -o $@
+
+corpus-check: build/corpus_check
+	./build/corpus_check tools/drift_corpus/corpus.jsonl --write
+
 build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@
 

@@ -15269,3 +15269,66 @@ emitted reasoning without the parser, now routed through
 `recover_calls_from_reasoning()`, shared with the non-stream resolver.
 Commits 638008d, 2129d9f, 6a23132, 250103f.
 
+## 2026-08-25 (b): Phase 2 -- the oracle's first number
+
+**Current-vs-intended agreement on the drift corpus: 132 of 137 shapes
+(96.4%), 1,118 of 1,123 captured turns (99.55%). Zero replay mismatches.
+All five disagreements are real, and four are the same defect.**
+
+The tooling: `tools/corpus_label.py propose` reads each redacted shape with
+a regex and no parser and writes `intended` as a proposal; `make
+corpus-check` (tools/corpus_check.cpp) replays every shape through
+`resolve_ordered_tool_segments` the way the server would (TOOL segment for
+a wrapped body, TEXT for a bare one, THINK for reasoning, the real
+StreamSplitter when the wrapper is in the text), records `current`, diffs
+names, keys and placeholder values against `intended`, and prints the
+number. Two independent readings of the same bytes; a human looks only
+where they differ, then `confirm`s. Replay uses Claude Code's schemas for
+the tools the corpus names (`--tools FILE` for an exact list); a shape whose
+replay outcome contradicts its captured outcome is a REPLAY MISMATCH and a
+schema problem, not a parser one. Eleven rows from the 08-24 qwopus capture
+are marked replay-unreliable and excluded: an older redactor wrote a bare
+`true` as `TEXT_n` (no longer JSON) and split strings at fences, and it
+knew no declared names, so those rows replay as something the server never
+saw. The redactor now keeps JSON literals valid (true/false/null, numbers
+as 0).
+
+The five, all from the Qwen3.8 suite capture, all singletons:
+
+| id | outcome | intended | current |
+|---|---|---|---|
+| 03a8a851 | recovered:native | 3 TaskUpdate | 1; calls 2-3 emitted as text |
+| b645b48f | recovered:native | 3 Read | 2; call 3 emitted as text |
+| a29175c3 | recovered:22 | Read, Bash | Read; the Bash call emitted as text |
+| ea9ead21 | recovered:xmlclose | 2 Read | 1 (the second); the first emitted as text |
+| 831ac625 | strict | 1 TaskUpdate | 1, plus a bogus `TaskUpdate` argument |
+
+The pattern: a batch whose later calls open with something other than the
+first call's opener -- a mode-22 `<parameter=NAME>` after a `<function=NAME>`,
+a `<tool_call>` separator inside one wrapper, the `{"tool_call":` head on
+the first of an xmlclose pair -- recovers its first call and hands the rest
+to the client as prose. The fifth is the strict XML parser reading a stray
+`<parameter=TaskUpdate>` opener as a parameter of the previous call. Every
+one of these reached a client during the suite (the suite scored 0.895
+regardless; the model retried).
+
+**Reading against the kill criterion.** The design said: agreement above
+99% and the catalogue is nearly right; the rewrite buys churn reduction
+only. By captured turn this corpus is above the line (99.55%); by distinct
+shape it is not (96.4%), and the five shapes are one class. Two things
+narrow the decision: the corpus is one model, one suite, one day, and the
+defect is a batch-continuation rule that either chain design would have to
+carry. What the number does settle is that the parser is not wrong in
+small, scattered ways -- it is right almost everywhere and wrong in one
+place. The next capture should be real sessions, not the suite.
+
+**The constrained column.** The same bytes walked through the
+`--constrain-tools` grammar (host-only, schema-aware for XML): 926 turns
+accepted, 152 disengaged, 23 never engaged (bare or in reasoning). The
+disengagements are the shapes above the model would never have been able
+to emit under the grammar -- a doubled `</function>`, prose after the
+closer, and every mode-22 opener at byte 1 -- so the constraint bet would
+remove the batch-continuation class at the source rather than parse around
+it. That is the measurement the design wanted before betting on it; the
+serving-quality cost is still unmeasured.
+

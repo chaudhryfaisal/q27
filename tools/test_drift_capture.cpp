@@ -58,6 +58,23 @@ static void test_fences_inside_a_string_value_stay_inside_it() {
     CHECK(xo.find("</parameter>") != std::string::npos);
 }
 
+static void test_json_literals_stay_valid_json() {
+    // the corpus is replayed through the parser (Phase 2); a bare boolean
+    // or number redacted to TEXT_n is no longer valid JSON and the strict
+    // parser refuses a call the live server accepted
+    const std::string in =
+        R"({"name":"Edit","arguments":{"file_path":"/w/a.py","old_string":"x","new_string":"y","replace_all":true,"timeout":120000,"n":null,"v":false}})";
+    const std::string out = q27::redact_drift(in);
+    CHECK(out.find("\"replace_all\":true") != std::string::npos);
+    CHECK(out.find("\"timeout\":0") != std::string::npos);
+    CHECK(out.find("\"n\":null") != std::string::npos);
+    CHECK(out.find("\"v\":false") != std::string::npos);
+    CHECK(out.find("120000") == std::string::npos);
+    CHECK(nlohmann::json::accept(out));   // still JSON
+    // a bare word that is not a literal is still redacted
+    CHECK(q27::redact_drift(R"({"name":"Edit","arguments":{"x":secret}})").find("secret") == std::string::npos);
+}
+
 static void test_placeholder_type_from_key() {
     const std::string in =
         "<function=Bash>\n<parameter=command>\nrm -rf /\n</parameter>\n"
@@ -272,6 +289,7 @@ int main() {
     test_preserves_dialect_inside_values();
     test_redacts_json_string_values();
     test_placeholder_type_from_key();
+    test_json_literals_stay_valid_json();
     test_fences_inside_a_string_value_stay_inside_it();
     test_length_class_recorded();
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }

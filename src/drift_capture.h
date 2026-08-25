@@ -155,6 +155,18 @@ struct Redactor {
 
     void placeholder(const std::string& core, const char* type) {
         if (std::strcmp(type, "NAME") == 0 && name_allowed(core, names)) { out += core; return; }
+        // A bare JSON literal stays a valid literal, so the redacted text
+        // still parses as the JSON the model wrote: true/false/null are not
+        // identifying, a number becomes 0. Anything else bare is TEXT_n.
+        if (json_depth > 0 && std::strcmp(type, "NAME") != 0) {
+            if (core == "true" || core == "false" || core == "null") { out += core; return; }
+            bool numeric = !core.empty();
+            for (size_t i = 0; i < core.size() && numeric; i++) {
+                const char c = core[i];
+                numeric = (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E';
+            }
+            if (numeric) { out += '0'; return; }
+        }
         counter++;
         out += type;
         out += '_';
