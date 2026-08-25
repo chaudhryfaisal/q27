@@ -2387,13 +2387,27 @@ int main(int argc, char** argv) {
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
                 bool any_call = false;
-                std::string tool_buf;
-                q27::BareToolTextHoldback bare_text;
+                // Routing state shared with the /v1/messages twin (issue #38,
+                // reopened: the twins had drifted and this one never consulted
+                // the parser on the reasoning channel).
+                q27::StreamToolRouter router;
+                router.has_tools = has_tools;
+                std::string& tool_buf = router.tool_buf;
                 bool forced_control_token = false;
                 auto emit_text = [&](const std::string& t) {
                     if (t.empty()) return;
                     if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                        json{{"content", t}})))
+                        alive = false;
+                };
+                // reasoning_content (no official OpenAI field for this; matches
+                // the vLLM/SGLang/llama.cpp convention -- see
+                // openai_reasoning_delta) rather than leaking raw <think> tags
+                // into `content`.
+                auto emit_think = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       q27::openai_reasoning_delta(t))))
                         alive = false;
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
@@ -2449,39 +2463,8 @@ int main(int argc, char** argv) {
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) {
-                        if (tool_buf.empty()) {
-                            bare_text.finish(false,allowed_tool_names,
-                                             emit_text,classify_bare);
-                            bare_text.reset_context();
-                        }
-                        tool_buf += t;
-                        return;
-                    }
-                    if (!tool_buf.empty()) emit_tool();
-                    if (t.empty()) return;
-                    // reasoning_content (no official OpenAI field for this;
-                    // matches the vLLM/SGLang/llama.cpp convention -- see
-                    // openai_reasoning_delta) rather than leaking raw <think>
-                    // tags into `content` (the bug this whole path also
-                    // happens to fix).
-                    if (ch == StreamSplitter::THINK) {
-                        bare_text.finish(false,allowed_tool_names,
-                                         emit_text,classify_bare);
-                        bare_text.reset_context();
-                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
-                                                            q27::openai_reasoning_delta(t))))
-                            alive = false;
-                        return;
-                    }
-                    // Only decoder-injected close whitespace is parser control.
-                    // Preserve ordinary leading whitespace, including when
-                    // thinking is disabled or the model closes naturally.
-                    if (forced_control_token && q27::strip_ws2(t).empty()) return;
-                    if (has_tools)
-                        bare_text.route(t,allowed_tool_names,
-                                        emit_text,classify_bare);
-                    else emit_text(t);
+                    router.segment(ch, t, forced_control_token, allowed_tool_names,
+                                   emit_text, emit_think, emit_tool, classify_bare);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -2532,8 +2515,8 @@ int main(int argc, char** argv) {
                     } else emit_tool();
                 }
                 if (!final_tool_incomplete)
-                    bare_text.finish(produced < nm && !bt.budget_truncated,
-                                     allowed_tool_names,emit_text,classify_bare);
+                    router.finish(produced < nm && !bt.budget_truncated,
+                                  allowed_tool_names, emit_text, emit_think, classify_bare);
                 // TODO(batch error surfacing): no standard OpenAI mid-stream
                 // error chunk exists (matches the plain-text leg's TODO
                 // above); end=error lands in the [req] line, [req-error]
@@ -2944,18 +2927,14 @@ int main(int argc, char** argv) {
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected opener
                 ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
                 budget.start();
-                std::string tool_buf;
-                q27::BareToolTextHoldback bare_text;
-                // Issue #38 (cosmicnag, 2026-08-24): the model sometimes emits a
-                // complete tool call INSIDE its <think> block. The splitter routes
-                // everything between <think> and </think> to THINK, and nothing on
-                // that path ever consulted the tool parser, so the XML streamed to
-                // the client as visible reasoning and the call never fired. Same
-                // bytes in TEXT parse fine -- it was an uncovered channel, not a
-                // parse failure. Reasoning gets its own holdback (never share one
-                // with TEXT: the display-context lexer state is per-channel, and a
-                // fence opened in prose must not silence a call in reasoning).
-                q27::BareToolTextHoldback think_text;
+                // Issue #38 (cosmicnag, 2026-08-24; reopened 2026-08-25): the
+                // model sometimes emits a complete tool call INSIDE its <think>
+                // block, and reasoning is a channel the parser has to see. The
+                // routing lives in q27::StreamToolRouter, shared with the
+                // /v1/chat/completions twin so the two cannot drift again.
+                q27::StreamToolRouter router;
+                router.has_tools = has_tools;
+                std::string& tool_buf = router.tool_buf;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
@@ -3052,40 +3031,8 @@ int main(int argc, char** argv) {
                 };
                 bool forced_control_token = false;
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) {
-                        if(tool_buf.empty()) {
-                            bare_text.finish(false,allowed_tool_names,
-                                             emit_text,classify_bare);
-                            bare_text.reset_context();
-                        }
-                        tool_buf += t;
-                        return;
-                    }
-                    if (!tool_buf.empty()) emit_tool();
-                    if (t.empty()) return;
-                    const bool think = ch == StreamSplitter::THINK;
-                    // Injected template whitespace is parser control; model
-                    // whitespace, including after a natural close, is content.
-                    if (!think && forced_control_token && q27::strip_ws2(t).empty()) return;
-                    if (think) {
-                        bare_text.finish(false,allowed_tool_names,
-                                         emit_text,classify_bare);
-                        bare_text.reset_context();
-                        if (has_tools)
-                            think_text.route(t,allowed_tool_names,
-                                             emit_think,classify_bare);
-                        else emit_think(t);
-                    } else {
-                        // leaving reasoning: settle any held candidate as
-                        // thinking before the channel changes
-                        think_text.finish(false,allowed_tool_names,
-                                          emit_think,classify_bare);
-                        think_text.reset_context();
-                        if (has_tools)
-                            bare_text.route(t,allowed_tool_names,
-                                            emit_text,classify_bare);
-                        else emit_text(t);
-                    }
+                    router.segment(ch, t, forced_control_token, allowed_tool_names,
+                                   emit_text, emit_think, emit_tool, classify_bare);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -3136,14 +3083,9 @@ int main(int argc, char** argv) {
                                     rec);
                     } else emit_tool();
                 }
-                if(!final_tool_incomplete) {
-                    bare_text.finish(produced<nm && !bt.budget_truncated,
-                                     allowed_tool_names,emit_text,classify_bare);
-                    // a turn that ended still inside <think> can hold a complete
-                    // call; without this it is lost exactly as issue #38 reported
-                    think_text.finish(produced<nm && !bt.budget_truncated,
-                                      allowed_tool_names,emit_think,classify_bare);
-                }
+                if(!final_tool_incomplete)
+                    router.finish(produced<nm && !bt.budget_truncated,
+                                  allowed_tool_names,emit_text,emit_think,classify_bare);
                 if (idx < 0 && !any) { // nothing at all: empty text block for validity
                     idx = block_counter++;
                     chan_open = 0;

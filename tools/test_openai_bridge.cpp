@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <set>
 
 using json = nlohmann::json;
 using q27::Msg;
@@ -2708,7 +2709,186 @@ static void test_ordered_tool_segments_preserve_first_call_and_rejected_text() {
     CHECK(displayed.text==displayed_wrapper);
 }
 
+// ---- Issue #38, reopened: the streaming router ------------------------------
+// Drives q27::StreamToolRouter -- the one copy of the per-chunk routing both
+// SSE handlers now call -- through the real StreamSplitter, with the exact
+// call shape from the report inside a prompt-injected <think> block, in
+// chunks small enough that the <tool_call> wrapper straddles them. The
+// collectors stand in for the endpoint-specific emit_* lambdas; the classify
+// callback is the handlers' classify_bare verbatim.
+struct StreamRun {
+    std::string text, think;
+    std::vector<q27::ToolCall> calls;
+};
+
+static json stream_tools() {
+    return json::parse(R"([
+      {"type":"function","function":{"name":"read","parameters":{"type":"object",
+        "properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"required":["path"]}}},
+      {"type":"function","function":{"name":"bash","parameters":{"type":"object",
+        "properties":{"command":{"type":"string"}},"required":["command"]}}}])");
+}
+
+static StreamRun stream_turn(const std::string& generated, bool start_in_think,
+                             size_t chunk, bool allow_repair_at_end = true,
+                             bool with_tools = true) {
+    const json tools = with_tools ? stream_tools() : json::array();
+    std::set<std::string> names;
+    for (const auto& t : tools) names.insert(t["function"]["name"].get<std::string>());
+    q27::StreamSplitter sp;
+    if (start_in_think) sp.chan = q27::StreamSplitter::THINK;
+    q27::StreamToolRouter r;
+    r.has_tools = with_tools;
+    StreamRun out;
+    auto emit_text = [&](const std::string& t) { out.text += t; };
+    auto emit_think = [&](const std::string& t) { out.think += t; };
+    auto emit_call = [&](const q27::ToolCall& c) { out.calls.push_back(c); return true; };
+    auto classify = [&](const std::string& source, bool allow_repair, auto&& visible) {
+        std::string pre, residual;
+        auto bcs = q27::parse_bare_tool_calls(source, &pre, &tools, true, allow_repair, &residual);
+        if (bcs.empty()) return q27::BareToolCandidateResult{};
+        size_t cursor = 0, recovered = 0;
+        for (const auto& bc : bcs) {
+            visible(source.substr(cursor, bc.source_begin - cursor));
+            cursor = bc.source_end;
+            if (emit_call(bc)) recovered++;
+            else visible(source.substr(bc.source_begin, bc.source_end - bc.source_begin));
+        }
+        visible(source.substr(cursor));
+        return q27::BareToolCandidateResult{true, recovered != 0};
+    };
+    auto emit_tool = [&]() {
+        auto c = q27::parse_tool_call(q27::strip_ws2(r.tool_buf));
+        r.tool_buf.clear();
+        if (!c.ok) {
+            if (!classify(c.raw, true, emit_text) && !q27::only_dialect_control_bytes(c.raw))
+                emit_text(c.raw);
+        } else emit_call(c);
+    };
+    auto seg = [&](q27::StreamSplitter::Chan ch, const std::string& t) {
+        r.segment(ch, t, false, names, emit_text, emit_think, emit_tool, classify);
+    };
+    for (size_t i = 0; i < generated.size(); i += chunk)
+        for (auto& [ch, t] : sp.feed(generated.substr(i, chunk))) seg(ch, t);
+    for (auto& [ch, t] : sp.flush()) seg(ch, t);
+    if (!r.tool_buf.empty()) emit_tool();
+    r.finish(allow_repair_at_end, names, emit_text, emit_think, classify);
+    return out;
+}
+
+// the report's bytes: wrapped call in reasoning, doubled </tool_call>
+static const char* kIssue38Think =
+    "There's no agents/ directory. Next, read the temp file.\n"
+    "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/code-reviewer-diff.md\n"
+    "</parameter>\n<parameter=limit>\n160\n</parameter>\n</function>\n</tool_call>\n</tool_call>\n";
+
+static void test_stream_router_wrapped_call_in_reasoning() {
+    for (size_t chunk : {size_t(1), size_t(3), size_t(7), size_t(64)}) {
+        auto r = stream_turn(std::string(kIssue38Think) + "</think>\n\nReading it now.", true, chunk);
+        CHECK(r.calls.size() == 1);
+        if (r.calls.size() == 1) {
+            CHECK(r.calls[0].name == "read");
+            CHECK(r.calls[0].arguments.value("path", std::string()) == "/tmp/code-reviewer-diff.md");
+        }
+        CHECK(r.think.find("<function=") == std::string::npos);   // the call is not reasoning
+        CHECK(r.think.find("<parameter=") == std::string::npos);
+        CHECK(r.think.find("Next, read the temp file.") != std::string::npos);  // the prose is
+        CHECK(q27::strip_ws2(r.text) == "Reading it now.");
+    }
+}
+
+static void test_stream_router_bare_call_in_reasoning() {
+    const std::string gen =
+        "plan\n<function=bash>\n<parameter=command>\nls /tmp\n</parameter>\n</function>\n</think>\n\ndone";
+    auto r = stream_turn(gen, true, 7);
+    CHECK(r.calls.size() == 1);
+    if (!r.calls.empty()) CHECK(r.calls[0].name == "bash");
+    CHECK(r.think.find("<function=") == std::string::npos);
+}
+
+static void test_stream_router_four_calls_in_one_think_block() {
+    // the reporter's host-only repro: read + bash, four calls, one block
+    std::string gen = "gather everything first\n";
+    for (int i = 0; i < 2; i++) {
+        gen += "<tool_call>\n<function=read>\n<parameter=path>\n/w/f" + std::to_string(i) +
+               ".ts\n</parameter>\n</function>\n</tool_call>\n";
+        gen += "<tool_call>\n<function=bash>\n<parameter=command>\ncat /w/f" + std::to_string(i) +
+               ".ts\n</parameter>\n</function>\n</tool_call>\n";
+    }
+    gen += "</think>\n\nok";
+    auto r = stream_turn(gen, true, 7);
+    CHECK(r.calls.size() == 4);
+    if (r.calls.size() == 4) {
+        CHECK(r.calls[0].name == "read");
+        CHECK(r.calls[1].name == "bash");
+        CHECK(r.calls[3].arguments.value("command", std::string()) == "cat /w/f1.ts");
+    }
+    CHECK(r.think.find("<function=") == std::string::npos);
+}
+
+static void test_stream_router_fenced_example_in_reasoning_stays_reasoning() {
+    // the model writing ABOUT a call: a fenced example and an inline-code
+    // mention must not fire -- the safety rule the non-stream fix recorded
+    const std::string fenced =
+        "The dialect looks like this:\n```\n<tool_call>\n<function=read>\n<parameter=path>\n/x\n"
+        "</parameter>\n</function>\n</tool_call>\n```\nbut I will not call it.\n</think>\n\nno call";
+    auto r = stream_turn(fenced, true, 7);
+    CHECK(r.calls.empty());
+    CHECK(r.think.find("<function=read>") != std::string::npos);   // kept as reasoning
+    const std::string inline_mention =
+        "I could use `<function=read>` here but the file is known.\n</think>\n\nanswer";
+    auto r2 = stream_turn(inline_mention, true, 7);
+    CHECK(r2.calls.empty());
+}
+
+static void test_stream_router_turn_ends_inside_think() {
+    // no </think> ever arrives: the held call must still fire at finish
+    auto r = stream_turn(kIssue38Think, true, 7, /*allow_repair_at_end=*/true);
+    CHECK(r.calls.size() == 1);
+    if (!r.calls.empty()) CHECK(r.calls[0].name == "read");
+}
+
+static void test_stream_router_reasoning_call_then_text_call_in_order() {
+    const std::string gen = std::string(kIssue38Think) +
+        "</think>\n\nNow run it.\n<tool_call>\n<function=bash>\n<parameter=command>\nmake\n"
+        "</parameter>\n</function>\n</tool_call>";
+    auto r = stream_turn(gen, true, 7);
+    CHECK(r.calls.size() == 2);
+    if (r.calls.size() == 2) {
+        CHECK(r.calls[0].name == "read");
+        CHECK(r.calls[1].name == "bash");
+    }
+    CHECK(q27::strip_ws2(r.text) == "Now run it.");
+}
+
+static void test_stream_router_without_tools_passes_reasoning_through() {
+    auto r = stream_turn(std::string(kIssue38Think) + "</think>\n\nhi", true, 7, true, /*with_tools=*/false);
+    CHECK(r.calls.empty());
+    CHECK(r.think == std::string(kIssue38Think));   // byte-for-byte, nothing blanked
+    CHECK(q27::strip_ws2(r.text) == "hi");
+}
+
+static void test_think_wrapper_blanker_straddles_chunks() {
+    q27::ThinkWrapperBlanker b;
+    CHECK(b.feed("ab<tool_c") == "ab");                 // partial token held
+    CHECK(b.feed("all>cd") == std::string(11, ' ') + "cd"); // completed: blanked, length kept
+    CHECK(b.feed("<") == "");
+    CHECK(b.feed("/tool_call>x") == std::string(12, ' ') + "x");
+    CHECK(b.feed("<tool_x") == "<tool_x");               // not a prefix of either token
+    CHECK(b.feed("y</tool_") == "y");
+    CHECK(b.flush() == "</tool_");                        // the tail is content after all
+    CHECK(b.feed("<tool_call></tool_call>") == std::string(23, ' '));
+}
+
 int main() {
+    test_stream_router_wrapped_call_in_reasoning();
+    test_stream_router_bare_call_in_reasoning();
+    test_stream_router_four_calls_in_one_think_block();
+    test_stream_router_fenced_example_in_reasoning_stays_reasoning();
+    test_stream_router_turn_ends_inside_think();
+    test_stream_router_reasoning_call_then_text_call_in_order();
+    test_stream_router_without_tools_passes_reasoning_through();
+    test_think_wrapper_blanker_straddles_chunks();
     test_tools_passthrough();
     test_tools_absent();
     test_responses_tool_fields_reject_wrong_types();

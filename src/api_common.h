@@ -3499,6 +3499,123 @@ struct BareToolTextHoldback {
     }
 };
 
+// ---- Streaming tool routing shared by the SSE handlers ---------------------
+// Issue #38, reopened (cosmicnag, 2026-08-25). The /v1/messages and
+// /v1/chat/completions SSE handlers each carried a hand-copied twin of the
+// per-chunk routing below. 152d3a2 gave one twin a reasoning holdback and
+// missed the other, so on /v1/chat/completions a call emitted inside <think>
+// still streamed out as reasoning_content and never fired; and even the fixed
+// twin never blanked the <tool_call> wrapper before classifying reasoning, so
+// only the bare shape recovered there. Twins drift. This is the one copy,
+// tested through the real StreamSplitter (tools/test_openai_bridge.cpp).
+
+// Inside reasoning a literal <tool_call> wrapper survives the splitter (it
+// scans THINK for </think> only) and the display lexer treats it as an inert
+// container, so the holdback never arms on the call inside it. The non-stream
+// THINK branch blanks the two wrapper tokens (length-preserving) before
+// classification; this does the same for a stream, where a token can straddle
+// two chunks: the longest tail that is a proper prefix of either token is held
+// until the next chunk decides what it was.
+struct ThinkWrapperBlanker {
+    std::string held;
+    static const char* const* tokens() {
+        static const char* const k[2] = {"<tool_call>", "</tool_call>"};
+        return k;
+    }
+    std::string feed(const std::string& t) {
+        held += t;
+        for (int i = 0; i < 2; i++) {
+            const char* tk = tokens()[i];
+            const size_t n = std::char_traits<char>::length(tk);
+            for (size_t at = held.find(tk); at != std::string::npos; at = held.find(tk, at + n))
+                held.replace(at, n, std::string(n, ' '));
+        }
+        size_t keep = 0;
+        for (int i = 0; i < 2; i++) {
+            const char* tk = tokens()[i];
+            const size_t n = std::char_traits<char>::length(tk);
+            for (size_t k = std::min(n - 1, held.size()); k > keep; k--)
+                if (held.compare(held.size() - k, k, tk, k) == 0) { keep = k; break; }
+        }
+        std::string out = held.substr(0, held.size() - keep);
+        held.erase(0, held.size() - keep);
+        return out;
+    }
+    std::string flush() { std::string out; out.swap(held); return out; }
+};
+
+// The per-request routing state a streaming handler keeps between splitter
+// segments: the TEXT holdback, the reasoning holdback (never shared with TEXT:
+// the display-context lexer state is per-channel, and a fence opened in prose
+// must not silence a call in reasoning), the wrapper blanker for reasoning,
+// and the wrapped segment being collected. The handler supplies what differs
+// between endpoints -- how a text delta, a reasoning delta, a complete
+// wrapped segment and a bare-chain classification are emitted.
+struct StreamToolRouter {
+    BareToolTextHoldback bare_text;
+    BareToolTextHoldback think_text;
+    ThinkWrapperBlanker think_blank;
+    std::string tool_buf;
+    bool has_tools = false;
+
+    template<class Names, class EmitThink, class Classify>
+    void settle_think(const Names& names, EmitThink&& emit_think, Classify&& classify,
+                      bool allow_repair = false) {
+        const std::string tail = think_blank.flush();
+        if (!tail.empty()) think_text.route(tail, names, emit_think, classify);
+        think_text.finish(allow_repair, names, emit_think, classify);
+        think_text.reset_context();
+    }
+    template<class Names, class EmitText, class Classify>
+    void settle_text(const Names& names, EmitText&& emit_text, Classify&& classify,
+                     bool allow_repair = false) {
+        bare_text.finish(allow_repair, names, emit_text, classify);
+        bare_text.reset_context();
+    }
+
+    // One splitter segment. emit_tool consumes tool_buf (a complete wrapped
+    // segment); classify is the bare-chain callback both holdbacks use.
+    template<class Names, class EmitText, class EmitThink, class EmitTool, class Classify>
+    void segment(StreamSplitter::Chan ch, const std::string& t, bool forced_control_token,
+                 const Names& names, EmitText&& emit_text, EmitThink&& emit_think,
+                 EmitTool&& emit_tool, Classify&& classify) {
+        if (ch == StreamSplitter::TOOL) {
+            if (tool_buf.empty()) {
+                settle_text(names, emit_text, classify);
+                settle_think(names, emit_think, classify);
+            }
+            tool_buf += t;
+            return;
+        }
+        if (!tool_buf.empty()) emit_tool();
+        if (t.empty()) return;
+        if (ch == StreamSplitter::THINK) {
+            settle_text(names, emit_text, classify);
+            if (has_tools) think_text.route(think_blank.feed(t), names, emit_think, classify);
+            else emit_think(t);
+            return;
+        }
+        // leaving reasoning: settle any held candidate as thinking before
+        // the channel changes
+        settle_think(names, emit_think, classify);
+        // Only decoder-injected close whitespace is parser control. Ordinary
+        // leading whitespace, including after a natural close, is content.
+        if (forced_control_token && strip_ws2(t).empty()) return;
+        if (has_tools) bare_text.route(t, names, emit_text, classify);
+        else emit_text(t);
+    }
+
+    // Generation end, after the splitter flush and the wrapped-tail handling.
+    // A turn that ended still inside <think> can hold a complete call; without
+    // this it is lost exactly as issue #38 reported.
+    template<class Names, class EmitText, class EmitThink, class Classify>
+    void finish(bool allow_repair, const Names& names, EmitText&& emit_text,
+                EmitThink&& emit_think, Classify&& classify) {
+        settle_think(names, emit_think, classify, allow_repair);
+        settle_text(names, emit_text, classify, allow_repair);
+    }
+};
+
 template<class EmitText,class EmitCall>
 inline size_t route_bare_tool_sequence(
     const std::string& source,const std::vector<ToolCall>& calls,
