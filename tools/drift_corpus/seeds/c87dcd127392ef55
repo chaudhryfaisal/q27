@@ -1,0 +1,9 @@
+<function=Write>
+<parameter=content>
+TEXT_1:big
+
+</parameter>
+<parameter=file_path>
+PATH_2
+</parameter>
+</function>

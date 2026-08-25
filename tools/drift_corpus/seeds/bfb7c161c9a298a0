@@ -1,0 +1,19 @@
+<function=Write>
+<parameter=file_path>
+PATH_1
+</parameter>
+<parameter=content>
+TEXT_2:ml `TEXT_3`TEXT_4:ml `TEXT_5` TEXT_6:ml`
+      TEXT_7:ml
+    `TEXT_8:ml
+        `TEXT_9:ml`TEXT_10:ml
+        `TEXT_11`TEXT_12:ml
+        `TEXT_13:ml`TEXT_14:ml`TEXT_15`TEXT_16:ml
+        `TEXT_17:ml`TEXT_18:ml
+        `TEXT_19`TEXT_20:ml
+        `TEXT_21`TEXT_22:ml
+        `TEXT_23:ml`TEXT_24:ml
+        `TEXT_25`TEXT_26:ml `TEXT_27`TEXT_28:ml
+
+</parameter>
+</function>

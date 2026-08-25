@@ -1,0 +1,14 @@
+<function=Edit>
+<parameter=replace_all>
+TEXT_1
+</parameter>
+<parameter=file_path>
+PATH_2
+</parameter>
+<parameter=new_string>
+CODE_3:ml
+</parameter>
+<parameter=old_string>
+CODE_4:ml
+</parameter>
+</function>

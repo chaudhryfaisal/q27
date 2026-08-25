@@ -1,0 +1,11 @@
+<function=Edit>
+<parameter=file_path>
+PATH_1
+</parameter>
+<parameter=new_string>
+CODE_2:ml `CODE_3`CODE_4:ml
+</parameter>
+<parameter=old_string>
+CODE_5:ml
+</parameter>
+</function>

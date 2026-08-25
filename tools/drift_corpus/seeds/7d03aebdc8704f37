@@ -1,0 +1,8 @@
+<function=TaskUpdate>
+<parameter=taskId>
+TEXT_1
+</parameter>
+<parameter=status>
+TEXT_2
+</parameter>
+</function>
