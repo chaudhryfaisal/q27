@@ -103,6 +103,7 @@ build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_ma
 # tools/fuzz_seeds (the shapes the model actually emits) is tracked.
 fuzz: build/fuzz_tool_parser
 	mkdir -p build/fuzz_corpus && cp -n tools/fuzz_seeds/* build/fuzz_corpus/ 2>/dev/null || true
+	cp -n tools/drift_corpus/seeds/* build/fuzz_corpus/ 2>/dev/null || true
 	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_tool_parser build/fuzz_corpus \
 	  -max_total_time=$${FUZZ_SECONDS:-300} -max_len=32768 -print_final_stats=1
 
