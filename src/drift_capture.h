@@ -491,18 +491,18 @@ inline void write_drift_record(const char* path, const std::string& text, const 
     static std::mutex mu;
     static bool warned = false;
     std::lock_guard<std::mutex> lock(mu);
+    auto fail = [&](const char* what) {
+        if (warned) return;
+        warned = true;
+        std::fprintf(stderr, "[drift-corpus] %s %s: %s (further failures not logged)\n",
+                     what, path, std::strerror(errno));
+    };
     FILE* f = std::fopen(path, "ab");
-    if (!f) {
-        if (!warned) {
-            warned = true;
-            std::fprintf(stderr, "[drift-corpus] cannot append to %s: %s (further failures not logged)\n",
-                         path, std::strerror(errno));
-        }
-        return;
-    }
-    std::fwrite(line.data(), 1, line.size(), f);
-    std::fputc('\n', f);
-    std::fclose(f);
+    if (!f) { fail("cannot open"); return; }
+    const bool ok = std::fwrite(line.data(), 1, line.size(), f) == line.size() &&
+                    std::fputc('\n', f) != EOF;
+    const bool closed = std::fclose(f) == 0;
+    if (!ok || !closed) fail("short write to");
 }
 
 }  // namespace q27

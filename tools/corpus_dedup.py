@@ -11,13 +11,21 @@ exemplar is kept per shape with a `count`, and two things are written:
     <out>/corpus.jsonl   one exemplar per shape, descending count, no `ts`
     <out>/seeds/<id>     the exemplar's redacted text, for `make fuzz`
 
+A shape's row keeps the FIRST exemplar's `redacted`, `tags` and `outcome`,
+and counts everything folded into it in `outcomes` and `tag_counts`: the
+key is the markup skeleton, so one shape can arrive from reasoning and from
+text, recovered one time and refused the next. Read the histograms, not the
+singular fields, when that matters.
+
 An existing <out>/corpus.jsonl is merged, so counts accumulate across capture
 sessions and a hand-written `shape` label survives the next fold. `ts` is
 dropped on purpose: a record's time of day is the one field that says
 something about the session rather than the model, and the corpus is public.
 
 A capture file is folded once: <out>/folded.json remembers the content hash of
-every file already counted, and a repeat is skipped (--force overrides).
+every file already counted, and a repeat is skipped (--force overrides). The
+hash is of the bytes, so two files with identical content are one capture by
+design -- a re-copied capture is the mistake this guards against.
 `count` is captures, not turns -- the streaming holdback can classify one
 candidate twice (deferred, then repaired), which shows up as two outcomes on
 one shape.
@@ -62,11 +70,14 @@ def fold(existing, records):
     for rec, _ in records:
         sid = rec["id"]
         outcome = rec.get("outcome", "")
+        tags = ",".join(rec.get("tags", []))
         if sid in table:
             ex = table[sid]
             ex["count"] = ex.get("count", 1) + 1
             ex.setdefault("outcomes", {})
             ex["outcomes"][outcome] = ex["outcomes"].get(outcome, 0) + 1
+            ex.setdefault("tag_counts", {})
+            ex["tag_counts"][tags] = ex["tag_counts"].get(tags, 0) + 1
             ex["bytes_max"] = max(ex.get("bytes_max", ex.get("bytes", 0)), rec.get("bytes", 0))
             continue
         new_ids.add(sid)
@@ -76,6 +87,7 @@ def fold(existing, records):
             "tags": rec.get("tags", []),
             "outcome": outcome,
             "outcomes": {outcome: 1},
+            "tag_counts": {tags: 1},
             "redacted": rec["redacted"],
             "bytes": rec.get("bytes", 0),
             "bytes_max": rec.get("bytes", 0),
