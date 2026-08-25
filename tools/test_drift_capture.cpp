@@ -147,6 +147,18 @@ static void test_shape_hash_ignores_values_not_structure() {
     // in tomorrow's corpus_dedup.py as in today's capture
     CHECK(q27::shape_hash("") == 0xcbf29ce484222325ull);           // FNV-1a offset basis
     CHECK(q27::shape_hash("a") == 0xaf63dc4c8601ec8cull);          // FNV-1a("a")
+    // the key is the skeleton: size class and prose line count are not shape
+    CHECK(q27::shape_key("<parameter=content>\nTEXT_1:big\n</parameter>") ==
+          "<parameter=content>\nTEXT\n</parameter>");
+    CHECK(q27::shape_hash("PROSE_1:ml\n<tool_call>") == q27::shape_hash("PROSE_1\n<tool_call>"));
+    CHECK(q27::shape_hash("TEXT_1:big") == q27::shape_hash("TEXT_1"));
+    CHECK(q27::shape_hash("PATH_1 PATH_2") == q27::shape_hash("PATH_1 PATH_9"));
+    // but a raw newline inside a value is (mode 5 / 11)
+    CHECK(q27::shape_hash("{\"content\":\"TEXT_1:ml\"}") != q27::shape_hash("{\"content\":\"TEXT_1\"}"));
+    // and a preamble is (prefix handling)
+    CHECK(q27::shape_hash("PROSE_1\n<tool_call>") != q27::shape_hash("<tool_call>"));
+    // an ordinary identifier that merely looks like a placeholder is untouched
+    CHECK(q27::shape_key("\"MY_KEY_2\"") == "\"MY_KEY_2\"");
 }
 
 static std::string hex16(uint64_t h) {
@@ -176,6 +188,9 @@ static void test_record_format() {
     json j2 = json::parse(q27::format_drift_record(
         R"({"name":"Read","arguments":{"file_path":"/a"}})", "unrescued", ctx, nullptr, 0));
     CHECK(j2["tags"] == json::array({"json", "no_wrapper", "in_think"}));
+    // pretty-printed JSON is still json
+    CHECK(q27::drift_tags("{ \"name\" : \"Read\" }", q27::DriftContext{}) == std::vector<std::string>({"json", "no_wrapper"}));
+    CHECK(q27::drift_tags("the word name: here", q27::DriftContext{}) == std::vector<std::string>({"no_wrapper"}));
 
     // a TOOL-segment body reaches the parser with its wrapper already stripped
     // by the splitter; the caller says so and it must not read as no_wrapper

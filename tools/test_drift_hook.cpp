@@ -160,9 +160,36 @@ static void test_residue_below_the_warning_bar_is_still_captured() {
     if (recs.empty()) return;
     CHECK(recs[0]["outcome"] == "unrescued");
     CHECK(no_secret(recs));
-    // but plain prose is not a record
+    // but plain prose is not a record, even quoting a tool name
     auto none = capture({{q27::StreamSplitter::TEXT, "Just a sentence about /secret/i and nothing else."}});
     CHECK(none.empty());
+    auto quoted = capture({{q27::StreamSplitter::TEXT, "I will Read\" the file and Bash\", then stop."}});
+    CHECK(quoted.empty());
+}
+
+static void test_strict_miss_hint_is_one_shot() {
+    // a wrapped body that fails the strict parser tags the NEXT bare parse of
+    // the same bytes as wrapped (the streaming handlers' order), and only that
+    // one: an unrelated turn later must not inherit it
+    remove(kPath);
+    setenv("Q27_DRIFT_CORPUS", kPath, 1);
+    // the wrapped mode-10 shape: strict JSON fails, the bare chain recovers
+    const std::string body = "Read\", \"file_path\": \"/secret/k\"}";
+    CHECK(!q27::parse_tool_call(body).ok);
+    json t = tools();
+    std::string pre;
+    q27::parse_bare_tool_calls(body, &pre, &t);                 // the handler's next step
+    q27::parse_bare_tool_calls(body, &pre, &t);                 // a later, unrelated turn
+    unsetenv("Q27_DRIFT_CORPUS");
+    std::vector<json> recs;
+    std::ifstream f(kPath);
+    for (std::string line; std::getline(f, line);) if (!line.empty()) recs.push_back(json::parse(line));
+    remove(kPath);
+    CHECK(recs.size() == 2);
+    if (recs.size() != 2) return;
+    CHECK(!has_tag(recs[0], "no_wrapper"));
+    CHECK(has_tag(recs[1], "no_wrapper"));
+    CHECK(no_secret(recs));
 }
 
 static void test_batch_records_once_per_turn() {
@@ -202,6 +229,7 @@ int main(int argc, char** argv) {
     test_undeclared_name_is_redacted();
     test_reentrant_modes_record_once();
     test_residue_below_the_warning_bar_is_still_captured();
+    test_strict_miss_hint_is_one_shot();
     test_batch_records_once_per_turn();
     test_unset_writes_nothing_and_parses_the_same();
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }

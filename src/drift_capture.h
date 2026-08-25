@@ -40,6 +40,7 @@
 #pragma once
 
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -368,12 +369,50 @@ inline std::string redact_drift(const std::string& in, const DriftNames* names =
     return drift_detail::Redactor(in, names)();
 }
 
-// Dedup key for the corpus: FNV-1a over the redacted text. Values are already
-// placeholders, so two turns with the same markup skeleton hash alike and a
-// dropped closer does not. A hash, not a security primitive.
+// The markup skeleton a record is deduplicated by: the redacted text with
+// placeholder indices dropped (PATH_3 -> PATH), `:big` dropped (size is not
+// structure) and `:ml` kept only on value placeholders, where a raw newline
+// inside a JSON string is the mode-5/11 signature -- a multi-line prose run
+// is not a shape. Whitespace between tokens stays: the XML dialect is
+// newline-delimited and the parser treats those bytes as structure.
+inline std::string shape_key(const std::string& redacted) {
+    static const char* const kTypes[] = {"PATH", "CODE", "TEXT", "PROSE", "NAME"};
+    std::string key;
+    key.reserve(redacted.size());
+    size_t i = 0;
+    while (i < redacted.size()) {
+        bool matched = false;
+        for (const char* t : kTypes) {
+            const size_t n = std::strlen(t);
+            if (redacted.compare(i, n, t) != 0 || i + n >= redacted.size() || redacted[i + n] != '_')
+                continue;
+            size_t j = i + n + 1;
+            if (j >= redacted.size() || !std::isdigit((unsigned char)redacted[j])) continue;
+            while (j < redacted.size() && std::isdigit((unsigned char)redacted[j])) j++;
+            key += t;
+            if (redacted.compare(j, 3, ":ml") == 0) {
+                if (std::strcmp(t, "PROSE") != 0) key += ":ml";
+                j += 3;
+            } else if (redacted.compare(j, 4, ":big") == 0) {
+                j += 4;
+            }
+            i = j;
+            matched = true;
+            break;
+        }
+        if (!matched) key += redacted[i++];
+    }
+    return key;
+}
+
+// Dedup key for the corpus: FNV-1a over shape_key(redacted). Two turns with
+// the same markup skeleton hash alike and a dropped closer does not. A hash,
+// not a security primitive; a 64-bit collision would merge two shapes'
+// counts, which the exemplar's text would make visible.
 inline uint64_t shape_hash(const std::string& redacted) {
+    const std::string key = shape_key(redacted);
     uint64_t h = 0xcbf29ce484222325ull;
-    for (unsigned char c : redacted) { h ^= c; h *= 0x100000001b3ull; }
+    for (unsigned char c : key) { h ^= c; h *= 0x100000001b3ull; }
     return h;
 }
 
@@ -383,14 +422,25 @@ struct DriftContext {
     bool in_think = false;  // the bytes came from the reasoning channel
 };
 
+// `"key"` followed by optional whitespace and ':' -- a JSON key in any
+// formatting the model uses, compact or pretty-printed.
+inline bool has_json_key(const std::string& text, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        size_t p = at + needle.size();
+        while (p < text.size() && drift_detail::is_ws(text[p])) p++;
+        if (p < text.size() && text[p] == ':') return true;
+    }
+    return false;
+}
+
 // Cheap lexical labels for the histogram; not a parse.
 inline std::vector<std::string> drift_tags(const std::string& text, const DriftContext& ctx) {
     std::vector<std::string> tags;
     if (text.find("<function=") != std::string::npos || text.find("<parameter=") != std::string::npos ||
         text.find("<tool_name>") != std::string::npos)
         tags.push_back("xml");
-    if (text.find("{\"name\"") != std::string::npos || text.find("{\"tool_call\"") != std::string::npos ||
-        text.find("\"arguments\"") != std::string::npos)
+    if (has_json_key(text, "name") || has_json_key(text, "tool_call") || has_json_key(text, "arguments"))
         tags.push_back("json");
     if (!ctx.wrapped && text.find("<tool_call>") == std::string::npos) tags.push_back("no_wrapper");
     if (ctx.in_think) tags.push_back("in_think");
@@ -422,24 +472,37 @@ inline std::string format_drift_record(const std::string& text, const std::strin
         {"bytes", text.size()},
         {"ts", when},
     };
-    // replace, not throw: a kept token is ASCII by construction, but the
-    // request handler must never die on a capture-side surprise
+    // `replace` rewrites only INVALID UTF-8 sequences (valid multi-byte text
+    // is serialised as-is); the redacted field is ASCII by construction
+    // anyway. The point is that the request handler never dies on a
+    // capture-side surprise.
     return rec.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 // Append one record to the Q27_DRIFT_CORPUS file. Serialised: server threads
-// capture concurrently and a torn line is an unreadable corpus.
+// capture concurrently and a torn line is an unreadable corpus. (A static
+// local in an inline function is one object program-wide, per
+// [dcl.inline]; this is not per-TU.) An unwritable path is reported once --
+// the corpus is this phase's output, so silence would be the worse failure.
 inline void write_drift_record(const char* path, const std::string& text, const std::string& outcome,
                                const DriftContext& ctx, const DriftNames* names) {
     if (!path || !*path || text.empty()) return;
     const std::string line = format_drift_record(text, outcome, ctx, names, std::time(nullptr));
     static std::mutex mu;
+    static bool warned = false;
     std::lock_guard<std::mutex> lock(mu);
-    if (FILE* f = std::fopen(path, "ab")) {
-        std::fwrite(line.data(), 1, line.size(), f);
-        std::fputc('\n', f);
-        std::fclose(f);
+    FILE* f = std::fopen(path, "ab");
+    if (!f) {
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[drift-corpus] cannot append to %s: %s (further failures not logged)\n",
+                         path, std::strerror(errno));
+        }
+        return;
     }
+    std::fwrite(line.data(), 1, line.size(), f);
+    std::fputc('\n', f);
+    std::fclose(f);
 }
 
 }  // namespace q27

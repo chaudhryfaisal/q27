@@ -16,10 +16,17 @@ sessions and a hand-written `shape` label survives the next fold. `ts` is
 dropped on purpose: a record's time of day is the one field that says
 something about the session rather than the model, and the corpus is public.
 
+A capture file is folded once: <out>/folded.json remembers the content hash of
+every file already counted, and a repeat is skipped (--force overrides).
+`count` is captures, not turns -- the streaming holdback can classify one
+candidate twice (deferred, then repaired), which shows up as two outcomes on
+one shape.
+
 Prints the shape histogram. Read it before touching the parser: it is the
 first look at what the model actually emits, weighted by how often.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -106,7 +113,14 @@ def main(argv=None):
     ap.add_argument("captures", nargs="+", help="JSONL file(s) written by Q27_DRIFT_CORPUS")
     ap.add_argument("--out", default="tools/drift_corpus", help="corpus directory (default: tools/drift_corpus)")
     ap.add_argument("--dry-run", action="store_true", help="print the histogram, write nothing")
+    ap.add_argument("--force", action="store_true", help="fold a capture file even if it was folded before")
     args = ap.parse_args(argv)
+
+    ledger_path = os.path.join(args.out, "folded.json")
+    ledger = {}
+    if os.path.exists(ledger_path):
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            ledger = json.load(f)
 
     existing = []
     corpus_path = os.path.join(args.out, "corpus.jsonl")
@@ -115,7 +129,15 @@ def main(argv=None):
 
     total = 0
     records = []
+    folded_now = {}
     for path in args.captures:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        if digest in ledger and not args.force:
+            print(f"skipping {path}: already folded as {ledger[digest]} (use --force to count it again)",
+                  file=sys.stderr)
+            continue
+        folded_now[digest] = os.path.basename(path)
         for item in load_records(path):
             records.append(item)
             total += 1
@@ -138,6 +160,9 @@ def main(argv=None):
     if args.dry_run:
         return 0
     written = write_corpus(args.out, rows)
+    ledger.update(folded_now)
+    with open(ledger_path, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=1, sort_keys=True)
     print(f"wrote {written} and {len(rows)} seed(s) under {os.path.join(args.out, 'seeds')}")
     return 0
 

@@ -2977,8 +2977,11 @@ inline thread_local int drift_parse_depth = 0;
 inline thread_local DriftContext drift_ctx;
 inline thread_local const json* drift_tools = nullptr;
 // The streaming handlers hand a wrapped body that failed the strict parser to
-// the bare chain as the same bytes (server.cu emit_tool). Remembering the last
-// miss lets that record say `wrapped` without server.cu having to say so.
+// the bare chain as the same bytes (server.cu emit_tool: parse_tool_call on
+// strip_ws2(tool_buf), then classify_bare on c.raw, which IS that string).
+// Remembering the miss lets that record say `wrapped` without server.cu
+// having to say so. One-shot: the next top-level bare parse on the thread
+// consumes it whether or not the bytes match, so it cannot go stale.
 inline thread_local std::string drift_last_strict_miss;
 // Which recovery produced the result: a mode number, "native", "xmlclose",
 // or the final block's mode flags. Set by the impl at each success site,
@@ -3009,6 +3012,20 @@ inline const char* drift_corpus_path() {
     return (p && *p) ? p : nullptr;
 }
 
+// Both tool-list shapes the server hands the parser (OpenAI function
+// entries and bare Anthropic entries).
+inline void declared_tool_names(const json* tools, DriftNames& names) {
+    if (!tools || !tools->is_array()) return;
+    for (const auto& t : *tools) {
+        if (!t.is_object()) continue;
+        if (t.contains("function") && t["function"].is_object() &&
+            t["function"].contains("name") && t["function"]["name"].is_string())
+            names.insert(t["function"]["name"].get<std::string>());
+        else if (t.contains("name") && t["name"].is_string())
+            names.insert(t["name"].get<std::string>());
+    }
+}
+
 // Wider than looks_like_intended_tool_call on purpose. That predicate gates a
 // WARNING, so it demands a closer the model never opened; the corpus wants
 // every turn carrying dialect residue, because a dropped-opener turn that
@@ -3021,41 +3038,49 @@ inline bool drift_bearing(const std::string& text, const json* tools) {
                                          "<parameter=", "</parameter>", "<tool_name>"};
     for (const char* m : kMarks)
         if (text.find(m) != std::string::npos) return true;
-    // the mode-10 signature: a declared tool name with the string's closing
-    // quote still attached (`Read", "file_path": ...`)
-    if (tools && tools->is_array()) {
-        for (const auto& t : *tools) {
-            std::string name;
-            if (t.is_object() && t.contains("function") && t["function"].is_object() &&
-                t["function"].contains("name") && t["function"]["name"].is_string())
-                name = t["function"]["name"].get<std::string>();
-            else if (t.is_object() && t.contains("name") && t["name"].is_string())
-                name = t["name"].get<std::string>();
-            if (!name.empty() && text.find(name + "\"") != std::string::npos) return true;
+    // the mode-10 signature: a declared tool name at the start of a line with
+    // the string's closing quote and the comma still attached
+    // (`Read", "file_path": ...`). Anchored to the line start, so a name
+    // quoted in prose (`I will Read" the file and Bash", then`) is not one.
+    DriftNames names;
+    declared_tool_names(tools, names);
+    for (const auto& name : names) {
+        const std::string needle = name + "\"";
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+            if (at != 0 && text[at - 1] != '\n') continue;
+            size_t p = at + needle.size();
+            while (p < text.size() && text[p] == ' ') p++;
+            if (p < text.size() && text[p] == ',') return true;
         }
     }
     return false;
 }
 
+// A tool name survives redaction only when declared. The strict parser is
+// called from the streaming handlers without the request's tool list, so
+// every declared set that does pass through here is remembered
+// process-wide and used as the fallback: a name is kept only if SOME request
+// this process served declared it. Before the first such request, names are
+// placeholders -- the safe direction. Bounded so a hostile client cannot grow
+// it without limit.
 inline void capture_drift(const std::string& text, const std::string& outcome,
                           const json* tools) {
     const char* path = drift_corpus_path();
     if (!path) return;
     if (!tools) tools = drift_tools;
+    static std::mutex reg_mu;
+    static DriftNames registry;
     DriftNames names;
-    if (tools && tools->is_array()) {
-        for (const auto& t : *tools) {
-            if (!t.is_object()) continue;
-            if (t.contains("function") && t["function"].is_object() &&
-                t["function"].contains("name") && t["function"]["name"].is_string())
-                names.insert(t["function"]["name"].get<std::string>());
-            else if (t.contains("name") && t["name"].is_string())
-                names.insert(t["name"].get<std::string>());
+    declared_tool_names(tools, names);
+    {
+        std::lock_guard<std::mutex> lock(reg_mu);
+        if (tools) {
+            if (registry.size() + names.size() <= 4096) registry.insert(names.begin(), names.end());
+        } else {
+            names = registry;
         }
     }
-    DriftContext ctx = drift_ctx;
-    if (!drift_last_strict_miss.empty() && drift_last_strict_miss == text) ctx.wrapped = true;
-    write_drift_record(path, text, outcome, ctx, tools ? &names : nullptr);
+    write_drift_record(path, text, outcome, drift_ctx, &names);
     drift_records_written++;
 }
 
@@ -5714,8 +5739,18 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
 // unrescued (dialect residue, nothing recovered -- drift_bearing is wider than
 // the UN-RESCUED warning's bar on purpose; that bar is unchanged). Depth 1
 // only: the mode-10 probe and the dialect retry re-enter through this same
-// wrapper and are not turns. With Q27_DRIFT_CORPUS unset this is the old
-// function with one extra integer increment.
+// wrapper and are not turns; an inner call's hint is always overwritten by
+// the outer call's own success site, so the hint names the outer mode.
+// Nothing may call parse_bare_tool_calls_impl directly. With
+// Q27_DRIFT_CORPUS unset this is the old function with one extra integer
+// increment.
+//
+// Records are per top-level parse, which is per turn on the non-stream
+// TEXT/TOOL path. The holdbacks (reasoning here, streaming in server.cu)
+// classify per candidate, and re-classify a deferred candidate at finish
+// with repair enabled, so one candidate can yield `unrescued` and then
+// `recovered:*`. corpus_dedup.py folds those into one shape with both
+// outcomes counted; `count` there is captures, not turns.
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools,
@@ -5723,7 +5758,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    bool allow_eof_repair,
                                                    std::string* remaining_text) {
     DriftParseScope drift_scope;
-    if (drift_parse_depth == 1) drift_mode_hint.clear();
+    bool from_strict_miss = false;
+    if (drift_parse_depth == 1) {
+        drift_mode_hint.clear();
+        from_strict_miss = !drift_last_strict_miss.empty() && drift_last_strict_miss == text_in;
+        drift_last_strict_miss.clear();
+    }
+    DriftCtxScope drift_miss(from_strict_miss, false, nullptr);
     auto out = parse_bare_tool_calls_impl(text_in, prefix, tools, allow_o10,
                                           allow_eof_repair, remaining_text);
     if (drift_parse_depth == 1 && drift_corpus_path()) {
