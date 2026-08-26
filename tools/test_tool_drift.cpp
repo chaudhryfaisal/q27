@@ -2018,6 +2018,71 @@ static void test_parameter_name_opener() {
     }
 }
 
+// A BATCH THAT MIXES OPENER SPELLINGS (2026-08-25, drift corpus 03a8a851,
+// b645b48f, a29175c3): a planning turn emits several calls and drifts
+// mid-batch, so the first opens `<function=NAME>` and a later one opens
+// `<parameter=NAME>` (mode 22's parameter-as-opener), or vice versa. The
+// native batch scanner recovered only the run it started with and handed the
+// rest to the client as prose. It now opens on either spelling, so one batch
+// mixes them -- mode 22 folded into the same scan rather than a separate pass
+// that only fires when the native one found nothing.
+static void test_batch_mixed_opener_spellings() {
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Bash", {{"command", true}, {"description", false}}),
+                              tool("TaskUpdate", {{"status", false}, {"taskId", true}})});
+    auto names = [](const std::vector<q27::ToolCall>& v) {
+        std::string s;
+        for (auto& c : v) { s += c.name; s += ' '; }
+        return s;
+    };
+    std::string pre, remaining;
+    // <function=> first, then two <parameter=NAME> continuations (03a8a851)
+    {
+        const std::string t =
+            "<function=TaskUpdate>\n<parameter=status>\ndone\n</parameter>\n<parameter=taskId>\nt1\n</parameter>\n</function>\n"
+            "<parameter=TaskUpdate>\n<parameter=status>\ndone\n</parameter>\n<parameter=taskId>\nt2\n</parameter>\n</function>\n"
+            "<parameter=TaskUpdate>\n<parameter=status>\ndone\n</parameter>\n<parameter=taskId>\nt3\n</parameter>\n</function>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 3 && names(v) == "TaskUpdate TaskUpdate TaskUpdate " &&
+               v[2].arguments.value("taskId", std::string()) == "t3",
+           "mixed openers: <function=> then two <parameter=> continuations -> 3 calls");
+        ok(q27::strip_ws2(remaining).empty(), "mixed openers: nothing left as text");
+    }
+    // two <function=> calls separated by <tool_call>, then a <parameter=> one (b645b48f)
+    {
+        const std::string t =
+            "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n<tool_call>\n"
+            "<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n</function>\n"
+            "<parameter=Read>\n<parameter=file_path>\n/c\n</parameter>\n</function>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 3 && v[0].arguments.value("file_path", std::string()) == "/a" &&
+               v[2].arguments.value("file_path", std::string()) == "/c",
+           "mixed openers: <function=> x2 then <parameter=> -> 3 calls, generation order");
+        ok(q27::strip_ws2(remaining).empty(), "mixed openers: b645b48f leaves no text");
+    }
+    // <parameter=> first, then a <function=> one -- the scanner must not need
+    // to start on <function=
+    {
+        const std::string t =
+            "<parameter=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
+            "<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 2 && names(v) == "Read Bash ",
+           "mixed openers: <parameter=> then <function=> -> both, in order");
+    }
+    // an UNDECLARED <parameter=NAME> is not an opener -- it is an ordinary
+    // parameter, and must not start a spurious call or break the batch
+    {
+        const std::string t =
+            "<function=Bash>\n<parameter=command>\nls\n</parameter>\n"
+            "<parameter=unknownkey>\nvalue\n</parameter>\n</function>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 1 && v[0].name == "Bash" &&
+               v[0].arguments.value("unknownkey", std::string()) == "value",
+           "mixed openers: an undeclared <parameter=> stays an ordinary parameter");
+    }
+}
+
 // AN ABORTED SECOND CALL (2026-08-25, drift corpus 831ac625): the model
 // closes a call, opens another with the mode-22 spelling, and stops --
 //
@@ -2470,6 +2535,7 @@ int main() {
     test_value_containing_closer();
     test_last_parameter_garbled_tail();
     test_aborted_second_call();
+    test_batch_mixed_opener_spellings();
     test_parameter_name_opener();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();

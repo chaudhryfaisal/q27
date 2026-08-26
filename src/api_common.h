@@ -5111,12 +5111,42 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
             // (`<name>`, `<parameter_name>`) counts only when the name it
             // carries is declared: `<name>` is ordinary prose often enough
             // that an undeclared one must not start -- and break -- a batch.
-            auto next_opener = [&](size_t from) -> size_t {
+            // An opener in the batch, in ANY of its spellings. mode22_name is
+            // set (and mode22_params points at the first real parameter) when
+            // the opener is the mode-22 `<parameter=NAME>` spelling: a call
+            // whose name wears a parameter tag. Reporting it here rather than
+            // in the separate mode-22 pass lets ONE batch mix the spellings --
+            // `<function=X>` then `<parameter=Y>`, the shape a planning turn
+            // emits when it drifts mid-batch (drift corpus 03a8a851, b645b48f).
+            std::string mode22_name;
+            size_t mode22_params = std::string::npos;
+            auto next_opener = [&](size_t from, std::string* m22_name = nullptr,
+                                   size_t* m22_params = nullptr) -> size_t {
+                if (m22_name) m22_name->clear();
+                if (m22_params) *m22_params = std::string::npos;
                 for (size_t c = text_in.find('<', from); c != std::string::npos;
                      c = text_in.find('<', c + 1)) {
                     std::string nm_probe;
                     size_t after_probe;
                     if (parse_function_opener(text_in, c, nm_probe, after_probe)) return c;
+                    // mode-22 opener: `<parameter=NAME>` (declared) whose next
+                    // non-space byte opens the first REAL parameter -- mode 22's
+                    // own gate, so an ordinary `<parameter=key>` value is not
+                    // mistaken for a call opener.
+                    {
+                        std::string pn;
+                        size_t pgt = 0;
+                        if (find_parameter_opener(text_in, c, &pn, &pgt) == c) {
+                            const size_t nxt = find_parameter_opener(text_in, pgt);
+                            std::string canon = declared(pn) ? pn : canonical_declared_name(tools, pn);
+                            if (!canon.empty() && nxt != std::string::npos &&
+                                text_in.find_first_not_of(" \t\r\n", pgt) == nxt) {
+                                if (m22_name) *m22_name = canon;
+                                if (m22_params) *m22_params = nxt;
+                                return c;
+                            }
+                        }
+                    }
                     const size_t nl = bare_native_opener_len_at(text_in, c);
                     if (!nl || text_in.compare(c, 10, "<function=") == 0) continue;
                     size_t q = text_in.find_first_not_of(" \t\r\n", c + nl);
@@ -5131,15 +5161,20 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                 return std::string::npos;
             };
             for (;;) {
-                size_t fb = next_opener(cur);
+                size_t fb = next_opener(cur, &mode22_name, &mode22_params);
                 if (fb == std::string::npos) break;
-                std::string span = text_in.substr(fb);
+                const bool synth = !mode22_name.empty();
+                // For a mode-22 opener the call body starts at the first real
+                // parameter; for every other spelling the span is the opener
+                // and what follows, exactly as before.
+                std::string span = text_in.substr(synth ? mode22_params : fb);
+                const size_t body_at = synth ? mode22_params : fb;
                 size_t fe = native_function_closer(span);
                 if (fe == std::string::npos) fe = span.find("</function>");
                 size_t span_end = text_in.size();
                 if (fe != std::string::npos) {
                     span = span.substr(0, fe + 11);
-                    span_end = fb + fe + 11;
+                    span_end = body_at + fe + 11;
                 } else {
                     // No </function> at all. Running to end-of-text sweeps the
                     // NEXT call's parameters into this one, and
@@ -5150,7 +5185,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     // span at the next call boundary keeps that refusal
                     // meaningful: the boundary is what distinguishes "the model
                     // started another call" from "the model mangled this one".
-                    size_t nb = next_opener(fb + 1);
+                    size_t nb = next_opener(std::max(fb, body_at) + 1);
                     // BOTH markers bound the call. `</tool_call>` is the one
                     // that matters: a batch separated by `</tool_call>\n<tool_call>`
                     // ends each call at the CLOSER, and searching only for the
@@ -5161,10 +5196,15 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         if (p != std::string::npos && (nb == std::string::npos || p < nb)) nb = p;
                     }
                     if (nb != std::string::npos) {
-                        span = text_in.substr(fb, nb - fb);
+                        span = text_in.substr(body_at, nb - body_at);
                         span_end = nb;
                     }
                 }
+                // A mode-22 span carries no `<function=NAME>` head -- it starts
+                // at the first parameter. Synthesize the head so the one parser
+                // reads it, exactly as the standalone mode-22 pass does; the
+                // source span still points at the original `<parameter=NAME>`.
+                if (synth) span = "<function=" + mode22_name + ">\n" + span;
                 // Hallucinated-result rule (2026-08-21): a <result>/<output>
                 // element enclosing this span -- or inside it -- means the
                 // "call" is part of invented result output. Break the batch
@@ -5178,7 +5218,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                 // rest. An unparseable FIRST span leaves the batch empty and
                 // falls through to the modes below exactly as before.
                 if (!parse_native_xml_call(span, tc)) break;
-                if (!declared(tc.name)) {
+                if (synth) tc.name = mode22_name;   // declared by construction
+                else if (!declared(tc.name)) {
                     // `<function name="NAME>` -- the quote opens and never
                     // closes before '>', so the name arrives as `"NAME`. Strip
                     // an unmatched quote ONLY when what remains names a
