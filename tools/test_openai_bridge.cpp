@@ -2943,6 +2943,30 @@ static void test_dialect_residue_is_not_text() {
     CHECK(res.text.find("<tool_call>") == std::string::npos);
 }
 
+// The `{"tool_call":`-wrapped JSON batch (drift corpus ea9ead21): the model
+// opens the batch with the mode-4 head and never closes its brace, so the
+// whole thing was one malformed blob and only the last call survived. The
+// xmlclose retry now blanks the head, and both calls recover with nothing
+// left as text.
+static void test_tool_call_wrapped_json_batch() {
+    const json tools = stream_tools();
+    std::string pre, remaining;
+    const std::string batch =
+        "{\"tool_call\":\n{\"name\": \"read\", \"arguments\": {\"path\":\"/a\"}}\n</tool_call>\n"
+        "{\"name\": \"read\", \"arguments\": {\"path\":\"/b\"}}\n</tool_call>";
+    auto v = q27::parse_bare_tool_calls(batch, &pre, &tools, true, true, &remaining);
+    CHECK(v.size() == 2);
+    if (v.size() == 2) {
+        CHECK(v[0].arguments.value("path", std::string()) == "/a");
+        CHECK(v[1].arguments.value("path", std::string()) == "/b");
+    }
+    CHECK(q27::strip_ws2(remaining).empty());   // the head is residue, not text
+    // a `{"tool_call":` whose value is a STRING is not this shape and must not
+    // be mangled into a call
+    auto none = q27::parse_bare_tool_calls("{\"tool_call\": \"see the docs\"}", &pre, &tools, true, true, &remaining);
+    CHECK(none.empty());
+}
+
 // The streaming holdback arms on every bare opener spelling the parser
 // accepts, not just `<function=` (pylint-6903 emitted `<parameter_name>`;
 // mode 18 is `<name>`). Both were parser-recognised for weeks while the
@@ -3030,6 +3054,7 @@ int main() {
     test_stream_router_without_tools_passes_reasoning_through();
     test_think_wrapper_blanker_straddles_chunks();
     test_recover_calls_from_reasoning();
+    test_tool_call_wrapped_json_batch();
     test_stream_router_arms_on_every_opener_spelling();
     test_dialect_residue_is_not_text();
     test_tools_passthrough();

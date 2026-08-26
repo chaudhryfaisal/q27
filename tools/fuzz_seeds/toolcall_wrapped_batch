@@ -1,0 +1,5 @@
+{"tool_call":
+{"name": "Read", "arguments": {"file_path":"/a"}}
+</tool_call>
+{"name": "Read", "arguments": {"file_path":"/b"}}
+</tool_call>

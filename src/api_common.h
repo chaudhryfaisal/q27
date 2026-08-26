@@ -3594,6 +3594,15 @@ inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t en
             if (q == end || s[q] == '<') return n;
         }
     }
+    // the `{"tool_call":` JSON-keyed opener head, when it wraps an object: the
+    // xmlclose retry blanks it to make the batch parse, and it is residue in
+    // front of the first recovered call, not text (drift corpus ea9ead21)
+    if (s.compare(i, 13, "{\"tool_call\":") == 0) {
+        // the wrapped object can begin exactly at `end` (it IS the call being
+        // absorbed), so check the full string, not [i,end)
+        const size_t q = s.find_first_not_of(" \t\r\n", i + 13);
+        if (q != std::string::npos && q < s.size() && s[q] == '{') return 13;
+    }
     for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
                            "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>"}) {
         const size_t n = strlen(tk);
@@ -4591,6 +4600,24 @@ inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
             continue;
         }
         if (c == '"') { in_str = true; continue; }
+        // A `{"tool_call":` JSON-keyed opener (drift mode 4) whose value is an
+        // OBJECT, so `{"tool_call":\n{"name":...}}\n</tool_call>\n{"name":...}`
+        // -- the model wraps the first call of a batch in the opener and never
+        // closes its brace, which leaves the whole batch one malformed blob and
+        // the main scan recovered only the last call (drift corpus ea9ead21).
+        // Blanking the head (its brace included) makes the inner objects
+        // top-level, and the JSON batch scan reads them all. Only here, in the
+        // last-resort retry, so a well-formed single mode-4 call -- handled
+        // upstream -- never reaches it.
+        if (c == '{' && out.compare(i, 13, "{\"tool_call\":") == 0) {
+            const size_t q = out.find_first_not_of(" \t\r\n", i + 13);
+            if (q != std::string::npos && out[q] == '{') {
+                for (size_t k = 0; k < 13; k++) { out[i + k] = ' '; blanked[i + k] = true; }
+                i += 12;
+                blanked_end = i + 1;
+                continue;
+            }
+        }
         if (c != '<') continue;
         bool hit = false;
         for (const char* t : kClosers) {
