@@ -5113,6 +5113,22 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     t["function"].value("name", std::string()) == nm) return true;
             return false;
         };
+        // A declared tool whose schema lists NO required parameters -- so a
+        // zero-argument call is schema-valid. Used to tell a real zero-arg
+        // mode-22 call (`<parameter=memex_recall>\n</function>`, issue #38)
+        // from an aborted one (`<parameter=TaskUpdate>\n</function>`, where
+        // taskId is required and a zero-arg call would be refused by the
+        // client): the first fires, the second stays residue.
+        auto no_required_params = [&](const std::string& nm) {
+            for (const auto& t : *tools) {
+                if (!t.contains("function") ||
+                    t["function"].value("name", std::string()) != nm) continue;
+                const json params = t["function"].value("parameters", json::object());
+                const json req = params.value("required", json::array());
+                return !req.is_array() || req.empty();
+            }
+            return false;
+        };
         // (a) a bare opener with no <tool_call> wrapper, in ANY of its
         // spellings. One scan for "<function" and let parse_function_opener
         // decide -- before the consolidation this was two searches that between
@@ -5166,10 +5182,24 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         if (find_parameter_opener(text_in, c, &pn, &pgt) == c) {
                             const size_t nxt = find_parameter_opener(text_in, pgt);
                             std::string canon = declared(pn) ? pn : canonical_declared_name(tools, pn);
-                            if (!canon.empty() && nxt != std::string::npos &&
-                                text_in.find_first_not_of(" \t\r\n", pgt) == nxt) {
+                            const size_t nb = text_in.find_first_not_of(" \t\r\n", pgt);
+                            if (!canon.empty() && nxt != std::string::npos && nb == nxt) {
                                 if (m22_name) *m22_name = canon;
-                                if (m22_params) *m22_params = nxt;
+                                if (m22_params) *m22_params = nxt;   // a real parameter follows
+                                return c;
+                            }
+                            // Zero-argument mode-22 call: the opener is followed
+                            // by `</function>` (no parameter), and the tool takes
+                            // no required args (issue #38, memex_recall). The
+                            // aborted-call case -- a required-args tool opened and
+                            // left empty -- has parameters missing and stays
+                            // residue. m22_params points at the `</function>`, so
+                            // the synthesized span is `<function=NAME>\n</function>`.
+                            if (!canon.empty() && nb != std::string::npos &&
+                                text_in.compare(nb, 11, "</function>") == 0 &&
+                                no_required_params(canon)) {
+                                if (m22_name) *m22_name = canon;
+                                if (m22_params) *m22_params = nb;
                                 return c;
                             }
                         }
@@ -5191,6 +5221,25 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                 size_t fb = next_opener(cur, &mode22_name, &mode22_params);
                 if (fb == std::string::npos) break;
                 const bool synth = !mode22_name.empty();
+                // A zero-argument mode-22 call (issue #38): mode22_params points
+                // AT its `</function>`, so the call ends right there. Build the
+                // span directly -- searching for the closer would run past this
+                // call's `</function>` to the NEXT call's and sweep its
+                // parameters in.
+                const bool synth_zero_arg =
+                    synth && text_in.compare(mode22_params, 11, "</function>") == 0;
+                if (synth_zero_arg) {
+                    ToolCall tc;
+                    if (!parse_native_xml_call("<function=" + mode22_name + ">\n</function>", tc)) break;
+                    tc.name = mode22_name;
+                    tc.source_begin = fb;
+                    tc.source_end = mode22_params + 11;
+                    if (first_begin == std::string::npos) first_begin = fb;
+                    cur = tc.source_end;
+                    batch.push_back(std::move(tc));
+                    if (cur >= text_in.size()) break;
+                    continue;
+                }
                 // For a mode-22 opener the call body starts at the first real
                 // parameter; for every other spelling the span is the opener
                 // and what follows, exactly as before.

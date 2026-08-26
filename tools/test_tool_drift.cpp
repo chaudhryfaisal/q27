@@ -2083,6 +2083,57 @@ static void test_batch_mixed_opener_spellings() {
     }
 }
 
+// A ZERO-ARGUMENT mode-22 call in a batch (2026-08-26, issue #38, cosmicnag):
+// the model plans a parallel batch and its first call takes no arguments --
+//   <parameter=memex_recall>\n</function>
+//   <parameter=read>\n<parameter=path>\n/a\n</parameter>\n</function>\n</tool_call>
+// mode 22 required a parameter after the opener, so the zero-arg call was
+// dropped and the agent stalled. It fires now IFF the tool has no required
+// params; a required-args tool opened empty stays residue (831ac625).
+static void test_zero_arg_mode22_call() {
+    json tools = json::array({
+        tool("memex_recall", {}),
+        tool("Read", {{"path", true}}),
+        tool("TaskUpdate", {{"taskId", true}, {"status", false}}),
+    });
+    auto names = [](const std::vector<q27::ToolCall>& v) {
+        std::string s; for (auto& c : v) { s += c.name; s += ' '; } return s;
+    };
+    std::string pre, remaining;
+    {
+        const std::string t =
+            "<parameter=memex_recall>\n</function>\n"
+            "<parameter=read>\n<parameter=path>\n/a/SKILL.md\n</parameter>\n</function>\n</tool_call>\n"
+            "<parameter=read>\n<parameter=path>\n/b/CONTEXT.md\n</parameter>\n</function>\n</tool_call>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 3 && names(v) == "memex_recall Read Read " &&
+               v[0].arguments.empty() &&
+               v[1].arguments.value("path", std::string()) == "/a/SKILL.md",
+           "zero-arg mode22: memex_recall + two reads recover in order");
+        ok(q27::strip_ws2(remaining).empty(), "zero-arg mode22: nothing leaks as text");
+    }
+    {
+        auto v = q27::parse_bare_tool_calls("<parameter=memex_recall>\n</function>",
+                                            &pre, &tools, true, true, &remaining);
+        ok(v.size() == 1 && v[0].name == "memex_recall" && v[0].arguments.empty(),
+           "zero-arg mode22: an isolated zero-arg call fires");
+    }
+    {
+        const std::string t =
+            "<function=TaskUpdate>\n<parameter=taskId>\nt1\n</parameter>\n</function>\n"
+            "<parameter=TaskUpdate>\n</function>";
+        auto v = q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 1 && v[0].name == "TaskUpdate" &&
+               v[0].arguments.value("taskId", std::string()) == "t1",
+           "zero-arg mode22: an empty required-args opener stays residue (aborted call)");
+    }
+    {
+        auto v = q27::parse_bare_tool_calls("<parameter=notatool>\n</function>",
+                                            &pre, &tools, true, true, &remaining);
+        ok(v.empty(), "zero-arg mode22: an undeclared empty opener is not a call");
+    }
+}
+
 // AN ABORTED SECOND CALL (2026-08-25, drift corpus 831ac625): the model
 // closes a call, opens another with the mode-22 spelling, and stops --
 //
@@ -2536,6 +2587,7 @@ int main() {
     test_last_parameter_garbled_tail();
     test_aborted_second_call();
     test_batch_mixed_opener_spellings();
+    test_zero_arg_mode22_call();
     test_parameter_name_opener();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();

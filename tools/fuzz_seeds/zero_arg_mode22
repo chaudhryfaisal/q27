@@ -1,0 +1,8 @@
+<parameter=memex_recall>
+</function>
+<parameter=read>
+<parameter=path>
+/a
+</parameter>
+</function>
+</tool_call>
