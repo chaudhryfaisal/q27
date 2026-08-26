@@ -3017,6 +3017,18 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         else tc.arguments[key] = val;
         if (unterminated) break;
         p = ve + PC.size();
+        // The call closed: `</function>` right after this closer. Anything
+        // after that is not this call's parameter -- observed 2026-08-25 as
+        // `</function>\n<parameter=TaskUpdate>\n</function>`, an aborted
+        // second call, which the scan below used to read as a parameter
+        // named TaskUpdate and hand to the client as an argument. A value
+        // that merely CONTAINS `</function>` is unaffected: the check is on
+        // what follows a closer, not on the value.
+        {
+            size_t q = p;
+            while (q < seg.size() && isspace((unsigned char)seg[q])) q++;
+            if (seg.compare(q, 11, "</function>") == 0) break;
+        }
     }
     tc.ok = true;   // zero-parameter calls are legal
     return true;
@@ -3501,6 +3513,28 @@ inline bool bare_candidate_repair_eligible(
 // wrapper token, or a truncated closer (`</functio`) that ends where a token
 // would -- at whitespace, at the next tag, or at `end`. 0 if none.
 inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t end) {
+    // a mode-22 opener with nothing inside it up to the bound --
+    // `<parameter=TaskUpdate>\n</function>`, the model starting a call and
+    // abandoning it -- is residue: mode 22 refuses a zero-parameter opener,
+    // so there is no call to make and no value to show. NOT `<function=`:
+    // `<function=TaskList>\n</function>` is a legal zero-parameter call.
+    if (s.compare(i, 11, "<parameter=") == 0) {
+        const size_t gt = s.find('>', i);
+        if (gt != std::string::npos && gt < end) {
+            size_t q = gt + 1;
+            while (q < end) {
+                if (isspace((unsigned char)s[q])) { q++; continue; }
+                size_t n = 0;
+                for (const char* tk : {"</function>", "</parameter>", "</tool_call>"}) {
+                    const size_t m = strlen(tk);
+                    if (q + m <= end && s.compare(q, m, tk) == 0) { n = m; break; }
+                }
+                if (!n) break;
+                q += n;
+            }
+            if (q == end) return gt + 1 - i;
+        }
+    }
     for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>"}) {
         const size_t n = strlen(tk);
         if (i + n <= end && s.compare(i, n, tk) == 0) return n;
@@ -4422,6 +4456,23 @@ inline bool wrapped_body_exceeds_one_call(const std::string& body) {
         if (parse_function_opener(body, c, nm, after) && ++openers > 1) return true;
     }
     if (openers == 0) return false;
+    // A mode-22 opener after a closed call -- `</function>\n<parameter=Bash>\n
+    // <parameter=command>...` -- is a second call the strict parser would
+    // silently drop (it reads one call and stops). An opener with nothing
+    // inside (`<parameter=TaskUpdate>\n</function>`) is an aborted call and
+    // stays here, where the strict parser now stops at `</function>` and the
+    // tail is dropped as residue.
+    for (size_t fc = body.find("</function>"); fc != std::string::npos; fc = body.find("</function>", fc + 11)) {
+        size_t q = body.find_first_not_of(" \t\r\n", fc + 11);
+        if (q == std::string::npos) break;
+        std::string k;
+        size_t after;
+        if (!parse_parameter_opener(body, q, k, after)) continue;
+        size_t r = body.find_first_not_of(" \t\r\n", after);
+        std::string k2;
+        size_t after2;
+        if (r != std::string::npos && parse_parameter_opener(body, r, k2, after2)) return true;
+    }
     const size_t last = body.rfind("</function>");
     if (last == std::string::npos) return false;
     return body.find_first_not_of(" \t\r\n", last + 11) != std::string::npos;

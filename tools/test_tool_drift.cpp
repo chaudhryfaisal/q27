@@ -1970,6 +1970,58 @@ static void test_last_parameter_garbled_tail() {
        "garbled tail: the same value as a non-last parameter still reads whole");
 }
 
+// AN ABORTED SECOND CALL (2026-08-25, drift corpus 831ac625): the model
+// closes a call, opens another with the mode-22 spelling, and stops --
+//
+//   <function=TaskUpdate>...</parameter>\n</function>\n<parameter=TaskUpdate>\n</function>
+//
+// The strict parser kept scanning past `</function>` and handed the client a
+// TaskUpdate call with a bogus `TaskUpdate` argument. Now: parameters stop
+// where the call closed; an opener with nothing inside is residue, not text
+// and not a call; and a real mode-22 second call after `</function>` (one
+// that carries a parameter) goes to the batch chain rather than being
+// silently dropped by a parser that reads one call.
+static void test_aborted_second_call() {
+    json tools = json::array({tool("TaskUpdate", {{"taskId", true}, {"status", false}}),
+                              tool("Read", {{"file_path", true}}),
+                              tool("Bash", {{"command", true}})});
+    const std::string one =
+        "<function=TaskUpdate>\n<parameter=status>\ndone\n</parameter>\n<parameter=taskId>\nt7\n</parameter>\n</function>";
+    const std::string aborted = one + "\n<parameter=TaskUpdate>\n</function>";
+    {
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(aborted, tc) && tc.arguments.size() == 2 &&
+               tc.arguments.value("taskId", std::string()) == "t7" && !tc.arguments.contains("TaskUpdate"),
+           "aborted second call: the strict parser stops at </function>");
+    }
+    {
+        // wrapped: one call, and the aborted opener is neither text nor a call
+        auto out = resolve_stream("<tool_call>\n" + aborted + "\n</tool_call>", &tools);
+        ok(out.calls.size() == 1 && out.calls[0].arguments.size() == 2,
+           "aborted second call: wrapped -> exactly one call with two arguments");
+        ok(q27::strip_ws2(out.text).empty(), "aborted second call: wrapped -> nothing shown as text");
+        // and a legal zero-parameter call is untouched by the residue rule
+        const json list_tools = json::array({tool("TaskList", {})});
+        auto zero = resolve_stream("<tool_call>\n<function=TaskList>\n</function>\n</tool_call>", &list_tools);
+        ok(zero.calls.size() == 1 && zero.calls[0].name == "TaskList",
+           "aborted second call: a zero-parameter <function=> call still fires");
+    }
+    {
+        // bare, in text: same
+        std::string pre, remaining;
+        auto v = q27::parse_bare_tool_calls(aborted, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 1 && v[0].arguments.size() == 2, "aborted second call: bare -> exactly one call");
+        ok(q27::strip_ws2(remaining).empty(), "aborted second call: bare -> the opener is residue, not remaining text");
+    }
+    {
+        // a REAL mode-22 second call after </function> is not the aborted case
+        const std::string real = "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
+                                 "<parameter=Bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+        ok(q27::wrapped_body_exceeds_one_call(real), "aborted second call: a second call with a parameter leaves the strict path");
+        ok(!q27::wrapped_body_exceeds_one_call(aborted), "aborted second call: the empty opener stays on the strict path");
+    }
+}
+
 // THE TERMINATOR WRITTEN IN THE WRONG DIALECT (2026-08-21, from the UN-RESCUED
 // lines of the parity arm):
 //
@@ -2369,6 +2421,7 @@ int main() {
     test_parameter_attribute_reaches_drift_modes();
     test_value_containing_closer();
     test_last_parameter_garbled_tail();
+    test_aborted_second_call();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
     test_xml_bleed_into_json_key();
