@@ -1,0 +1,221 @@
+name: Build & Release q27-server
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_repo:
+        description: "Source repo to clone/build (URL or owner/repo). Empty = this repo."
+        required: false
+        default: ""
+      git_commit:
+        description: "Commit SHA to build. Empty = the triggering commit (github.sha)."
+        required: false
+        default: ""
+      gh_repo:
+        description: "owner/repo to publish the GitHub release to. Empty = this repo."
+        required: false
+        default: ""
+      targets:
+        description: "Space-separated make targets (server variants) to build."
+        required: false
+        default: "q27-server q27-server-w8"
+      nvccflags:
+        description: "Override NVCCFLAGS. Empty = all-arch default below."
+        required: false
+        default: ""
+  push:
+    # Fires on pushes to any branch, incl. the push GitHub creates when a
+    # fork is synced from upstream ("Sync fork"). The job below restricts
+    # actual execution to the default branch.
+
+concurrency:
+  group: q27-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # required for gh release create/delete with GITHUB_TOKEN
+
+env:
+  BUILD_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu22.04
+  BUILD_CONTAINER: q27-builder
+  # "All sm archs" here means every architecture CUDA 12.8 can target that
+  # this codebase can plausibly run on. The kernels lean on tensor-core /
+  # mma instructions, so pre-Ampere (sm_70/75 and older) is left out as
+  # very unlikely to be supported by the source; override via the
+  # `nvccflags` input if you do need e.g. sm_75 (Turing) or older.
+  #   sm_80  = A100
+  #   sm_86  = RTX 3090 / A6000 (upstream's own fallback target)
+  #   sm_89  = RTX 4090 / L40 / L40S
+  #   sm_90  = H100 / H200
+  #   sm_100 = B100 / B200 (datacenter Blackwell)
+  #   sm_120 = RTX 5090 (upstream's own primary target)
+  DEFAULT_NVCCFLAGS: >-
+    -O2 -std=c++17 -Xcompiler -Wall
+    -gencode arch=compute_80,code=sm_80
+    -gencode arch=compute_86,code=sm_86
+    -gencode arch=compute_89,code=sm_89
+    -gencode arch=compute_90,code=sm_90
+    -gencode arch=compute_100,code=sm_100
+    -gencode arch=compute_120,code=sm_120
+
+jobs:
+  build-release:
+    # Run on manual dispatch, or on push to the repo's default branch
+    # (this also covers fork-sync pushes, which land on the default branch).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve build inputs
+        id: vars
+        run: |
+          GIT_REPO="${{ github.event.inputs.git_repo }}"
+          GIT_COMMIT="${{ github.event.inputs.git_commit }}"
+          GH_REPO="${{ github.event.inputs.gh_repo }}"
+          TARGETS="${{ github.event.inputs.targets }}"
+          NVCCFLAGS="${{ github.event.inputs.nvccflags }}"
+
+          # Defaults: current repo / current commit when nothing was supplied.
+          [ -n "$GIT_REPO" ]   || GIT_REPO="https://github.com/${{ github.repository }}.git"
+          [ -n "$GIT_COMMIT" ] || GIT_COMMIT="${{ github.sha }}"
+          [ -n "$GH_REPO" ]    || GH_REPO="${{ github.repository }}"
+          [ -n "$TARGETS" ]    || TARGETS="q27-server q27-server-w8"
+          [ -n "$NVCCFLAGS" ]  || NVCCFLAGS="$DEFAULT_NVCCFLAGS"
+
+          CLONE_DIR="q27-$GIT_COMMIT"
+          GIT_COMMIT_SHORT="${GIT_COMMIT:0:7}"
+          GH_TAG="$GIT_COMMIT_SHORT"
+
+          {
+            echo "git_repo=$GIT_REPO"
+            echo "git_commit=$GIT_COMMIT"
+            echo "git_commit_short=$GIT_COMMIT_SHORT"
+            echo "gh_repo=$GH_REPO"
+            echo "clone_dir=$CLONE_DIR"
+            echo "targets=$TARGETS"
+            echo "gh_tag=$GH_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          # NVCCFLAGS can contain spaces/commas; write via env file, not GITHUB_OUTPUT.
+          {
+            echo "NVCCFLAGS<<EOF"
+            echo "$NVCCFLAGS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          echo "==> GIT_REPO=$GIT_REPO"
+          echo "==> GIT_COMMIT=$GIT_COMMIT"
+          echo "==> GIT_COMMIT_SHORT=$GIT_COMMIT_SHORT"
+          echo "==> GH_REPO=$GH_REPO"
+          echo "==> CLONE_DIR=$CLONE_DIR"
+          echo "==> TARGETS=$TARGETS"
+          echo "==> NVCCFLAGS=$NVCCFLAGS"
+          echo "==> GH_TAG=$GH_TAG"
+
+      - name: Skip if a release already exists for this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ steps.vars.outputs.gh_repo }}
+          GH_TAG: ${{ steps.vars.outputs.gh_tag }}
+        run: |
+          if curl -fsS -o /dev/null \
+               -H "Authorization: Bearer $GH_TOKEN" \
+               "https://api.github.com/repos/$GH_REPO/releases/tags/$GH_TAG"; then
+            echo "release $GH_TAG already exists in $GH_REPO — skipping build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Clone: shallow-clone the exact commit, no history ----
+      - name: Clone source at commit
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GIT_REPO: ${{ steps.vars.outputs.git_repo }}
+          GIT_COMMIT: ${{ steps.vars.outputs.git_commit }}
+          CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
+        run: |
+          mkdir -p "$CLONE_DIR"
+          git init -q "$CLONE_DIR"
+          git -C "$CLONE_DIR" remote add origin "$GIT_REPO"
+
+          SHA="$GIT_COMMIT"
+          if ! git -C "$CLONE_DIR" fetch --depth 1 origin "$SHA" 2>/dev/null; then
+            echo "==> '$GIT_COMMIT' isn't a full 40-char SHA; resolving via GitHub API"
+            OWNER_REPO=$(echo "$GIT_REPO" | sed -E 's#.*github\.com[:/]+([^/]+/[^/.]+)(\.git)?/?$#\1#')
+            SHA=$(curl -fsSL -H "Accept: application/vnd.github.sha" \
+                  "https://api.github.com/repos/$OWNER_REPO/commits/$GIT_COMMIT")
+            [ -n "$SHA" ] || { echo "Could not resolve $GIT_COMMIT to a full SHA"; exit 1; }
+            echo "==> Resolved $GIT_COMMIT -> $SHA"
+            git -C "$CLONE_DIR" fetch --depth 1 origin "$SHA"
+          fi
+          git -C "$CLONE_DIR" checkout -q FETCH_HEAD
+
+      # ---- Build: pull the CUDA devel image, build each server variant ----
+      - name: Build server variants in Docker
+        if: steps.check.outputs.skip != 'true'
+        env:
+          CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
+          TARGETS: ${{ steps.vars.outputs.targets }}
+        run: |
+          docker pull "$BUILD_IMAGE"
+          docker run -d --name "$BUILD_CONTAINER" \
+            -v "$PWD/$CLONE_DIR":/work -w /work \
+            "$BUILD_IMAGE" sleep infinity
+
+          for t in $TARGETS; do
+            echo "==> Building build/$t"
+            docker exec -w /work "$BUILD_CONTAINER" \
+              sh -lc "make build/$t NVCCFLAGS=\"$NVCCFLAGS\""
+          done
+
+          ls -lah "$CLONE_DIR/build"
+
+      # ---- Release: publish each built variant as one GitHub release ----
+      - name: Create GitHub release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ steps.vars.outputs.gh_repo }}
+          GIT_COMMIT: ${{ steps.vars.outputs.git_commit }}
+          GH_TAG: ${{ steps.vars.outputs.gh_tag }}
+          CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
+          TARGETS: ${{ steps.vars.outputs.targets }}
+        run: |
+          GH_FILES=""
+          for t in $TARGETS; do
+            f="$CLONE_DIR/build/$t"
+            [ -f "$f" ] || { echo "Expected artifact $f not found"; exit 1; }
+            GH_FILES="$GH_FILES $f"
+          done
+
+          echo "==> Removing any existing release/tag $GH_TAG"
+          gh release delete "$GH_TAG" -y --repo "$GH_REPO" >/dev/null 2>&1 || true
+          git push --delete "https://github.com/$GH_REPO.git" "$GH_TAG" >/dev/null 2>&1 || true
+
+          NOTES_FILE=$(mktemp)
+          sha256sum $GH_FILES > "$NOTES_FILE"
+
+          echo "==> Creating release $GH_TAG in $GH_REPO with variants: $TARGETS"
+          gh release create "$GH_TAG" $GH_FILES \
+            --repo "$GH_REPO" \
+            --target "$GIT_COMMIT" \
+            --title "$GH_TAG" \
+            --notes-file "$NOTES_FILE"
+          rm -f "$NOTES_FILE"
+
+      # ---- Cleanup: always stop/remove the container and clone dir ----
+      - name: Clean up
+        if: always()
+        env:
+          CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
+        run: |
+          docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+          # Build artifacts inside CLONE_DIR were written as root by the
+          # container, so the (non-root) runner user can't rm them directly.
+          sudo rm -rf "$CLONE_DIR"
+
+
