@@ -15384,3 +15384,44 @@ shapes (96.2%) and 1,434/1,442 turns (99.45%). The six disagreements are
 the batch-continuation class from (b), the bogus-parameter attribution,
 and the new shape. Nothing else.
 
+## 2026-08-25 (d): Phase 3 -- the batch-continuation class, and corpus-check at 100%
+
+Phase 2's oracle (entry (b)) left five real disagreements after the closer
+and opener-parity fixes; four were one class and the fifth its JSON cousin.
+All closed here, and `make corpus-check` now agrees on **159/159 shapes
+(100.0%) and 1,442/1,442 captured turns**.
+
+The class: a planning turn emits several calls and drifts mid-batch, so the
+openers stop matching. Two fixes, the design's "normalize to one form, then
+parse" applied to the opener:
+
+- XML (03a8a851, b645b48f, a29175c3): the native batch scanner's next_opener
+  now reports a `<parameter=NAME>` opener (mode 22's parameter-as-opener,
+  declared name + a real parameter next) alongside `<function=`/`<name>`/
+  `<parameter_name>`, and the loop synthesizes the `<function=NAME>` head for
+  its span. So ONE batch mixes the spellings and recovers every call in
+  order -- mode 22 folded into the batch scan rather than a separate pass
+  that only fired when the native scan found nothing.
+- JSON (ea9ead21): the model opens a batch with the `{"tool_call":` mode-4
+  head, wraps the first call, and never closes the brace, so the batch was
+  one malformed blob and only the last call survived. The xmlclose retry
+  (which already blanks `</tool_call>` closers) now also blanks a
+  `{"tool_call":` head whose value is an object, making the inner objects
+  top-level for the JSON batch scan; the head is absorbed as residue in
+  front of the first call, and a `{"tool_call":` with a string value is left
+  alone.
+
+Commits: c914128 (XML), d38fe91 (JSON). Both landed with fixtures on both
+drift legs, extract_check green, and ASAN/UBSAN fuzz; the shapes are fuzz
+seeds. The corpus is 170 shapes / 1,456 turns; 11 qwopus rows from the
+pre-fix redactor stay replay-unreliable and out of the denominator.
+
+The number the design asked for: current-vs-intended agreement is at the
+kill-criterion line and above (100% by shape, 100% by turn on this corpus).
+The catalogue, for the traffic captured so far, is complete. What the
+rewrite would still buy is the churn reduction the design argued for --
+these five fixes were five parser-code edits, not five registry entries --
+but the correctness case for it is now "keep it from regressing," not "it is
+wrong today." The honest next step is more real-session capture (this corpus
+is one model over two days of benchmark and scripted traffic), not more
+parser edits against a corpus that agrees.
