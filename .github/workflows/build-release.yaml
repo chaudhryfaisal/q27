@@ -85,13 +85,17 @@ jobs:
           [ -n "$NVCCFLAGS" ]  || NVCCFLAGS="$DEFAULT_NVCCFLAGS"
 
           CLONE_DIR="q27-$GIT_COMMIT"
+          GIT_COMMIT_SHORT="${GIT_COMMIT:0:7}"
+          GH_TAG="$GIT_COMMIT_SHORT"
 
           {
             echo "git_repo=$GIT_REPO"
             echo "git_commit=$GIT_COMMIT"
+            echo "git_commit_short=$GIT_COMMIT_SHORT"
             echo "gh_repo=$GH_REPO"
             echo "clone_dir=$CLONE_DIR"
             echo "targets=$TARGETS"
+            echo "gh_tag=$GH_TAG"
           } >> "$GITHUB_OUTPUT"
 
           # NVCCFLAGS can contain spaces/commas; write via env file, not GITHUB_OUTPUT.
@@ -103,22 +107,24 @@ jobs:
 
           echo "==> GIT_REPO=$GIT_REPO"
           echo "==> GIT_COMMIT=$GIT_COMMIT"
+          echo "==> GIT_COMMIT_SHORT=$GIT_COMMIT_SHORT"
           echo "==> GH_REPO=$GH_REPO"
           echo "==> CLONE_DIR=$CLONE_DIR"
           echo "==> TARGETS=$TARGETS"
           echo "==> NVCCFLAGS=$NVCCFLAGS"
+          echo "==> GH_TAG=$GH_TAG"
 
       - name: Skip if a release already exists for this commit
         id: check
         env:
           GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ steps.vars.outputs.gh_repo }}
-          GIT_COMMIT: ${{ steps.vars.outputs.git_commit }}
+          GH_TAG: ${{ steps.vars.outputs.gh_tag }}
         run: |
           if curl -fsS -o /dev/null \
                -H "Authorization: Bearer $GH_TOKEN" \
-               "https://api.github.com/repos/$GH_REPO/releases/tags/$GIT_COMMIT"; then
-            echo "release $GIT_COMMIT already exists in $GH_REPO — skipping build"
+               "https://api.github.com/repos/$GH_REPO/releases/tags/$GH_TAG"; then
+            echo "release $GH_TAG already exists in $GH_REPO — skipping build"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -175,11 +181,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ steps.vars.outputs.gh_repo }}
           GIT_COMMIT: ${{ steps.vars.outputs.git_commit }}
+          GH_TAG: ${{ steps.vars.outputs.gh_tag }}
           CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
           TARGETS: ${{ steps.vars.outputs.targets }}
         run: |
-          GH_TAG="$GIT_COMMIT"
-
           GH_FILES=""
           for t in $TARGETS; do
             f="$CLONE_DIR/build/$t"
