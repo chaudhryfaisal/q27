@@ -3383,6 +3383,83 @@ inline size_t bare_native_opener_probe_start(
         return std::string::npos;
     return best;
 }
+
+// A mode-22 opener in streamed bare TEXT: `<parameter=NAME>` where NAME is a
+// declared tool, followed by another `<parameter=` (a real argument) or by
+// `</function>` (a zero-argument call). The parameter-as-opener shape reaches
+// the text holdback the same way `<function=` does -- the splitter only routes
+// a `<tool_call>`-wrapped call to TOOL -- but the holdback never armed on it,
+// so a bare mode-22 batch streamed out as text and never fired (issue #38,
+// cosmicnag, 2026-08-26). The no-required zero-arg gate is applied later by the
+// parser; arming is enough. `<parameter=key>` whose key is not a declared tool
+// (an ordinary parameter) does not arm.
+template<class NameSet>
+inline size_t bare_mode22_opener_position(const std::string& text,const NameSet& names,
+                                          JsonStringLexState string_state={},
+                                          MarkdownFenceLexState fence_state={},
+                                          bool end_is_final=true) {
+    for(size_t i=0;i<text.size();i++) {
+        if(text[i]=='<' && text.compare(i,11,"<parameter=")==0) {
+            std::string key; size_t after=0;
+            if(parse_parameter_opener(text,i,key,after) && names.find(key)!=names.end()) {
+                const size_t nb=text.find_first_not_of(" \t\r\n",after);
+                const bool param_next=nb!=std::string::npos && text.compare(nb,11,"<parameter=")==0;
+                const bool zero_arg=nb!=std::string::npos && text.compare(nb,11,"</function>")==0;
+                if((param_next||zero_arg||(end_is_final&&nb==std::string::npos)) &&
+                   bare_context_is_executable(text,i,string_state,fence_state,end_is_final))
+                    return i;
+            }
+        }
+        consume_bare_text_context(string_state,fence_state,text[i]);
+    }
+    return std::string::npos;
+}
+// Start of a trailing `<parameter=...` that could STILL become a mode-22
+// opener once more bytes arrive, so its head is held rather than leaked. Unlike
+// `<function=` (an unambiguous 11-char prefix that arms immediately), a
+// `<parameter=` is ambiguous with an ordinary parameter, so it is held only
+// while unresolved: a partial `<parameter` prefix, a `<parameter=NAME` whose
+// tag or declared-ness is not yet decidable, or a `<parameter=NAME>` (declared)
+// whose boundary token has not arrived. A closed tag with an undeclared name,
+// or a declared name followed by a real value, is not an opener and is not
+// held.
+template<class NameSet>
+inline size_t bare_mode22_opener_probe_start(
+    const std::string& text,const NameSet& names,
+    JsonStringLexState string_state={},MarkdownFenceLexState fence_state={}) {
+    static const std::string O="<parameter=";
+    size_t hold=std::string::npos;
+    // (1) a trailing partial prefix of "<parameter="
+    for(size_t len=std::min(text.size(),O.size()-1);len;--len) {
+        const size_t start=text.size()-len;
+        if(text.compare(start,len,O.c_str(),len)==0) { hold=start; break; }
+    }
+    // (2) the last complete "<parameter=" whose opener-ness is undecided
+    const size_t p=text.rfind(O);
+    if(p!=std::string::npos) {
+        std::string key; size_t after=0;
+        if(!parse_parameter_opener(text,p,key,after)) {
+            hold=(hold==std::string::npos?p:std::min(hold,p));   // tag not closed
+        } else if(names.find(key)!=names.end()) {
+            const size_t nb=text.find_first_not_of(" \t\r\n",after);
+            bool decided=false;
+            if(nb!=std::string::npos && text[nb]!='<') decided=true;  // a value -> ordinary param
+            else if(nb!=std::string::npos) {
+                // a '<' has started: decided only once it is long enough to be
+                // classified as `<parameter=` / `</function>` or ruled out
+                const size_t avail=text.size()-nb;
+                decided = avail>=11 ||
+                          (text.compare(nb,std::min(avail,(size_t)11),"<parameter=",std::min(avail,(size_t)11))!=0 &&
+                           text.compare(nb,std::min(avail,(size_t)11),"</function>",std::min(avail,(size_t)11))!=0);
+            }
+            if(!decided) hold=(hold==std::string::npos?p:std::min(hold,p));
+        }
+    }
+    if(hold==std::string::npos) return hold;
+    if(!bare_text_position_is_executable(text,hold,string_state,fence_state,false))
+        return std::string::npos;
+    return hold;
+}
 // End of a bare native-dialect candidate: the first </function> that closes
 // a parameter (or an empty call), plus one stray </tool_call> right after it.
 // A </function> inside a value is preceded by value bytes, not </parameter>,
@@ -3560,13 +3637,14 @@ inline bool bare_candidate_repair_eligible(
 // Length of a residue token at s[i] within [i,end): a complete closer or
 // wrapper token, or a truncated closer (`</functio`) that ends where a token
 // would -- at whitespace, at the next tag, or at `end`. 0 if none.
-inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t end) {
+inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t end,
+                                      bool params_are_residue = true) {
     // a mode-22 opener with nothing inside it up to the bound --
     // `<parameter=TaskUpdate>\n</function>`, the model starting a call and
     // abandoning it -- is residue: mode 22 refuses a zero-parameter opener,
     // so there is no call to make and no value to show. NOT `<function=`:
     // `<function=TaskList>\n</function>` is a legal zero-parameter call.
-    if (s.compare(i, 11, "<parameter=") == 0) {
+    if (params_are_residue && s.compare(i, 11, "<parameter=") == 0) {
         const size_t gt = s.find('>', i);
         if (gt != std::string::npos && gt < end) {
             size_t q = gt + 1;
@@ -3618,12 +3696,13 @@ inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t en
 // where it begins (s.size() if none); `complete` says a whole token is in it;
 // `partial` says it ends in a truncated token, which a later chunk may finish.
 struct DialectResidueSuffix { size_t start; bool complete; bool partial; };
-inline DialectResidueSuffix dialect_residue_suffix(const std::string& s) {
+inline DialectResidueSuffix dialect_residue_suffix(const std::string& s,
+                                                  bool params_are_residue = true) {
     DialectResidueSuffix r{0, false, false};
     size_t i = 0;
     while (i < s.size()) {
         if (isspace((unsigned char)s[i])) { i++; continue; }
-        const size_t n = dialect_residue_token_at(s, i, s.size());
+        const size_t n = dialect_residue_token_at(s, i, s.size(), params_are_residue);
         if (!n) { i++; r.start = i; r.complete = false; r.partial = false; continue; }
         // a truncated token only counts at the very end
         const bool whole = i + n < s.size() || s.compare(i, n, "</function>") == 0 ||
@@ -3779,9 +3858,12 @@ struct BareToolTextHoldback {
                         remaining,names,string_state,fence_state,input_final);
                 const size_t native_pos=bare_native_opener_position(
                     remaining,string_state,fence_state,input_final);
+                const size_t mode22_pos=bare_mode22_opener_position(
+                    remaining,names,string_state,fence_state,input_final);
                 size_t opener=object_pos;
                 if(mode10_pos<opener) opener=mode10_pos;
                 if(native_pos<opener) opener=native_pos;
+                if(mode22_pos<opener) opener=mode22_pos;
                 if(opener==std::string::npos) {
                     size_t keep=input_final || ordinary_call_seen?std::string::npos:
                         bare_mode10_probe_start(
@@ -3797,6 +3879,11 @@ struct BareToolTextHoldback {
                         if(native_keep!=std::string::npos)
                             keep=keep==std::string::npos?native_keep:
                                  std::min(keep,native_keep);
+                        const size_t m22_keep=bare_mode22_opener_probe_start(
+                            remaining,names,string_state,fence_state);
+                        if(m22_keep!=std::string::npos)
+                            keep=keep==std::string::npos?m22_keep:
+                                 std::min(keep,m22_keep);
                     }
                     if(keep==std::string::npos) emit_head(remaining,emit_text);
                     else {
@@ -3809,7 +3896,8 @@ struct BareToolTextHoldback {
                 pending=remaining.substr(opener);
                 holding=true;
                 mode10=mode10_pos==opener;
-                native=!mode10 && object_pos!=opener && native_pos==opener;
+                native=!mode10 && object_pos!=opener &&
+                       (native_pos==opener || mode22_pos==opener);
                 if(native) native_scan.begin(); else scan.begin(mode10);
                 remaining.clear();
             }
@@ -3876,6 +3964,14 @@ struct BareToolTextHoldback {
             input_allow_repair=false;
         }
         flush_candidate(allow_repair,emit_text,emit_candidate);
+    }
+
+    // The holdback has a call candidate in flight: armed (holding), speculatively
+    // held in `probe`, mid-parse in `pending`, or a deferred-failure repair.
+    // Used by the router so it will not strip a trailing `</function>` (a
+    // candidate's own closer) into residue while a candidate is open.
+    bool pending_candidate() const {
+        return holding || !probe.empty() || !pending.empty() || !deferred.empty();
     }
 
     void reset_context() {
@@ -4015,10 +4111,18 @@ struct StreamToolRouter {
         std::string chunk;
         chunk.swap(text_residue);
         chunk += t;
-        const DialectResidueSuffix r = dialect_residue_suffix(chunk);
-        if (r.complete || r.partial) {
-            text_residue = chunk.substr(r.start);
-            chunk.erase(r.start);
+        // Hold a chunk's trailing dialect residue back only when NO candidate
+        // is open: once the holdback is holding one, a trailing `</function>`
+        // is that call's own closer, not a stray to drop (issue #38 bare
+        // mode-22). And a `<parameter=` opener is never held (the holdback's
+        // probe holds a partial one), so a bare mode-22 opener reaches route().
+        if (!bare_text.pending_candidate()) {
+            const DialectResidueSuffix r =
+                dialect_residue_suffix(chunk, /*params_are_residue=*/false);
+            if (r.complete || r.partial) {
+                text_residue = chunk.substr(r.start);
+                chunk.erase(r.start);
+            }
         }
         if (!chunk.empty()) bare_text.route(chunk, names, emit_text, classify);
     }
@@ -4032,7 +4136,12 @@ struct StreamToolRouter {
         settle_think(names, emit_think, classify, allow_repair);
         // a complete closer with nothing after it is residue; a truncated one
         // could have been the model's own text, and is shown
-        if (dialect_residue_suffix(text_residue).complete) text_residue.clear();
+        // ...but a trailing `</function>` while the holdback is still holding
+        // is the candidate's own closer (bare mode-22, issue #38); keep it so
+        // release_text_residue feeds it to the candidate.
+        if (!bare_text.pending_candidate() &&
+            dialect_residue_suffix(text_residue, /*params_are_residue=*/false).complete)
+            text_residue.clear();
         release_text_residue(names, emit_text, classify);
         settle_text(names, emit_text, classify, allow_repair);
         if (drift_corpus_path() && drift_records_written == records_at_start &&

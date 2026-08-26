@@ -2971,6 +2971,140 @@ static void test_tool_call_wrapped_json_batch() {
 // accepts, not just `<function=` (pylint-6903 emitted `<parameter_name>`;
 // mode 18 is `<name>`). Both were parser-recognised for weeks while the
 // stream knew only `<function=`, so they worked off stream only.
+// Streaming recovery of a bare mode-22 batch whose FIRST call takes no
+// arguments (issue #38, cosmicnag). The model drops the <function=NAME> head
+// and writes <parameter=NAME> instead; a zero-argument call is
+// `<parameter=NAME>` immediately closed by `</function>`. This shape reaches
+// the TEXT/THINK holdback (not the TOOL channel -- there is no <tool_call>
+// wrapper), where the ambiguous `<parameter=` opener has to be held across
+// chunk boundaries until it resolves. Uses its own tool set: memex_recall
+// takes no arguments, read requires a path.
+static json mode22_zero_arg_tools() {
+    return json::parse(R"([
+      {"type":"function","function":{"name":"memex_recall","parameters":{
+        "type":"object","properties":{}}}},
+      {"type":"function","function":{"name":"read","parameters":{"type":"object",
+        "properties":{"path":{"type":"string"}},"required":["path"]}}}])");
+}
+static StreamRun stream_turn_tools(const json& tools, const std::string& generated,
+                                   bool start_in_think, size_t chunk,
+                                   bool allow_repair_at_end = true) {
+    std::set<std::string> names;
+    for (const auto& t : tools) names.insert(t["function"]["name"].get<std::string>());
+    q27::StreamSplitter sp;
+    if (start_in_think) sp.chan = q27::StreamSplitter::THINK;
+    q27::StreamToolRouter r;
+    r.has_tools = true;
+    StreamRun out;
+    auto emit_text = [&](const std::string& t) { out.text += t; };
+    auto emit_think = [&](const std::string& t) { out.think += t; };
+    auto emit_call = [&](const q27::ToolCall& c) { out.calls.push_back(c); return true; };
+    auto classify = [&](const std::string& source, bool allow_repair, auto&& visible) {
+        std::string pre, residual;
+        auto bcs = q27::parse_bare_tool_calls(source, &pre, &tools, true, allow_repair, &residual);
+        if (bcs.empty()) return q27::BareToolCandidateResult{};
+        size_t cursor = 0, recovered = 0;
+        for (const auto& bc : bcs) {
+            visible(source.substr(cursor, bc.source_begin - cursor));
+            cursor = bc.source_end;
+            if (emit_call(bc)) recovered++;
+            else visible(source.substr(bc.source_begin, bc.source_end - bc.source_begin));
+        }
+        visible(source.substr(cursor));
+        return q27::BareToolCandidateResult{true, recovered != 0};
+    };
+    auto emit_tool = [&]() {
+        auto c = q27::parse_tool_call(q27::strip_ws2(r.tool_buf));
+        r.tool_buf.clear();
+        if (!c.ok) {
+            if (!classify(c.raw, true, emit_text) && !q27::only_dialect_control_bytes(c.raw))
+                emit_text(c.raw);
+        } else emit_call(c);
+    };
+    auto seg = [&](q27::StreamSplitter::Chan ch, const std::string& t) {
+        r.segment(ch, t, false, names, emit_text, emit_think, emit_tool, classify);
+    };
+    for (size_t i = 0; i < generated.size(); i += chunk)
+        for (auto& [ch, t] : sp.feed(generated.substr(i, chunk))) seg(ch, t);
+    for (auto& [ch, t] : sp.flush()) seg(ch, t);
+    if (!r.tool_buf.empty()) emit_tool();
+    r.finish(allow_repair_at_end, names, emit_text, emit_think, classify);
+    return out;
+}
+
+// cosmicnag's shape: a zero-arg memex_recall planned in parallel with reads,
+// parameter-as-opener spelling, only stray </tool_call> closers.
+static const char* kBareMode22Batch =
+    "<parameter=memex_recall>\n</function>\n"
+    "<parameter=read>\n<parameter=path>\n/a/SKILL.md\n</parameter>\n</function>\n"
+    "<parameter=read>\n<parameter=path>\n/b/NOTES.md\n</parameter>\n</function>\n"
+    "</tool_call>\n";
+
+static void test_stream_router_bare_mode22_zero_arg_batch() {
+    const json tools = mode22_zero_arg_tools();
+    for (size_t chunk : {size_t(1), size_t(3), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, kBareMode22Batch, false, chunk);
+        CHECK(r.calls.size() == 3);
+        if (r.calls.size() == 3) {
+            CHECK(r.calls[0].name == "memex_recall");
+            CHECK(r.calls[0].arguments.empty());
+            CHECK(r.calls[1].name == "read");
+            CHECK(r.calls[1].arguments.value("path", std::string()) == "/a/SKILL.md");
+            CHECK(r.calls[2].name == "read");
+            CHECK(r.calls[2].arguments.value("path", std::string()) == "/b/NOTES.md");
+        }
+        CHECK(r.text.find("<parameter=") == std::string::npos);   // nothing leaked as text
+    }
+}
+
+// Same batch inside a <think> block: it is a call, not reasoning text.
+static void test_stream_router_bare_mode22_in_reasoning() {
+    const json tools = mode22_zero_arg_tools();
+    const std::string gen = std::string("Load memory, then read.\n") + kBareMode22Batch +
+                            "</think>\n\nDone.";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, true, chunk);
+        CHECK(r.calls.size() == 3);
+        if (!r.calls.empty()) CHECK(r.calls[0].name == "memex_recall");
+        CHECK(r.think.find("<parameter=") == std::string::npos);
+        CHECK(r.think.find("Load memory, then read.") != std::string::npos);
+    }
+}
+
+// A lone zero-arg call at the very end of the stream (its </function> is the
+// final token, so it lands in the router's trailing residue) still fires.
+static void test_stream_router_bare_mode22_standalone_zero_arg() {
+    const json tools = mode22_zero_arg_tools();
+    for (size_t chunk : {size_t(1), size_t(3), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, "<parameter=memex_recall>\n</function>\n", false, chunk);
+        CHECK(r.calls.size() == 1);
+        if (!r.calls.empty()) CHECK(r.calls[0].name == "memex_recall");
+        CHECK(r.text.find("<parameter=") == std::string::npos);
+    }
+}
+
+// The ambiguous `<parameter=` opener must never fabricate a call or swallow
+// text when it is NOT a mode-22 opener: an undeclared name, a declared name
+// followed by a real value (an ordinary parameter), a prose mention, a fenced
+// example, or a partial tag at end of stream. Each must yield zero calls and
+// surface its text verbatim.
+static void test_stream_router_parameter_tag_that_is_not_a_call() {
+    const json tools = mode22_zero_arg_tools();
+    struct Case { const char* gen; const char* must_contain; } cases[] = {
+        {"here is <parameter=foo>bar</parameter> in prose", "<parameter=foo>"},
+        {"text <parameter=read>hello world</parameter> more", "<parameter=read>"},
+        {"the <parameter=x> placeholder syntax is common", "<parameter=x>"},
+        {"```xml\n<parameter=read>\n</function>\n```\ndone", "<parameter=read>"},
+        {"trailing text <parameter=re", "trailing text"},
+    };
+    for (const auto& c : cases)
+        for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+            auto r = stream_turn_tools(tools, c.gen, false, chunk);
+            CHECK(r.calls.empty());
+            CHECK(r.text.find(c.must_contain) != std::string::npos);
+        }
+}
+
 static void test_stream_router_arms_on_every_opener_spelling() {
     for (const std::string& opener : {std::string("<parameter_name>read"), std::string("<name>read")}) {
         const std::string shape = opener + "\n</parameter>\n<parameter=path>\n/w/x.py\n";
@@ -3056,6 +3190,10 @@ int main() {
     test_recover_calls_from_reasoning();
     test_tool_call_wrapped_json_batch();
     test_stream_router_arms_on_every_opener_spelling();
+    test_stream_router_bare_mode22_zero_arg_batch();
+    test_stream_router_bare_mode22_in_reasoning();
+    test_stream_router_bare_mode22_standalone_zero_arg();
+    test_stream_router_parameter_tag_that_is_not_a_call();
     test_dialect_residue_is_not_text();
     test_tools_passthrough();
     test_tools_absent();
