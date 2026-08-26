@@ -1,0 +1,5 @@
+<function=TaskGet>
+<parameter=taskId>
+TEXT_1
+</parameter>
+</function>

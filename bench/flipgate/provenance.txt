@@ -1,0 +1,28 @@
+FLIP GATE corpus -- agentic38.i32 (2026-08-22)
+
+Source: scratchpad/ccreplay2/req_0029.json (not in the repo; the rendered
+stream and its region map are, so the gate is reproducible from here), a REAL Claude Code /v1/messages
+body captured against q27-server (59 messages, 27 assistant turns, 43
+tool_use blocks, 28 tools declared, 161,972 rendered chars).
+
+Rendering: build/render_request, which calls the same functions the
+/v1/messages handler calls, in the same order -- anthropic_tools_json ->
+select_openai_tools -> anthropic_tools_decl(RAW body, selected names) ->
+chatml_prompt(anthropic_msgs, tools, think=false) -- so the tools preamble
+and the client's key order are the ones the server actually sends (both
+changed 2026-08-22; a corpus rendered any other way measures a prompt the
+server would never emit).
+
+  agentic38.i32   41,099 tokens   sha256 f750ab71c9979b17...
+  regions38.tsv   per-token class from build/flip_regions
+  pos38.i32       11,639 target positions, classes out+tool
+
+Region split: out 336, tool 11,303, think 84, prompt 29,376. Agentic traffic
+is mostly tool calls, and Write/Edit calls carry file bodies, which is why
+`tool` dominates. `out` is only 336 tokens -- treat its rate as indicative,
+not as a second significant figure.
+
+NOT the older scratchpad/t3_quality/corpus/agentic_req0031.i32: that one is
+154k tokens of which a single runaway assistant message is 128k (the same
+shape as the 30k-token generations in the 08-22 arm logs), so 83% of its
+"assistant output" is one pathological turn.

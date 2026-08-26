@@ -13,9 +13,9 @@ BIN="$(dirname "$0")/../build/q27"
 # CANON_MD5 remains the explicit escape hatch for a locally derived canonical.
 CANON_ARCH="${CANON_ARCH:-sm120}"
 CANON_TIER="${CANON_TIER:-default}"
+# shellcheck source=canonical_md5.sh
+source "$(dirname "$0")/canonical_md5.sh"
 if [[ -z "${CANON_MD5:-}" ]]; then
-  # shellcheck source=canonical_md5.sh
-  source "$(dirname "$0")/canonical_md5.sh"
   if ! CANON_MD5="$(canonical_md5_for "$CANON_ARCH" "$CANON_TIER")"; then
     echo "no published canonical for architecture=$CANON_ARCH tier=$CANON_TIER" >&2
     echo "run a same-device upstream/candidate differential or set CANON_MD5 explicitly" >&2
@@ -57,6 +57,24 @@ if ! valid_generated "$a" || ! valid_generated "$b"; then
   fail=1
 elif [[ "$a" == "$b" ]]; then echo "  OK  (identical across runs)"
 else echo "  FAIL seeded runs differ" >&2; fail=1; fi
+
+echo "== gate 2b: published sampled-seed anchor (flags are PART of the anchor -- see canonical_md5.sh)"
+if [[ -z "${SAMPLED_MD5:-}" ]]; then
+  SAMPLED_MD5="$(sampled_md5_for "$CANON_ARCH" "$CANON_TIER")" || SAMPLED_MD5=""
+fi
+if [[ -n "$SAMPLED_MD5" ]]; then
+  s="$(gen "$tmp/anchor.out" -n 64 --temp 0.7 --top-p 0.95 --seed 42)"
+  if ! valid_generated "$s"; then
+    echo "  FAIL anchor run produced no generated trajectory" >&2
+    fail=1
+  else
+    smd5="$(printf '%s\n' "$s" | md5sum | cut -d' ' -f1)"
+    if [[ "$smd5" == "$SAMPLED_MD5" ]]; then echo "  OK  md5=$smd5"
+    else echo "  FAIL md5=$smd5 want $SAMPLED_MD5" >&2; fail=1; fi
+  fi
+else
+  echo "  SKIP (no published sampled anchor for $CANON_ARCH:$CANON_TIER)"
+fi
 
 echo "== gate 3: seed varies + sampled != greedy (sanity)"
 c="$(gen "$tmp/s3.out" -n 48 --temp 0.85 --top-p 0.95 --seed 7)"

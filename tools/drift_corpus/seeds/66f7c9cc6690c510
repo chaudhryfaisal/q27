@@ -1,0 +1,10 @@
+<function=Write>
+<parameter=file_path>
+PATH_1
+</parameter>
+<parameter=content>
+TEXT_2 ``TEXT_3`` TEXT_4 ``TEXT_5`` TEXT_6 ``TEXT_7`` TEXT_8:ml ``TEXT_9`` TEXT_10
+``TEXT_11`` TEXT_12 ``TEXT_13``TEXT_14 ``TEXT_15`` TEXT_16:ml ``TEXT_17`` TEXT_18 ``TEXT_19`` TEXT_20 ``TEXT_21``TEXT_22:ml ``TEXT_23`` TEXT_24 ``TEXT_25`` TEXT_26:ml ``TEXT_27``TEXT_28
+
+</parameter>
+</function>

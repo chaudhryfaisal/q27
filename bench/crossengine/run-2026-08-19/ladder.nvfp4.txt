@@ -1,0 +1,16 @@
+C=1 nvfp4 aggregate=157.2 t/s  (sum_dec=6824, union=43.4s, client_wall=43.5s)
+   per-stream tps: median=157.2 min=157.2 max=157.2
+   ttft_ms: median=38 max=38
+JSON {"c": 1, "label": "nvfp4", "aggregate_tps": 157.2, "sum_dec": 6824, "union_s": 43.4, "client_wall_s": 43.5, "per_stream_median": 157.2, "ttft_ms_median": 37.5, "n_streams": 1, "server_side_agg": null}
+C=2 nvfp4 aggregate=299.7 t/s  (sum_dec=9941, union=33.2s, client_wall=33.2s)
+   per-stream tps: median=157.1 min=153.9 max=160.2
+   ttft_ms: median=69 max=102
+JSON {"c": 2, "label": "nvfp4", "aggregate_tps": 299.7, "sum_dec": 9941, "union_s": 33.2, "client_wall_s": 33.2, "per_stream_median": 157.1, "ttft_ms_median": 69.4, "n_streams": 2, "server_side_agg": null}
+C=4 nvfp4 aggregate=442.3 t/s  (sum_dec=24527, union=55.4s, client_wall=55.6s)
+   per-stream tps: median=146.5 min=144.8 max=149.1
+   ttft_ms: median=134 max=233
+JSON {"c": 4, "label": "nvfp4", "aggregate_tps": 442.3, "sum_dec": 24527, "union_s": 55.4, "client_wall_s": 55.6, "per_stream_median": 146.5, "ttft_ms_median": 134.2, "n_streams": 4, "server_side_agg": null}
+C=8 nvfp4 aggregate=834.3 t/s  (sum_dec=42826, union=51.3s, client_wall=51.5s)
+   per-stream tps: median=123.1 min=119.1 max=129.7
+   ttft_ms: median=262 max=504
+JSON {"c": 8, "label": "nvfp4", "aggregate_tps": 834.3, "sum_dec": 42826, "union_s": 51.3, "client_wall_s": 51.5, "per_stream_median": 123.1, "ttft_ms_median": 261.9, "n_streams": 8, "server_side_agg": null}

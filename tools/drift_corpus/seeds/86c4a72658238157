@@ -1,0 +1,9 @@
+<function=Bash>
+<parameter=command>
+CODE_1:ml `CODE_2`CODE_3:ml `CODE_4`CODE_5:ml `CODE_6`CODE_7:ml
+
+</parameter>
+<parameter=description>
+TEXT_8
+</parameter>
+</function>

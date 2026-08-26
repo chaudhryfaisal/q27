@@ -1,0 +1,12 @@
+<parameter=Write>
+<parameter=content>
+TEXT_1:ml `TEXT_2` TEXT_3 `TEXT_4` TEXT_5 `TEXT_6` TEXT_7:ml `TEXT_8` TEXT_9 `TEXT_10` TEXT_11 `TEXT_12`
+ TEXT_13 `TEXT_14` TEXT_15 `TEXT_16` TEXT_17:ml `TEXT_18` TEXT_19:ml`TEXT_20`TEXT_21:ml`TEXT_22`TEXT_23:ml `TEXT_24` TEXT_25 `TEXT_26`TEXT_27:ml `TEXT_28`
+ TEXT_29 `TEXT_30` TEXT_31 `TEXT_32` TEXT_33 `TEXT_34`TEXT_35:ml `TEXT_36` TEXT_37:ml
+
+</parameter>
+<parameter=file_path>
+PATH_38
+</parameter>
+</function>
+</function>

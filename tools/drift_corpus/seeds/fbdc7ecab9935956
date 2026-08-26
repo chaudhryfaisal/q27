@@ -1,0 +1,10 @@
+<function=Bash>
+<parameter=command>
+CODE_1:ml
+
+</parameter>
+<parameter=description>
+TEXT_2
+</parameter>
+</function>
+PROSE_3

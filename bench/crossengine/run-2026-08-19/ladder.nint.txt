@@ -1,0 +1,16 @@
+C=1 nint aggregate=137.0 t/s  (sum_dec=5538, union=40.4s, client_wall=40.5s)
+   per-stream tps: median=137.0 min=137.0 max=137.0
+   ttft_ms: median=86 max=86
+JSON {"c": 1, "label": "nint", "aggregate_tps": 137.0, "sum_dec": 5538, "union_s": 40.4, "client_wall_s": 40.5, "per_stream_median": 137.0, "ttft_ms_median": 85.7, "n_streams": 1, "server_side_agg": null}
+C=2 nint aggregate=179.5 t/s  (sum_dec=10427, union=58.1s, client_wall=58.2s)
+   per-stream tps: median=98.9 min=93.7 max=104.1
+   ttft_ms: median=144 max=202
+JSON {"c": 2, "label": "nint", "aggregate_tps": 179.5, "sum_dec": 10427, "union_s": 58.1, "client_wall_s": 58.2, "per_stream_median": 98.9, "ttft_ms_median": 143.5, "n_streams": 2, "server_side_agg": null}
+C=4 nint aggregate=219.5 t/s  (sum_dec=20313, union=92.5s, client_wall=92.7s)
+   per-stream tps: median=56.6 min=55.4 max=61.1
+   ttft_ms: median=267 max=481
+JSON {"c": 4, "label": "nint", "aggregate_tps": 219.5, "sum_dec": 20313, "union_s": 92.5, "client_wall_s": 92.7, "per_stream_median": 56.6, "ttft_ms_median": 267.4, "n_streams": 4, "server_side_agg": null}
+C=8 nint aggregate=353.6 t/s  (sum_dec=41024, union=116.0s, client_wall=116.3s)
+   per-stream tps: median=52.4 min=49.2 max=58.7
+   ttft_ms: median=562 max=1136
+JSON {"c": 8, "label": "nint", "aggregate_tps": 353.6, "sum_dec": 41024, "union_s": 116.0, "client_wall_s": 116.3, "per_stream_median": 52.4, "ttft_ms_median": 561.6, "n_streams": 8, "server_side_agg": null}

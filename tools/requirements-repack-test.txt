@@ -1,0 +1,21 @@
+# Hash-locked Qwen3.8 repack/test environment for Apple-silicon release runners.
+# Supported interpreters: CPython 3.12-3.14. Install with:
+# gguf declares network/progress extras that this local reader/writer path never
+# imports. --no-deps is intentional; PyYAML is the one eager gguf import.
+#   python3 -m pip install --no-deps --require-hashes -r tools/requirements-repack-test.txt
+numpy==2.5.1 \
+    --hash=sha256:ab451b59c5643c570974c43aef780703ef1d3b4965d2be07afd530615a9358d1 \
+    --hash=sha256:78798bd5b9ad744056af8efa90e3b9ddaa53272a0848a483084a1cc0a13b2dc0 \
+    --hash=sha256:30b44a6b53a7ae63c54c089a8726e5563ed302716c5b7ccc85afade40b0e7ff6 \
+    --hash=sha256:6165343f81b56ef8f514f396989e529b61d9dc709b99421b07e9f3e698e2287d \
+    --hash=sha256:32985c896d897419ef8da6917872d80b78ad0ea26d85b23245c7366ffde76d75 \
+    --hash=sha256:efd736408cc97c79b9e6917338dfc8f06013b2274f992e96b1d9a81a71e2a2c2 \
+    --hash=sha256:a33276be12fa045805f477f22482088b66bb758ffbe89a9d21457de863a32e22 \
+    --hash=sha256:f089d7b00756190aacf1f5d34bdfc8c3c430ac82b4f868f8cede73380460fce7
+gguf==0.19.0 \
+    --hash=sha256:70bcd10edfe697fb2dad6e40af2234b9d8ece9a41a99761405121ebda1c3c1cd
+PyYAML==6.0.3 \
+    --hash=sha256:fc09d0aa354569bc501d4e787133afc08552722d3ab34836a80547331bb5d4a0 \
+    --hash=sha256:2283a07e2c21a2aa78d9c4442724ec1eb15f5e42a723b99cb3d822d48f5f7ad1 \
+    --hash=sha256:34d5fcd24b8445fadc33f9cf348c1047101756fd760b4dacb5c3e99755703310 \
+    --hash=sha256:c1ff362665ae507275af2853520967820d9124984e0f7466736aea23d8611fba

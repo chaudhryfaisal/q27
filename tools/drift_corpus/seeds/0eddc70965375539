@@ -1,0 +1,15 @@
+<function=Edit>
+<parameter=file_path>
+PATH_1
+</parameter>
+<parameter=new_string>
+CODE_2:ml`CODE_3`CODE_4:ml`CODE_5`CODE_6:ml
+</parameter>
+<parameter=old_string>
+CODE_7:ml`CODE_8`CODE_9:ml`CODE_10`CODE_11:ml
+</parameter>
+<parameter=replace_all>
+TEXT_12
+</parameter>
+</function>
+</function>

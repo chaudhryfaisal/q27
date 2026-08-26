@@ -1,0 +1,132 @@
+HEAD-TO-HEAD  ninfer vs q27   (bench/crossengine)
+run: 2026-08-17T18:20:36-07:00
+arms: agentic,ladder
+legs: vllm
+q27 commit: 77f46bf
+ninfer commit: 604bdc5
+driver: 580.119.02
+
+legs:
+  q4s     q27 q4s        15.46 GB  canonical anchor
+  nint    ninfer int     17.50 GB  format control
+  q5f     q27 q5f        18.22 GB  bpw-matched to nvfp4
+  nvfp4   ninfer nvfp4   18.32 GB  their headline
+  llama   llama.cpp      18.19 GB  Q5_K_M, master 01818e49, q8_0 KV
+  vllm    vLLM NVFP4     ~23 GB    unsloth fixed-MTP, nightly 0.27.2rc1
+
+==============================================================================
+AGENTIC -- 12 SWE-bench_Verified instances driven by Claude Code
+==============================================================================
+leg      inst  nonempty   gold  quit@1  wall/inst    decode   reqs
+q4s        12        10      9       2        48s    215.5    254
+nint       12        12     11       3       327s    261.5    308
+q5f        12        11     10       1        47s    223.4    266
+nvfp4      12        12     11       0        97s    250.2    230
+llama      12        12     11       0        71s    120.5    280
+vllm       12         9      9       0        84s     67.8    315
+
+  decode = tokens / summed decode windows, client-observed via the tap
+  quit@1 = agent stopped after one turn (see TOOL-NAMING note below)
+
+==============================================================================
+PREFILL + PREFIX-CACHE MISS RATE (real agentic traffic)
+==============================================================================
+leg       reqs  reuse tok-wtd  effective tok/s   prompt tok
+q4s        254            n/a            24224      8041948
+nint       311            n/a             2717     10173421
+q5f        266            n/a            31314      8846341
+nvfp4      230            n/a             7641      7200662
+llama      372         93.92%            17715      8689098
+vllm       315            n/a            42094      9999628
+
+  reuse comes from each engine's OWN instrument -- q27 [gen] prefix_hit,
+  ninfer reqlog prefix_cache_hit_tokens, llama/vllm Anthropic
+  cache_read_input_tokens. Denominators differ; see reuse_stats().
+  cache MISS rate = 100% - cache hit. This is the number BUILDLOG names
+  as the gate on the prefill-performance plan's ROI.
+
+==============================================================================
+CONCURRENCY LADDER -- aggregate decode t/s
+==============================================================================
+leg            C=1       C=2       C=4       C=8     peak   scaling
+q4s          135.8     218.8     307.6     412.9    412.9     3.04x
+nint         138.8     160.7     218.2     349.8    349.8     2.52x
+q5f          127.1     194.2     290.9     385.9    385.9     3.04x
+nvfp4        159.3     277.5     494.9     790.0    790.0     4.96x
+llama         90.1     156.1     129.1     230.3    230.3     2.56x
+vllm          67.5     110.0     216.5     398.8    398.8     5.91x
+
+  [calib] q4s C=1: client 135.8 vs server 135.8 (+0.0%)
+  [calib] q4s C=2: client 218.8 vs server 218.7 (+0.0%)
+  [calib] q4s C=4: client 307.6 vs server 307.5 (+0.0%)
+  [calib] q4s C=8: client 412.9 vs server 412.6 (+0.1%)
+  [calib] q5f C=1: client 127.1 vs server 127.1 (+0.0%)
+  [calib] q5f C=2: client 194.2 vs server 194.1 (+0.1%)
+  [calib] q5f C=4: client 290.9 vs server 290.7 (+0.1%)
+  [calib] q5f C=8: client 385.9 vs server 385.6 (+0.1%)
+
+==============================================================================
+QUALITY -- benchlocal --medium, 5 packs / 75 scenarios, temp 0, no-think
+==============================================================================
+pack                             q4s        nint         q5f       nvfp4       llama        vllm
+toolcall-15                    14/15       14/15       15/15       13/15       14/15       14/15
+instructfollow-15              12/15       12/15       12/15       13/15       13/15       13/15
+structoutput-15                14/15       13/15       14/15       14/15       14/15       14/15
+dataextract-15                 13/15       13/15       13/15       13/15       12/15       13/15
+reasonmath-15                  11/15       12/15       12/15       12/15       13/15       12/15
+TOTAL                          64/75       64/75       66/75       65/75       66/75       66/75
+
+  q5f vs nvfp4 is the bpw-matched pair -- the only comparison here
+  where a quality delta is attributable to engine/kernel rather than bits.
+
+==============================================================================
+TOOL-NAMING CONFOUND
+==============================================================================
+  q4s     quit@1: 2/12   unparsed tool names in text: {'Explore': 2}
+  nint    quit@1: 3/12   unparsed tool names in text: {}
+  q5f     quit@1: 1/12   unparsed tool names in text: {'Explore': 1}
+  nvfp4   quit@1: 0/12   unparsed tool names in text: {}
+  llama   quit@1: 0/12   unparsed tool names in text: {}
+  vllm    quit@1: 0/12   unparsed tool names in text: {}
+
+  These are tool calls the model emitted as TEXT that no registry
+  recognized, so the agent saw prose and stopped. It is a property of
+  the vanilla 3.6 checkpoint + this Claude Code build, not of either
+  engine -- but it caps task success on BOTH sides, so gold-hit rates
+  here are not comparable to the 2026-07-15 baseline (11/12).
+
+==============================================================================
+vs 2026-07-14 BASELINE (not config-matched -- see note)
+==============================================================================
+
+  q4s:
+    instance                    base turns/gold   now turns/gold  delta
+    pallets__flask-5014                    13/Y              1/N  LOST
+    psf__requests-1142                     10/Y             11/Y
+    psf__requests-1724                     12/N             17/N
+    psf__requests-1766                      8/Y              1/N  LOST
+    psf__requests-1921                     16/Y              9/Y
+    pydata__xarray-4075                    19/Y             18/Y
+    pydata__xarray-4094                    44/Y             44/Y
+    pylint-dev__pylint-4970                36/Y             34/Y
+    pylint-dev__pylint-6903                 4/Y              5/Y
+    pytest-dev__pytest-10081               23/Y             14/Y
+    pytest-dev__pytest-5262                 4/Y              4/Y
+    pytest-dev__pytest-5809                 4/Y              4/Y
+
+  q5f:
+    instance                    base turns/gold   now turns/gold  delta
+    pallets__flask-5014                    13/Y             12/Y
+    psf__requests-1142                     10/Y             12/Y
+    psf__requests-1724                     12/N              9/N
+    psf__requests-1766                      8/Y              1/N  LOST
+    psf__requests-1921                     16/Y             18/Y
+    pydata__xarray-4075                    19/Y             17/Y
+    pydata__xarray-4094                    44/Y             49/Y
+    pylint-dev__pylint-4970                36/Y             53/Y
+    pylint-dev__pylint-6903                 4/Y              5/Y
+    pytest-dev__pytest-10081               23/Y             27/Y
+    pytest-dev__pytest-5262                 4/Y             12/Y
+    pytest-dev__pytest-5809                 4/Y              4/Y
+
+  baseline headline: 202.7 t/s agg, 47 s/inst, 11/12 gold

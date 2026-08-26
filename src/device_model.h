@@ -57,11 +57,36 @@ class DeviceModel {
     // corrupted state). ~10 ms for the full 16.75 GB model.
     void checksum_baseline();
     int checksum_verify(bool print) const; // returns number of mismatched tensors
+    // One digest over every tensor's baseline sum, comparable ACROSS PROCESSES.
+    // checksum_verify() only catches drift AFTER the baseline was taken, so an
+    // upload that landed wrong is blessed as correct and verifies clean. This
+    // is the only way to see a bad upload: the same artifact must produce the
+    // same aggregate on every load. Printed at load under Q27_PRINT_WSUM=1.
+    unsigned long long checksum_aggregate() const;
+    // HOST-side twin of the above, summed on the CPU from the SOURCE bytes
+    // immediately before each cudaMemcpy (enabled by Q27_PRINT_WSUM=1, since it
+    // touches the whole model on the CPU). Comparing the two localizes a
+    // corrupt load: host==device but both varying across runs => the bytes were
+    // already wrong in host memory (page cache / DRAM / read path); host stable
+    // while device varies => the copy or VRAM is at fault.
+    unsigned long long host_aggregate() const { return host_sum_; }
+    void enable_host_sum(bool on) { want_host_sum_ = on; }
+    // Q27_WSUM_LOCATE=1 (2026-08-24): per-tensor host-vs-device comparison
+    // after upload. The aggregate digest says A load went wrong; this says
+    // WHICH tensor, at which byte offset, which bit, which direction, and
+    // which tensors sit adjacent in device memory. That is the evidence that
+    // separates an out-of-bounds device write (offset at a buffer edge, a
+    // neighbour's name) from a transfer fault (random offset). Returns the
+    // number of tensors that mismatched.
+    int locate_upload_errors() const;
 
   private:
     const Model& model_;
     std::unordered_map<std::string, DevTensor> dev_;
     std::unordered_map<std::string, unsigned long long> sums_;
+    std::unordered_map<std::string, unsigned long long> host_sums_; // per-tensor, data only
+    unsigned long long host_sum_ = 0;
+    bool want_host_sum_ = false;
     size_t bytes_ = 0;
 };
 

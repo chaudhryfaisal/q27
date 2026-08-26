@@ -57,6 +57,17 @@ void gdn_delta_chunk3(const float* S0, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
 // after l2norm3) and g/beta scalars into the per-layer record arena (row L-1),
 // so the commit Fold can replay exactly the bytes the verify consumed after
 // the lane buffers are reused by the next layer.
+// 2026-08-18 GDN mix fusion: the vw>1 decode mix chain collapsed 6 -> 3
+// launches. gdn_convnorm3 = conv_chunk3 + l2norm3 + record3 (one launch, all
+// lanes); gdn_delta_all = delta_step (lane 0, commits S) + delta_chunk3
+// (lanes 1..nsp) with S staged once in smem. Both are bitwise twins of the
+// sequences they replace -- gated by build/gdn_fuse_eq; MIRROR WARNINGS in
+// spec3.cu apply.
+void gdn_convnorm3(const float* ring, CP3 qkv, const float* convw, P3 out, CP3 g, CP3 beta,
+                   float* rec_qkv, float* rec_conv, float* rec_g, float* rec_beta, int channels,
+                   int n_heads, float eps, int vw, cudaStream_t st);
+void gdn_delta_all(const float* Ssrc, float* Sdst, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
+                   cudaStream_t st);
 void gdn_record3(CP3 qkv, CP3 conv, CP3 g, CP3 beta, float* rec_qkv, float* rec_conv,
                  float* rec_g, float* rec_beta, int channels, int n_heads, int nsp,
                  cudaStream_t st = 0);
@@ -96,9 +107,16 @@ void wht3(P3 x, int n_heads, int head_dim, int stride, bool inv, cudaStream_t st
           int ntok = 3);
 
 // Flash-decode split-K partial layout: NS position splits per (token, head)
-// pair, each partial = {m, l, acc[256]} = FD_ST floats. Every split writes its
-// full partial (even when its position range is empty), so scratch must hold
+// pair, each partial = {m, l, acc[256]} = FD_ST floats. scratch must hold
 // ntok * n_q_heads * FD_MAXNS * FD_ST floats regardless of context length.
+// EMPTY SPLITS ARE NOT WRITTEN by fd2 (the live default path): it returns
+// early for sp*chunk >= seq, and k_attn_fd_combine re-derives the same
+// used-split count from the same *pos and never reads past it. Those cells of
+// scratch therefore hold undefined memory -- a reader that sums a fixed ns
+// instead of `used` would pull garbage into the online-softmax rescale. This
+// header used to claim every split wrote its partial, which was true only of
+// the frozen v1 kernel; the writer/reader agreement is the real contract, and
+// any new consumer of `part` must re-derive `used` exactly as the combine does.
 // FD_NS stays 16 so Q27_FD=v1 reproduces the historical kernel bit-for-bit;
 // fd2 uses its own FD2_NS -- with register accumulators the block is cheap,
 // and the grid needs ~4-5 blocks per SM resident for latency hiding

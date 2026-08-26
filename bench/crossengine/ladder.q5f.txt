@@ -1,0 +1,20 @@
+C=1 q5f aggregate=127.1 t/s  (sum_dec=6206, union=48.8s, client_wall=48.9s)
+   per-stream tps: median=127.2 min=127.2 max=127.2
+   ttft_ms: median=103 max=103
+   [calib] server-side convention: 127.1 t/s (1 reqs, 6206 tok)  client is +0.0%
+JSON {"c": 1, "label": "q5f", "aggregate_tps": 127.1, "sum_dec": 6206, "union_s": 48.8, "client_wall_s": 48.9, "per_stream_median": 127.2, "ttft_ms_median": 102.6, "n_streams": 1, "server_side_agg": 127.1}
+C=2 q5f aggregate=194.2 t/s  (sum_dec=15732, union=81.0s, client_wall=81.2s)
+   per-stream tps: median=101.6 min=101.1 max=102.0
+   ttft_ms: median=198 max=216
+   [calib] server-side convention: 194.1 t/s (2 reqs, 15732 tok)  client is +0.0%
+JSON {"c": 2, "label": "q5f", "aggregate_tps": 194.2, "sum_dec": 15732, "union_s": 81.0, "client_wall_s": 81.2, "per_stream_median": 101.6, "ttft_ms_median": 197.7, "n_streams": 2, "server_side_agg": 194.1}
+C=4 q5f aggregate=290.9 t/s  (sum_dec=29793, union=102.4s, client_wall=102.8s)
+   per-stream tps: median=78.6 min=76.2 max=80.5
+   ttft_ms: median=376 max=377
+   [calib] server-side convention: 290.7 t/s (4 reqs, 29793 tok)  client is +0.1%
+JSON {"c": 4, "label": "q5f", "aggregate_tps": 290.9, "sum_dec": 29793, "union_s": 102.4, "client_wall_s": 102.8, "per_stream_median": 78.6, "ttft_ms_median": 376.2, "n_streams": 4, "server_side_agg": 290.7}
+C=8 q5f aggregate=385.9 t/s  (sum_dec=57974, union=150.2s, client_wall=151.0s)
+   per-stream tps: median=53.7 min=51.1 max=55.6
+   ttft_ms: median=675 max=684
+   [calib] server-side convention: 385.6 t/s (8 reqs, 57974 tok)  client is +0.1%
+JSON {"c": 8, "label": "q5f", "aggregate_tps": 385.9, "sum_dec": 57974, "union_s": 150.2, "client_wall_s": 151.0, "per_stream_median": 53.7, "ttft_ms_median": 674.9, "n_streams": 8, "server_side_agg": 385.6}

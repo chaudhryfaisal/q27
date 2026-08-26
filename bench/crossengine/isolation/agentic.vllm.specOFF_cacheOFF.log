@@ -1,0 +1,40 @@
+=== agentic | leg=vllm | tap=:8081 ===
+[run] vllm/pallets__flask-5014 (pallets/flask) ...
+[run] vllm/pallets__flask-5014 done wall=38s
+
+=== SUMMARY (vllm) ===
+  instances: 1  nonempty-diff: 1/1  edited-gold-file: 1/1
+  total wall: 38s (38s/inst avg)
+  decode: 58.6 t/s agg / 58.6 med  (9 reqs, 931 tok)
+  prefill: 7543.8 t/s agg  (179919 prompt tok over 24s TTFT)
+=== END (vllm) ===
+=== agentic | leg=vllm | tap=:8081 ===
+[run] vllm/psf__requests-1142 (psf/requests) ...
+[run] vllm/psf__requests-1142 done wall=128s
+
+=== SUMMARY (vllm) ===
+  instances: 1  nonempty-diff: 1/1  edited-gold-file: 1/1
+  total wall: 128s (128s/inst avg)
+  decode: 63.7 t/s agg / 63.7 med  (18 reqs, 3983 tok)
+  prefill: 7421.5 t/s agg  (494572 prompt tok over 67s TTFT)
+=== END (vllm) ===
+=== agentic | leg=vllm | tap=:8081 ===
+[run] vllm/psf__requests-1724 (psf/requests) ...
+[run] vllm/psf__requests-1724 done wall=39s
+
+=== SUMMARY (vllm) ===
+  instances: 1  nonempty-diff: 1/1  edited-gold-file: 0/1
+  total wall: 39s (39s/inst avg)
+  decode: 53.8 t/s agg / 53.8 med  (6 reqs, 869 tok)
+  prefill: 7039.4 t/s agg  (173732 prompt tok over 25s TTFT)
+=== END (vllm) ===
+=== agentic | leg=vllm | tap=:8081 ===
+[run] vllm/psf__requests-1766 (psf/requests) ...
+[run] vllm/psf__requests-1766 done wall=54s
+
+=== SUMMARY (vllm) ===
+  instances: 1  nonempty-diff: 1/1  edited-gold-file: 1/1
+  total wall: 54s (54s/inst avg)
+  decode: 60.8 t/s agg / 60.8 med  (9 reqs, 1884 tok)
+  prefill: 7928.8 t/s agg  (189974 prompt tok over 24s TTFT)
+=== END (vllm) ===

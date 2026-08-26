@@ -1,0 +1,11 @@
+<function=TaskOutput>
+<parameter=block>
+TEXT_1
+</parameter>
+<parameter=task_id>
+TEXT_2
+</parameter>
+<parameter=timeout>
+TEXT_3
+</parameter>
+</function>

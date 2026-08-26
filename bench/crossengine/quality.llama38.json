@@ -1,0 +1,271 @@
+{
+ "endpoint": "http://127.0.0.1:8081",
+ "equivalent_score_150": 108,
+ "finished_at": "2026-08-22T19:25:25.568261Z",
+ "mode": "medium",
+ "model": "llama38",
+ "packs": [
+  {
+   "diagnostics": {
+    "extraction": {
+     "issues": {},
+     "methods": {},
+     "response_fields": {
+      "message.content": 12
+     }
+    },
+    "finish_reasons": {
+     "counts": {
+      "stop": 6,
+      "tool_calls": 13
+     },
+     "length": 0,
+     "length_rate": 0.0,
+     "total": 19
+    }
+   },
+   "latency": {
+    "mean": 0.5980291062003137,
+    "p50": 0.4217279439981212,
+    "p95": 0.9503291830005764
+   },
+   "pack_id": "toolcall-15",
+   "pass_at_k": {
+    "credited_flaky": 0,
+    "k": 3,
+    "passed": 13,
+    "retried_scenarios": 2,
+    "retry_attempts": 4,
+    "safety_flaky": 0,
+    "score": 0.8666666666666667,
+    "systematic": 2,
+    "total": 15
+   },
+   "passed": 13,
+   "scenario_count": 15,
+   "score": 0.8666666666666667,
+   "skipped": false,
+   "status": "ok",
+   "thinking_enabled": false,
+   "total": 15,
+   "upstream_commit": "615b1576e257a1b859f6e9183d52408bb4e05ee3",
+   "variance": null,
+   "version": "1.0.1",
+   "warnings": []
+  },
+  {
+   "diagnostics": {
+    "extraction": {
+     "issues": {},
+     "methods": {},
+     "response_fields": {
+      "message.content": 19
+     }
+    },
+    "finish_reasons": {
+     "counts": {
+      "stop": 19
+     },
+     "length": 0,
+     "length_rate": 0.0,
+     "total": 19
+    }
+   },
+   "latency": {
+    "mean": 0.49703653033357115,
+    "p50": 0.46274362100302824,
+    "p95": 0.7707068790004996
+   },
+   "pack_id": "instructfollow-15",
+   "pass_at_k": {
+    "credited_flaky": 0,
+    "k": 3,
+    "passed": 13,
+    "retried_scenarios": 2,
+    "retry_attempts": 4,
+    "safety_flaky": 0,
+    "score": 0.8666666666666667,
+    "systematic": 2,
+    "total": 15
+   },
+   "passed": 13,
+   "scenario_count": 15,
+   "score": 0.8666666666666667,
+   "skipped": false,
+   "status": "ok",
+   "thinking_enabled": false,
+   "total": 15,
+   "upstream_commit": "536a1044aef0acbfdbc5a19ca49170f5346d3cd4",
+   "variance": null,
+   "version": "1.0.0",
+   "warnings": []
+  },
+  {
+   "diagnostics": {
+    "extraction": {
+     "issues": {},
+     "methods": {},
+     "response_fields": {
+      "message.content": 17
+     }
+    },
+    "finish_reasons": {
+     "counts": {
+      "stop": 17
+     },
+     "length": 0,
+     "length_rate": 0.0,
+     "total": 17
+    }
+   },
+   "latency": {
+    "mean": 0.8546862567328692,
+    "p50": 0.7664305530015554,
+    "p95": 1.4043130139980349
+   },
+   "pack_id": "structoutput-15",
+   "pass_at_k": {
+    "credited_flaky": 0,
+    "k": 3,
+    "passed": 14,
+    "retried_scenarios": 1,
+    "retry_attempts": 2,
+    "safety_flaky": 0,
+    "score": 0.9333333333333333,
+    "systematic": 1,
+    "total": 15
+   },
+   "passed": 14,
+   "scenario_count": 15,
+   "score": 0.9333333333333333,
+   "skipped": false,
+   "status": "ok",
+   "thinking_enabled": false,
+   "total": 15,
+   "upstream_commit": "b82f11cc85bbbb7814c2d85e47fa9fa8104d5c4a",
+   "variance": null,
+   "version": "1.0.0",
+   "warnings": []
+  },
+  {
+   "diagnostics": {
+    "extraction": {
+     "issues": {},
+     "methods": {},
+     "response_fields": {
+      "message.content": 39
+     }
+    },
+    "finish_reasons": {
+     "counts": {
+      "stop": 39
+     },
+     "length": 0,
+     "length_rate": 0.0,
+     "total": 39
+    }
+   },
+   "latency": {
+    "mean": 1.2807265739337406,
+    "p50": 1.177668709999125,
+    "p95": 1.8755160859982425
+   },
+   "pack_id": "dataextract-15",
+   "pass_at_k": {
+    "credited_flaky": 0,
+    "k": 3,
+    "passed": 3,
+    "retried_scenarios": 12,
+    "retry_attempts": 24,
+    "safety_flaky": 0,
+    "score": 0.2,
+    "systematic": 12,
+    "total": 15
+   },
+   "passed": 3,
+   "scenario_count": 15,
+   "score": 0.2,
+   "skipped": false,
+   "status": "ok",
+   "thinking_enabled": false,
+   "total": 15,
+   "upstream_commit": "ec3a131ff218ced7c6d0d524af764eae5c25665b",
+   "variance": null,
+   "version": "1.0.0",
+   "warnings": []
+  },
+  {
+   "diagnostics": {
+    "extraction": {
+     "issues": {},
+     "methods": {},
+     "response_fields": {
+      "message.content": 17
+     }
+    },
+    "finish_reasons": {
+     "counts": {
+      "length": 3,
+      "stop": 14
+     },
+     "length": 3,
+     "length_rate": 0.17647058823529413,
+     "total": 17
+    }
+   },
+   "latency": {
+    "mean": 3.6920347274669134,
+    "p50": 3.3182128420012305,
+    "p95": 6.818540295997082
+   },
+   "pack_id": "reasonmath-15",
+   "pass_at_k": {
+    "credited_flaky": 0,
+    "k": 3,
+    "passed": 11,
+    "retried_scenarios": 1,
+    "retry_attempts": 2,
+    "safety_flaky": 0,
+    "score": 0.7333333333333333,
+    "systematic": 4,
+    "total": 15
+   },
+   "passed": 11,
+   "scenario_count": 15,
+   "score": 0.7333333333333333,
+   "skipped": false,
+   "status": "ok",
+   "thinking_enabled": false,
+   "total": 15,
+   "upstream_commit": "78ef138cc26ad6b11f89238e20430de9a9e862aa",
+   "variance": null,
+   "version": "1.0.0",
+   "warnings": []
+  }
+ ],
+ "pass_at_k": {
+  "credited_flaky": 0,
+  "k": 3,
+  "passed": 54,
+  "retried_scenarios": 18,
+  "retry_attempts": 36,
+  "safety_flaky": 0,
+  "score": 0.72,
+  "systematic": 21,
+  "total": 75
+ },
+ "repeat": 1,
+ "runner_version": "0.9.8",
+ "schema_version": "1",
+ "started_at": "2026-08-22T19:22:50.444351Z",
+ "thinking_enabled": false,
+ "thinking_mode": "force-off",
+ "totals": {
+  "passed": 54,
+  "score": 0.72,
+  "total": 75
+ },
+ "warnings": [
+  "timeout scaling active: measured_decode_tps=76.7, reference_tps=100.0, scale=1.30, token-budget-multiplier=16384/1024=16.00"
+ ]
+}

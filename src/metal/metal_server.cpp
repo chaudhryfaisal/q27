@@ -664,7 +664,7 @@ struct Runtime {
     // default for speed). --think flips the profile to prefilling an open
     // think tag. Either way, per-request fields override (resolve_think).
     std::vector<std::string> vocab_bytes_v;
-    q27::ToolMaskCache mask_cache;
+    q27::ToolMaskCache<q27::ToolGrammar> mask_cache;
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
@@ -1710,6 +1710,24 @@ struct Runtime {
         tc.enabled=q27::metal_tool_constraint_enabled(
             constrain_tools,!tool_names.empty(),sampling.temperature==0.0f,
             effective_speculation_width(sampling,bounded_reasoning),forced_tool_choice);
+        // Metal is still on the 1-arg tc.begin (JSON grammar only) -- it has
+        // no parallel cache_xml and the filtered tools JSON isn't threaded
+        // through to this site. If the model is XML-trained (Qwen3.8) and
+        // --constrain-tools is on, the JSON grammar dead-states on the first
+        // body byte ('<', where JSON expects '{') and the constraint drops
+        // cleanly. No crash, but the feature silently no-ops. Warn once so
+        // it's visible (review 2026-08-20).
+        if (tc.enabled && q27::tool_dialect_xml()) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr,
+                        "[metal] WARNING: --constrain-tools + XML-dialect model "
+                        "(Qwen3.8) is not wired on Metal -- constraint will "
+                        "disengage on the first body byte. CUDA path uses "
+                        "ToolGrammarXml and works correctly; Metal is JSON-only.\n");
+            }
+        }
         {
             auto gpu=lease_now();
             tc.begin(tool_names);
@@ -2325,10 +2343,18 @@ int main(int argc,char** argv) {
                 const std::string error_id="arrival_metal_"+runtime.boot_id+"_"+
                     std::to_string((long)req_counter++);
                 runtime.trace.event({{"kind","arrival"},{"api",api},{"id",error_id}});
+                // cpp-httplib 0.53.1 renamed Request::is_connection_alive to
+                // is_connection_closed and INVERTED its sense (it defaults to
+                // []{ return true; }, i.e. "closed"). Handlers below take a
+                // LIVENESS predicate, so this negates rather than renames --
+                // a straight rename compiles and reports every live connection
+                // as dead.
+                const std::function<bool()> live=
+                    [&request]{ return !request.is_connection_closed(); };
                 try { handler(json::parse(request.body),response,
                               request.has_header("x-codex-installation-id") ||
                               request.has_header("x-codex-turn-metadata"),
-                              request.is_connection_alive); }
+                              live); }
                 catch(const Runtime::ClientGone&) {
                     response.status=499;
                 }
@@ -2375,7 +2401,15 @@ int main(int argc,char** argv) {
                     response.set_content(q27::anthropic_error_json("invalid_request_error","invalid JSON body"),"application/json");
                     return;
                 }
-                try { handler(body,response,request.is_connection_alive); }
+                // cpp-httplib 0.53.1 renamed Request::is_connection_alive to
+                // is_connection_closed and INVERTED its sense (it defaults to
+                // []{ return true; }, i.e. "closed"). Handlers below take a
+                // LIVENESS predicate, so this negates rather than renames --
+                // a straight rename compiles and reports every live connection
+                // as dead.
+                const std::function<bool()> live=
+                    [&request]{ return !request.is_connection_closed(); };
+                try { handler(body,response,live); }
                 catch(const Runtime::ClientGone&) {
                     response.status=499;
                 }
@@ -2512,7 +2546,7 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.guard_engine([&]{
                             return runtime.run(ids,n,sampling,stops,emit,
                                 std::vector<std::string>{},snap_hint,id,nullptr,false,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         // Terminal chunk with a real finish_reason before [DONE]
@@ -2575,7 +2609,8 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
-            std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req,nullptr,nullptr,{},{},&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Chat),TokenLimitApi::Chat);
@@ -2661,7 +2696,7 @@ int main(int argc,char** argv) {
                 std::string tx=q27::strip_ws2(ordered.text);
                 std::vector<q27::ToolCall> good=std::move(ordered.calls);
                 if(ordered.recovered) {
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",ordered.recovered);
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (chat nonstream)\n",ordered.recovered);
                     runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",ordered.recovered}});
                 }
                 json tcs=json::array();
@@ -2748,7 +2783,7 @@ int main(int argc,char** argv) {
                                 if(!before && any_call) recovered++;
                             }
                             if(recovered) {
-                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat stream)\n",recovered);
+                                fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (chat stream)\n",recovered);
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},
                                                      {"stream",true},{"count",recovered}});
                             }
@@ -2895,7 +2930,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -2983,9 +3018,10 @@ int main(int argc,char** argv) {
             q27::validate_anthropic_tool_choice_thinking(tchoice,think_cfg);
             bool think_req=think_cfg.enabled;
             if(tchoice.mode==q27::ToolChoice::FORCED) think_req=false;
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
             std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),selected.tools,think_req,nullptr,nullptr,
-                q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+                q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
@@ -3022,9 +3058,10 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
             std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),tools,think_req,nullptr,nullptr,
-                q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+                q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Messages));
@@ -3113,7 +3150,7 @@ int main(int argc,char** argv) {
                     content.push_back({{"type","thinking"},{"thinking",th},{"signature","q27-local"}});
                 std::vector<q27::ToolCall> good=std::move(ordered.calls);
                 if(ordered.recovered) {
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",ordered.recovered);
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (nonstream)\n",ordered.recovered);
                     runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",false},{"count",ordered.recovered}});
                 }
                 const bool any_call=!good.empty();
@@ -3227,7 +3264,7 @@ int main(int argc,char** argv) {
                             if(!before && any_call) recovered++;
                         }
                         if(recovered) {
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",recovered);
+                            fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (stream)\n",recovered);
                             runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},
                                                  {"stream",true},{"count",recovered}});
                         }
@@ -3395,7 +3432,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,mid,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -3505,7 +3542,8 @@ int main(int argc,char** argv) {
                 think_cfg.budget_set=true;
                 think_cfg.budget=-1;
             }
-            std::string rendered=q27::chatml_prompt(merged,tools,think_req);
+            const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            std::string rendered=q27::chatml_prompt(merged,tools,think_req,nullptr,nullptr,{},{},&topts);
             if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             const uint32_t requested_n=max_tokens(body,q27::metal_default_max_tokens(q27::MetalEndpoint::Responses),TokenLimitApi::Responses);
@@ -3610,7 +3648,7 @@ int main(int argc,char** argv) {
                     }
                     push_message(tx.substr(cursor),incomplete_item);
                     if(recovered) {
-                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",recovered);
+                        fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp nonstream)\n",recovered);
                         runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
                                              {"stream",false},{"count",recovered}});
                     }
@@ -3972,7 +4010,7 @@ int main(int argc,char** argv) {
                                 recovered=emit_recovered(
                                     bare_pending,bcs,incomplete_item,incomplete_call);
                                 if(recovered) {
-                                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",recovered);
+                                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp stream)\n",recovered);
                                     runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
                                                          {"stream",true},{"count",recovered}});
                                 }
@@ -4278,7 +4316,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },grammar_tool_names,snap_hint,resp_id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_alive(); });
+                                [&]{ return sink.is_writable(); });
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) {
                             runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},

@@ -208,9 +208,10 @@ static int anthropic_api_selftest() {
         expect(msgs.size() == 4 && msgs[1].role == "user" && msgs[1].content == "hello",
                "plain user");
         expect(msgs.size() == 4 && msgs[2].role == "assistant" &&
-                   msgs[2].content == "<think>\nhmm\n</think>\nI'll call a tool.\n"
+                   msgs[2].content == "I'll call a tool.\n"
                                       "<tool_call>\n{\"name\": \"ls\", \"arguments\": "
-                                      "{\"path\":\"/w\"}}\n</tool_call>",
+                                      "{\"path\":\"/w\"}}\n</tool_call>" &&
+                   msgs[2].reasoning == "hmm",
                "assistant think+text+tool_use");
         expect(msgs.size() == 4 && msgs[3].role == "user" &&
                    msgs[3].content == "<tool_response>\na.md\n</tool_response>",
@@ -643,8 +644,8 @@ int main(int argc, char** argv) {
     // right after "<|im_end|>\n" and right before "<|im_start|>assistant\n",
     // and encoding the prefix substring must be deterministic.
     {
-        std::vector<q27::Msg> msgs = {{"system", "S"}, {"user", "hi"},
-                                      {"assistant", "yo"}, {"user", "go"}};
+        std::vector<q27::Msg> msgs = {{"system", "S", {}}, {"user", "hi", {}},
+                                      {"assistant", "yo", {}}, {"user", "go", {}}};
         size_t off = 0;
         std::string r = q27::chatml_prompt(msgs, nlohmann::json::array(), false, &off);
         bool ok = off > 0 && off < r.size() &&
@@ -720,7 +721,7 @@ int main(int argc, char** argv) {
                                           "abc", "\n",  "}",    " ",      "</tool_call>",
                                           ""};
         const int CLOSER = 9, CTRL = 10;
-        q27::ToolMaskCache mc;
+        q27::ToolMaskCache<q27::ToolGrammar> mc;
         mc.init(&vocab, CLOSER);
         q27::ToolGrammar g;
         g.reset({"write", "view"});
@@ -749,7 +750,7 @@ int main(int argc, char** argv) {
     {
         auto vb = tok.vocab_bytes();
         int closer = tok.token_id("</tool_call>");
-        q27::ToolMaskCache mc;
+        q27::ToolMaskCache<q27::ToolGrammar> mc;
         mc.init(&vb, closer);
         q27::ToolGrammar g;
         g.reset({"write", "view", "ls", "bash", "grep", "glob", "edit"});

@@ -1,0 +1,8 @@
+<function=TaskCreate>
+<parameter=description>
+TEXT_1
+</parameter>
+<parameter=subject>
+TEXT_2
+</parameter>
+</function>

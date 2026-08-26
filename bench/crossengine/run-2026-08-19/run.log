@@ -1,0 +1,444 @@
+run: 2026-08-19T14:05:50-07:00
+arms: agentic,ladder
+legs: q4s,nint,q5f,nvfp4,llama,vllm
+q27 commit: c7aec66
+ninfer commit: 604bdc5
+driver: 580.119.02
+
+################ LEG q4s (serving) ################
+up after 2s
+[q4s] booted in 2s on :8110, VRAM 30651 MiB
+=== agentic | leg=q4s | tap=:8081 ===
+[run] q4s/pallets__flask-5014 (pallets/flask) ...
+[run] q4s/pallets__flask-5014 done wall=10s
+[run] q4s/psf__requests-1142 (psf/requests) ...
+[run] q4s/psf__requests-1142 done wall=47s
+[run] q4s/psf__requests-1724 (psf/requests) ...
+[run] q4s/psf__requests-1724 done wall=23s
+[run] q4s/psf__requests-1766 (psf/requests) ...
+[run] q4s/psf__requests-1766 done wall=10s
+[run] q4s/psf__requests-1921 (psf/requests) ...
+[run] q4s/psf__requests-1921 done wall=79s
+[run] q4s/pydata__xarray-4075 (pydata/xarray) ...
+[run] q4s/pydata__xarray-4075 done wall=34s
+[run] q4s/pydata__xarray-4094 (pydata/xarray) ...
+[run] q4s/pydata__xarray-4094 done wall=116s
+[run] q4s/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] q4s/pylint-dev__pylint-4970 done wall=144s
+[run] q4s/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] q4s/pylint-dev__pylint-6903 done wall=18s
+[run] q4s/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] q4s/pytest-dev__pytest-10081 done wall=91s
+[run] q4s/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] q4s/pytest-dev__pytest-5262 done wall=11s
+[run] q4s/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] q4s/pytest-dev__pytest-5809 done wall=12s
+
+=== SUMMARY (q4s) ===
+  instances: 12  nonempty-diff: 9/12  edited-gold-file: 8/12
+  total wall: 595s (50s/inst avg)
+  decode: 260.7 t/s agg / 228.8 med  (295 reqs, 56804 tok)
+  prefill: 30763.9 t/s agg  (10523114 prompt tok over 342s TTFT)
+=== END (q4s) ===
+[q4s] peak VRAM 30655 MiB
+
+################ LEG nint (serving) ################
+up after 4s
+[nint] booted in 13s on :8120, VRAM 27411 MiB
+=== agentic | leg=nint | tap=:8081 ===
+[run] nint/pallets__flask-5014 (pallets/flask) ...
+[run] nint/pallets__flask-5014 done wall=138s
+[run] nint/psf__requests-1142 (psf/requests) ...
+[run] nint/psf__requests-1142 done wall=172s
+[run] nint/psf__requests-1724 (psf/requests) ...
+[run] nint/psf__requests-1724 done wall=155s
+[run] nint/psf__requests-1766 (psf/requests) ...
+[run] nint/psf__requests-1766 done wall=93s
+[run] nint/psf__requests-1921 (psf/requests) ...
+[run] nint/psf__requests-1921 done wall=249s
+[run] nint/pydata__xarray-4075 (pydata/xarray) ...
+[run] nint/pydata__xarray-4075 done wall=576s
+[run] nint/pydata__xarray-4094 (pydata/xarray) ...
+[run] nint/pydata__xarray-4094 done wall=659s
+[run] nint/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] nint/pylint-dev__pylint-4970 done wall=240s
+[run] nint/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] nint/pylint-dev__pylint-6903 done wall=69s
+[run] nint/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] nint/pytest-dev__pytest-10081 done wall=700s
+[run] nint/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] nint/pytest-dev__pytest-5262 done wall=103s
+[run] nint/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] nint/pytest-dev__pytest-5809 done wall=41s
+
+=== SUMMARY (nint) ===
+  instances: 12  nonempty-diff: 12/12  edited-gold-file: 11/12
+  total wall: 3195s (266s/inst avg)
+  decode: 231.2 t/s agg / 194.8 med  (258 reqs, 45860 tok)
+  prefill: 2756.1 t/s agg  (8122913 prompt tok over 2947s TTFT)
+=== END (nint) ===
+[nint] peak VRAM 27413 MiB
+
+################ LEG q5f (serving) ################
+up after 48s
+[q5f] booted in 49s on :8130, VRAM 30651 MiB
+=== agentic | leg=q5f | tap=:8081 ===
+[run] q5f/pallets__flask-5014 (pallets/flask) ...
+[run] q5f/pallets__flask-5014 done wall=17s
+[run] q5f/psf__requests-1142 (psf/requests) ...
+[run] q5f/psf__requests-1142 done wall=53s
+[run] q5f/psf__requests-1724 (psf/requests) ...
+[run] q5f/psf__requests-1724 done wall=22s
+[run] q5f/psf__requests-1766 (psf/requests) ...
+[run] q5f/psf__requests-1766 done wall=37s
+[run] q5f/psf__requests-1921 (psf/requests) ...
+[run] q5f/psf__requests-1921 done wall=46s
+[run] q5f/pydata__xarray-4075 (pydata/xarray) ...
+[run] q5f/pydata__xarray-4075 done wall=66s
+[run] q5f/pydata__xarray-4094 (pydata/xarray) ...
+[run] q5f/pydata__xarray-4094 done wall=115s
+[run] q5f/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] q5f/pylint-dev__pylint-4970 done wall=71s
+[run] q5f/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] q5f/pylint-dev__pylint-6903 done wall=20s
+[run] q5f/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] q5f/pytest-dev__pytest-10081 done wall=70s
+[run] q5f/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] q5f/pytest-dev__pytest-5262 done wall=26s
+[run] q5f/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] q5f/pytest-dev__pytest-5809 done wall=13s
+
+=== SUMMARY (q5f) ===
+  instances: 12  nonempty-diff: 12/12  edited-gold-file: 11/12
+  total wall: 556s (46s/inst avg)
+  decode: 216.8 t/s agg / 207.9 med  (273 reqs, 49931 tok)
+  prefill: 26170.7 t/s agg  (8147194 prompt tok over 311s TTFT)
+=== END (q5f) ===
+[q5f] peak VRAM 30653 MiB
+
+################ LEG nvfp4 (serving) ################
+up after 3s
+[nvfp4] booted in 11s on :8140, VRAM 28201 MiB
+=== agentic | leg=nvfp4 | tap=:8081 ===
+[run] nvfp4/pallets__flask-5014 (pallets/flask) ...
+[run] nvfp4/pallets__flask-5014 done wall=73s
+[run] nvfp4/psf__requests-1142 (psf/requests) ...
+[run] nvfp4/psf__requests-1142 done wall=76s
+[run] nvfp4/psf__requests-1724 (psf/requests) ...
+[run] nvfp4/psf__requests-1724 done wall=73s
+[run] nvfp4/psf__requests-1766 (psf/requests) ...
+[run] nvfp4/psf__requests-1766 done wall=34s
+[run] nvfp4/psf__requests-1921 (psf/requests) ...
+[run] nvfp4/psf__requests-1921 done wall=83s
+[run] nvfp4/pydata__xarray-4075 (pydata/xarray) ...
+[run] nvfp4/pydata__xarray-4075 done wall=80s
+[run] nvfp4/pydata__xarray-4094 (pydata/xarray) ...
+[run] nvfp4/pydata__xarray-4094 done wall=328s
+[run] nvfp4/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] nvfp4/pylint-dev__pylint-4970 done wall=228s
+[run] nvfp4/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] nvfp4/pylint-dev__pylint-6903 done wall=30s
+[run] nvfp4/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] nvfp4/pytest-dev__pytest-10081 done wall=253s
+[run] nvfp4/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] nvfp4/pytest-dev__pytest-5262 done wall=95s
+[run] nvfp4/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] nvfp4/pytest-dev__pytest-5809 done wall=13s
+
+=== SUMMARY (nvfp4) ===
+  instances: 12  nonempty-diff: 12/12  edited-gold-file: 10/12
+  total wall: 1366s (114s/inst avg)
+  decode: 245.2 t/s agg / 235.2 med  (260 reqs, 46271 tok)
+  prefill: 7572.8 t/s agg  (8621227 prompt tok over 1138s TTFT)
+=== END (nvfp4) ===
+[nvfp4] peak VRAM 28203 MiB
+
+################ LEG llama (serving) ################
+up after 50s
+[llama] booted in 50s on :8150, VRAM 26233 MiB
+=== agentic | leg=llama | tap=:8081 ===
+[run] llama/pallets__flask-5014 (pallets/flask) ...
+[run] llama/pallets__flask-5014 done wall=30s
+[run] llama/psf__requests-1142 (psf/requests) ...
+[run] llama/psf__requests-1142 done wall=60s
+[run] llama/psf__requests-1724 (psf/requests) ...
+[run] llama/psf__requests-1724 done wall=25s
+[run] llama/psf__requests-1766 (psf/requests) ...
+[run] llama/psf__requests-1766 done wall=31s
+[run] llama/psf__requests-1921 (psf/requests) ...
+[run] llama/psf__requests-1921 done wall=68s
+[run] llama/pydata__xarray-4075 (pydata/xarray) ...
+[run] llama/pydata__xarray-4075 done wall=75s
+[run] llama/pydata__xarray-4094 (pydata/xarray) ...
+[run] llama/pydata__xarray-4094 done wall=126s
+[run] llama/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] llama/pylint-dev__pylint-4970 done wall=89s
+[run] llama/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] llama/pylint-dev__pylint-6903 done wall=17s
+[run] llama/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] llama/pytest-dev__pytest-10081 done wall=142s
+[run] llama/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] llama/pytest-dev__pytest-5262 done wall=41s
+[run] llama/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] llama/pytest-dev__pytest-5809 done wall=15s
+
+=== SUMMARY (llama) ===
+  instances: 12  nonempty-diff: 12/12  edited-gold-file: 11/12
+  total wall: 719s (60s/inst avg)
+  decode: 133.8 t/s agg / 136.7 med  (272 reqs, 52053 tok)
+  prefill: 1831.8 t/s agg  (556165 prompt tok over 304s TTFT)
+=== END (llama) ===
+[llama] peak VRAM 26277 MiB
+
+################ LEG vllm (serving) ################
+up after 231s
+[vllm] booted in 233s on :8160, VRAM 29597 MiB
+=== agentic | leg=vllm | tap=:8081 ===
+[run] vllm/pallets__flask-5014 (pallets/flask) ...
+[run] vllm/pallets__flask-5014 done wall=38s
+[run] vllm/psf__requests-1142 (psf/requests) ...
+[run] vllm/psf__requests-1142 done wall=66s
+[run] vllm/psf__requests-1724 (psf/requests) ...
+[run] vllm/psf__requests-1724 done wall=16s
+[run] vllm/psf__requests-1766 (psf/requests) ...
+[run] vllm/psf__requests-1766 done wall=49s
+[run] vllm/psf__requests-1921 (psf/requests) ...
+[run] vllm/psf__requests-1921 done wall=167s
+[run] vllm/pydata__xarray-4075 (pydata/xarray) ...
+[run] vllm/pydata__xarray-4075 done wall=72s
+[run] vllm/pydata__xarray-4094 (pydata/xarray) ...
+[run] vllm/pydata__xarray-4094 done wall=238s
+[run] vllm/pylint-dev__pylint-4970 (pylint-dev/pylint) ...
+[run] vllm/pylint-dev__pylint-4970 done wall=46s
+[run] vllm/pylint-dev__pylint-6903 (pylint-dev/pylint) ...
+[run] vllm/pylint-dev__pylint-6903 done wall=23s
+[run] vllm/pytest-dev__pytest-10081 (pytest-dev/pytest) ...
+[run] vllm/pytest-dev__pytest-10081 done wall=202s
+[run] vllm/pytest-dev__pytest-5262 (pytest-dev/pytest) ...
+[run] vllm/pytest-dev__pytest-5262 done wall=20s
+[run] vllm/pytest-dev__pytest-5809 (pytest-dev/pytest) ...
+[run] vllm/pytest-dev__pytest-5809 done wall=9s
+
+=== SUMMARY (vllm) ===
+  instances: 12  nonempty-diff: 10/12  edited-gold-file: 9/12
+  total wall: 946s (79s/inst avg)
+  decode: 67.1 t/s agg / 66.1 med  (285 reqs, 47489 tok)
+  prefill: 44361.2 t/s agg  (9111794 prompt tok over 205s TTFT)
+=== END (vllm) ===
+[vllm] peak VRAM 30287 MiB
+
+################ LEG q4s (ladder) ################
+up after 70s
+[q4s] slot 0 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 1 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 2 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 3 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 4 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 5 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 6 ready: ctx=16384
+[q4s] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q4s] slot 7 ready: ctx=16384
+[q4s] VRAM after boot 28223 MiB
+C=1 q4s aggregate=141.3 t/s  (sum_dec=5055, union=35.8s, client_wall=35.9s)
+   per-stream tps: median=141.3 min=141.3 max=141.3
+   ttft_ms: median=94 max=94
+   [calib] server-side convention: 141.3 t/s (1 reqs, 5055 tok)  client is +0.0%
+JSON {"c": 1, "label": "q4s", "aggregate_tps": 141.3, "sum_dec": 5055, "union_s": 35.8, "client_wall_s": 35.9, "per_stream_median": 141.3, "ttft_ms_median": 94.0, "n_streams": 1, "server_side_agg": 141.3}
+C=2 q4s aggregate=229.7 t/s  (sum_dec=16384, union=71.3s, client_wall=71.5s)
+   per-stream tps: median=115.7 min=114.8 max=116.5
+   ttft_ms: median=173 max=186
+   [calib] server-side convention: 229.6 t/s (2 reqs, 16384 tok)  client is +0.0%
+JSON {"c": 2, "label": "q4s", "aggregate_tps": 229.7, "sum_dec": 16384, "union_s": 71.3, "client_wall_s": 71.5, "per_stream_median": 115.7, "ttft_ms_median": 173.1, "n_streams": 2, "server_side_agg": 229.6}
+C=4 q4s aggregate=352.3 t/s  (sum_dec=30376, union=86.2s, client_wall=86.6s)
+   per-stream tps: median=92.7 min=92.3 max=97.0
+   ttft_ms: median=330 max=331
+   [calib] server-side convention: 352.1 t/s (4 reqs, 30376 tok)  client is +0.1%
+JSON {"c": 4, "label": "q4s", "aggregate_tps": 352.3, "sum_dec": 30376, "union_s": 86.2, "client_wall_s": 86.6, "per_stream_median": 92.7, "ttft_ms_median": 330.5, "n_streams": 4, "server_side_agg": 352.1}
+C=8 q4s aggregate=530.6 t/s  (sum_dec=59720, union=112.6s, client_wall=113.3s)
+   per-stream tps: median=72.9 min=70.7 max=74.5
+   ttft_ms: median=633 max=635
+   [calib] server-side convention: 530.1 t/s (8 reqs, 59720 tok)  client is +0.1%
+JSON {"c": 8, "label": "q4s", "aggregate_tps": 530.6, "sum_dec": 59720, "union_s": 112.6, "client_wall_s": 113.3, "per_stream_median": 72.9, "ttft_ms_median": 633.5, "n_streams": 8, "server_side_agg": 530.1}
+
+################ LEG nint (ladder) ################
+up after 4s
+[nint] VRAM after boot 25071 MiB
+C=1 nint aggregate=137.0 t/s  (sum_dec=5538, union=40.4s, client_wall=40.5s)
+   per-stream tps: median=137.0 min=137.0 max=137.0
+   ttft_ms: median=86 max=86
+JSON {"c": 1, "label": "nint", "aggregate_tps": 137.0, "sum_dec": 5538, "union_s": 40.4, "client_wall_s": 40.5, "per_stream_median": 137.0, "ttft_ms_median": 85.7, "n_streams": 1, "server_side_agg": null}
+C=2 nint aggregate=179.5 t/s  (sum_dec=10427, union=58.1s, client_wall=58.2s)
+   per-stream tps: median=98.9 min=93.7 max=104.1
+   ttft_ms: median=144 max=202
+JSON {"c": 2, "label": "nint", "aggregate_tps": 179.5, "sum_dec": 10427, "union_s": 58.1, "client_wall_s": 58.2, "per_stream_median": 98.9, "ttft_ms_median": 143.5, "n_streams": 2, "server_side_agg": null}
+C=4 nint aggregate=219.5 t/s  (sum_dec=20313, union=92.5s, client_wall=92.7s)
+   per-stream tps: median=56.6 min=55.4 max=61.1
+   ttft_ms: median=267 max=481
+JSON {"c": 4, "label": "nint", "aggregate_tps": 219.5, "sum_dec": 20313, "union_s": 92.5, "client_wall_s": 92.7, "per_stream_median": 56.6, "ttft_ms_median": 267.4, "n_streams": 4, "server_side_agg": null}
+C=8 nint aggregate=353.6 t/s  (sum_dec=41024, union=116.0s, client_wall=116.3s)
+   per-stream tps: median=52.4 min=49.2 max=58.7
+   ttft_ms: median=562 max=1136
+JSON {"c": 8, "label": "nint", "aggregate_tps": 353.6, "sum_dec": 41024, "union_s": 116.0, "client_wall_s": 116.3, "per_stream_median": 52.4, "ttft_ms_median": 561.6, "n_streams": 8, "server_side_agg": null}
+
+################ LEG q5f (ladder) ################
+up after 3s
+[q5f] slot 0 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 1 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 2 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 3 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 4 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 5 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 6 ready: ctx=16384
+[q5f] spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+[q5f] slot 7 ready: ctx=16384
+[q5f] VRAM after boot 28213 MiB
+C=1 q5f aggregate=134.7 t/s  (sum_dec=8192, union=60.8s, client_wall=60.9s)
+   per-stream tps: median=134.7 min=134.7 max=134.7
+   ttft_ms: median=98 max=98
+   [calib] server-side convention: 134.6 t/s (1 reqs, 8192 tok)  client is +0.0%
+JSON {"c": 1, "label": "q5f", "aggregate_tps": 134.7, "sum_dec": 8192, "union_s": 60.8, "client_wall_s": 60.9, "per_stream_median": 134.7, "ttft_ms_median": 98.5, "n_streams": 1, "server_side_agg": 134.6}
+C=2 q5f aggregate=173.8 t/s  (sum_dec=11762, union=67.7s, client_wall=67.9s)
+   per-stream tps: median=110.0 min=104.7 max=115.2
+   ttft_ms: median=182 max=197
+   [calib] server-side convention: 173.8 t/s (2 reqs, 11762 tok)  client is +0.0%
+JSON {"c": 2, "label": "q5f", "aggregate_tps": 173.8, "sum_dec": 11762, "union_s": 67.7, "client_wall_s": 67.9, "per_stream_median": 110.0, "ttft_ms_median": 182.2, "n_streams": 2, "server_side_agg": 173.8}
+C=4 q5f aggregate=299.9 t/s  (sum_dec=27552, union=91.9s, client_wall=92.3s)
+   per-stream tps: median=87.7 min=86.1 max=89.5
+   ttft_ms: median=351 max=352
+   [calib] server-side convention: 299.7 t/s (4 reqs, 27552 tok)  client is +0.1%
+JSON {"c": 4, "label": "q5f", "aggregate_tps": 299.9, "sum_dec": 27552, "union_s": 91.9, "client_wall_s": 92.3, "per_stream_median": 87.7, "ttft_ms_median": 351.3, "n_streams": 4, "server_side_agg": 299.7}
+C=8 q5f aggregate=509.7 t/s  (sum_dec=59946, union=117.6s, client_wall=118.4s)
+   per-stream tps: median=68.9 min=67.8 max=70.6
+   ttft_ms: median=667 max=669
+   [calib] server-side convention: 509.2 t/s (8 reqs, 59946 tok)  client is +0.1%
+JSON {"c": 8, "label": "q5f", "aggregate_tps": 509.7, "sum_dec": 59946, "union_s": 117.6, "client_wall_s": 118.4, "per_stream_median": 68.9, "ttft_ms_median": 667.5, "n_streams": 8, "server_side_agg": 509.2}
+
+################ LEG nvfp4 (ladder) ################
+up after 3s
+[nvfp4] VRAM after boot 25863 MiB
+C=1 nvfp4 aggregate=157.2 t/s  (sum_dec=6824, union=43.4s, client_wall=43.5s)
+   per-stream tps: median=157.2 min=157.2 max=157.2
+   ttft_ms: median=38 max=38
+JSON {"c": 1, "label": "nvfp4", "aggregate_tps": 157.2, "sum_dec": 6824, "union_s": 43.4, "client_wall_s": 43.5, "per_stream_median": 157.2, "ttft_ms_median": 37.5, "n_streams": 1, "server_side_agg": null}
+C=2 nvfp4 aggregate=299.7 t/s  (sum_dec=9941, union=33.2s, client_wall=33.2s)
+   per-stream tps: median=157.1 min=153.9 max=160.2
+   ttft_ms: median=69 max=102
+JSON {"c": 2, "label": "nvfp4", "aggregate_tps": 299.7, "sum_dec": 9941, "union_s": 33.2, "client_wall_s": 33.2, "per_stream_median": 157.1, "ttft_ms_median": 69.4, "n_streams": 2, "server_side_agg": null}
+C=4 nvfp4 aggregate=442.3 t/s  (sum_dec=24527, union=55.4s, client_wall=55.6s)
+   per-stream tps: median=146.5 min=144.8 max=149.1
+   ttft_ms: median=134 max=233
+JSON {"c": 4, "label": "nvfp4", "aggregate_tps": 442.3, "sum_dec": 24527, "union_s": 55.4, "client_wall_s": 55.6, "per_stream_median": 146.5, "ttft_ms_median": 134.2, "n_streams": 4, "server_side_agg": null}
+C=8 nvfp4 aggregate=834.3 t/s  (sum_dec=42826, union=51.3s, client_wall=51.5s)
+   per-stream tps: median=123.1 min=119.1 max=129.7
+   ttft_ms: median=262 max=504
+JSON {"c": 8, "label": "nvfp4", "aggregate_tps": 834.3, "sum_dec": 42826, "union_s": 51.3, "client_wall_s": 51.5, "per_stream_median": 123.1, "ttft_ms_median": 261.9, "n_streams": 8, "server_side_agg": null}
+
+################ LEG llama (ladder) ################
+up after 4s
+[llama] 0.03.047.192 I srv    load_model: initializing, n_slots = 6, n_ctx_slot = 16384, kv_unified = 'false'
+[llama] VRAM after boot 29933 MiB
+C=1 llama aggregate=84.8 t/s  (sum_dec=5351, union=63.1s, client_wall=63.3s)
+   per-stream tps: median=84.8 min=84.8 max=84.8
+   ttft_ms: median=126 max=126
+JSON {"c": 1, "label": "llama", "aggregate_tps": 84.8, "sum_dec": 5351, "union_s": 63.1, "client_wall_s": 63.3, "per_stream_median": 84.8, "ttft_ms_median": 125.8, "n_streams": 1, "server_side_agg": null}
+C=2 llama aggregate=168.3 t/s  (sum_dec=14041, union=83.4s, client_wall=83.8s)
+   per-stream tps: median=88.0 min=87.2 max=88.9
+   ttft_ms: median=290 max=290
+JSON {"c": 2, "label": "llama", "aggregate_tps": 168.3, "sum_dec": 14041, "union_s": 83.4, "client_wall_s": 83.8, "per_stream_median": 88.0, "ttft_ms_median": 289.5, "n_streams": 2, "server_side_agg": null}
+C=4 llama aggregate=149.1 t/s  (sum_dec=28985, union=194.5s, client_wall=195.1s)
+   per-stream tps: median=40.3 min=39.4 max=42.1
+   ttft_ms: median=582 max=584
+JSON {"c": 4, "label": "llama", "aggregate_tps": 149.1, "sum_dec": 28985, "union_s": 194.5, "client_wall_s": 195.1, "per_stream_median": 40.3, "ttft_ms_median": 582.5, "n_streams": 4, "server_side_agg": null}
+C=8 llama aggregate=193.1 t/s  (sum_dec=54422, union=281.8s, client_wall=283.0s)
+   per-stream tps: median=52.1 min=37.9 max=55.2
+   ttft_ms: median=1007 max=117930
+JSON {"c": 8, "label": "llama", "aggregate_tps": 193.1, "sum_dec": 54422, "union_s": 281.8, "client_wall_s": 283.0, "per_stream_median": 52.1, "ttft_ms_median": 1007.1, "n_streams": 8, "server_side_agg": null}
+
+################ LEG vllm (ladder) ################
+up after 207s
+[vllm] VRAM after boot 29589 MiB
+C=1 vllm aggregate=67.4 t/s  (sum_dec=8192, union=121.5s, client_wall=122.0s)
+   per-stream tps: median=67.4 min=67.4 max=67.4
+   ttft_ms: median=498 max=498
+JSON {"c": 1, "label": "vllm", "aggregate_tps": 67.4, "sum_dec": 8192, "union_s": 121.5, "client_wall_s": 122.0, "per_stream_median": 67.4, "ttft_ms_median": 497.6, "n_streams": 1, "server_side_agg": null}
+C=2 vllm aggregate=121.4 t/s  (sum_dec=14870, union=122.5s, client_wall=122.8s)
+   per-stream tps: median=60.8 min=60.8 max=60.8
+   ttft_ms: median=258 max=259
+JSON {"c": 2, "label": "vllm", "aggregate_tps": 121.4, "sum_dec": 14870, "union_s": 122.5, "client_wall_s": 122.8, "per_stream_median": 60.8, "ttft_ms_median": 257.9, "n_streams": 2, "server_side_agg": null}
+C=4 vllm aggregate=215.7 t/s  (sum_dec=29775, union=138.0s, client_wall=138.2s)
+   per-stream tps: median=59.4 min=59.3 max=59.4
+   ttft_ms: median=103 max=104
+JSON {"c": 4, "label": "vllm", "aggregate_tps": 215.7, "sum_dec": 29775, "union_s": 138.0, "client_wall_s": 138.2, "per_stream_median": 59.4, "ttft_ms_median": 103.1, "n_streams": 4, "server_side_agg": null}
+C=8 vllm aggregate=438.7 t/s  (sum_dec=59689, union=136.0s, client_wall=136.3s)
+   per-stream tps: median=60.3 min=60.2 max=60.4
+   ttft_ms: median=112 max=114
+JSON {"c": 8, "label": "vllm", "aggregate_tps": 438.7, "sum_dec": 59689, "union_s": 136.0, "client_wall_s": 136.3, "per_stream_median": 60.3, "ttft_ms_median": 111.7, "n_streams": 8, "server_side_agg": null}
+
+################ DONE ################
+results in bench/crossengine/run-2026-08-19
+total 4512
+drwxrwxr-x 2 gabe gabe   4096 Aug 19 17:02 .
+drwxrwxr-x 5 gabe gabe   4096 Aug 19 14:05 ..
+-rw-rw-r-- 1 gabe gabe   5407 Aug 19 15:56 agentic.llama.jsonl
+-rw-rw-r-- 1 gabe gabe   1531 Aug 19 15:56 agentic.llama.log
+-rw-rw-r-- 1 gabe gabe   5436 Aug 19 15:09 agentic.nint.jsonl
+-rw-rw-r-- 1 gabe gabe   1515 Aug 19 15:09 agentic.nint.log
+-rw-rw-r-- 1 gabe gabe   5420 Aug 19 15:43 agentic.nvfp4.jsonl
+-rw-rw-r-- 1 gabe gabe   1536 Aug 19 15:43 agentic.nvfp4.log
+-rw-rw-r-- 1 gabe gabe   5351 Aug 19 14:15 agentic.q4s.jsonl
+-rw-rw-r-- 1 gabe gabe   1478 Aug 19 14:15 agentic.q4s.log
+-rw-rw-r-- 1 gabe gabe   5401 Aug 19 15:19 agentic.q5f.jsonl
+-rw-rw-r-- 1 gabe gabe   1478 Aug 19 15:19 agentic.q5f.log
+-rw-rw-r-- 1 gabe gabe   5349 Aug 19 16:15 agentic.vllm.jsonl
+-rw-rw-r-- 1 gabe gabe   1503 Aug 19 16:15 agentic.vllm.log
+-rw-rw-r-- 1 gabe gabe   1473 Aug 19 16:49 ladder.llama.txt
+-rw-rw-r-- 1 gabe gabe   1461 Aug 19 16:28 ladder.nint.txt
+-rw-rw-r-- 1 gabe gabe   1471 Aug 19 16:38 ladder.nvfp4.txt
+-rw-rw-r-- 1 gabe gabe   1786 Aug 19 16:22 ladder.q4s.txt
+-rw-rw-r-- 1 gabe gabe   1786 Aug 19 16:34 ladder.q5f.txt
+-rw-rw-r-- 1 gabe gabe   1468 Aug 19 17:02 ladder.vllm.txt
+-rw-rw-r-- 1 gabe gabe    150 Aug 19 14:05 manifest.txt
+-rw-rw-r-- 1 gabe gabe  24239 Aug 19 17:02 run.log
+-rw-rw-r-- 1 gabe gabe 285963 Aug 19 15:56 server.llama.agentic.log
+-rw-rw-r-- 1 gabe gabe  86284 Aug 19 16:49 server.llama.ladder.log
+-rw-rw-r-- 1 gabe gabe 256077 Aug 19 15:09 server.nint.agentic.log
+-rw-rw-r-- 1 gabe gabe 796212 Aug 19 15:09 server.nint.agentic.reqlog.jsonl
+-rw-rw-r-- 1 gabe gabe  20433 Aug 19 16:28 server.nint.ladder.log
+-rw-rw-r-- 1 gabe gabe  62024 Aug 19 16:28 server.nint.ladder.reqlog.jsonl
+-rw-rw-r-- 1 gabe gabe 190263 Aug 19 15:43 server.nvfp4.agentic.log
+-rw-rw-r-- 1 gabe gabe 624629 Aug 19 15:43 server.nvfp4.agentic.reqlog.jsonl
+-rw-rw-r-- 1 gabe gabe  16032 Aug 19 16:38 server.nvfp4.ladder.log
+-rw-rw-r-- 1 gabe gabe  50802 Aug 19 16:38 server.nvfp4.ladder.reqlog.jsonl
+-rw-rw-r-- 1 gabe gabe 220613 Aug 19 14:15 server.q4s.agentic.log
+-rw-rw-r-- 1 gabe gabe  15098 Aug 19 16:22 server.q4s.ladder.log
+-rw-rw-r-- 1 gabe gabe 205389 Aug 19 15:19 server.q5f.agentic.log
+-rw-rw-r-- 1 gabe gabe  15100 Aug 19 16:34 server.q5f.ladder.log
+-rw-rw-r-- 1 gabe gabe 112267 Aug 19 16:16 server.vllm.agentic.container.log
+-rw-rw-r-- 1 gabe gabe     65 Aug 19 15:56 server.vllm.agentic.log
+-rw-rw-r-- 1 gabe gabe  37538 Aug 19 17:02 server.vllm.ladder.container.log
+-rw-rw-r-- 1 gabe gabe     65 Aug 19 16:50 server.vllm.ladder.log
+-rw-rw-r-- 1 gabe gabe   3276 Aug 19 16:49 tapladder.llama.jsonl
+-rw-rw-r-- 1 gabe gabe   3257 Aug 19 16:28 tapladder.nint.jsonl
+-rw-rw-r-- 1 gabe gabe   3274 Aug 19 16:38 tapladder.nvfp4.jsonl
+-rw-rw-r-- 1 gabe gabe   3269 Aug 19 16:22 tapladder.q4s.jsonl
+-rw-rw-r-- 1 gabe gabe   3266 Aug 19 16:34 tapladder.q5f.jsonl
+-rw-rw-r-- 1 gabe gabe   3274 Aug 19 17:02 tapladder.vllm.jsonl
+-rw-rw-r-- 1 gabe gabe  71757 Aug 19 15:56 tap.llama.jsonl
+-rw-rw-r-- 1 gabe gabe  69564 Aug 19 15:09 tap.nint.jsonl
+-rw-rw-r-- 1 gabe gabe  69767 Aug 19 15:43 tap.nvfp4.jsonl
+-rw-rw-r-- 1 gabe gabe  78881 Aug 19 14:15 tap.q4s.jsonl
+-rw-rw-r-- 1 gabe gabe  72282 Aug 19 15:19 tap.q5f.jsonl
+-rw-rw-r-- 1 gabe gabe    126 Aug 19 16:53 tap.stderr
+-rw-rw-r-- 1 gabe gabe 981290 Aug 19 16:15 tap.vllm.jsonl
