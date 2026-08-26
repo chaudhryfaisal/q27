@@ -179,6 +179,139 @@ static inline void validate_arch(const q27::Model& model) {
     // irregular layout is legal here. MetalEngine does assume it and checks it
     // itself (docs/PORTING.md, "What is already data-driven").
 }
+// ---------------------------------------------------------------------------
+// TENSOR MANIFEST. validate_arch() above pins the metadata and the embedding
+// shape, and that is not enough on its own. Every kernel below takes rows/cols
+// FROM THE FILE and writes into buffers sized from the compile-time constants,
+// and roughly a dozen tensors are read straight through `(const float*)t.data`.
+// So a file that is a perfectly valid q27 container but declares, say,
+// blk.0.attn_norm.weight as [4] -- or as Q4 instead of F32 -- gets an
+// out-of-bounds device write or a garbage raw read, with nothing upstream to
+// stop it. This walks every tensor the engine actually consumes and pins name,
+// dtype class and exact shape BEFORE upload_all().
+//
+// The shapes are not guessed. They were read off 19 shipped artifacts (default
+// / q4s / q5f / q6 / q6f / q6k / q8 across Qwen3.6 and Qwen3.8 plus three
+// fine-tunes) and are invariant across every one. Only the WEIGHT dtype varies
+// by tier (Q4_G64 vs Q8_G128), which is why WEIGHT accepts a class and F32V
+// does not.
+enum class TKind : uint8_t {
+    WEIGHT, // goes through mm()/mm5(), which dispatch on dtype
+    F32V,   // read as `(const float*)t.data` -- dtype MUST be exactly F32
+};
+struct TSpec {
+    const char* leaf;
+    TKind kind;
+    int64_t d0, d1; // d1 == 0 => 1-D
+};
+
+// Every layer, attention or GDN.
+static constexpr TSpec kTCommon[] = {
+    {"attn_norm.weight", TKind::F32V, N_EMBD, 0},
+    {"post_attention_norm.weight", TKind::F32V, N_EMBD, 0},
+    {"ffn_gate.weight", TKind::WEIGHT, N_FFN, N_EMBD},
+    {"ffn_up.weight", TKind::WEIGHT, N_FFN, N_EMBD},
+    {"ffn_down.weight", TKind::WEIGHT, N_EMBD, N_FFN},
+};
+// attn_q carries the gate as well, hence 2 x N_HEAD x HEAD_DIM rows (this is
+// what qg is allocated for).
+static constexpr TSpec kTAttn[] = {
+    {"attn_q.weight", TKind::WEIGHT, 2 * N_HEAD * HEAD_DIM, N_EMBD},
+    {"attn_k.weight", TKind::WEIGHT, N_KV * HEAD_DIM, N_EMBD},
+    {"attn_v.weight", TKind::WEIGHT, N_KV * HEAD_DIM, N_EMBD},
+    {"attn_output.weight", TKind::WEIGHT, N_EMBD, N_HEAD * HEAD_DIM},
+    {"attn_q_norm.weight", TKind::F32V, HEAD_DIM, 0},
+    {"attn_k_norm.weight", TKind::F32V, HEAD_DIM, 0},
+};
+static constexpr TSpec kTGdn[] = {
+    {"attn_qkv.weight", TKind::WEIGHT, GDN_CH, N_EMBD},
+    {"attn_gate.weight", TKind::WEIGHT, GDN_V, N_EMBD},
+    {"ssm_out.weight", TKind::WEIGHT, N_EMBD, GDN_V},
+    {"ssm_alpha.weight", TKind::WEIGHT, GDN_HEADS, N_EMBD},
+    {"ssm_beta.weight", TKind::WEIGHT, GDN_HEADS, N_EMBD},
+    {"ssm_a", TKind::F32V, GDN_HEADS, 0},
+    {"ssm_dt.bias", TKind::F32V, GDN_HEADS, 0},
+    {"ssm_conv1d.weight", TKind::F32V, GDN_CH, 4},
+    {"ssm_norm.weight", TKind::F32V, GDN_DIM, 0},
+};
+// The MTP block (blk.N_LAYER) is an attention layer plus these.
+static constexpr TSpec kTMtp[] = {
+    {"nextn.eh_proj.weight", TKind::WEIGHT, N_EMBD, 2 * N_EMBD},
+    {"nextn.enorm.weight", TKind::F32V, N_EMBD, 0},
+    {"nextn.hnorm.weight", TKind::F32V, N_EMBD, 0},
+    {"nextn.shared_head_norm.weight", TKind::F32V, N_EMBD, 0},
+};
+
+static inline void manifest_one(const q27::Model& m, const std::string& name, const TSpec& s,
+                                std::vector<std::string>& bad) {
+    const q27::Tensor* t = m.find(name);
+    if (!t) { bad.push_back(name + ": missing"); return; }
+    std::vector<uint64_t> want{(uint64_t)s.d0};
+    if (s.d1) want.push_back((uint64_t)s.d1);
+    if (t->shape != want) {
+        std::string got, exp = std::to_string(s.d0);
+        for (size_t i = 0; i < t->shape.size(); i++)
+            got += (i ? "," : "") + std::to_string(t->shape[i]);
+        if (s.d1) exp += "," + std::to_string(s.d1);
+        bad.push_back(name + ": shape [" + got + "], this build needs [" + exp + "]");
+    }
+    if (s.kind == TKind::F32V) {
+        if (t->dtype != q27::DType::F32)
+            bad.push_back(name + ": dtype " + q27::dtype_name(t->dtype) +
+                          ", must be F32 (the engine reads it as raw floats)");
+    } else if (t->dtype == q27::DType::FP4_G16 || !q27::cuda_weight_dtype_supported(t->dtype)) {
+        bad.push_back(name + ": dtype " + q27::dtype_name(t->dtype) +
+                      " is not a weight this engine can multiply");
+    }
+}
+
+// attn_layer must already be parsed: it decides which per-layer set applies.
+// Reports EVERY mismatch before exiting -- a bad artifact should take one run to
+// diagnose, not one run per wrong tensor.
+static inline void validate_tensor_manifest(const q27::Model& m, const bool* attn_layer) {
+    std::vector<std::string> bad;
+    auto layer_set = [&](int il, const TSpec* set, size_t n) {
+        char b[128];
+        for (size_t i = 0; i < n; i++) {
+            snprintf(b, sizeof b, "blk.%d.%s", il, set[i].leaf);
+            manifest_one(m, b, set[i], bad);
+        }
+    };
+    manifest_one(m, "token_embd.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+    manifest_one(m, "output_norm.weight", {"", TKind::F32V, N_EMBD, 0}, bad);
+    manifest_one(m, "output.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+    // --fast-head tier only; validated when present, never required.
+    if (m.find("output_q4.weight"))
+        manifest_one(m, "output_q4.weight", {"", TKind::WEIGHT, VOCAB, N_EMBD}, bad);
+
+    for (int il = 0; il < N_LAYER; il++) {
+        layer_set(il, kTCommon, sizeof kTCommon / sizeof *kTCommon);
+        if (attn_layer[il]) layer_set(il, kTAttn, sizeof kTAttn / sizeof *kTAttn);
+        else                layer_set(il, kTGdn, sizeof kTGdn / sizeof *kTGdn);
+    }
+    // The MTP block is optional as a whole (a checkpoint without a draft head is
+    // still servable); present means fully present.
+    char probe[128];
+    snprintf(probe, sizeof probe, "blk.%d.nextn.eh_proj.weight", N_LAYER);
+    if (m.find(probe)) {
+        layer_set(N_LAYER, kTCommon, sizeof kTCommon / sizeof *kTCommon);
+        layer_set(N_LAYER, kTAttn, sizeof kTAttn / sizeof *kTAttn);
+        layer_set(N_LAYER, kTMtp, sizeof kTMtp / sizeof *kTMtp);
+    }
+
+    if (bad.empty()) return;
+    fprintf(stderr, "q27: model tensor manifest does not match this build (%zu problem%s):\n",
+            bad.size(), bad.size() == 1 ? "" : "s");
+    size_t shown = 0;
+    for (const std::string& b : bad) {
+        if (shown++ == 20) { fprintf(stderr, "     ... and %zu more\n", bad.size() - 20); break; }
+        fprintf(stderr, "     %s\n", b.c_str());
+    }
+    fprintf(stderr, "     this build is compiled for qwen35 %dL x %d (docs/PORTING.md)\n",
+            N_LAYER, N_EMBD);
+    exit(1);
+}
+
 // Validate BEFORE the DeviceModel upload, not after. Engine::init() calls
 // validate_arch too and that is the backstop no construction path can skip,
 // but by then the owning ctor has already pushed the full weight set to the
@@ -810,10 +943,21 @@ struct Engine {
         p += strlen("\"attn_layers\": [");
         while (p < mj.size() && mj[p] != ']') {
             int v = atoi(mj.c_str() + p);
-            if (v <= N_LAYER) attn_layer[v] = true;
+            // atoi happily returns a NEGATIVE value, and attn_layer[-n] = true is
+            // an out-of-bounds write into this object. The upper bound was always
+            // right (the array is deliberately N_LAYER + 1 wide); the lower bound
+            // was missing.
+            if (v >= 0 && v <= N_LAYER) attn_layer[v] = true;
             p = mj.find_first_of(",]", p);
+            // A truncated meta_json -- "attn_layers": [0,1,2 with no closing
+            // bracket -- returns npos here, and mj[npos] is out of bounds. The
+            // loop head cannot catch it: it runs after this read.
+            if (p == std::string::npos) break;
             if (mj[p] == ',') p++;
         }
+        // Needs attn_layer[], so it cannot live inside validate_arch(); still
+        // ahead of every cudaMalloc and of upload_all().
+        validate_tensor_manifest(model, attn_layer);
 
         auto A = [](void** pp, size_t n) { CUDA_CHECK(cudaMalloc(pp, n)); };
         A((void**)&h, N_EMBD * 4); A((void**)&x1, N_EMBD * 4); A((void**)&y, N_EMBD * 4);
@@ -1019,6 +1163,22 @@ struct Engine {
         d_draft_L[0] = d_draft; d_draft_L[1] = d_draft2; d_draft_L[2] = d_draft3;
         d_draft_L[3] = d_draft4; d_draft_L[4] = d_draft5; d_draft_L[5] = d_draft6;
         d_draft_L[6] = d_draft7;
+        // Same argument as the wide-lane memsets above, which the by-name
+        // lanes 5..7 were missing: k_finish_round dereferences ALL W_PLUMB
+        // draft/verdict slots every round and copies them out as outcome[],
+        // but a run below its depth ceiling (the canonical recipe is depth-4,
+        // width-5) never WRITES lanes 5..7. The accept walk value-gates the
+        // junk out via `k <= max_draft`, so this was not a live wrong-token
+        // bug; it was reading undefined memory into a host-visible struct and
+        // resting correctness on a downstream gate. Measured 2026-08-18: this
+        // driver (r580) hands a fresh process zeroed pages, so the values were
+        // already 0 here -- that is a driver courtesy, not a guarantee, and
+        // not something to leave a bitwise contract standing on.
+        for (int L = 5; L <= 7; L++) {
+            CUDA_CHECK(cudaMemset(d_draft_L[L - 1], 0, 4));
+            CUDA_CHECK(cudaMemset(d_v_L[L], 0, 4));
+            CUDA_CHECK(cudaMemset(d_pos_L[L], 0, 4));
+        }
         A((void**)&d_P, 4);
         A((void**)&d_outcome, OUTCOME_INTS * 4); // {n, t1, dr1..dr(W_PLUMB-1), pending}
         kv_memset_mtp();
@@ -1203,9 +1363,36 @@ struct Engine {
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
+            if (getenv("Q27_PRINT_WSUM")) dm.enable_host_sum(true);
             dm.upload_all(q27k::pf4_on(), q27k::pf4_instrument());
             dm.checksum_baseline();
             fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
+            // Q27_PRINT_WSUM=1: aggregate weight digest. The SAME artifact must
+            // print the SAME value on every load; a difference means the upload
+            // itself landed wrong, which checksum_verify() cannot see because
+            // its baseline is taken after the copy (2026-08-19 investigation).
+            if (const char* pw = getenv("Q27_PRINT_WSUM")) {
+                fprintf(stderr, "wsum: %016llx hsum: %016llx\n", dm.checksum_aggregate(),
+                        dm.host_aggregate());
+                // Q27_WSUM_LOCATE=1: on ANY host/device disagreement, name the
+                // tensor, offset, bit and neighbours (see DeviceModel).
+                // (wsum mixes the scales in by XOR and hsum adds them, so the two
+                // aggregates never agree by construction -- the per-tensor pass
+                // is the comparison, and it runs on every load under the flag.)
+                if (getenv("Q27_WSUM_LOCATE")) dm.locate_upload_errors();
+                // Q27_PRINT_WSUM=3: recompute the digest twice more from the SAME
+                // resident bytes. A wsum that differs from the canonical value but
+                // is STABLE across recomputes means the DATA is corrupt; one that
+                // varies between recomputes means the checksum COMPUTE is
+                // unreliable. Both produce identical +-2^k deltas in one sample,
+                // so only repetition separates them.
+                if (atoi(pw) >= 3)
+                    for (int r = 0; r < 2; r++) {
+                        dm.checksum_baseline();
+                        fprintf(stderr, "wsum_recompute%d: %016llx\n", r + 1,
+                                dm.checksum_aggregate());
+                    }
+            }
         }
         if (q27k::pf4_on()) {
             if (dm.model_has("blk.0.ffn_gate.weight.pf4"))
@@ -1841,20 +2028,23 @@ struct Engine {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         q27k::conv_step(conv_ring[il], conv_ring[il], qkv, cw, convout, GDN_CH, st); // lane 0
-        if (vw > 1)
-            q27k::gdn_conv_chunk3(conv_ring[il], LANESW(qkv), cw, LANESW(convout), GDN_CH,
-                                  vw - 1, st);
-        // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
-        q27k::l2norm3(LANESW(convout), 32,
-                      GDN_DIM, eps, st, vw);
-        if (vw > 1)
-            q27k::gdn_record3(LANESW(qkv), LANESW(convout), LANESW(g), LANESW(beta),
-                              rec_qkv[il], rec_conv[il], rec_g[il], rec_beta[il], GDN_CH,
-                              GDN_HEADS, vw - 1, st);
-        q27k::delta_step(S[il], S[il], convout, g, beta, o, st); // lane 0
-        if (vw > 1)
-            q27k::gdn_delta_chunk3(S[il], LANESW(convout), LANESW(g), LANESW(beta),
-                                   LANESW(o), vw - 1, st);
+        if (vw > 1) {
+            // 2026-08-18 fusion: 6 -> 3 launches per layer. The chain wall was
+            // 38.8 us of which 13.0 us inter-kernel gap (nsys), and the delta
+            // pair moved S three times. convnorm3 = conv_chunk3 + l2norm3 +
+            // record3; delta_all = delta_step + delta_chunk3 with S staged
+            // once in smem. Bitwise twins of the replaced sequence, gated by
+            // build/gdn_fuse_eq + ninv + the canonical digest.
+            q27k::gdn_convnorm3(conv_ring[il], LANESW(qkv), cw, LANESW(convout), LANESW(g),
+                                LANESW(beta), rec_qkv[il], rec_conv[il], rec_g[il],
+                                rec_beta[il], GDN_CH, GDN_HEADS, eps, vw, st);
+            q27k::gdn_delta_all(S[il], S[il], LANESW(convout), LANESW(g), LANESW(beta),
+                                LANESW(o), vw - 1, st);
+        } else {
+            // vw == 1: today's launches, byte-for-byte.
+            q27k::l2norm3(LANESW(convout), 32, GDN_DIM, eps, st, vw);
+            q27k::delta_step(S[il], S[il], convout, g, beta, o, st);
+        }
     }
     // M1 commit Fold: advance committed GDN state by the accepted speculative
     // rows (fold_pending = n-1, set at commit, shrunk by refinish_round).
@@ -2140,8 +2330,14 @@ struct Engine {
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
         // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
         // unchanged: it keys on n<=vw and its src select covers n in 1..5.
-        for (int k = 0; k < v.vw; k++)
-            q27k::nucleus(v.lg[k], VOCAB, d_samp, d_nuc + k * 4, v.stm);
+        // One launch, one block per lane (2026-08-18): bitwise identical per
+        // lane, but the lanes no longer serialize as vw single-block kernels
+        // each occupying one SM of 170.
+        {
+            q27k::CP3 lgs{};
+            for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
+            q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
+        }
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
                           d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
@@ -2764,6 +2960,10 @@ struct Engine {
         gs.verify_ms += verify_ms;
         gs.draft_steps += steps;
     }
+    // Fused draft-phase host wall (round-budget T2). Separate mutator rather
+    // than a 4th arg: solo rounds never call it, so the solo phd/phv/phs
+    // accounting is untouched and fdraft_ms stays identically 0 there.
+    void phase_stats_add_fdraft(double ms) { gs.fdraft_ms += ms; }
     // ---- P3 T3 exec-cache accessors (A4; plan 2026-07-16-batch-p3-capture) --
     // why: the conductor's graph-cache shape key includes each member's
     // KV-cache kind -- attn_mix's kv_store/attn_decode kernel family
@@ -3759,6 +3959,18 @@ struct Engine {
         // draft_steps is NOT shared: steps THIS member launched.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
+        // FUSED DRAFT WALL (2026-08-18, round-budget T2). phd above is only
+        // the cstm-visible tail by construction, so it cannot price the draft
+        // phase at batch -- the phase runs host-synced per step inside
+        // Conductor::draft_widths, BEFORE ev_round_start exists, and reads
+        // ~0.01 ms/round at C=4 while ~2.85 steps per member actually launch.
+        // fdraft_ms is that phase measured where it lives: a host wall clock
+        // around draft_widths(). Host timing is exact here precisely BECAUSE
+        // the phase host-syncs every step. Same SHARED-WALL semantics as
+        // phd/phv (one round, one wall, attributed in full to each member),
+        // so round_ms - fdraft_ms - phv - phd is the true unattributed
+        // remainder. Inert: a host clock read, no stream op, no capture node.
+        double fdraft_ms = 0;
         // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)
         // -- the marginal-lane cost curve that prices deep ladders with
         // draft off the critical path (Saguaro follow-up). Index by W; 0..1

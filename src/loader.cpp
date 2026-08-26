@@ -117,6 +117,26 @@ bool cuda_weight_dtype_supported(DType dtype) {
     }
     return false;
 }
+
+// Metal serves the q4s tier: F32/F16 activations and the Q4/Q8/ternary weight
+// kernels in q27_kernels.metal. FP4_G16 is an nvfp4 PREFILL SIDECAR emitted by
+// `repack.py --pf4` and consumed only by src/pf4.cu on sm_120a -- there is no
+// Metal kernel for it and there is no reason for one.
+bool metal_weight_dtype_supported(DType dtype) {
+    switch (dtype) {
+        case DType::F32:
+        case DType::F16:
+        case DType::Q8_G128:
+        case DType::Q4_G64:
+        case DType::T2_G128:
+        case DType::T3_G128:
+        case DType::B1_G128:
+            return true;
+        case DType::FP4_G16:
+            return false;
+    }
+    return false;
+}
 void validate_cuda_tensor(const Tensor& tensor) {
     if(tensor.name=="token_embd.weight" && tensor.dtype!=DType::Q8_G128)
         throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128");

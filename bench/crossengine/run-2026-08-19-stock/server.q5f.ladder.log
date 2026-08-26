@@ -1,0 +1,148 @@
+no-think: empty-think prefill on all chat paths
+profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=1 think=0 batch-gemm=auto(k>=3)
+loading tokenizer...
+loading model...
+tool dialect: json (general.name "Qwen3.6-27B")
+uploading weights...
+resident: 18.22 GB (checksummed)
+vram: free 13.11 GB post-weights
+[prefill] shared arena 0.85 GB (one per process)
+[pool] 8 slots, floor 2.28 GB (half-ctx x slots), pool 3.15 GB
+[pool] paged KV: 3.15 GB (K 24054 pages x 65536 B, V 24054 pages x 65536 B)
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 0 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 1 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 2 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 3 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 4 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 5 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 6 ready: ctx=16384
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +P14 sampled per-width verify 2..5; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+slot 7 ready: ctx=16384
+vram: free 4.07 GB at ready
+interleave: round-granularity
+[gcache] fused-verify graph cache ON (Q27_BATCH_GRAPH=1, cap 64)
+continuous batching: ON (Q27_BATCH=1 explicit env, union cap 12)
+q27-server listening on http://127.0.0.1:8131 (ctx 16384, fast head)
+[http] GET /health -> 200
+[gen] prompt=75 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen-done] n_max: 8192 tokens in 62.8s (130.5 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.313 tokens/round (8192 tok/3541 rounds)
+[req] rid=0 api=oai conv=f9acf5fce3b82010 qw_ms=0 tok_ms=0 prompt=75 hit=0 ckpt=-1 pf=75 pf_ms=78 dec=8192 dec_ms=62766 cb_ms=3 rounds=3541 tps=130.5 end=n_max gw=0 yields=0 slot=0 t=65566 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=0.0 phv=0.0 phs=0 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=0.0 sfx=0,0 bat=1.0,0
+[http] POST /v1/chat/completions -> 200
+[gen] prompt=71 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=73 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen-done] eos: 6249 tokens in 60.0s (104.2 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.269 tokens/round (6249 tok/2754 rounds)
+[req] rid=1 api=oai conv=d977417ea54d7247 qw_ms=35 tok_ms=0 prompt=73 hit=0 ckpt=-1 pf=73 pf_ms=113 dec=6249 dec_ms=59991 cb_ms=2 rounds=2754 tps=104.2 end=eos gw=67 yields=2 slot=2 t=131271 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=124.7 phv=48920.0 phs=7932 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=10868.1 sfx=0,0 bat=2.0,2754
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 73.3s (111.8 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.336 tokens/round (8192 tok/3507 rounds)
+[req] rid=2 api=oai conv=f1b07932e5abed26 qw_ms=0 tok_ms=0 prompt=71 hit=0 ckpt=-1 pf=71 pf_ms=134 dec=8192 dec_ms=73278 cb_ms=4 rounds=3507 tps=111.8 end=n_max gw=92 yields=2 slot=1 t=144545 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=124.7 phv=48920.0 phs=8123 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=10868.1 sfx=0,0 bat=1.8,2754
+[http] POST /v1/chat/completions -> 200
+[gen] prompt=71 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=71 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=73 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=74 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen-done] eos: 7127 tokens in 84.8s (84.0 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.138 tokens/round (7127 tok/3334 rounds)
+[req] rid=6 api=oai conv=2248042319be3f46 qw_ms=69 tok_ms=0 prompt=73 hit=0 ckpt=-1 pf=73 pf_ms=213 dec=7127 dec_ms=84802 cb_ms=3 rounds=3334 tps=84.0 end=eos gw=167 yields=2 slot=5 t=235239 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=9.8 phv=66230.4 phs=9648 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=18398.3 sfx=0,0 bat=4.0,3334
+[http] POST /v1/chat/completions -> 200
+[gen-done] eos: 7951 tokens in 90.6s (87.7 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.232 tokens/round (7951 tok/3563 rounds)
+[req] rid=3 api=oai conv=fb4beca1d07983e9 qw_ms=0 tok_ms=0 prompt=71 hit=0 ckpt=-1 pf=71 pf_ms=255 dec=7951 dec_ms=90618 cb_ms=4 rounds=3563 tps=87.7 end=eos gw=213 yields=2 slot=3 t=241027 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=10.0 phv=70878.5 phs=10548 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=19531.2 sfx=0,0 bat=3.9,3562
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 91.5s (89.5 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.276 tokens/round (8192 tok/3600 rounds)
+[req] rid=4 api=oai conv=d3f6fc44422a11db qw_ms=35 tok_ms=0 prompt=71 hit=0 ckpt=-1 pf=71 pf_ms=234 dec=8192 dec_ms=91541 cb_ms=3 rounds=3600 tps=89.5 end=n_max gw=192 yields=2 slot=4 t=241965 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=10.4 phv=71654.2 phs=10811 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=19691.6 sfx=0,0 bat=3.9,3600
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 94.5s (86.7 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 2.174 tokens/round (8192 tok/3768 rounds)
+[req] rid=5 api=oai conv=a7c5dad0c5e73d0f qw_ms=113 tok_ms=0 prompt=74 hit=0 ckpt=-1 pf=74 pf_ms=183 dec=8192 dec_ms=94496 cb_ms=3 rounds=3768 tps=86.7 end=n_max gw=137 yields=2 slot=6 t=244947 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=10.4 phv=71654.2 phs=10582 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=19691.6 sfx=0,0 bat=3.8,3600
+[http] POST /v1/chat/completions -> 200
+[gen] prompt=74 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=71 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=73 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=70 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=74 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=72 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=78 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen] prompt=74 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen-done] eos: 5366 tokens in 87.9s (61.0 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.758 tokens/round (5366 tok/3052 rounds)
+[req] rid=10 api=oai conv=a7c1755473209890 qw_ms=155 tok_ms=0 prompt=74 hit=0 ckpt=-1 pf=74 pf_ms=411 dec=5366 dec_ms=87936 cb_ms=2 rounds=3052 tps=61.0 end=eos gw=366 yields=2 slot=5 t=339165 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=17.1 phv=70382.9 phs=5597 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=17372.4 sfx=0,0 bat=8.0,3052
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 130.0s (63.0 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.798 tokens/round (8192 tok/4555 rounds)
+[req] rid=13 api=oai conv=a4007e0f4dd233ed qw_ms=242 tok_ms=0 prompt=78 hit=0 ckpt=-1 pf=78 pf_ms=350 dec=8192 dec_ms=129958 cb_ms=3 rounds=4555 tps=63.0 end=n_max gw=304 yields=2 slot=4 t=381214 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.1 phv=104661.3 phs=8477 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25087.2 sfx=0,0 bat=7.7,4555
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 130.2s (62.9 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.795 tokens/round (8192 tok/4563 rounds)
+[req] rid=14 api=oai conv=13ce3978c059827c qw_ms=286 tok_ms=0 prompt=74 hit=0 ckpt=-1 pf=74 pf_ms=318 dec=8192 dec_ms=130164 cb_ms=3 rounds=4563 tps=62.9 end=n_max gw=273 yields=2 slot=6 t=381434 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.1 phv=104843.7 phs=8545 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25123.9 sfx=0,0 bat=7.7,4563
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 132.0s (62.1 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.773 tokens/round (8192 tok/4621 rounds)
+[req] rid=9 api=oai conv=d7a156c4d4651966 qw_ms=77 tok_ms=0 prompt=73 hit=0 ckpt=-1 pf=73 pf_ms=464 dec=8192 dec_ms=131970 cb_ms=3 rounds=4621 tps=62.1 end=n_max gw=418 yields=2 slot=2 t=383173 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.3 phv=106212.7 phs=8602 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25491.5 sfx=0,0 bat=7.6,4621
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 132.4s (61.9 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.767 tokens/round (8192 tok/4637 rounds)
+[req] rid=11 api=oai conv=5a375205af3a8d3 qw_ms=119 tok_ms=0 prompt=70 hit=0 ckpt=-1 pf=70 pf_ms=433 dec=8192 dec_ms=132403 cb_ms=3 rounds=4637 tps=61.9 end=n_max gw=392 yields=2 slot=1 t=383620 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.3 phv=106569.9 phs=8663 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25580.6 sfx=0,0 bat=7.6,4637
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 132.7s (61.7 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.763 tokens/round (8192 tok/4646 rounds)
+[req] rid=8 api=oai conv=ed6e14899cf16e6e qw_ms=42 tok_ms=0 prompt=71 hit=0 ckpt=-1 pf=71 pf_ms=486 dec=8192 dec_ms=132666 cb_ms=3 rounds=4646 tps=61.7 end=n_max gw=445 yields=2 slot=0 t=383857 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.3 phv=106759.9 phs=8642 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25626.9 sfx=0,0 bat=7.6,4646
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 132.8s (61.7 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.761 tokens/round (8192 tok/4653 rounds)
+[req] rid=7 api=oai conv=3a00d6e58be60716 qw_ms=0 tok_ms=0 prompt=74 hit=0 ckpt=-1 pf=74 pf_ms=516 dec=8192 dec_ms=132823 cb_ms=3 rounds=4653 tps=61.7 end=n_max gw=470 yields=2 slot=7 t=384000 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.3 phv=106880.0 phs=8624 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25650.1 sfx=0,0 bat=7.6,4652
+[http] POST /v1/chat/completions -> 200
+[gen-done] n_max: 8192 tokens in 132.8s (61.7 t/s), n_max=8192
+[sample-stats] T=0.600 top_p=0.950: 1.759 tokens/round (8192 tok/4656 rounds)
+[req] rid=12 api=oai conv=be9d2690610ea153 qw_ms=198 tok_ms=0 prompt=72 hit=0 ckpt=-1 pf=72 pf_ms=380 dec=8192 dec_ms=132830 cb_ms=3 rounds=4656 tps=61.7 end=n_max gw=335 yields=2 slot=3 t=384073 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=0,0,0,0,0,0,0,0 glf=0,0,0,0,0,0,0 gla=0,0,0,0,0,0,0 phd=24.3 phv=106880.0 phs=8638 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=25650.1 sfx=0,0 bat=7.6,4652
+[http] POST /v1/chat/completions -> 200

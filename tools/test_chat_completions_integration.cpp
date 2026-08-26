@@ -6,8 +6,9 @@
 // api_common.h, toolgram.h, toolconstrain.h, stream_split.h, and
 // tokenizer.{h,cpp} unmodified. The build_prompt/handle block below this
 // preamble is a byte-for-byte extraction of src/server.cu's new code
-// (see tools/extract_check.sh) -- this is a genuine compile+run check of
-// the shipped logic, not a reimplementation of it.
+// (checked by tools/extract_check.sh, which `make test-tools` runs first;
+// re-splice with tools/extract_sync.py after editing handle()) -- this is
+// a genuine compile+run check of the shipped logic, not a reimplementation.
 //
 // Build+run:
 //   bash tools/build_chat_completions_integration.sh
@@ -406,7 +407,7 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
                                          bool& thinking,
                                          q27::ThinkCfg& tcfg,
                                          size_t* stable_off,
-                                         size_t* sys_off) {
+                                         size_t* sys_off, const std::string* raw_body) {
         tchoice=q27::parse_anthropic_tool_choice(body);
         json all_tools=q27::anthropic_tools_json(body);
         json normalized={{"tools",all_tools}};
@@ -423,27 +424,34 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
             thinking=false;
             tcfg=q27::ThinkCfg{false,-1,false,true};
         }
+        q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        // client key order survives only in the raw text (the parsed json is
+        // sorted); restrict to the selected subset so decl matches `tools`.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
-            q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+            q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
         if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
         return rendered;
     };
     PreparedAnthropicPrompt result;
     result.rendered=prepare_anthropic_prompt(
         body,result.tchoice,result.tools,result.tool_names,result.thinking,
-        result.tcfg,nullptr,nullptr);
+        result.tcfg,nullptr,nullptr,nullptr);
     return result;
 }
 
 static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv,
                         bool constrain_tools, bool sampled_on, int max_prompt,
                         int max_slot_ctx, std::atomic<long>& req_counter,
-                        q27::ToolMaskCache& tool_mask_cache, std::vector<Slot>& slots,
+                        q27::ToolMaskCache<q27::ToolGrammar>& tool_mask_cache, std::vector<Slot>& slots,
                         const json& body, bool chat, bool batch = false,
                         int budget_flag = 0) {
     const int EOS = tok.eos();
     std::mutex route_m;
+    // --constrain-tools is off in every test here, so the XML-dialect mask
+    // cache the real handle() captures is never consulted; it only has to exist.
+    q27::ToolMaskCache<q27::ToolGrammarXml> tool_mask_cache_xml;
     void* conductor = batch ? reinterpret_cast<void*>(1) : nullptr;
     q27::GpuGate gpu_gate; // real type (api_common.h, CUDA-free) -- Lease is RAII-only here
     const bool req_think = true;
@@ -645,8 +653,12 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0, sys_off = 0;
+            q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            // client key order survives only in the raw text; restrict to the
+            // tool_choice selection so the declaration matches `tools`.
+            topts.tools_decl=q27::openai_tools_decl(req.body,&tool_names_v);
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
             // P16b: token length of the system+tools block. Measured with a
             // THIRD encode used only for its length -- the prompt itself is
             // still built from the same two pieces, so no request's bytes
@@ -828,7 +840,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
-            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
             tc.host2dev = &sl.tool_mask_host2dev;
             // FORCED requests are prompt-injected past the <tool_call> marker
             // (above) -- scan_round's engage trigger scans GENERATED text for
@@ -837,7 +849,10 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             // comment); AUTO (the default) and NONE are unaffected.
             tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                         eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            auto params_per_name = q27::tool_param_keys_per_name(tools);
+            auto required_per_name = q27::tool_required_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, required_per_name,
+                     q27::tool_dialect_xml());
             // FORCED: the opener was injected into the PROMPT, not generated,
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
@@ -904,12 +919,26 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     return q27::tool_choice_allows_call(
                         tchoice, allowed_tool_names, name, accepted);
                 });
-            ordered.text+=unclosed_tool;
+            // unclosed-<tool_call> tail: recover COMPLETE inner calls the same
+            // way bb60661 recovers closed ones, without EOF repair (see the
+            // helper). Only finished inner JSON executes; a partial Write stays
+            // text.
+            ordered.recovered += q27::recover_unclosed_tool_tail(
+                unclosed_tool, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                [&](const std::string& t) { ordered.append_visible_text(t); },
+                [&](q27::ToolCall c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                            tchoice, allowed_tool_names, c.name,
+                            ordered.calls.size()))
+                        return false;
+                    ordered.append_tool_call(std::move(c));
+                    return true;
+                });
             std::string tx = ordered.text;
             std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
             if (ordered.recovered)
                 fprintf(stderr,
-                        "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                        "[tool-fallback] %zu drifted call(s) recovered (oai-nonstream)\n",
                         ordered.recovered);
             const bool any_call = !eligible_calls.empty();
             if (q27::forced_tool_choice_missing_is_error(
@@ -1038,11 +1067,14 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 // mechanical twin of the /v1/messages SSE handler above.
                 const std::string cid = "chatcmpl-q27-" + std::to_string(rid);
                 ToolConstrainer tc;
-                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                auto params_per_name = q27::tool_param_keys_per_name(tools);
+                auto required_per_name = q27::tool_required_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, required_per_name,
+                         q27::tool_dialect_xml());
                 StreamSplitter sp;
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
@@ -1054,13 +1086,27 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
                 bool any_call = false;
-                std::string tool_buf;
-                q27::BareToolTextHoldback bare_text;
+                // Routing state shared with the /v1/messages twin (issue #38,
+                // reopened: the twins had drifted and this one never consulted
+                // the parser on the reasoning channel).
+                q27::StreamToolRouter router;
+                router.has_tools = has_tools;
+                std::string& tool_buf = router.tool_buf;
                 bool forced_control_token = false;
                 auto emit_text = [&](const std::string& t) {
                     if (t.empty()) return;
                     if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                        json{{"content", t}})))
+                        alive = false;
+                };
+                // reasoning_content (no official OpenAI field for this; matches
+                // the vLLM/SGLang/llama.cpp convention -- see
+                // openai_reasoning_delta) rather than leaking raw <think> tags
+                // into `content`.
+                auto emit_think = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       q27::openai_reasoning_delta(t))))
                         alive = false;
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
@@ -1094,7 +1140,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     visible(source.substr(cursor));
                     if (recovered)
                         fprintf(stderr,
-                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                "[tool-fallback] %zu drifted call(s) recovered (oai-stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
@@ -1102,43 +1148,22 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                        if (!classify_bare(c.raw,true,emit_text)) {
+                            // dialect control bytes only (a repeated <tool_call>
+                            // opener at EOS) -- no call, and echoing the marker
+                            // is worse than saying nothing. Logged, not silent.
+                            if (q27::only_dialect_control_bytes(c.raw))
+                                fprintf(stderr,
+                                    "[q27] tool body was dialect control bytes only "
+                                    "(%zu B) -- no call; suppressed from visible text\n",
+                                    c.raw.size());
+                            else emit_text(c.raw);
+                        }
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) {
-                        if (tool_buf.empty()) {
-                            bare_text.finish(false,allowed_tool_names,
-                                             emit_text,classify_bare);
-                            bare_text.reset_context();
-                        }
-                        tool_buf += t;
-                        return;
-                    }
-                    if (!tool_buf.empty()) emit_tool();
-                    if (t.empty()) return;
-                    // reasoning_content (no official OpenAI field for this;
-                    // matches the vLLM/SGLang/llama.cpp convention -- see
-                    // openai_reasoning_delta) rather than leaking raw <think>
-                    // tags into `content` (the bug this whole path also
-                    // happens to fix).
-                    if (ch == StreamSplitter::THINK) {
-                        bare_text.finish(false,allowed_tool_names,
-                                         emit_text,classify_bare);
-                        bare_text.reset_context();
-                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
-                                                            q27::openai_reasoning_delta(t))))
-                            alive = false;
-                        return;
-                    }
-                    // Only decoder-injected close whitespace is parser control.
-                    // Preserve ordinary leading whitespace, including when
-                    // thinking is disabled or the model closes naturally.
-                    if (forced_control_token && q27::strip_ws2(t).empty()) return;
-                    if (has_tools)
-                        bare_text.route(t,allowed_tool_names,
-                                        emit_text,classify_bare);
-                    else emit_text(t);
+                    router.segment(ch, t, forced_control_token, allowed_tool_names,
+                                   emit_text, emit_think, emit_tool, classify_bare);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -1176,13 +1201,21 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) {
                     if (final_tool_incomplete) {
-                        emit_text(tool_buf);
+                        // recover COMPLETE inner calls from the truncated
+                        // wrapper; no EOF repair, so a partial Write stays text.
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, has_tools ? &tools : nullptr,
+                            emit_text, emit_call);
                         tool_buf.clear();
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (oai-stream truncated wrapper)\n",
+                                    rec);
                     } else emit_tool();
                 }
                 if (!final_tool_incomplete)
-                    bare_text.finish(produced < nm && !bt.budget_truncated,
-                                     allowed_tool_names,emit_text,classify_bare);
+                    router.finish(produced < nm && !bt.budget_truncated,
+                                  allowed_tool_names, emit_text, emit_think, classify_bare);
                 // TODO(batch error surfacing): no standard OpenAI mid-stream
                 // error chunk exists (matches the plain-text leg's TODO
                 // above); end=error lands in the [req] line, [req-error]
@@ -1256,8 +1289,8 @@ static std::vector<Slot> fresh_slots() {
     return slots;
 }
 
-static q27::ToolMaskCache fresh_cache(std::vector<std::string>& vocab_bytes) {
-    q27::ToolMaskCache c;
+static q27::ToolMaskCache<q27::ToolGrammar> fresh_cache(std::vector<std::string>& vocab_bytes) {
+    q27::ToolMaskCache<q27::ToolGrammar> c;
     c.init(&vocab_bytes, -1); // </tool_call> id unused (constrain_tools off in these tests)
     return c;
 }
@@ -1642,6 +1675,66 @@ int main() {
         }
         CHECK(saw_reasoning);
         CHECK(saw_content);
+    }
+
+    // ---- Test 8b2 (issue #38, reopened): a complete tool call emitted INSIDE
+    // <think> on the /v1/chat/completions STREAM path must fire as a tool_calls
+    // delta and must not stream out as reasoning_content. The pieces split the
+    // <tool_call> wrapper across two chunks (the splitter scans THINK only for
+    // </think>, so a wrapper token can straddle segments) and double the
+    // closer, exactly as reported. This drives the real handle(). ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            /*0*/ "<eos>",
+            /*1*/ "<think>",
+            /*2*/ "Next, read the temp file.\n<tool_c",
+            /*3*/ "all>\n<function=read>\n<parameter=path>\n/tmp/code-reviewer-diff.md\n</parameter>\n",
+            /*4*/ "<parameter=limit>\n160\n</parameter>\n</function>\n</tool_call>\n",
+            /*5*/ "</tool_call>\n",
+            /*6*/ "</think>",
+            /*7*/ "Reading it now.",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {2, 3, 4, 5, 6, 7}; // prompt already contains <think>
+        std::atomic<long> rc{0};
+        json body = {
+            {"stream", true},
+            {"enable_thinking", true},
+            {"tools", json::array({
+                {{"type","function"},{"function",{{"name","read"},{"description","r"},
+                    {"parameters", {{"type","object"},
+                                    {"properties", {{"path", {{"type","string"}}},
+                                                    {"limit", {{"type","integer"}}}}},
+                                    {"required", json::array({"path"})}}}}}}
+            })},
+            {"messages", json::array({{{"role","user"},{"content","read the diff"}}})},
+        };
+        run_request(tok, "q27-test", /*no_think_srv=*/false, false, true, 100000, 100000, rc,
+                   cache, slots, body, true);
+        bool saw_tool = false, saw_content = false;
+        std::string reasoning;
+        for (auto& ev : g_sse_events) {
+            if (!ev.contains("choices") || ev["choices"].empty()) continue;
+            auto& delta = ev["choices"][0]["delta"];
+            if (delta.contains("reasoning_content"))
+                reasoning += delta["reasoning_content"].get<std::string>();
+            if (delta.contains("tool_calls")) {
+                saw_tool = true;
+                CHECK(delta["tool_calls"][0]["function"]["name"] == "read");
+                json args = json::parse(
+                    delta["tool_calls"][0]["function"]["arguments"].get<std::string>());
+                CHECK(args["path"] == "/tmp/code-reviewer-diff.md");
+            }
+            if (delta.contains("content") && delta["content"] == "Reading it now.") saw_content = true;
+        }
+        CHECK(saw_tool);
+        CHECK(saw_content);
+        CHECK(reasoning.find("Next, read the temp file.") != std::string::npos); // prose stays reasoning
+        CHECK(reasoning.find("<function=") == std::string::npos);                 // the call does not
+        CHECK(reasoning.find("<parameter=") == std::string::npos);
     }
 
     // ---- Test 8c: a request reasoning budget closes THINK at the token
@@ -2416,7 +2509,12 @@ int main() {
         CHECK(visible.find("\"name\":\"second\"")!=std::string::npos);
     }
 
-    // ---- Test 13d: max-token truncation cannot expose an unclosed wrapper. ----
+    // ---- Test 13d: max-token truncation cannot expose an unclosed wrapper.
+    // Since 144948f (tail recovery) a truncated wrapper whose inner call is
+    // COMPLETE is recovered as a call -- the client gets the call and
+    // finish_reason "length" says the generation was cut -- while a partial
+    // inner call still stays text (13e/13f). The wrapper bytes never reach
+    // the client either way. ----
     {
         FakeTok tok;
         tok.pieces={"<eos>","<tool_call>{\"name\":\"first\",\"arguments\":{}}"};
@@ -2432,8 +2530,9 @@ int main() {
                    {"messages",json::array({{{"role","user"},{"content","run"}}})}};
         run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
         const auto& choice=g_last_response["choices"][0];
-        CHECK(!choice["message"].contains("tool_calls"));
-        CHECK(choice["message"]["content"].get<std::string>().find("first")!=std::string::npos);
+        CHECK(choice["message"].contains("tool_calls") &&
+              choice["message"]["tool_calls"][0]["function"]["name"]=="first");
+        CHECK(choice["message"]["content"].is_null());   // no wrapper bytes as text
         CHECK(choice["finish_reason"]=="length");
     }
     {
@@ -2461,8 +2560,8 @@ int main() {
                 saw_raw=true;
             if(choice["finish_reason"]=="length") saw_length=true;
         }
-        CHECK(!saw_tool);
-        CHECK(saw_raw);
+        CHECK(saw_tool);
+        CHECK(!saw_raw);
         CHECK(saw_length);
     }
 

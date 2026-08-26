@@ -1,0 +1,5 @@
+<function=Bash>
+<parameter=command>
+ls -la
+</parameter>
+</function>

@@ -1,0 +1,6 @@
+run: 2026-08-19T17:18:28-07:00
+arms: ladder
+legs: q38,q38q4s
+q27 commit: c7aec66
+ninfer commit: 604bdc5
+driver: 580.119.02

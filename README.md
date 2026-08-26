@@ -4,15 +4,45 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
 
 ## Why this is interesting
 
-- **Fastest known way to run this model.** +47% decode over tuned
-  llama.cpp on a 5090 (same model, GPU, harness, day; protocol filed
-  before it could pass). On a 24GB 3090: +19% decode at 2x the
-  context over mainline llama.cpp (that run used the turbo3 default of
-  the day at 262K; the default is now turbo5k, ~76% of that window for
-  43% fewer catastrophic KV positions -- `Q27_KV=turbo3` restores it). vLLM measured 4.7x slower wall on real
-  Claude-Code traffic (its prefix cache gets 0% reuse on this
-  hybrid-GDN architecture); sglang 0.5.15 cannot load the model at all
-  (BUILDLOG 2026-07-12).
+- **Fastest of the four engines tested, on this harness -- across two
+  independent runs.** Mean wall per SWE-bench instance, same 12 tasks, one
+  harness, unchanged competitor binaries:
+
+  | leg | 2026-08-17 | 2026-08-19 |
+  |---|--:|--:|
+  | **q27** q5f | 46.8 s | **46.3 s** |
+  | **q27** q4s | 48.5 s | 49.6 s |
+  | llama.cpp | 71.4 s | 59.9 s |
+  | vLLM | 84.5 s | 78.8 s |
+  | ninfer NVFP4 | 96.8 s | 113.8 s |
+  | ninfer int8 | 327.4 s | 266.2 s |
+
+  Two runs is what it takes to see the honest shape: **q27 is the only leg that
+  reproduced** (46.8 -> 46.3 s), while every competitor moved 7-19% on identical
+  binaries. So the ordering is stable but the margins are not -- q27's edge over
+  llama.cpp reads 1.53x one day and 1.29x the next. Quoting either as *the*
+  number overstates the precision. n=1 per instance, trajectories diverge freely
+  (turn counts range 1 to 56), legs ran sequentially, and sampling is each
+  engine's own defaults rather than matched. Caveats in
+  [FINDINGS.md](bench/crossengine/FINDINGS.md#6-caveats).
+
+  q5f leads rather than the q4s canonical tier because q4s lost 3 of 12 instances
+  to turn-1 quits in the 08-19 run (q5f: 0), which makes its mean cheap for the
+  wrong reason. Those quits are model-side degeneration -- q27 logs the intended
+  call it could not rescue, and all three were corrupted JSON rather than a
+  dialect the parser refuses. The
+  win is prefix reuse, not raw decode -- ninfer decodes *faster* than q27
+  (250-261 t/s vs 215-223) and still takes 2-7x the wall time, because it
+  re-prefills every turn. On a 24GB 3090: +19% decode at 2x the context over
+  mainline llama.cpp (that run used the turbo3 default of the day at 262K; the
+  default is now turbo5k, ~76% of that window for 43% fewer catastrophic KV
+  positions -- `Q27_KV=turbo3` restores it). sglang 0.5.15 cannot load the
+  model at all (BUILDLOG 2026-07-12).
+  **Where q27 loses:** ninfer's NVFP4 tier peaks at 834 t/s aggregate at 8
+  concurrent streams against q27's 531 (2026-08-19 re-run, both same session) --
+  a 1.57x gap, down from 1.91x. Not an fp4-arithmetic win: their own
+  `text_policy()` grants the batch kernel to NVFP4 only, so their int tier is
+  locked out of it. Logged here at the same rate as the wins.
 - **turbo3 3-bit KV cache** (capacity lever, not a quality-parity format --
   see the 2026-08-01 tail study: 6x fp8's catastrophic-position rate against an
   fp16 reference, at a dPPL of only +0.804%), symmetric K+V: 14.1 KB/token (14400 B,
@@ -55,9 +85,15 @@ campaign replaces it.
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.4+ at
-`/usr/local/cuda` (12.4 is a hard floor: older ptxas rejects the sm_89
-e4m3 MMA forms), and gcc. `make` builds ONE tri-arch binary (sm_86 +
+Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.8+ at
+`/usr/local/cuda`, and gcc. **12.8 is the floor for the default build on
+every card, including a 3090**: `make` unconditionally emits `sm_120` and
+links `build/pf4.o`, which is compiled for the arch-specific `sm_120a`
+target, into every engine binary. (12.4 is only the floor for the sm_89
+e4m3 MMA forms; older ptxas rejects those too.) To build on a 12.4
+toolkit you would have to drop the sm_120 gencode from `NVCCFLAGS` and
+the `build/pf4.o` dependency from the engine targets -- untested.
+`make` builds ONE tri-arch binary (sm_86 +
 sm_89 + sm_120: 3090, 4090/Ada, and 5090 class); arch dispatch is at
 runtime -- fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80)
 runs the fp16-MMA verify (h16) and fp16/turbo3 KV. (v0.3.1+
@@ -131,18 +167,21 @@ All four are smaller AND lower-PPL than 3.6-recipe builds of the same
 checkpoint. Per-tier canonicals are in the HF model card; note they gate
 change, not identity (nearby tiers can share a 128-token greedy walk).
 
-Serving 3.8 for agentic use: run with `--think` -- with thinking off the
-model runs plausible-looking sessions that self-declare done and fail
-hidden tests. Full 21-task thunderdome suite (one trial per task, BUILDLOG
-2026-08-15 + same-day correction): hidden-tests mean 0.511, composite
-0.507, nine tasks at 1.000. The failures are a class, not a slope: 3.8
-holds 1.000 on bugfix / features / real-repo / recovery work but
-flat-zeros the greenfield/complex and most hard-reasoning tasks that the
-3.6-era serving scored 0.84-1.000 on (3.6-era mean on the same suite:
-0.908). Weigh that against 3.8's throughput and long-context gains before
-picking a default for build-from-scratch workloads. The engine
-auto-selects 3.8's trained XML tool dialect from the artifact's
-`general.name` and carries drift rescues (modes 14-17) for the forms the
+Serving 3.8 for agentic use: run with `--think` and the card sampler,
+`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0`. Full
+19-task thunderdome suite under that recipe, one trial per task,
+digest-verified load (BUILDLOG 2026-08-25): hidden-tests mean 0.928,
+composite 0.895, 13 tasks at 1.000, nothing below 0.80. The 0.511 recorded
+on 2026-08-15 for the same suite was measured with the think budget at its
+16K default and greedy decoding, the two defaults the 08-22/08-23 entries
+later found to be the problem; the tasks that flat-zeroed then
+(task-queue, time-tracker, constraint-scheduler) score 1.000, 1.000 and
+0.974 under the recipe. Single trials carry roughly +-0.1-0.15 of
+trajectory noise on the volatile tasks, so read the per-task numbers as a
+demonstrated ceiling, not a distribution. With thinking off the model runs
+plausible-looking sessions that self-declare done and fail hidden tests.
+The engine auto-selects 3.8's trained XML tool dialect from the artifact's
+`general.name` and carries drift rescues (modes 14-22) for the forms the
 model falls into under thinking.
 
 ```bash
@@ -235,8 +274,17 @@ checkpoint already skips their prefill. Deep cold prefill (the saturated
 large-T grid) gets a complementary lever since v0.3.4: an ntx M-minitile
 GEMM that shares one activation `ldmatrix` load across two row-tiles
 (+3.4% GEMM / ~6% cold-prefill wall, bitwise, sm_120; `Q27_PF_NTX=0`
-opts out). fp4/`tcgen05` is a hardware dead end here -- consumer/
-workstation Blackwell has no fp4 MMA in PTX, so int8 is the ceiling.
+opts out). fp4 is **not** a hardware dead end here -- that earlier verdict
+was a toolchain trap, retracted 2026-08-14. The block-scaled fp4 MMA
+(`mma.sync...kind::mxf4nvf4`) does exist on consumer Blackwell, but only
+behind the arch-SPECIFIC `sm_120a` target; under the plain `sm_120`
+gencode ptxas rejects the instruction and the failure is indistinguishable
+from missing silicon. It runs, at 780-868 TFLOPS (`tools/microbench_mxf4`).
+`tcgen05` really is absent. fp4 still loses at decode, for an unrelated
+reason: nvfp4 spends 0.5 B of e2m1 plus one ue4m3 per 16 = 4.50 bpw
+against Q4_G64's 0.5 plus one fp16 per 64 = 4.25, so it moves **1.0588x
+the bytes for the same weights**, and decode here is a byte count, not a
+FLOP count. Measured 1.016-1.085x end to end against a >=1.25x bar.
 
 Two serving-side additions since: **P16 persistent prefix cache** (opt-in,
 `--prefix-cache DIR`) survives a restart or a fresh conversation by writing the
@@ -359,10 +407,23 @@ order-dependent and all-or-nothing: it cannot be paged, cannot be shared by
 hash, and cannot be reconstructed from any cached block -- only replayed
 from position 0 or restored from a snapshot you took yourself. A block
 cache covers 17/65 layers; without the matching GDN state those blocks are
-dead weight. Measured consequence (SWE-bench agentic, 07-15): vLLM's
-prefix cache got **0% reuse** and re-prefilled every turn -- competitive
-decode (117 t/s) but the WORST wall time of all five engines tested
-(133 s/instance).
+dead weight.
+
+Measured consequence, 2026-08-17 four-engine run: **ninfer gets 0% reuse** on
+real Claude-Code traffic -- 541 requests across two quant tiers, every one
+logged `full_reset`, `computed_prefill_tokens == prompt_tokens` exactly. Not a
+misconfiguration: their design admits exactly two resume offsets and their
+maintainer docs list arbitrary longest-common-prefix reuse as an explicit
+non-goal, for precisely the reason above. The cost is 97-327 s/instance against
+q27's 47 s while *decoding faster* (250-261 t/s vs 215-223).
+
+The other two engines do solve it, differently, and each pays somewhere:
+llama.cpp reaches 93.9% by keeping recurrent-state checkpoints **per slot** at
+~1047 MiB each -- which OOMs at 8 slots, capping it at 6 on a 32 GB card. vLLM
+reaches 89.8%; note this is a change, its prefix cache measured 0% on this
+architecture in the 07-15 run and has since been fixed upstream. Any claim that
+hybrid GDN makes prefix reuse impossible is now falsified three ways; what
+remains true is that it is not free, and the bill differs by design.
 
 q27 treats the GDN summary as a first-class object instead of a cache miss:
 
@@ -386,12 +447,22 @@ q27 treats the GDN summary as a first-class object instead of a cache miss:
 
 A warm CC turn is therefore restore + suffix-only prefill -- real traffic
 looks like `prompt=25473 hit=24136 pf=1337` in the `[req]` log, ~1.3 s
-instead of a 10-20 s full re-prefill at p50 agentic depth. That arithmetic,
-times every turn of a 30-90-turn trajectory, is the whole wall-time story:
-**q27 47 s/instance vs vLLM 133 s** on identical tasks, with decode speed
-(203 vs 117 t/s) explaining less than half the gap. The continuous-batching
-stack (07-14..16) is independent of this machinery and stacks on top:
-snapshots own prefill, batching owns decode.
+instead of a 10-20 s full re-prefill at p50 agentic depth. Measured over the
+whole 08-17 agentic run: 88.7% of prompt tokens reused on q4s, 92.1% on q5f
+(token-weighted, from `[gen] prefix_hit`), for an effective prefill rate of
+24,224 and 31,314 tok/s against a cold 3,300-3,350.
+
+That arithmetic, times every turn of a 30-90-turn trajectory, is the whole
+wall-time story: **q27 46-50 s/instance vs ninfer 97-114 s** across two runs on
+identical tasks, where
+decode speed explains *none* of the gap -- ninfer decodes faster and still
+loses by 2x. The continuous-batching stack (07-14..16) is independent of this
+machinery and stacks on top: snapshots own prefill, batching owns decode.
+
+The corollary cuts against spending more here: at an 8-11% miss rate, faster
+prefill has little left to buy on this workload. See
+`docs/plans/2026-08-17-prefill-performance.md`, which names the miss rate as
+its own ROI gate.
 
 ## Architecture facts (ground truth from GGUF metadata)
 
@@ -532,12 +603,56 @@ turbo3 from v0.3.0, turbo5k since 2026-08-01) (--kv-fp16 or Q27_KV=fp16 opts out
   exactly as pre-batching (a default must never kill a
   formerly-working invocation).
 
+## Security
+
+The model chooses every byte q27's tool-call parser sees, so that parser is
+attack surface. `docs/SECURITY.md` documents the trust boundaries (a parser
+bug is GPU-host code execution; a *semantic* parser bug is client-sandbox
+execution), why the vLLM `eval()` class does not reach this codebase (no
+`eval`, no template engine), and the two defences: fuzzing for memory safety
+(`make fuzz`, coverage-guided under ASan+UBSan) and per-shape adversarial
+tests for the case where a model writing *about* a call must not make one.
+
 ## Serving
 
 ```
 make build/q27-server
 ./build/q27-server model.q27 model.tok --port 8080
 ```
+
+**Sampler: greedy by default, and that is a choice you may want to change.**
+`--temp T` / `--top-p P` set the sampler used when a request OMITS the field
+(the client still wins; `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P` still force). The
+default is temperature 0 -- greedy argmax -- which is what every determinism
+gate and byte-identity anchor in this repo assumes. It also means that a
+client which sends no sampling fields gets greedy decoding: Claude Code sends
+none, so agentic serving was greedy until you say otherwise, while llama.cpp
+applies whatever the GGUF metadata carries (for Qwen3.8: temp 1.0, top_k 20,
+top_p 0.95, min_p 0.05). Measured 2026-08-22 on a 4-task agentic suite, greedy
+0.758, sampled 0.799, both defaults matched 0.847, llama.cpp 0.878 mean
+hidden-test score. With both matched, no task separates the two engines
+(p=0.199 to 0.898; pooled across 38 trials p=0.824); under the old defaults
+three of four did (p=0.031, 0.031, 0.003). **For agentic serving of Qwen3.8, start the server with
+`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0`** -- the
+model card's sampler, which is what llama.cpp applies from GGUF metadata.
+(`--top-k`/`--min-p` added 2026-08-23; before that q27 had top_p only, so a
+"matched sampler" comparison was not actually matched. They compose as logit
+thresholds in llama.cpp's chain order and are gated against the CPU reference
+at zero support mismatches. One documented difference: q27 filters the
+temperature-scaled distribution, llama.cpp filters raw logits and applies
+temperature last -- identical at T=1.0, the card value.) The third flag matters as much
+as the first two: the default think budget is 50% of the client's
+`max_tokens`, and Claude Code sends 64000, so reasoning is force-closed at
+32,000 tokens. When that fires the model can emit EOS with no answer, and an
+empty assistant turn ends the session -- measured 2026-08-23, 5 of 6
+task-queue trials wrote no files at all and scored 0.000. `--think-budget 0`
+removes the cap (llama.cpp has none, and its reasoning blocks run larger);
+with it, every trial wrote files and the task mean went 0.334 -> 0.525
+against llama.cpp's 0.549. The startup banner prints `sampler=greedy` or
+`sampler=temp=1.00/top_p=0.95/top_k=20/min_p=0.05` so a log always records
+which ran. The full 19-task suite under this recipe (2026-08-25) scored
+0.928 hidden / 0.895 composite, against the 0.511 measured under the old
+defaults.
 
 **Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
@@ -747,32 +862,153 @@ varies, tokens never do. The CLI and `Q27_PROFILE=ref` leave it all unset.
 
 ## Benchmarks
 
-Cross-engine comparison against llama.cpp (mainline, and TheTom's `ngram-mod`
-fork) on a **public, reproducible** agentic task set: 12 pinned
-SWE-bench_Verified instances driven through Claude Code, the **same**
-Qwen3.6-27B-MTP model on every engine, all 5090-only + q8 KV + greedy. Real
-agentic decode throughput:
+Four engines, one 5090, one harness, one accounting convention, same
+Qwen3.6-27B-MTP weights. 12 pinned SWE-bench_Verified instances driven through
+Claude Code; requests normalized across engines so each sees identical bytes;
+timing taken client-side by a measurement proxy rather than from four different
+log dialects (2026-08-17). What is normalized is the request payload -- SAMPLING
+IS NOT MATCHED (each engine applies its own defaults when the client sends
+none, which is the real-world configuration but not a controlled one), and
+trajectories diverged between legs, so the reuse comparison is across different
+conversation populations. n=1 per instance.
 
-| engine | decode | wall/inst |
-|---|---|---|
-| **q27** (MTP + SuffixDraft, fused) | **202.7 t/s** | **47 s** |
-| vLLM NVFP4 + MTP | 117.1 t/s | 133 s |
-| llama mainline + MTP (`--spec-type draft-mtp`) | 116.3 t/s | 80 s |
-| llama `ngram-mod` (fork) | 61.1 t/s | 118 s |
-| llama mainline (no spec) | 62.0 t/s | 120 s |
+**Real agentic traffic** -- the workload the engine exists for:
 
-With the *same* MTP head, enabling MTP nearly doubles stock llama.cpp, and
-**two independent engines (llama.cpp and vLLM) land on the same ~117 t/s**
--- yet q27 is a further ~1.73x on top: the residual is the engine, not the
-drafter choice. ngram-mod adds ~nothing on real coding; vLLM's wall/inst
-is worst because its prefix caching is dead on this hybrid-GDN arch.
-Quality converged to the model across engines (11-12/12
-edited-gold-file; both tool protocols validated first -- unvalidated
-tool parsing is how engines DO move quality).
+| engine | decode | wall/inst | prefix reuse | gold |
+|---|--:|--:|--:|--:|
+| **q27** q5f (MTP + SuffixDraft, fused) | **223.4 t/s** | **47 s** | 92.1% | 10/12 |
+| **q27** q4s | 215.5 t/s | 48 s | 88.7% | 9/12 |
+| ninfer NVFP4 | 250.2 t/s | 97 s | **0%** | 11/12 |
+| ninfer int8 | 261.5 t/s | 327 s † | **0%** | 11/12 |
+| llama.cpp Q5_K_M + MTP | 120.5 t/s | 71 s | 93.9% | 11/12 |
+| vLLM NVFP4 (no spec ‡) | 67.8 t/s | 84 s | 89.8% | 9/12 |
+
+† 3 of 12 hit the harness's 700 s cap; its 9 uncapped instances averaged 203 s.
+‡ vLLM's MTP path had to be disabled -- see the defect note below.
+
+**Decode is not where engines differ most; prefix reuse is.** ninfer decodes
+*faster* than q27 and still takes 2-7x the wall time, because it re-prefills
+the whole conversation every turn: its design supports exactly two resume
+offsets and lists arbitrary longest-common-prefix reuse as an explicit
+non-goal, since Qwen3.6's GDN state cannot be rebuilt from a KV prefix. q27,
+llama.cpp and vLLM all solve that; ninfer is the outlier.
+
+**Concurrency ladder** -- aggregate decode t/s, distinct salted prompts, n=1.
+Re-run 2026-08-19 on the same harness and the same protocol (8 slots / 16K),
+because q27 gained ~19% at C=8 from work shipped after the original run and
+leaving the old figure up understated its own engine by that much. **Competitor
+binaries are byte-identical to the 08-17 run** -- ninfer built 08-15, llama.cpp
+08-17, the same vLLM nightly image -- so this isolates q27's change rather than
+measuring two moving targets:
+
+| engine | C=1 | C=2 | C=4 | C=8 | 08-17 C=8 | slots at 16K |
+|---|--:|--:|--:|--:|--:|--:|
+| **q27** q4s | 141.3 | 229.7 | 352.3 | **530.6** | 412.9 | **8** |
+| **q27** q5f | 134.7 | 173.8 | 299.9 | 509.7 | 385.9 | 8 |
+| ninfer NVFP4 | 157.2 | 299.7 | 442.3 | **834.3** | 790.0 | 8 |
+| ninfer int8 | 137.0 | 179.5 | 219.5 | 353.6 | 349.8 | 8 |
+| vLLM NVFP4 | 67.4 | 121.4 | 215.7 | 438.7 | 398.8 | 6.53 |
+| llama.cpp | 84.8 | 168.3 | 149.1 | 193.1 | 230.3 | **6** |
+
+**The q27 rows run `Q27_DRAFT_CEIL1=1`, which is opt-in and OFF by default.**
+Stated plainly because it is an asymmetry: q27 is tuned here and the other three
+engines are at their shipped defaults. The flag is worth **+8.6%** at C=8 and
+nothing anywhere else (q4s stock: 142.5 / 226.5 / 360.3 / **488.4**), because it
+only binds where the width trim floors every lane -- so **q27 is +18.3% at C=8
+on defaults alone**, and the tuned number is the ceiling rather than the
+out-of-the-box figure.
+
+Read the competitor deltas as the noise floor: on unchanged binaries they came
+back +1.1%, +5.6%, +10.0% and -16.1%, so single rungs move ~10-16% between
+sessions. Both q27 legs moved +28.5% and +32.1% in the same direction, which is
+what makes them a result rather than a wobble. The one outlier inside q27's own
+rows -- q5f at C=2, down 10.5% while its neighbours rose -- is that same
+rung-level noise; its C=4 and C=8 track q4s.
+
+**q27 still loses this half, by less.** ninfer's NVFP4 peaks at **1.57x**
+q27's best (834.3 vs 530.6, same session), down from the 1.91x the 08-17 run
+recorded -- the gap closed by q27 moving, not by ninfer slipping. *An earlier
+draft of this section read that as a format win -- fp4 MMA engaging at batch
+width -- because ninfer's own int8 tier peaks below q27. That attribution was
+wrong, and their source says so: `text_policy()` hands `AllowA4` to
+`QType::NVFP4` and `A16Only` to every other qtype, so **their int tier is locked
+out of their own batch kernel by policy**. fp4 did not make nvfp4 fast; A16Only
+made nint slow, and the within-engine comparison was never a format control. The
+real gap is per-lane cost: their round wall is FLAT from C=1 to C=2 (15.04 ->
+15.00 ms), which is a reclaimed-idle-machine story, not an arithmetic one.*
+Client-side accounting agrees with q27's internal
+`[req]` telemetry to within 0.1% at every rung, so these are comparable across
+engines and to q27's own ladder history.
+
+**Everyone pays for hybrid-GDN state; the bill lands in a different place.**
+llama.cpp keeps recurrent state per slot at ~1047 MiB and OOMs at 8 slots
+(measured ceiling 6). vLLM's KV pool holds 6.53 sequences at 16K. ninfer trades
+reuse away entirely. q27 reaches 8 slots at 16K because M1 record-then-fold cut
+its per-slot GDN cost -- that is what the 530.6 t/s rung is made of.
+
+**Quality does not separate them.** benchlocal `--medium`, 5 packs / 75
+deterministic-verifier scenarios, temp 0: q27 q5f **66**, llama.cpp **66**,
+vLLM **66**, ninfer NVFP4 65, q27 q4s 64, ninfer int8 64 -- four engines and
+five quant formats inside a 2-point band. No difference was DETECTED on these
+75 scenarios -- at n=1 per scenario that is a null result, not a demonstration
+of equivalence, and it does not rule out differences smaller than the band or
+outside these packs. On this evidence the throughput numbers above
+carry no quality asterisk.
+
+**Defect found, filable upstream:** vLLM's MTP speculative path produces
+*corrupted* generations under sustained agentic traffic on this checkpoint --
+incoherent token soup returned as HTTP 200 after ~3 instances. Isolated over 4
+instances x 3 configurations: spec ON = 1/4 gold with 3 sessions dead at turn 1;
+spec OFF (prefix cache still on) = 3/4 gold with every session running 6-20
+turns; spec OFF + cache OFF = 3/4 gold. One variable, and it is the speculative
+path. vLLM is measured above in its best *working* configuration; no throughput
+benchmark would have caught this.
 
 Full methodology, fairness controls, the payload microbench, and reproduce
 steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,
 and raw per-instance results: [bench/swebench/](bench/swebench/).
+
+The 2026-08-17 four-engine run lives in
+[bench/crossengine/](bench/crossengine/) -- harness, per-leg raw data, the
+write-up in [FINDINGS.md](bench/crossengine/FINDINGS.md), and the two
+attribution experiments the headline claims rest on (the vLLM MTP corruption
+A/B and llama.cpp's slot-ceiling walk) under `isolation/`. The wall-time,
+prefill and decode tables regenerate from the committed data with:
+
+```bash
+python3 bench/crossengine/harness/analyze.py bench/crossengine
+```
+
+**In the 08-17 archive the prefix-reuse column did not** -- it printed `n/a`
+for both q27 and both ninfer legs, because that number comes from each engine's
+own instrument and only llama.cpp's rode in the committed tap logs
+(`cache_read_tok`, in `tap.llama.jsonl`). q27's reuse is parsed from
+`[gen] prompt=N prefix_hit=M` server lines and ninfer's from its request log,
+and neither file was archived.
+
+**Fixed for the 08-19 re-run**, whose directory ships those server logs and
+reqlogs (pure counters -- no prompt or completion text), so every leg's reuse
+regenerates from a clone:
+
+| leg | reuse, tok-weighted |
+|---|--:|
+| llama.cpp | 93.47% |
+| **q27** q4s | **91.64%** |
+| **q27** q5f | 89.91% |
+| ninfer int8 / NVFP4 | 0.00% |
+| vLLM | n/a (emits no cache field) |
+
+vLLM stays `n/a` because it reports no per-request cache field at all, which is
+an engine limitation rather than a missing file.
+
+That section also documents the seven harness bugs the run hit, each of which
+produced a plausible and wrong number first -- the worst of them said "ninfer
+does not scale with concurrency", which is the opposite of true.
+
+The earlier three-engine run (2026-07-14, q8 KV + greedy, llama `ngram-mod`
+fork included) is superseded but not deleted -- it is the reason ngram-style
+drafting is not in this engine: it added ~nothing on real coding while MTP
+nearly doubled stock llama.cpp.
 
 ## Open items (2026-07-30)
 

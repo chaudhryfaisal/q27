@@ -1,4 +1,5 @@
 // q27 CLI: bench / greedy / spec-decode harness.
+#include <algorithm>
 #include <chrono>
 #include <tuple>
 #include "engine.cuh"
@@ -46,6 +47,17 @@ int main(int argc, char** argv) {
     // catastrophic position to nothing -- which is exactly the blind spot a
     // KV-quant tail study needs to see. Written by the --nll-long path.
     std::string nll_dump;
+    // --flip-dump FILE: the top-1-flip gate (2026-08-22). Teacher-forces the
+    // token stream in one pass (same path as --nll-long, no resets) and writes
+    // the top-K distribution at selected target positions, so two runs can be
+    // compared for TOP-1 AGREEMENT rather than for a corpus mean. A mean NLL
+    // over wikitext averages away exactly what agentic serving cares about: a
+    // handful of flipped tokens inside tool calls, which is where the damage
+    // is (a flipped path byte executes the wrong command). Pair with
+    // tools/flip_regions.cpp (which positions are assistant output / inside a
+    // tool call) and tools/flip_gate.py (the comparison).
+    std::string flip_dump, flip_pos_path;
+    int flip_topk = 16, flip_n = 0;
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
     std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
@@ -70,6 +82,10 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--nll-max") && i + 1 < argc) nll_max = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
         if (!strcmp(argv[i], "--nll-dump") && i + 1 < argc) nll_dump = argv[++i];
+        if (!strcmp(argv[i], "--flip-dump") && i + 1 < argc) flip_dump = argv[++i];
+        if (!strcmp(argv[i], "--flip-topk") && i + 1 < argc) flip_topk = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--flip-n") && i + 1 < argc) flip_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--flip-positions") && i + 1 < argc) flip_pos_path = argv[++i];
         if (!strcmp(argv[i], "--verify-weights")) verify_weights = true;
         if (!strcmp(argv[i], "--kvstats") && i + 1 < argc) kvstats_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
@@ -713,6 +729,113 @@ int main(int argc, char** argv) {
         const DevTensor& onw = e.dm.get("output_norm.weight");
         const DevTensor& head = e.dm.get("output.weight");
         const int PT = Engine::PF_T;
+
+        if (!flip_dump.empty()) {
+            const int cap = flip_n > 0 ? flip_n : (int)tk.size();
+            const int N = std::min((int)tk.size(), std::min(cap, ctx));
+            if (flip_topk < 1 || flip_topk > 256) {
+                fprintf(stderr, "--flip-topk %d out of range (1..256)\n", flip_topk);
+                return 1;
+            }
+            // Which target positions to capture. Default all; a positions file
+            // (int32 list, as tools/flip_regions.cpp writes) restricts to the
+            // assistant-output positions, which is what a flip rate should be
+            // measured over -- flips on the prompt are not the model choosing.
+            std::vector<char> want((size_t)N, flip_pos_path.empty() ? 1 : 0);
+            long wanted = flip_pos_path.empty() ? std::max(0, N - 1) : 0;
+            if (!flip_pos_path.empty()) {
+                FILE* pf = fopen(flip_pos_path.c_str(), "rb");
+                if (!pf) {
+                    fprintf(stderr, "cannot open --flip-positions %s\n", flip_pos_path.c_str());
+                    return 1;
+                }
+                int v;
+                long outside = 0;
+                while (fread(&v, 4, 1, pf) == 1) {
+                    if (v < 1 || v >= N) { outside++; continue; }
+                    if (!want[(size_t)v]) { want[(size_t)v] = 1; wanted++; }
+                }
+                fclose(pf);
+                fprintf(stderr, "flip: %ld positions selected (%ld outside [1,%d))\n",
+                        wanted, outside, N);
+            }
+            if (wanted <= 0) { fprintf(stderr, "flip: no positions to capture\n"); return 1; }
+            FILE* fo = fopen(flip_dump.c_str(), "wb");
+            if (!fo) { fprintf(stderr, "cannot open --flip-dump %s\n", flip_dump.c_str()); return 1; }
+            // header: magic, K, count, vocab, N -- the reader refuses a pair
+            // whose K/vocab/N disagree, so a comparison can never straddle two
+            // different capture protocols.
+            const char magic[8] = {'Q','2','7','F','L','I','P','1'};
+            const int hk = flip_topk, hn = (int)wanted, hv = VOCAB, hN = N;
+            fwrite(magic, 1, 8, fo);
+            fwrite(&hk, 4, 1, fo); fwrite(&hn, 4, 1, fo);
+            fwrite(&hv, 4, 1, fo); fwrite(&hN, 4, 1, fo);
+            fprintf(stderr, "flip: %d tokens, single pass, no resets, top-%d at %ld positions\n",
+                    N, flip_topk, wanted);
+            const int PT = Engine::PF_T;
+            int* d_toks;
+            float* d_lg;
+            CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)N * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)PT * VOCAB * 4));
+            CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+            e.reset();
+            std::vector<float> row(VOCAB);
+            std::vector<int> idx(VOCAB);
+            long written = 0;
+            for (int c0 = 0; c0 < N - 1; c0 += PT) {
+                const int T = std::min(PT, N - c0);
+                e.prefill_chunk(d_toks + c0, c0, T);
+                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                e.qxT(e.x1T, N_EMBD, T);
+                e.mmT(head, e.x1T, d_lg, T);
+                const int nrows = std::min(T, N - 1 - c0);
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                for (int r = 0; r < nrows; r++) {
+                    const int tpos = c0 + r + 1; // the position this row predicts
+                    if (!want[(size_t)tpos]) continue;
+                    CUDA_CHECK(cudaMemcpy(row.data(), d_lg + (size_t)r * VOCAB,
+                                          (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
+                    // logsumexp in double: the comparison is between two runs
+                    // whose logits differ in the last bits, so the normalizer
+                    // must not be the thing that moves.
+                    double mx = -1e300;
+                    for (int v = 0; v < VOCAB; v++) mx = std::max(mx, (double)row[v]);
+                    double se = 0;
+                    for (int v = 0; v < VOCAB; v++) se += exp((double)row[v] - mx);
+                    const double lse = log(se) + mx;
+                    for (int v = 0; v < VOCAB; v++) idx[v] = v;
+                    const int K = std::min(flip_topk, VOCAB);
+                    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                                      [&](int a, int b) {
+                                          if (row[a] != row[b]) return row[a] > row[b];
+                                          return a < b; // same tie order as argmax
+                                      });
+                    const int tgt = tk[(size_t)tpos];
+                    const float nll = (float)(lse - (double)row[tgt]);
+                    const float flse = (float)lse;
+                    fwrite(&tpos, 4, 1, fo);
+                    fwrite(&tgt, 4, 1, fo);
+                    fwrite(&nll, 4, 1, fo);
+                    fwrite(&flse, 4, 1, fo);
+                    for (int k = 0; k < K; k++) {
+                        const int id = idx[(size_t)k];
+                        fwrite(&id, 4, 1, fo);
+                        fwrite(&row[id], 4, 1, fo);
+                    }
+                    written++;
+                }
+                if ((c0 / PT) % 8 == 0)
+                    fprintf(stderr, "  pos %d/%d (%ld captured)\r", c0, N, written);
+            }
+            fclose(fo);
+            printf("\nflip-dump -> %s: %ld positions, top-%d, vocab %d, N %d\n",
+                   flip_dump.c_str(), written, flip_topk, VOCAB, N);
+            if (written != wanted)
+                fprintf(stderr,
+                        "flip: WARNING captured %ld of %ld selected positions\n",
+                        written, wanted);
+            return 0;
+        }
 
         if (nll_long > 0) {
             int N = std::min((int)tk.size(), std::min(nll_long, ctx));

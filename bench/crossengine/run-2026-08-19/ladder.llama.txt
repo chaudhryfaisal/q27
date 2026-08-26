@@ -1,0 +1,16 @@
+C=1 llama aggregate=84.8 t/s  (sum_dec=5351, union=63.1s, client_wall=63.3s)
+   per-stream tps: median=84.8 min=84.8 max=84.8
+   ttft_ms: median=126 max=126
+JSON {"c": 1, "label": "llama", "aggregate_tps": 84.8, "sum_dec": 5351, "union_s": 63.1, "client_wall_s": 63.3, "per_stream_median": 84.8, "ttft_ms_median": 125.8, "n_streams": 1, "server_side_agg": null}
+C=2 llama aggregate=168.3 t/s  (sum_dec=14041, union=83.4s, client_wall=83.8s)
+   per-stream tps: median=88.0 min=87.2 max=88.9
+   ttft_ms: median=290 max=290
+JSON {"c": 2, "label": "llama", "aggregate_tps": 168.3, "sum_dec": 14041, "union_s": 83.4, "client_wall_s": 83.8, "per_stream_median": 88.0, "ttft_ms_median": 289.5, "n_streams": 2, "server_side_agg": null}
+C=4 llama aggregate=149.1 t/s  (sum_dec=28985, union=194.5s, client_wall=195.1s)
+   per-stream tps: median=40.3 min=39.4 max=42.1
+   ttft_ms: median=582 max=584
+JSON {"c": 4, "label": "llama", "aggregate_tps": 149.1, "sum_dec": 28985, "union_s": 194.5, "client_wall_s": 195.1, "per_stream_median": 40.3, "ttft_ms_median": 582.5, "n_streams": 4, "server_side_agg": null}
+C=8 llama aggregate=193.1 t/s  (sum_dec=54422, union=281.8s, client_wall=283.0s)
+   per-stream tps: median=52.1 min=37.9 max=55.2
+   ttft_ms: median=1007 max=117930
+JSON {"c": 8, "label": "llama", "aggregate_tps": 193.1, "sum_dec": 54422, "union_s": 281.8, "client_wall_s": 283.0, "per_stream_median": 52.1, "ttft_ms_median": 1007.1, "n_streams": 8, "server_side_agg": null}

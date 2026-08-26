@@ -1,0 +1,8 @@
+<function=Read>
+<parameter=name>
+Bash
+</parameter>
+<parameter=command>
+id
+</parameter>
+</function>

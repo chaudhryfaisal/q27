@@ -308,5 +308,80 @@ int main() {
                 split_pieces({"reason", "ing", "</think>", "\n\nans"},
                              Chan::THINK),
                 preseeded_want) && ok;
+
+    // An UNBALANCED double quote in prose used to leave the JSON-string lexer
+    // in_string for every byte that followed, so the next genuine <tool_call>
+    // was classified non-structural and emitted as VISIBLE TEXT: the call was
+    // lost and the raw marker leaked to the user. A JSON string cannot contain
+    // a raw newline (RFC 8259), so the quote is prose and the string ends at
+    // the line break.
+    for(bool bytewise : {false, true}) {
+        const char* how = bytewise ? " (bytewise)" : "";
+        ok = expect((std::string("unbalanced quote does not disarm the opener")+how).c_str(),
+                    compact(split(
+                        "I ran echo \"---\nnow calling.\n<tool_call>{\"a\":1}</tool_call>",
+                        bytewise)),
+                    {{Chan::TEXT, "I ran echo \"---\nnow calling.\n"},
+                     {Chan::TOOL, "{\"a\":1}"}}) && ok;
+    }
+
+    // The rule must NOT reopen the fence-skip hole: a marker quoted inside a
+    // fenced block stays visible text, unbalanced quote or not.
+    ok = expect_visible("fenced marker after an unbalanced quote stays text",
+                        "say \"hi\n```\n<tool_call>{\"a\":1}</tool_call>\n",
+                        false) && ok;
+
+    // KNOWN LIMIT, pinned so a change is deliberate: an UNCLOSED fence runs to
+    // the end of the generation, so a real call after it is still refused. The
+    // conservative direction (never execute an echoed marker) is the right
+    // default, but it does cost the turn.
+    ok = expect_visible("unclosed fence still swallows a later call (known limit)",
+                        "here:\n```\ncode\n<tool_call>{\"a\":1}</tool_call>\n",
+                        false) && ok;
+
+    // BUG 6 (2026-08-22): the XML dialect has no escaping, so a call that
+    // legitimately writes ABOUT the protocol puts a literal </tool_call> inside
+    // <parameter=content>. Closing the TOOL channel at that byte truncated the
+    // call, lost it entirely, and leaked the trailing </parameter></function> as
+    // visible text. The doc describing this very bug was itself cut at 651
+    // bytes by it. An in-value </tool_call> is now PROVISIONAL: content if the
+    // value closes, the real closer if generation ends first.
+    {
+        const std::string body =
+            "<function=write>\n<parameter=path>\n/d.md\n</parameter>\n"
+            "<parameter=content>\nsaw </tool_call> in the log\n</parameter>\n</function>\n";
+        for (bool bytewise : {false, true}) {
+            const char* how = bytewise ? " (bytewise)" : "";
+            ok = expect((std::string("in-value </tool_call> is content, not the closer")+how).c_str(),
+                        compact(split("<tool_call>\n"+body+"</tool_call>", bytewise)),
+                        {{Chan::TOOL, "\n"+body}}) && ok;
+        }
+    }
+    // ...but a model that FORGOT </parameter> and closed with </tool_call> is a
+    // real working case: at EOF the provisional IS the closer. Preserved.
+    {
+        const std::string raw =
+            "<tool_call>\n<function=write>\n<parameter=content>\nhello\n</tool_call>";
+        for (bool bytewise : {false, true}) {
+            const char* how = bytewise ? " (bytewise)" : "";
+            ok = expect((std::string("unterminated value: provisional becomes the closer")+how).c_str(),
+                        compact(split(raw, bytewise)),
+                        {{Chan::TOOL, "\n<function=write>\n<parameter=content>\nhello\n"}}) && ok;
+        }
+    }
+    // trailing text after a promoted provisional closer stays TEXT
+    ok = expect("promoted provisional: trailing bytes route to TEXT",
+                compact(split("<tool_call>\n<parameter=content>\nx\n</tool_call>tail", false)),
+                {{Chan::TOOL, "\n<parameter=content>\nx\n"}, {Chan::TEXT, "tail"}}) && ok;
+    // a <parameter= opener SPLIT across feeds must not lose the value state
+    ok = expect("split <parameter= opener keeps value state",
+                compact(split_pieces({"<tool_call>\n<param", "eter=content>\nsaw </tool",
+                                      "_call> here\n</parameter>\n</function>\n", "</tool_call>"})),
+                {{Chan::TOOL, "\n<parameter=content>\nsaw </tool_call> here\n"
+                              "</parameter>\n</function>\n"}}) && ok;
+    // no parameters at all: the closer is structural immediately
+    ok = expect("no parameters: closer is structural",
+                compact(split("<tool_call>\n<function=ls>\n</function>\n</tool_call>", false)),
+                {{Chan::TOOL, "\n<function=ls>\n</function>\n"}}) && ok;
     return ok ? 0 : 1;
 }

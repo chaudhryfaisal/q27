@@ -1,0 +1,11 @@
+<function=TaskCreate>
+<parameter=activeForm>
+TEXT_1
+</parameter>
+<parameter=description>
+TEXT_2
+</parameter>
+<parameter=subject>
+TEXT_3
+</parameter>
+</function>

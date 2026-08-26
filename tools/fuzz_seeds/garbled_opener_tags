@@ -1,0 +1,7 @@
+<tool_use>
+<tool>
+<parameter_name>
+<parameter_name>Read
+</parameter>
+<parameter=file_path>
+/w/x.py

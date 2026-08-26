@@ -1,0 +1,16 @@
+C=1 vllm aggregate=67.5 t/s  (sum_dec=4389, union=65.0s, client_wall=65.7s)
+   per-stream tps: median=67.5 min=67.5 max=67.5
+   ttft_ms: median=725 max=725
+JSON {"c": 1, "label": "vllm", "aggregate_tps": 67.5, "sum_dec": 4389, "union_s": 65.0, "client_wall_s": 65.7, "per_stream_median": 67.5, "ttft_ms_median": 725.4, "n_streams": 1, "server_side_agg": null}
+C=2 vllm aggregate=110.0 t/s  (sum_dec=13071, union=118.9s, client_wall=119.3s)
+   per-stream tps: median=61.7 min=61.0 max=62.4
+   ttft_ms: median=421 max=424
+JSON {"c": 2, "label": "vllm", "aggregate_tps": 110.0, "sum_dec": 13071, "union_s": 118.9, "client_wall_s": 119.3, "per_stream_median": 61.7, "ttft_ms_median": 421.3, "n_streams": 2, "server_side_agg": null}
+C=4 vllm aggregate=216.5 t/s  (sum_dec=29919, union=138.2s, client_wall=138.4s)
+   per-stream tps: median=59.3 min=59.2 max=59.3
+   ttft_ms: median=133 max=133
+JSON {"c": 4, "label": "vllm", "aggregate_tps": 216.5, "sum_dec": 29919, "union_s": 138.2, "client_wall_s": 138.4, "per_stream_median": 59.3, "ttft_ms_median": 132.8, "n_streams": 4, "server_side_agg": null}
+C=8 vllm aggregate=398.8 t/s  (sum_dec=53802, union=134.9s, client_wall=135.2s)
+   per-stream tps: median=60.8 min=60.7 max=60.9
+   ttft_ms: median=167 max=170
+JSON {"c": 8, "label": "vllm", "aggregate_tps": 398.8, "sum_dec": 53802, "union_s": 134.9, "client_wall_s": 135.2, "per_stream_median": 60.8, "ttft_ms_median": 166.9, "n_streams": 8, "server_side_agg": null}

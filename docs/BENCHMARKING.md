@@ -1,5 +1,27 @@
 # q27 benchmarking methodology
 
+## Two scope facts that apply to every number in this document
+
+**Model.** Perf, determinism and canonical-anchor work is **Qwen3.6-27B-MTP**
+(vanilla, anchor `a2982c51`) -- that is what the rows below measure and what
+new sweeps should default to, so anchors keep their meaning. **Agentic and
+quality work from 2026-08-14 on is Qwen3.8-27B-MTP** (`qwen38-27b-mtp`, the
+default in `tools/effort_ab.sh`): tool-call parity, the drift-mode catalogue,
+the cross-engine quality legs, the sampler and think-budget findings. The two
+are different models; a claim from one arc does not transfer to the other
+without re-measurement.
+
+**Byte-identity is necessary, not sufficient.** GPU0 silently corrupts a small
+fraction of model loads with single-bit flips in resident weights, and
+**2 of 3 corrupt runs emitted byte-identical tokens** -- a token-identity gate
+cannot see it. Every campaign from 2026-08-19 is wsum-gated
+(`Q27_PRINT_WSUM=1`, and `Q27_EXPECT_WSUM` on `effort_ab.sh` tears down a load
+whose digest is off the tier's value before any request reaches it). Results
+sealed at n>=3 with cross-run agreement stand as recorded. **Single-run A/Bs
+from before 08-19 carry a ~1-6% chance that one arm ran on corrupted weights**;
+treat their margins accordingly, and re-measure any constant a decision rests
+on. See BUILDLOG 2026-08-18..19 and the localization queue.
+
 How the q27 numbers are produced, and how to reproduce the cross-engine
 comparison against the [llama-cpp-turboquant](https://github.com/) fork with
 `ngram-mod`. Two engines are compared throughout:

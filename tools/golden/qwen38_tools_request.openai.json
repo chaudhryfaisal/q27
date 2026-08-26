@@ -1,0 +1,10 @@
+{"model":"q27","messages":[
+ {"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."},
+ {"role":"user","content":"List the files in /workspace, then read index.ts."},
+ {"role":"assistant","content":"","reasoning_content":"I should list first, then read.","tool_calls":[{"id":"t1","type":"function","function":{"name":"Bash","arguments":"{\"command\": \"ls -la /workspace\"}"}}]},
+ {"role":"tool","tool_call_id":"t1","content":"total 12\nindex.ts\n"},
+ {"role":"assistant","content":"","reasoning_content":"Now read it.","tool_calls":[{"id":"t2","type":"function","function":{"name":"Read","arguments":"{\"file_path\": \"/workspace/index.ts\"}"}}]},
+ {"role":"tool","tool_call_id":"t2","content":"export const x = 1;\n"}],
+ "tools":[
+  {"type":"function","function":{"name":"Bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"Read","description":"Read a file","parameters":{"type":"object","required":["file_path"],"properties":{"file_path":{"type":"string"}}}}}]}

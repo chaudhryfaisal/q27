@@ -1,0 +1,13 @@
+<think>
+planning
+<tool_call>
+<function=Write>
+<parameter=file_path>
+x
+</parameter>
+<parameter=content>
+hi
+</parameter>
+</function>
+</tool_call>
+</think>

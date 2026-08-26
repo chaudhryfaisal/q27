@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "cuda_common.h" // KvKind
+#include "kernels.cuh"   // CP3 (per-lane logits pointers for nucleus_multi)
 
 // VERIFY-1/3/4/5 all resolved against ggml source (workflow wf_b19a6dde, high confidence):
 // head expansion = tile/modulo (converter pre-permutes V heads to tiled order),
@@ -114,6 +115,15 @@ struct SampleParams {
     float inv_temp; // 1/T (>0)
     float top_p;    // (0,1]; >=1 => full vocab
     unsigned long long seed;
+    // 2026-08-23: llama-server's chain for Qwen3.8 is top_k 20 -> top_p 0.95
+    // -> min_p 0.05 -> temperature, and q27 had only top_p, so a "matched
+    // sampler" comparison was never actually matched. Both are expressed as
+    // logit thresholds by nucleus_body and composed in the SAME order llama
+    // applies them, so the kept set is identical rather than merely similar.
+    // Defaults are off, and the members carry NSDMIs so existing three-field
+    // brace-init sites keep compiling.
+    int top_k = 0;     // <=0 or >=vocab => off
+    float min_p = 0.f; // <=0 => off; keep p_i >= min_p * p_max
 };
 
 // Gumbel-max over the top-p nucleus S={i: x_i>=logit_thresh} draws exactly
@@ -139,6 +149,12 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 // d_nuc + lane*4). Identical kernel to sample_g's -> spec/plain share the target.
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st = 0);
+// Batched twin: L lanes in ONE launch (block b == lane b), writing d_nuc + b*4.
+// Bitwise identical per lane -- same body, same per-block reduction order. The
+// per-lane loop it replaces cost ~16 single-block launches per round at C=8,
+// each on one SM of 170 (nsys 2026-08-18: 10.6% of all GPU kernel time).
+void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
+                   cudaStream_t st = 0);
 // Rejection-sampling accept walk over up to max_draft greedy drafts vs logits2.
 // d_nuc5 = [5][4], d_P = committed position (Philox key), cap forces n=1.
 // max_draft = accept-walk depth (P14 confidence gate: width-W verify walks W-1

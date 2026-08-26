@@ -1,0 +1,14 @@
+<tool_call>
+<function=Read>
+<parameter=file_path>
+/a
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=Read>
+<parameter=file_path>
+/b
+</parameter>
+</function>
+</tool_call>

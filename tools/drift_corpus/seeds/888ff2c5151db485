@@ -1,0 +1,12 @@
+<function=Write>
+<parameter=content>
+TEXT_1:ml `TEXT_2` TEXT_3:ml `TEXT_4`TEXT_5:ml
+          `TEXT_6`TEXT_7:ml
+          `TEXT_8`TEXT_9:ml
+
+</parameter>
+<parameter=file_path>
+PATH_10
+</parameter>
+</function>
+PROSE_11

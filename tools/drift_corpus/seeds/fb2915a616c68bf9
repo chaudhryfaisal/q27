@@ -1,0 +1,11 @@
+<function=Read>
+<parameter=file_path>
+PATH_1
+</parameter>
+</function>
+<function>
+<function=Read>
+<parameter=file_path>
+PATH_2
+</parameter>
+</function>

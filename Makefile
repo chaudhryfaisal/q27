@@ -1,5 +1,6 @@
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
+PYTHON    ?= python3
 NVCC      ?= /usr/local/cuda/bin/nvcc
 # sm_120 = RTX 5090, sm_89 = RTX 4090/Ada (needs CUDA 12.4+ for e4m3 MMA),
 # sm_86 = RTX 3090 (fallback device for tests)
@@ -7,7 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
+.PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 build/q27: src/engine.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
@@ -26,34 +27,147 @@ test-inspect: build/inspect build/test_loader_contracts
 	python3 tools/test_inspect.py ./build/inspect
 	./build/test_loader_contracts
 
+test-repack: tools/repack.py tools/test_repack_split.py tools/test_repack_split_e2e.py \
+             tools/test_repack_canonical_gate.py tools/requirements-repack-test.txt
+	$(PYTHON) tools/test_repack_split.py
+	$(PYTHON) tools/test_repack_split_e2e.py
+	$(PYTHON) tools/test_repack_canonical_gate.py
+
+# Opt-in release gate: repack a REAL source and compare the artifact MD5 to the
+# published digest. The tests above prove the split plumbing on synthetic
+# fixtures; only this proves the bytes we ship. Skips cleanly when unconfigured.
+#   SRC_GGUF=... [SRC_MTP_GGUF=...] CANON_MD5=... make test-repack-canonical
+test-repack-canonical: tools/repack_canonical_gate.sh tools/repack.py
+	bash tools/repack_canonical_gate.sh
+
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
-build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
 build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_stream_split.cpp -o $@
 
-build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+# CPU-only suites: no GPU, no model, no network. tool_strict() is a
+# process-lifetime memo, so the drift suite runs twice -- once tolerant, once
+# strict -- because the strict leg's assertions cannot share a process with the
+# tolerant ones.
+.PHONY: test-tools
+# extract_check first: the integration harness embeds server.cu's handle()
+# byte-for-byte, and a stale copy tests logic that no longer ships (it had
+# drifted for ten commits before anything noticed).
+test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
+            build/test_chat_completions_integration build/test_think_resolve \
+            build/test_stream_split build/test_toolconstrain build/test_template_golden \
+            build/test_drift_capture build/test_drift_hook
+	./tools/extract_check.sh
+	./build/test_tool_drift
+	Q27_TOOL_STRICT=1 ./build/test_tool_drift
+	./build/test_tool_drift_corpus
+	./build/test_openai_bridge
+	./build/test_chat_completions_integration
+	./build/test_think_resolve
+	./build/test_stream_split
+	./build/test_toolconstrain
+	./build/test_template_golden
+	./build/test_drift_capture
+	./build/test_drift_hook
+
+build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
 
-build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
+build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/drift_capture.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_chat_completions_integration.cpp -o $@
 
-build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
+
+build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
+
+# Fuzzing the tool-call parser. The model chooses every byte this parser sees,
+# so it is attack surface (docs/SECURITY.md). Two builds:
+#   make fuzz       coverage-guided libFuzzer (needs clang) -- far better reach
+#   make fuzz-gcc   standalone mutator under gcc+ASan, no clang needed
+# Both link ASan+UBSan; a hit aborts with a stack trace.
+FUZZ_CLANG ?= clang++-18
+FUZZ_GCC_DIR ?= /usr/lib/gcc/x86_64-linux-gnu/13
+
+build/fuzz_tool_parser: tools/fuzz_tool_parser.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(FUZZ_CLANG) --gcc-install-dir=$(FUZZ_GCC_DIR) -O1 -g -std=c++17 \
+	  -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	  -I src tools/fuzz_tool_parser.cpp -o $@
+
+build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) -O1 -g -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -I src tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp -o $@
+
+# corpus/ is scratch: libFuzzer grows it to thousands of files. Only
+# tools/fuzz_seeds (the shapes the model actually emits) is tracked.
+fuzz: build/fuzz_tool_parser
+	mkdir -p build/fuzz_corpus && cp -n tools/fuzz_seeds/* build/fuzz_corpus/ 2>/dev/null || true
+	cp -n tools/drift_corpus/seeds/* build/fuzz_corpus/ 2>/dev/null || true
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_tool_parser build/fuzz_corpus \
+	  -max_total_time=$${FUZZ_SECONDS:-300} -max_len=32768 -print_final_stats=1
+
+fuzz-gcc: build/fuzz_tool_parser_gcc
+	ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+	  ./build/fuzz_tool_parser_gcc $${FUZZ_ITERS:-200000} $${FUZZ_SEED:-1}
+
+.PHONY: fuzz fuzz-gcc
+
+build/render_request: tools/render_request.cpp src/api_common.h src/drift_capture.h src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/render_request.cpp src/tokenizer.cpp -o $@
+
+build/flip_regions: tools/flip_regions.cpp src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/flip_regions.cpp src/tokenizer.cpp -o $@
+
+build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift.cpp -o $@
 
-build/test_tool_drift_corpus: tools/test_tool_drift_corpus.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_tool_drift_corpus: tools/test_tool_drift_corpus.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_tool_drift_corpus.cpp -o $@
 
-build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+build/test_drift_capture: tools/test_drift_capture.cpp src/drift_capture.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_drift_capture.cpp -o $@
+
+build/test_drift_hook: tools/test_drift_hook.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_drift_hook.cpp -o $@
+
+# Drift corpus. Serve with Q27_DRIFT_CORPUS=<file> and every dialect-bearing
+# turn is appended as one redacted JSONL record (src/drift_capture.h). This
+# folds that capture into tools/drift_corpus/ -- one exemplar per shape plus a
+# count -- and prints the shape histogram; the seeds it writes feed `make
+# fuzz`. CORPUS defaults to the same variable the server reads.
+# Records are re-keyed first (build/drift_rekey) so a capture made under an
+# older shape_key() folds with today's; the redacted text itself is untouched.
+CORPUS ?= $(Q27_DRIFT_CORPUS)
+corpus-dedup: tools/corpus_dedup.py build/drift_rekey
+	@test -n "$(CORPUS)" || { echo "usage: make corpus-dedup CORPUS=/path/to/capture.jsonl (or export Q27_DRIFT_CORPUS)"; exit 2; }
+	./build/drift_rekey < $(CORPUS) > build/corpus_rekeyed.jsonl
+	python3 tools/corpus_dedup.py --out tools/drift_corpus build/corpus_rekeyed.jsonl
+
+build/drift_rekey: tools/drift_rekey.cpp src/drift_capture.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src tools/drift_rekey.cpp -o $@
+
+# Phase 2: replay every corpus shape through the parser, diff against the
+# human `intended` label (tools/corpus_label.py), print the agreement number,
+# and record `current` + `constrained` into the rows. Exit 1 if a
+# human-confirmed label disagrees.
+build/corpus_check: tools/corpus_check.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/corpus_check.cpp -o $@
+
+corpus-check: build/corpus_check
+	./build/corpus_check tools/drift_corpus/corpus.jsonl --write
+
+build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_think_resolve.cpp -o $@
 
-build/test_auth: tools/test_auth.cpp src/api_common.h | build
+build/test_auth: tools/test_auth.cpp src/api_common.h src/drift_capture.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_auth.cpp -o $@
 
-build/test_auth_integration: tools/test_auth_integration.cpp src/api_common.h third_party/httplib.h | build
+build/test_auth_integration: tools/test_auth_integration.cpp src/api_common.h src/drift_capture.h third_party/httplib.h | build
 	$(CXX) $(CXXFLAGS) -I src -I third_party -pthread tools/test_auth_integration.cpp -o $@
 
 check-chat-extract: tools/extract_check.sh src/server.cu tools/test_chat_completions_integration.cpp
@@ -87,9 +201,20 @@ build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks
 build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/test_argmax_tie.cu src/blocks.cu -o $@
 
+# Tensor-manifest gate (post-review). Positive leg needs artifacts, so it is not
+# in `all`; point it at every .q27 on the box before trusting the manifest:
+#   make build/test_manifest && ./build/test_manifest /path/to/*.q27
+build/test_manifest: tools/test_manifest.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h \
+                     src/conductor.h src/prefix_cache.h src/prefix_ram.h src/blocks.cu \
+                     src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu \
+                     src/loader.cpp build/pf4.o | build
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread tools/test_manifest.cu src/blocks.cu src/prefill.cu \
+	        src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+	        build/pf4.o -o $@
+
 
 build/q27-server: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -119,9 +244,12 @@ MXF4FLAGS = -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a -Xcompiler -W
 build/pf4.o: src/pf4.cu src/pf4.h | build
 	$(NVCC) $(MXF4FLAGS) -c src/pf4.cu -o $@
 
-build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp \
-                       src/prefill.cuh src/kernels.cuh src/device_model.h src/loader.h src/cuda_common.h | build
-	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
+# src/vgemm.cu is in the link line for the T2 decode leg: the union GEMM the
+# C-sweep routes batched decode to at k >= 3 is the BASELINE at decode shapes
+# (gemm_q4_T is prefill-only and is never reached from a fused round).
+build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+                       src/prefill.cuh src/kernels.cuh src/vgemm.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
@@ -137,6 +265,14 @@ build/vgemm_test: tools/vgemm_test.cu src/vgemm.cuh $(VGEMM_SRC) | build
 
 build/vgemm_race: tools/vgemm_race.cu src/vgemm.cuh $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/vgemm_race.cu $(VGEMM_SRC) -o $@
+
+# E6 attribution harness: splits the weight sweep's missing bandwidth into launch
+# gaps / reduce epilogue / grid tail / the tile itself, against a MEASURED SOL.
+build/vgemm_e6: tools/vgemm_e6.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/vgemm_e6.cu $(VGEMM_SRC) -o $@
+
+build/round_weight_cost: tools/round_weight_cost.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/round_weight_cost.cu $(VGEMM_SRC) -o $@
 
 build/fdmma_test: tools/fdmma_test.cu src/fdmma.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/fdmma_test.cu -o $@
@@ -158,7 +294,7 @@ build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 # fits (the historical role-set + 12x-zoo savings are engine-wide now).
 # Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -183,7 +319,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h src/kv_pool.h src/prefill_arena.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -261,7 +397,7 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp \
                         src/metal/metal_backend.h src/metal/stream_format.h \
                         src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
                         src/metal/snapshot_evict.h \
-                        src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                        src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                         src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
                         src/sampling.h src/tokenizer.h src/tokenizer.cpp \
                         third_party/httplib.h third_party/json.hpp | build
@@ -273,7 +409,7 @@ build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.c
                              src/metal/metal_backend.h src/metal/stream_format.h \
                              src/metal/serving_policy.h src/metal/disk_snapshot_store.h \
                              src/metal/snapshot_evict.h \
-                             src/metal/q27_kernels.metal src/api_common.h src/stream_split.h \
+                             src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                              src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
                              src/sampling.h src/tokenizer.h src/tokenizer.cpp \
                              third_party/httplib.h third_party/json.hpp | build
@@ -282,7 +418,7 @@ build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.c
 	        src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
 
 build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h \
-                         src/metal/serving_policy.h src/api_common.h src/stream_split.h \
+                         src/metal/serving_policy.h src/api_common.h src/drift_capture.h src/stream_split.h \
                          third_party/json.hpp | build
 	$(CXX) $(CXXFLAGS) -I src/metal src/metal/test_metal_stream.cpp -o $@
 

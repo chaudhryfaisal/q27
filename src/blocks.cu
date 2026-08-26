@@ -141,7 +141,8 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_conv_chunk3
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; 2026-08-18: also
+// k_gdn_convnorm3 in spec3.cu): k_gdn_conv_chunk3
 // (spec3.cu, the M1 speculative-lane chunk) and k_conv_prefill_T (prefill.cu)
 // are arithmetic twins of this tap/silu math -- any arithmetic change here
 // MUST be mirrored in both and re-gated with ninv's CHUNK+FOLD leg (bitwise,
@@ -177,11 +178,12 @@ void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const f
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
-// MIRROR WARNING (P3 exit review M2, re-scoped M1): k_gdn_delta_chunk3
-// (spec3.cu) and k_delta_scan_T (prefill.cu, also the M1 Fold) are per-step
-// arithmetic twins of this body (smem-resident state, identical tile split
-// and part[0..3] reduction order) -- mirror any change in both and re-gate
-// with ninv's CHUNK+FOLD leg (bitwise, both arches).
+// MIRROR WARNING (P3 exit review M2, re-scoped M1; extended 2026-08-18):
+// k_gdn_delta_chunk3 and k_gdn_delta_all (spec3.cu) and k_delta_scan_T
+// (prefill.cu, also the M1 Fold) are per-step arithmetic twins of this body
+// (smem-resident state, identical tile split and part[0..3] reduction order)
+// -- mirror any change in ALL of them and re-gate with ninv's CHUNK+FOLD leg
+// plus build/gdn_fuse_eq (bitwise, both arches).
 __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
                              const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,
@@ -534,9 +536,18 @@ __device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigne
 // inv_temp/top_p from the device param block (graph-fixed pointer). Writes
 // out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh clamped <= M so the argmax
 // token is always in the nucleus (guards degenerate/tiny top_p).
-__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
-                            float* __restrict__ out) {
+// Body factored out so the single-lane and multi-lane entry points cannot drift:
+// one block computes one lane, exactly as before. Every reduction is within the
+// block and no state crosses blocks, so running L lanes as L BLOCKS is bitwise
+// identical to L sequential single-block launches -- it only stops them
+// serializing on one SM. Measured 2026-08-18 (nsys, C=8): the per-lane loop was
+// ~16 launches/round x 280 us, one SM of 170 each, 10.6% of all GPU kernel time.
+__device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
+                                             const SampleParams* __restrict__ sp,
+                                             float* __restrict__ out) {
     const float inv_temp = sp->inv_temp, top_p = sp->top_p;
+    const int top_k = sp->top_k;
+    const float min_p = sp->min_p;
     __shared__ float sh[1024];
     __shared__ float s_M, s_logZ, s_lo, s_hi, s_thresh;
     const int t = threadIdx.x, B = blockDim.x;
@@ -573,12 +584,75 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
     }
     __syncthreads();
     const float logZ = s_logZ;
+    // --- top_k, then min_p, then top_p: llama.cpp's order, as thresholds ----
+    // Each filter only REMOVES tokens, so a chain is an intersection of kept
+    // sets, and an intersection of "x_i >= thr" sets is "x_i >= max(thr)".
+    // top_k and min_p do not depend on which other tokens survive, so they
+    // compose by max() exactly. top_p DOES depend on the surviving mass, so it
+    // is bisected below over the set the first two already left -- computing
+    // it on the full vocab instead would keep too many tokens whenever top_k
+    // binds, which for k=20 on a peaked distribution is almost always.
+    // s_logZp is SEPARATE from s_logZ on purpose: out[2] exports the FULL-vocab
+    // logZ and out[3]'s mass is sum_{kept} softmax_full(i), which the Phase-2
+    // accept test divides by. Overwriting s_logZ here would make mass ~1 and
+    // silently break the accept ratio.
+    __shared__ float s_pre, s_logZp;
+    if (t == 0) { s_pre = -FLT_MAX; s_logZp = s_logZ; }
+    __syncthreads();
+    // min_p: p_i/p_max >= min_p  <=>  inv_temp*(x_i - M) >= log(min_p).
+    // Scale-invariant under renormalisation, so its threshold is the same
+    // whether it runs before or after any other filter -- closed form, no
+    // bisection.
+    if (t == 0 && min_p > 0.f && min_p <= 1.0f && inv_temp > 0.f)
+        s_pre = fmaxf(s_pre, M + __logf(min_p) / inv_temp);
+    __syncthreads();
+    // top_k: bisect for the k-th largest LOGIT (same window and iteration
+    // count as the top_p bisection below, counting instead of summing). The
+    // count is monotone decreasing in thr, so the invariant matches.
+    if (top_k > 0 && top_k < n) {
+        if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
+        __syncthreads();
+        for (int it = 0; it < 24; it++) {
+            const float thr = 0.5f * (s_lo + s_hi);
+            float cnt = 0.f;
+            for (int i = t; i < n; i += B) if (x[i] >= thr) cnt += 1.f;
+            sh[t] = cnt; __syncthreads();
+            for (int s = B / 2; s > 0; s >>= 1) {
+                if (t < s) sh[t] += sh[t + s];
+                __syncthreads();
+            }
+            // keep the largest thr whose count still covers k
+            if (t == 0) { if (sh[0] > (float)top_k) s_lo = thr; else s_hi = thr; }
+            __syncthreads();
+        }
+        if (t == 0) s_pre = fmaxf(s_pre, s_hi); // s_hi keeps <= k tokens
+        __syncthreads();
+    }
+    const float pre = s_pre;
+    // Renormalise the remaining mass so top_p's cumulative is taken over the
+    // set that survived top_k/min_p, exactly as llama.cpp does.
+    if (top_p < 1.0f && pre > -FLT_MAX) {
+        float se2 = 0.f;
+        for (int i = t; i < n; i += B)
+            if (x[i] >= pre) se2 += expf(inv_temp * (x[i] - M));
+        sh[t] = se2; __syncthreads();
+        for (int s = B / 2; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            __syncthreads();
+        }
+        if (t == 0) s_logZp = logf(sh[0]);
+        __syncthreads();
+    }
+    const float logZp = s_logZp;
     if (top_p < 1.0f) {
+        if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
+        __syncthreads();
         for (int it = 0; it < 16; it++) {
             const float thr = 0.5f * (s_lo + s_hi); // s_lo/s_hi settled by prior __syncthreads
             float mass = 0.f;
             for (int i = t; i < n; i += B)
-                if (x[i] >= thr) mass += expf(inv_temp * (x[i] - M) - logZ);
+                if (x[i] >= thr && x[i] >= pre)
+                    mass += expf(inv_temp * (x[i] - M) - logZp);
             sh[t] = mass; __syncthreads();
             for (int s = B / 2; s > 0; s >>= 1) {
                 if (t < s) sh[t] += sh[t + s];
@@ -590,7 +664,8 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
     }
     if (t == 0) {
         float thresh = (top_p >= 1.0f) ? -FLT_MAX : s_lo; // s_lo is now the logit threshold
-        s_thresh = fminf(thresh, M); // argmax token always in nucleus
+        thresh = fmaxf(thresh, pre);  // intersect with top_k/min_p
+        s_thresh = fminf(thresh, M);  // argmax token always in nucleus
     }
     __syncthreads();
     // out[3] = nucleus mass = sum_{x_i >= thresh} softmax_full(i) (Phase 2 accept
@@ -612,6 +687,18 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
         out[2] = logZ;
         out[3] = sh[0]; // nucleus mass
     }
+}
+
+__global__ void k_nucleus_d(const float* __restrict__ x, int n, const SampleParams* __restrict__ sp,
+                            float* __restrict__ out) {
+    nucleus_body(x, n, sp, out);
+}
+
+// One block per verify lane, one launch. Same body, same per-block reduction
+// order -> bitwise identical to the loop it replaces.
+__global__ void k_nucleus_multi(CP3 xs, int n, const SampleParams* __restrict__ sp,
+                                float* __restrict__ out) {
+    nucleus_body(xs.p[blockIdx.x], n, sp, out + blockIdx.x * 4);
 }
 
 // Gumbel-max over the nucleus: argmax_i (inv_temp*x_i + G_i), G_i from Philox,
@@ -661,6 +748,16 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st) {
     k_nucleus_d<<<1, 1024, 0, st>>>(logits, n, d_sp, d_nuc);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Batched twin: L lanes in ONE launch, block b == lane b. Replaces the per-lane
+// nucleus() loop in the sampled verify (engine.cuh). Bitwise identical per lane;
+// the win is purely that L single-block launches stop serializing on one SM.
+void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
+                   cudaStream_t st) {
+    if (L <= 0) return;
+    k_nucleus_multi<<<L, 1024, 0, st>>>(xs, n, d_sp, d_nuc);
     CUDA_CHECK(cudaGetLastError());
 }
 

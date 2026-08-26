@@ -1,0 +1,10 @@
+<function=Write>
+<parameter=content>
+TEXT_1:ml`TEXT_2`TEXT_3:ml
+            `TEXT_4:ml`TEXT_5:ml`TEXT_6`TEXT_7:ml`TEXT_8`TEXT_9:ml`TEXT_10`TEXT_11:ml`TEXT_12`TEXT_13:ml`TEXT_14`TEXT_15:ml`TEXT_16`TEXT_17:ml`TEXT_18`TEXT_19:ml`TEXT_20`TEXT_21:ml`TEXT_22`TEXT_23:ml`TEXT_24`TEXT_25:ml`TEXT_26`TEXT_27:ml`TEXT_28`TEXT_29:ml`TEXT_30`TEXT_31:ml`TEXT_32`TEXT_33:ml`TEXT_34`TEXT_35:ml`TEXT_36`TEXT_37:ml`TEXT_38`TEXT_39:ml`TEXT_40`TEXT_41:ml`TEXT_42`TEXT_43:ml`TEXT_44`TEXT_45:ml`TEXT_46`TEXT_47:ml`TEXT_48`TEXT_49:ml
+
+</parameter>
+<parameter=file_path>
+PATH_50
+</parameter>
+</function>

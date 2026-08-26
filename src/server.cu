@@ -10,6 +10,15 @@
 //
 // usage: q27-server model.q27 model.tok [--port 8080] [--host 127.0.0.1]
 //                   [--ctx 8192] [--fast-head] [--slots N] [--slot1-ctx M]
+//                   [--temp T] [--top-p P]
+//
+// --temp/--top-p set the sampler used when a request omits the field (a
+// DEFAULT, not a force -- the client still wins). Default temp 0 = greedy,
+// which is what q27 has always served and what the determinism gates assume.
+// Claude Code sends no sampling fields at all, so agentic serving got greedy
+// argmax while llama.cpp served the same weights at the model card's sampler;
+// on bench-time-tracker that was worth 0.779 vs 0.967 (see docs/BUILDLOG.md
+// 2026-08-22 (c)). For Qwen3.8 agentic serving: --temp 1.0 --top-p 0.95.
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -56,6 +65,23 @@ static std::string jdump(const json& j) {
 // untouched regardless). A forced request with no client seed draws a distinct
 // atomic-counter seed, LOGGED, so each trial is an independent sample yet reproducible
 // by replaying that seed as an explicit request field.
+// Server-side DEFAULT sampler, used only when the request omits the field --
+// exactly what llama-server does with the params baked into a GGUF's metadata.
+// It matters more than it looks: Claude Code sends NO sampling fields at all
+// (0 of 29 captured bodies carry temperature/top_p/top_k), so before these
+// existed q27 served every agentic request at temperature 0, i.e. greedy
+// argmax, while llama.cpp served the same weights at the model card's
+// temp 1.0 / top_k 20 / top_p 0.95 / min_p 0.05. Measured 2026-08-22 on
+// bench-time-tracker: greedy n=15 mean 0.779, sampled n=12 mean 0.967
+// (Welch p=0.027), and q27-sampled vs llama.cpp p=0.82 -- the cross-engine
+// "quality gap" was this, not the engine. Greedy stays the default here so
+// every determinism gate and byte-identity anchor keeps its meaning; serving
+// turns it on with --temp/--top-p.
+static double g_default_temp = 0.0;  // 0 = greedy, the historical behaviour
+static double g_default_top_p = 1.0;
+static int g_default_top_k = 0;      // 0 = off
+static double g_default_min_p = 0.0; // 0 = off
+
 static q27k::SampleParams parse_sample(const json& body) {
     static const double force_temp = []{ const char* e = getenv("Q27_FORCE_TEMP"); return e ? atof(e) : 0.0; }();
     static const double force_tp   = []{ const char* e = getenv("Q27_FORCE_TOP_P"); return e ? atof(e) : 1.0; }();
@@ -65,11 +91,17 @@ static q27k::SampleParams parse_sample(const json& body) {
     // jnum/jint/jbool (api_common.h), not value(): a present-but-null field is
     // how many OpenAI-compatible clients spell "unset", and value() throws on
     // it -> httplib 500. Read null/wrong-typed as absent.
-    double temp = q27::jnum(body, "temperature", force_temp);
+    double temp = q27::jnum(body, "temperature",
+                            force_temp > 0.0 ? force_temp : g_default_temp);
     if (temp > 0.0) {
         s.inv_temp = (float)(1.0 / temp);
-        double tp = q27::jnum(body, "top_p", force_tp);
+        double tp = q27::jnum(body, "top_p",
+                              force_tp < 1.0 ? force_tp : g_default_top_p);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
+        const double tk = q27::jnum(body, "top_k", (double)g_default_top_k);
+        s.top_k = (tk > 0.0 && tk < 1e9) ? (int)tk : 0;
+        const double mp = q27::jnum(body, "min_p", g_default_min_p);
+        s.min_p = (float)((mp > 0.0 && mp <= 1.0) ? mp : 0.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
         else if (force_temp > 0.0) {
@@ -289,6 +321,11 @@ int main(int argc, char** argv) {
     if (served_name.size() > 4 && served_name.substr(served_name.size() - 4) == ".q27")
         served_name.resize(served_name.size() - 4);
     int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
+    // Remembered separately because the auto-ctx block writes the chosen size
+    // back into `ctx`: by the post-ready headroom check (issue #25) the value
+    // no longer says whether the OPERATOR pinned it.
+    bool ctx_explicit = false;
+    int ctx_requested = -1;
     int n_slots = 1, slot1_ctx = 32768;
     bool slot1_ctx_set = false; // explicit --slot1-ctx wins over --ctx propagation
     int fast_flag = -1;        // tri-state: explicit flag wins over profile
@@ -312,6 +349,8 @@ int main(int argc, char** argv) {
                  // SILENTLY start a ctx-0 server (issue #6); the docs advertise
                  // --ctx auto, so honor it. (Omitting --ctx also auto-sizes.)
             ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
+            ctx_explicit = ctx > 0;
+            ctx_requested = ctx;
         }
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = atoi(argv[++i]); slot1_ctx_set = true; }
@@ -322,6 +361,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--think-budget") && i + 1 < argc)
             think_budget_flag = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) g_default_temp = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) g_default_top_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) g_default_top_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) g_default_min_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
@@ -471,11 +514,15 @@ int main(int argc, char** argv) {
         // fp8 / 1.40x turbo3 (bar 1.38x), live CC fused rounds -17..-19%
         // phv/round at matched depth, solo cost 0.00% -- a single-slot server
         // pays nothing (k=1 falls through to the proven solo path, byte-
-        // identical). GRAPH_CAP=64: live CC traffic drew a 44+ graph-key
-        // alphabet vs the LRU-32 default (86% hits, benign eviction churn);
-        // 64 swallows the observed alphabet at ~460 MB worst case, and the
-        // conductor's ctor headroom check SHRINKS-never-aborts, so tight
-        // configs self-protect. Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0,
+        // identical). GRAPH_CAP: live CC traffic drew a 44+ graph-key alphabet
+        // vs the LRU-32 default (86% hits, benign eviction churn); 64 swallowed
+        // THAT alphabet, but the 2026-08-18 capture-tax measurement found the
+        // real cost is elsewhere -- heterogeneous C=3..6 explodes the shape
+        // space (35% miss at C=4 with ZERO evictions, i.e. shape-space
+        // exhaustion, not LRU pressure), and each miss costs 20-28 ms of
+        // capture+instantiate. Raised to 512 (E2.1): the conductor's ctor
+        // headroom check SHRINKS-never-aborts, so tight configs self-protect,
+        // and uniform C=8 is unaffected (one shape, always a hit). Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0,
         // Q27_PROFILE=ref (ref skips this whole block, so it stays off there).
         setenv("Q27_BATCH", "1", 0);
         setenv("Q27_BATCH_GRAPH", "1", 0);
@@ -502,9 +549,19 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "sampled graphs OFF (Q27_SAMPLED=0): temperature>0 requests get 400\n");
     }
+    // The serving sampler is a first-class fact about a run: greedy and
+    // sampled produce measurably different agentic behaviour (2026-08-22), so
+    // it belongs in the banner every arm's log already captures.
+    char sampler_buf[96];
+    if (g_default_temp > 0.0)
+        snprintf(sampler_buf, sizeof sampler_buf, "temp=%.2f/top_p=%.2f/top_k=%d/min_p=%.2f",
+                 g_default_temp, g_default_top_p, g_default_top_k, g_default_min_p);
+    else
+        snprintf(sampler_buf, sizeof sampler_buf, "greedy");
+    const std::string sampler_banner(sampler_buf);
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
-            "think=%d batch-gemm=%s\n",
+            "think=%d batch-gemm=%s sampler=%s\n",
             ref_profile ? "ref" : "cc", cc_arch, getenv("Q27_KV") ? getenv("Q27_KV") : "fp16",
             getenv("Q27_FD") ? getenv("Q27_FD") : "fd2",
             getenv("Q27_PMIN") ? getenv("Q27_PMIN") : "off",
@@ -512,7 +569,15 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX") ? getenv("Q27_SUFFIX") : "0",
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1,
-            getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)");
+            getenv("Q27_BATCH_GEMM") ? getenv("Q27_BATCH_GEMM") : "auto(k>=3)",
+            sampler_banner.c_str());
+    // The thinking budget is a FRACTION of each request's max_tokens, not an
+    // absolute, so an A/B over it leaves no other trace in the log. Announce a
+    // non-default one at boot so a run's own output says which arm it was.
+    if (q27::think_budget_frac() != q27::THINK_BUDGET_FRAC)
+        fprintf(stderr, "reasoning budget: %.2f of max_tokens (Q27_THINK_BUDGET_FRAC, "
+                        "default %.2f)\n",
+                q27::think_budget_frac(), q27::THINK_BUDGET_FRAC);
 
     // Per-engine non-KV reserve, the single source of truth shared by
     // auto-ctx (below) and the multi-slot skip loop. GDN state + graph zoo +
@@ -588,9 +653,32 @@ int main(int argc, char** argv) {
     q27::set_tool_dialect_for_model(shared_model.meta_json); // per-model tool dialect (BUILDLOG 2026-08-14)
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
+    // Q27_PRINT_WSUM lived only in engine.cuh, behind own_weights. The SERVER
+    // takes this shared-weights path, so the knob was INERT here: the variable
+    // was present in the environment, the model loaded, and no wsum line ever
+    // appeared. Every server-side campaign that believed it had the 5090
+    // silent-corruption guard was running without it (found 2026-08-21).
+    // Mirrors engine.cuh:1364 so both paths report the same way.
+    if (getenv("Q27_PRINT_WSUM")) shared_dm.enable_host_sum(true);
     shared_dm.upload_all(q27k::pf4_on());
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
+    if (const char* pw = getenv("Q27_PRINT_WSUM")) {
+        // The SAME artifact must print the SAME value on every load; a
+        // difference means the upload itself landed wrong, which
+        // checksum_verify() cannot see because its baseline is taken after the
+        // copy. =3 recomputes twice more from the same resident bytes: a value
+        // that is wrong but STABLE means the data is corrupt, one that varies
+        // means the checksum compute is.
+        fprintf(stderr, "wsum: %016llx hsum: %016llx\n", shared_dm.checksum_aggregate(),
+                shared_dm.host_aggregate());
+        if (atoi(pw) >= 3)
+            for (int r = 0; r < 2; r++) {
+                shared_dm.checksum_baseline();
+                fprintf(stderr, "wsum_recompute%d: %016llx\n", r + 1,
+                        shared_dm.checksum_aggregate());
+            }
+    }
 
     // --ctx auto (single-slot): size the KV budget to MEASURED free VRAM
     // with the weights already resident, so tier size (q4s/v1.4/q6),
@@ -875,6 +963,77 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "[pool] %d slots, floor %.2f GB (half-ctx x slots), pool %.2f GB\n",
                 n_slots, n_slots * ent_bytes / 1e9, pool_b / 1e9);
+
+        // AN EXPLICIT --ctx BIDS AGAINST THE ARCH SLACK (2026-08-20, the #25
+        // follow-up). pool_b above is "whatever free VRAM is left after a
+        // conservative fixed reservation" -- correct for auto-ctx, which is
+        // asking the machine what it can afford. But an operator who NAMED a
+        // ctx is not asking, and silently clamping them to a margin they never
+        // requested is the wrong default: reported on a 24 GB sm_86 card,
+        // `--ctx 151552` booted at 151552 before the pool landed and at 57344
+        // after -- same free VRAM, a 62% cut, one [pool] line of warning.
+        //
+        // So when the ctx is explicit, price it and try to meet it. The slack
+        // is REDUCED to a floor, never removed: it covers the ctx-scaled
+        // instantiate transient that issue #6 established on sm_86, and the
+        // pool is allocated before any capture. If even the floor cannot cover
+        // the request, keep the clamp (a forever-hang is worse) but say what
+        // is needed, what is reachable, and which knob restores the old
+        // behaviour -- Q27_KV_POOL=0 is per-slot KV, which is exactly what the
+        // pre-pool builds did for these operators.
+        if (ctx_explicit && pool_b > 0) {
+            // MUST mirror pages_for() in the clamp below, not approximate it:
+            // 16 attention pairs plus the MTP row, and the MTP row rounds up
+            // SEPARATELY, so 17*ceil(rows/64) is one page short whenever
+            // rows+1 crosses a 64-boundary. Being one page short buys the pool
+            // a size that still cannot entitle the window, and the clamp then
+            // drops a whole 4096-row step -- which is exactly the silent loss
+            // this block exists to prevent.
+            auto rows_bytes = [&](int rows) {
+                const size_t pages =
+                    16 * (size_t)((rows + 63) / 64) + (size_t)((rows + 1 + 63) / 64);
+                return (double)pages * 64.0 * (double)(k_row + v_row);
+            };
+            const double need_b = rows_bytes(ctx);
+            if (need_b > pool_b) {
+                // half the arch margin stays put; only the other half is biddable
+                const double floor_slack = pool_slack * 0.5;
+                const double reachable =
+                    (double)freeb - (fixed_for(n_slots) - (pool_slack - floor_slack));
+                if (reachable >= need_b) {
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB; spending %.2f GB of the %.2f GB "
+                            "arch slack to honor it\n",
+                            ctx, need_b / 1e9, (need_b - pool_b) / 1e9, pool_slack / 1e9);
+                    pool_b = need_b;
+                } else if (reachable > pool_b) {
+                    // TAKE WHAT IS REACHABLE, never all-or-nothing. Falling back
+                    // to the un-grown pool turns a rounding-sized shortfall into
+                    // a cliff: reported on an A10 (23028 MiB) where --ctx 100480
+                    // wanted 1.37 GB against 1.32 GB reachable -- 3.6% short --
+                    // and the window collapsed 96384 -> 57344, a 39% loss for a
+                    // 0.05 GB miss. The clamp below still picks the largest
+                    // entitlable window; this just makes sure it is choosing
+                    // from the biggest pool the card can actually back.
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB, only %.2f GB reachable (free "
+                            "%.2f GB, fixed stacks %.2f GB) -- growing the pool to that and "
+                            "clamping the window below. Q27_KV_POOL=0 restores per-slot KV "
+                            "and the pre-pool window if you need the full ctx.\n",
+                            ctx, need_b / 1e9, reachable / 1e9, (double)freeb / 1e9,
+                            fixed_for(n_slots) / 1e9);
+                    pool_b = reachable;
+                } else {
+                    fprintf(stderr,
+                            "[pool] --ctx %d needs %.2f GB of pool; at most %.2f GB is "
+                            "reachable here (free %.2f GB, fixed stacks %.2f GB). The window "
+                            "will be clamped below -- Q27_KV_POOL=0 restores per-slot KV and "
+                            "the pre-pool window if you need the full ctx.\n",
+                            ctx, need_b / 1e9, reachable / 1e9, (double)freeb / 1e9,
+                            fixed_for(n_slots) / 1e9);
+                }
+            }
+        }
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
             const double kfrac = (double)k_row / (double)(k_row + v_row);
@@ -1013,6 +1172,42 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         fprintf(stderr, "vram: free %.2f GB at ready\n", free_b / 1e9);
+        // issue #25: an EXPLICIT --ctx skips the auto-ctx arch margin, so
+        // --ctx N together with --prefix-cache can size KV + staging right up
+        // to the card and leave nothing for the allocations that come AFTER
+        // this line -- the conductor's side streams first. The failure landed
+        // as a bare "CUDA error: out of memory" at cudaStreamCreateWithFlags,
+        // after boot had already reported success, and it crash-looped because
+        // a bigger cache made it worse on every restart. Warn HERE, where the
+        // number that caused it is still on screen and the remedies are known.
+        // Not fatal: a config this tight can still run, and refusing to boot a
+        // server that works would be the worse failure.
+        // Q27_READY_FLOOR_MB overrides the threshold. Two uses: raising it on a
+        // card whose post-ready allocations are larger than this default
+        // assumes, and testing the branch itself without having to build a
+        // genuinely OOM-adjacent config.
+        size_t floor_mb = 192;
+        if (const char* e = getenv("Q27_READY_FLOOR_MB")) {
+            long v = atol(e);
+            if (v >= 0) floor_mb = (size_t)v;
+        }
+        if (free_b < (floor_mb << 20)) {
+            fprintf(stderr,
+                    "vram: WARNING -- only %.0f MB free at ready; the conductor, "
+                    "CUDA side streams and the exec cache still allocate after "
+                    "this point and may OOM.\n", free_b / 1e6);
+            if (ctx_explicit)
+                fprintf(stderr,
+                        "  --ctx %d was set explicitly, which skips the auto-ctx "
+                        "safety margin. Drop --ctx (or lower it) to size against "
+                        "measured free VRAM.\n", ctx_requested);
+            if (pfx_cache.enabled())
+                fprintf(stderr,
+                        "  --prefix-cache staging is pinned per slot from "
+                        "--prefix-cache-max-tokens (%d); lowering it, or "
+                        "--prefix-cache-max-gb, frees the rest.\n",
+                        pfx_cfg.max_tokens);
+        }
     }
     // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
     int max_slot_ctx = 0;
@@ -1029,11 +1224,31 @@ int main(int argc, char** argv) {
     // P7 shared mask cache (mutated only from generation callbacks, which
     // run while holding the GPU gate; pool ids are per-slot)
     std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
-    q27::ToolMaskCache tool_mask_cache;
+    q27::ToolMaskCache<q27::ToolGrammar> tool_mask_cache;
     tool_mask_cache.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
-    if (constrain_tools)
-        fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
-                tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
+    // Parallel cache for the XML-dialect toolgram (3.8 trained format);
+    // --constrain-tools routes the body through whichever matches the
+    // model's dialect (tool_dialect_xml). Same vocabulary / closer; distinct
+    // masks (different grammar signatures).
+    q27::ToolMaskCache<q27::ToolGrammarXml> tool_mask_cache_xml;
+    tool_mask_cache_xml.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
+    if (constrain_tools) {
+        fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d, dialect=%s)\n",
+                tok.token_id("<tool_call>"), tok.token_id("</tool_call>"),
+                q27::tool_dialect_xml() ? "xml" : "json");
+        // Scope of the guarantee, stated at boot rather than discovered from a
+        // client-side validation error (issue #2). Required-argument and
+        // duplicate-key enforcement lives in ToolGrammarXml only; the JSON
+        // dialect constrains SHAPE alone, so on that path a schema-invalid
+        // call (missing required key, undeclared key) is still sampleable.
+        if (q27::tool_dialect_xml())
+            fprintf(stderr, "constrain-tools: enforcing required args + "
+                            "rejecting duplicate/undeclared param keys\n");
+        else
+            fprintf(stderr, "constrain-tools: WARNING json dialect enforces SHAPE ONLY -- "
+                            "required args, duplicate and undeclared keys are NOT "
+                            "constrained (XML dialect only)\n");
+    }
 
     // R1b: FIFO ticket gate time-slices the GPU across concurrent
     // generations (q27::GpuGate). Engines are claimed via Slot::busy under
@@ -1146,11 +1361,11 @@ int main(int argc, char** argv) {
                      " phd=%.1f phv=%.1f phs=%ld"
                      " phwn=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
                      " phwm=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f"
-                     " sfxm=%.1f sfxn=%ld",
+                     " sfxm=%.1f sfxn=%ld phfd=%.1f",
                      g.draft_ms, g.verify_ms, g.draft_steps, g.vw_n[2], g.vw_n[3],
                      g.vw_n[4], g.vw_n[5], g.vw_n[6], g.vw_n[7], g.vw_n[8], g.vw_ms[2],
                      g.vw_ms[3], g.vw_ms[4], g.vw_ms[5], g.vw_ms[6], g.vw_ms[7],
-                     g.vw_ms[8], g.sfx_ms, g.sfx_rounds);
+                     g.vw_ms[8], g.sfx_ms, g.sfx_rounds, g.fdraft_ms);
         else
             phbuf[0] = '\0';
         if (getenv("Q27_NJOINT")) {
@@ -1739,8 +1954,12 @@ int main(int argc, char** argv) {
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0, sys_off = 0;
+            q27::TemplateOpts topts=q27::template_opts_from_body(body);
+            // client key order survives only in the raw text; restrict to the
+            // tool_choice selection so the declaration matches `tools`.
+            topts.tools_decl=q27::openai_tools_decl(req.body,&tool_names_v);
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
             // P16b: token length of the system+tools block. Measured with a
             // THIRD encode used only for its length -- the prompt itself is
             // still built from the same two pieces, so no request's bytes
@@ -1922,7 +2141,7 @@ int main(int argc, char** argv) {
                 else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
-            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
             tc.host2dev = &sl.tool_mask_host2dev;
             // FORCED requests are prompt-injected past the <tool_call> marker
             // (above) -- scan_round's engage trigger scans GENERATED text for
@@ -1931,7 +2150,10 @@ int main(int argc, char** argv) {
             // comment); AUTO (the default) and NONE are unaffected.
             tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                         eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            auto params_per_name = q27::tool_param_keys_per_name(tools);
+            auto required_per_name = q27::tool_required_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, required_per_name,
+                     q27::tool_dialect_xml());
             // FORCED: the opener was injected into the PROMPT, not generated,
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
@@ -1998,12 +2220,26 @@ int main(int argc, char** argv) {
                     return q27::tool_choice_allows_call(
                         tchoice, allowed_tool_names, name, accepted);
                 });
-            ordered.text+=unclosed_tool;
+            // unclosed-<tool_call> tail: recover COMPLETE inner calls the same
+            // way bb60661 recovers closed ones, without EOF repair (see the
+            // helper). Only finished inner JSON executes; a partial Write stays
+            // text.
+            ordered.recovered += q27::recover_unclosed_tool_tail(
+                unclosed_tool, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                [&](const std::string& t) { ordered.append_visible_text(t); },
+                [&](q27::ToolCall c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                            tchoice, allowed_tool_names, c.name,
+                            ordered.calls.size()))
+                        return false;
+                    ordered.append_tool_call(std::move(c));
+                    return true;
+                });
             std::string tx = ordered.text;
             std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
             if (ordered.recovered)
                 fprintf(stderr,
-                        "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                        "[tool-fallback] %zu drifted call(s) recovered (oai-nonstream)\n",
                         ordered.recovered);
             const bool any_call = !eligible_calls.empty();
             if (q27::forced_tool_choice_missing_is_error(
@@ -2132,11 +2368,14 @@ int main(int argc, char** argv) {
                 // mechanical twin of the /v1/messages SSE handler above.
                 const std::string cid = "chatcmpl-q27-" + std::to_string(rid);
                 ToolConstrainer tc;
-                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                auto params_per_name = q27::tool_param_keys_per_name(tools);
+                auto required_per_name = q27::tool_required_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, required_per_name,
+                         q27::tool_dialect_xml());
                 StreamSplitter sp;
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
@@ -2148,13 +2387,27 @@ int main(int argc, char** argv) {
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
                 bool any_call = false;
-                std::string tool_buf;
-                q27::BareToolTextHoldback bare_text;
+                // Routing state shared with the /v1/messages twin (issue #38,
+                // reopened: the twins had drifted and this one never consulted
+                // the parser on the reasoning channel).
+                q27::StreamToolRouter router;
+                router.has_tools = has_tools;
+                std::string& tool_buf = router.tool_buf;
                 bool forced_control_token = false;
                 auto emit_text = [&](const std::string& t) {
                     if (t.empty()) return;
                     if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                        json{{"content", t}})))
+                        alive = false;
+                };
+                // reasoning_content (no official OpenAI field for this; matches
+                // the vLLM/SGLang/llama.cpp convention -- see
+                // openai_reasoning_delta) rather than leaking raw <think> tags
+                // into `content`.
+                auto emit_think = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       q27::openai_reasoning_delta(t))))
                         alive = false;
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
@@ -2188,7 +2441,7 @@ int main(int argc, char** argv) {
                     visible(source.substr(cursor));
                     if (recovered)
                         fprintf(stderr,
-                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                "[tool-fallback] %zu drifted call(s) recovered (oai-stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
@@ -2196,43 +2449,22 @@ int main(int argc, char** argv) {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                        if (!classify_bare(c.raw,true,emit_text)) {
+                            // dialect control bytes only (a repeated <tool_call>
+                            // opener at EOS) -- no call, and echoing the marker
+                            // is worse than saying nothing. Logged, not silent.
+                            if (q27::only_dialect_control_bytes(c.raw))
+                                fprintf(stderr,
+                                    "[q27] tool body was dialect control bytes only "
+                                    "(%zu B) -- no call; suppressed from visible text\n",
+                                    c.raw.size());
+                            else emit_text(c.raw);
+                        }
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) {
-                        if (tool_buf.empty()) {
-                            bare_text.finish(false,allowed_tool_names,
-                                             emit_text,classify_bare);
-                            bare_text.reset_context();
-                        }
-                        tool_buf += t;
-                        return;
-                    }
-                    if (!tool_buf.empty()) emit_tool();
-                    if (t.empty()) return;
-                    // reasoning_content (no official OpenAI field for this;
-                    // matches the vLLM/SGLang/llama.cpp convention -- see
-                    // openai_reasoning_delta) rather than leaking raw <think>
-                    // tags into `content` (the bug this whole path also
-                    // happens to fix).
-                    if (ch == StreamSplitter::THINK) {
-                        bare_text.finish(false,allowed_tool_names,
-                                         emit_text,classify_bare);
-                        bare_text.reset_context();
-                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
-                                                            q27::openai_reasoning_delta(t))))
-                            alive = false;
-                        return;
-                    }
-                    // Only decoder-injected close whitespace is parser control.
-                    // Preserve ordinary leading whitespace, including when
-                    // thinking is disabled or the model closes naturally.
-                    if (forced_control_token && q27::strip_ws2(t).empty()) return;
-                    if (has_tools)
-                        bare_text.route(t,allowed_tool_names,
-                                        emit_text,classify_bare);
-                    else emit_text(t);
+                    router.segment(ch, t, forced_control_token, allowed_tool_names,
+                                   emit_text, emit_think, emit_tool, classify_bare);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -2270,13 +2502,21 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) {
                     if (final_tool_incomplete) {
-                        emit_text(tool_buf);
+                        // recover COMPLETE inner calls from the truncated
+                        // wrapper; no EOF repair, so a partial Write stays text.
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, has_tools ? &tools : nullptr,
+                            emit_text, emit_call);
                         tool_buf.clear();
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (oai-stream truncated wrapper)\n",
+                                    rec);
                     } else emit_tool();
                 }
                 if (!final_tool_incomplete)
-                    bare_text.finish(produced < nm && !bt.budget_truncated,
-                                     allowed_tool_names,emit_text,classify_bare);
+                    router.finish(produced < nm && !bt.budget_truncated,
+                                  allowed_tool_names, emit_text, emit_think, classify_bare);
                 // TODO(batch error surfacing): no standard OpenAI mid-stream
                 // error chunk exists (matches the plain-text leg's TODO
                 // above); end=error lands in the [req] line, [req-error]
@@ -2330,7 +2570,7 @@ int main(int argc, char** argv) {
                                          bool& thinking,
                                          q27::ThinkCfg& tcfg,
                                          size_t* stable_off,
-                                         size_t* sys_off) {
+                                         size_t* sys_off, const std::string* raw_body) {
         tchoice=q27::parse_anthropic_tool_choice(body);
         json all_tools=q27::anthropic_tools_json(body);
         json normalized={{"tools",all_tools}};
@@ -2347,9 +2587,13 @@ int main(int argc, char** argv) {
             thinking=false;
             tcfg=q27::ThinkCfg{false,-1,false,true};
         }
+        q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        // client key order survives only in the raw text (the parsed json is
+        // sorted); restrict to the selected subset so decl matches `tools`.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
-            q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+            q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
         if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
         return rendered;
     };
@@ -2376,7 +2620,7 @@ int main(int argc, char** argv) {
         std::string rendered;
         try {
             rendered=prepare_anthropic_prompt(
-                body,tchoice,tools,tool_names,thinking,tcfg,nullptr,nullptr);
+                body,tchoice,tools,tool_names,thinking,tcfg,nullptr,nullptr,&req.body);
         } catch(const std::exception& e) {
             anthropic_400(res,e.what());
             return;
@@ -2401,7 +2645,7 @@ int main(int argc, char** argv) {
         std::string rendered;
         try {
             rendered=prepare_anthropic_prompt(
-                body,tchoice,tools,tool_names_v,thinking,tcfg,&stable_off,&sys_off);
+                body,tchoice,tools,tool_names_v,thinking,tcfg,&stable_off,&sys_off,&req.body);
         } catch(const std::exception& e) {
             anthropic_400(res,e.what());
             return;
@@ -2506,11 +2750,14 @@ int main(int argc, char** argv) {
                 else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
-            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
             tc.host2dev = &sl.tool_mask_host2dev;
             tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                          eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            auto params_per_name = q27::tool_param_keys_per_name(tools);
+            auto required_per_name = q27::tool_required_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, required_per_name,
+                     q27::tool_dialect_xml());
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             eng.on_round = [&](const int* em, int nr) {
@@ -2572,7 +2819,19 @@ int main(int argc, char** argv) {
                     return q27::tool_choice_allows_call(
                         tchoice,allowed_tool_names,name,accepted);
                 });
-            ordered.append_visible_text(unclosed_tool);
+            // unclosed-<tool_call> tail: recover COMPLETE inner calls (bb60661
+            // style), no EOF repair -- a partial Write stays text.
+            ordered.recovered += q27::recover_unclosed_tool_tail(
+                unclosed_tool, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                [&](const std::string& t) { ordered.append_visible_text(t); },
+                [&](q27::ToolCall c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                            tchoice,allowed_tool_names,c.name,
+                            ordered.calls.size()))
+                        return false;
+                    ordered.append_tool_call(std::move(c));
+                    return true;
+                });
             json content = json::array();
             std::string th = q27::strip_ws2(ordered.reasoning);
             if (!th.empty())
@@ -2588,7 +2847,7 @@ int main(int argc, char** argv) {
                 return;
             }
             if (ordered.recovered)
-                fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (nonstream)\n",
+                fprintf(stderr, "[tool-fallback] %zu drifted call(s) recovered (nonstream)\n",
                         ordered.recovered);
             const size_t emitted=q27::append_anthropic_ordered_content(
                 content,ordered,[&](const q27::ToolCall& call,size_t call_number) {
@@ -2638,11 +2897,14 @@ int main(int argc, char** argv) {
                 const int nm = limits.n_max;
                 const int think_budget = limits.budget;
                 ToolConstrainer tc;
-                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                              eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                auto params_per_name = q27::tool_param_keys_per_name(tools);
+                auto required_per_name = q27::tool_required_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, required_per_name,
+                         q27::tool_dialect_xml());
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 bool alive = true; // cleared when a write fails (client disconnected)
@@ -2665,8 +2927,14 @@ int main(int argc, char** argv) {
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected opener
                 ReasoningBudgetObserver budget{tok, tb, eng, bt, think_close_ids, sp.chan};
                 budget.start();
-                std::string tool_buf;
-                q27::BareToolTextHoldback bare_text;
+                // Issue #38 (cosmicnag, 2026-08-24; reopened 2026-08-25): the
+                // model sometimes emits a complete tool call INSIDE its <think>
+                // block, and reasoning is a channel the parser has to see. The
+                // routing lives in q27::StreamToolRouter, shared with the
+                // /v1/chat/completions twin so the two cannot drift again.
+                q27::StreamToolRouter router;
+                router.has_tools = has_tools;
+                std::string& tool_buf = router.tool_buf;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
@@ -2696,6 +2964,12 @@ int main(int argc, char** argv) {
                     open_block(0);
                     ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
                         {"delta", {{"type", "text_delta"}, {"text", t}}}});
+                };
+                auto emit_think = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    open_block(1);
+                    ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
+                        {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
                     if (!c.ok || !q27::tool_choice_allows_call(
@@ -2734,7 +3008,7 @@ int main(int argc, char** argv) {
                     }
                     visible(source.substr(cursor));
                     if(recovered)
-                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",
+                        fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (stream)\n",
                                 recovered);
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
@@ -2742,37 +3016,23 @@ int main(int argc, char** argv) {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                        if (!classify_bare(c.raw,true,emit_text)) {
+                            // dialect control bytes only (a repeated <tool_call>
+                            // opener at EOS) -- no call, and echoing the marker
+                            // is worse than saying nothing. Logged, not silent.
+                            if (q27::only_dialect_control_bytes(c.raw))
+                                fprintf(stderr,
+                                    "[q27] tool body was dialect control bytes only "
+                                    "(%zu B) -- no call; suppressed from visible text\n",
+                                    c.raw.size());
+                            else emit_text(c.raw);
+                        }
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 bool forced_control_token = false;
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) {
-                        if(tool_buf.empty()) {
-                            bare_text.finish(false,allowed_tool_names,
-                                             emit_text,classify_bare);
-                            bare_text.reset_context();
-                        }
-                        tool_buf += t;
-                        return;
-                    }
-                    if (!tool_buf.empty()) emit_tool();
-                    if (t.empty()) return;
-                    const bool think = ch == StreamSplitter::THINK;
-                    // Injected template whitespace is parser control; model
-                    // whitespace, including after a natural close, is content.
-                    if (!think && forced_control_token && q27::strip_ws2(t).empty()) return;
-                    if (think) {
-                        bare_text.finish(false,allowed_tool_names,
-                                         emit_text,classify_bare);
-                        bare_text.reset_context();
-                        open_block(1);
-                        ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
-                            {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
-                    } else if (has_tools) {
-                        bare_text.route(t,allowed_tool_names,
-                                        emit_text,classify_bare);
-                    } else emit_text(t);
+                    router.segment(ch, t, forced_control_token, allowed_tool_names,
+                                   emit_text, emit_think, emit_tool, classify_bare);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -2813,13 +3073,19 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) {
                     if (final_tool_incomplete) {
-                        emit_text(tool_buf);
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, has_tools ? &tools : nullptr,
+                            emit_text, emit_call);
                         tool_buf.clear();
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (stream truncated wrapper)\n",
+                                    rec);
                     } else emit_tool();
                 }
                 if(!final_tool_incomplete)
-                    bare_text.finish(produced<nm && !bt.budget_truncated,
-                                     allowed_tool_names,emit_text,classify_bare);
+                    router.finish(produced<nm && !bt.budget_truncated,
+                                  allowed_tool_names,emit_text,emit_think,classify_bare);
                 if (idx < 0 && !any) { // nothing at all: empty text block for validity
                     idx = block_counter++;
                     chan_open = 0;
@@ -3057,7 +3323,8 @@ int main(int argc, char** argv) {
             tcfg = q27::ThinkCfg{false, -1, false, true};
         }
         size_t sys_off = 0;
-        std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
+        const q27::TemplateOpts topts=q27::template_opts_from_body(body);
+        std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off, {}, {}, &topts);
         if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
         std::vector<int> prompt = tok.encode(rendered);
         // P16b applies here even though P16a does not: this shape computes no
@@ -3102,20 +3369,6 @@ int main(int argc, char** argv) {
                 bool tool_tail=false;
             };
             auto ctx=std::make_shared<Ctx>();
-            auto flush_think=[&items,ctx,rid]() {
-                std::string th=q27::strip_ws2(ctx->think);
-                ctx->think.clear();
-                if(th.empty()) return json();
-                ctx->tool_tail=false;
-                json item={{"type","reasoning"},
-                           {"id","rs_q27_"+std::to_string(rid)+"_"+
-                                 std::to_string(ctx->reason_counter++)},
-                           {"status","completed"},
-                           {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
-                           {"encrypted_content",nullptr}};
-                items.push_back(item);
-                return item;
-            };
             auto push_text=[&items,rid,ctx](const std::string& tx,bool incomplete=false) {
                 if(tx.empty()) return json();
                 ctx->tool_tail=false;
@@ -3163,6 +3416,40 @@ int main(int argc, char** argv) {
                 auto c=q27::parse_tool_call(q27::strip_ws2(ctx->tool_buf));
                 ctx->tool_buf.clear();
                 return emit_tool(std::move(c));
+            };
+            // Issue #38 (reopened): a complete call inside <think> used to be
+            // emitted as a reasoning item and never fire on this leg too. The
+            // reasoning item keeps its place; the calls follow it.
+            auto flush_think=[&items,ctx,rid,emit_tool,&tools,&response_choice,
+                              &eligible_call_names,&tool_counter]() {
+                std::string raw=std::move(ctx->think);
+                ctx->think.clear();
+                std::vector<q27::ToolCall> calls;
+                size_t taken=0;
+                const std::string kept=q27::recover_calls_from_reasoning(
+                    raw,tools.empty()?nullptr:&tools,taken,[&](q27::ToolCall& call) {
+                        if(!q27::tool_choice_allows_call(response_choice,eligible_call_names,
+                                                         call.name,tool_counter+(int)calls.size()))
+                            return false;
+                        calls.push_back(std::move(call));
+                        return true;
+                    });
+                std::string th=q27::strip_ws2(kept);
+                json item;
+                if(!th.empty()) {
+                    ctx->tool_tail=false;
+                    item={{"type","reasoning"},
+                          {"id","rs_q27_"+std::to_string(rid)+"_"+
+                                std::to_string(ctx->reason_counter++)},
+                          {"status","completed"},
+                          {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                          {"encrypted_content",nullptr}};
+                    items.push_back(item);
+                }
+                for(auto& call:calls) emit_tool(std::move(call));
+                if(taken)
+                    fprintf(stderr,"[tool-fallback] %zu call(s) recovered from reasoning (resp)\n",taken);
+                return item;
             };
             return std::make_tuple(ctx,flush_think,flush_text,flush_tool,
                                    emit_tool,push_text);
@@ -3231,7 +3518,7 @@ int main(int argc, char** argv) {
                 }
                 push_text(source.substr(cursor),incomplete);
                 if(recovered)
-                    fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",
+                    fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp nonstream)\n",
                             recovered);
             };
             StreamSplitter sp;
@@ -3299,9 +3586,26 @@ int main(int argc, char** argv) {
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) {
                 if (unfinished_tool_wrapper) {
-                    push_text(ctx->tool_buf,true);
+                    // recover COMPLETE inner calls from the truncated wrapper
+                    // (bb60661 for the unclosed tail); no EOF repair, so a
+                    // partial Write stays text. Residual is incomplete text.
+                    const size_t rec = q27::recover_unclosed_tool_tail(
+                        ctx->tool_buf, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                        [&](const std::string& t) { push_text(t, true); },
+                        [&](q27::ToolCall c) -> bool {
+                            if (!c.ok || !q27::tool_choice_allows_call(
+                                    response_choice, eligible_call_names,
+                                    c.name, tool_counter))
+                                return false;
+                            emit_tool(std::move(c));
+                            return true;
+                        });
                     ctx->tool_buf.clear();
-                    ctx->tool_tail=false;
+                    ctx->tool_tail = rec != 0;
+                    if (rec)
+                        fprintf(stderr,
+                                "[tool-fallback] %zu drifted call(s) recovered (responses truncated wrapper)\n",
+                                rec);
                 } else flush_tool();
             }
             flush_think();
@@ -3392,17 +3696,38 @@ int main(int argc, char** argv) {
                         {"item",item}});
                     items.push_back(item);
                 };
+                // Issue #38 (reopened): reasoning is a channel the parser has
+                // to see on this leg too. The reasoning item keeps its place;
+                // recovered calls follow it (emit_call is defined below and
+                // captured by reference, so this closure is only ever invoked
+                // after it exists).
+                std::function<bool(q27::ToolCall)> emit_call_ref;
                 auto flush_think=[&]() {
-                    std::string th=q27::strip_ws2(think);
+                    std::string raw=std::move(think);
                     think.clear();
-                    if(th.empty()) return;
-                    output_tool_tail=false;
-                    item_done({{"type","reasoning"},
-                               {"id","rs_q27_"+std::to_string(rid)+"_"+
-                                     std::to_string(reason_counter++)},
-                               {"status","completed"},
-                               {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
-                               {"encrypted_content",nullptr}});
+                    std::vector<q27::ToolCall> calls;
+                    size_t taken=0;
+                    const std::string kept=q27::recover_calls_from_reasoning(
+                        raw,tools.empty()?nullptr:&tools,taken,[&](q27::ToolCall& call) {
+                            if(!q27::tool_choice_allows_call(response_choice,eligible_call_names,
+                                                             call.name,tool_counter+(int)calls.size()))
+                                return false;
+                            calls.push_back(std::move(call));
+                            return true;
+                        });
+                    std::string th=q27::strip_ws2(kept);
+                    if(!th.empty()) {
+                        output_tool_tail=false;
+                        item_done({{"type","reasoning"},
+                                   {"id","rs_q27_"+std::to_string(rid)+"_"+
+                                         std::to_string(reason_counter++)},
+                                   {"status","completed"},
+                                   {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                                   {"encrypted_content",nullptr}});
+                    }
+                    for(auto& call:calls) emit_call_ref(std::move(call));
+                    if(taken)
+                        fprintf(stderr,"[tool-fallback] %zu call(s) recovered from reasoning (resp-stream)\n",taken);
                 };
                 int msg_index=-1;
                 auto open_text=[&]() {
@@ -3488,6 +3813,7 @@ int main(int argc, char** argv) {
                     output_tool_tail=true;
                     return true;
                 };
+                emit_call_ref=emit_call;
                 auto flush_tool=[&]() {
                     auto call=q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
@@ -3539,7 +3865,7 @@ int main(int argc, char** argv) {
                     if(!calls.empty()) {
                         recovered=emit_recovered(bare_pending,calls,incomplete_item);
                         if(recovered)
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp)\n",
+                            fprintf(stderr,"[tool-fallback] %zu drifted call(s) recovered (resp)\n",
                                     recovered);
                     } else if(defer_failure) {
                         bare_deferred=std::move(bare_pending);
@@ -3732,9 +4058,18 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) {
                     if (unfinished_tool_wrapper) {
-                        append_text(tool_buf);
+                        // recover COMPLETE inner calls (bb60661 for the
+                        // unclosed tail); no EOF repair -- partial Write stays
+                        // text.
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                            append_text, emit_call);
                         tool_buf.clear();
-                        output_tool_tail=false;
+                        output_tool_tail = rec != 0;
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (responses-stream truncated wrapper)\n",
+                                    rec);
                     } else flush_tool();
                 }
                 flush_think();

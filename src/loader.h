@@ -29,7 +29,13 @@ struct Tensor {
 // Structural payload invariants shared by inspection and runtime loading.
 // Empty means valid; otherwise returns the first tensor-local failure.
 std::string validate_tensor_payload(const Tensor& tensor);
+// Per-backend dtype gates. BOTH are exhaustive switches with no default, so
+// adding a DType breaks every backend's build until it answers for the new
+// value. The Metal one lives here rather than in the .mm on purpose: metal
+// switches only compile on macOS, and FP4_G16 shipped without one because
+// nothing on the Linux dev host could notice.
 bool cuda_weight_dtype_supported(DType dtype);
+bool metal_weight_dtype_supported(DType dtype);
 
 
 struct Model {

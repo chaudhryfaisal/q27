@@ -2520,8 +2520,17 @@ static void test_wy_stream_isolation() {
     unsetenv("Q27_DS_MODE");
 }
 
+// top_k/min_p added 2026-08-23. Both are gated against the CPU reference:
+// top_k is native to q27::SamplingParams, and min_p is applied to the host's
+// kept set by its defining property (p_i >= min_p * p_max), which is
+// scale-invariant and therefore independent of where in the chain it runs --
+// the reason the kernel can compose all three as max() of logit thresholds.
+// NOTE the kernel filters on the TEMPERATURE-SCALED distribution while
+// llama.cpp filters raw logits and applies temperature last; the two coincide
+// exactly at T=1.0, which is the Qwen3.8 card value and the config we serve.
 static void check_nucleus_contract(const char* name, const std::vector<float>& logits,
-                                   float temperature, float top_p) {
+                                   float temperature, float top_p,
+                                   uint32_t top_k = 0, float min_p = 0.0f) {
     float* d_logits;
     float* d_nucleus;
     q27k::SampleParams* d_params;
@@ -2531,17 +2540,28 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
     CUDA_CHECK(cudaMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    const q27k::SampleParams device_params{1.0f / temperature, top_p, 0};
+    q27k::SampleParams device_params{1.0f / temperature, top_p, 0};
+    device_params.top_k = (int)top_k;
+    device_params.min_p = min_p;
     CUDA_CHECK(cudaMemcpy(d_params, &device_params, sizeof device_params,
                           cudaMemcpyHostToDevice));
     q27k::nucleus(d_logits, (int)logits.size(), d_params, d_nucleus);
     float nucleus[4];
     CUDA_CHECK(cudaMemcpy(nucleus, d_nucleus, sizeof nucleus, cudaMemcpyDeviceToHost));
 
-    const q27::SamplingParams host_params{temperature, top_p, 0, 0};
+    const q27::SamplingParams host_params{temperature, top_p, top_k, 0};
     const auto host = q27::build_served_distribution(logits, host_params);
     std::vector<uint8_t> host_kept(logits.size(), 0);
     for (uint32_t token : host.tokens) host_kept[token] = 1;
+    // min_p on the host side: keep p_i >= min_p * p_max. Applied to whatever
+    // top_k/top_p left, which is where llama.cpp applies it too.
+    if (min_p > 0.0f) {
+        float peak = -std::numeric_limits<float>::max();
+        for (uint32_t token : host.tokens) peak = std::max(peak, logits[token]);
+        const float floor_logit = peak + std::log(min_p) * temperature;
+        for (uint32_t token : host.tokens)
+            if (logits[token] < floor_logit) host_kept[token] = 0;
+    }
 
     int support_mismatches = 0;
     double max_probability_error = 0.0;
@@ -2554,9 +2574,10 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
                            nucleus[2]) /
                       nucleus[3]
                 : 0.0;
-        max_probability_error =
-            std::max(max_probability_error,
-                     std::fabs(device_probability - q27::served_probability(host, token)));
+        if (min_p <= 0.0f) // served_probability has no min_p notion to compare against
+            max_probability_error =
+                std::max(max_probability_error,
+                         std::fabs(device_probability - q27::served_probability(host, token)));
     }
 
     char label[128];
@@ -2586,6 +2607,15 @@ static void test_sample() {
     tied[1] = 3.0f;
     tied[2] = tied[3] = tied[4] = 2.0f;
     check_nucleus_contract("sample host/CUDA cutoff ties", tied, 1.0f, 0.8f);
+    // the chain llama-server runs for Qwen3.8, and each knob alone
+    check_nucleus_contract("sample host/CUDA top_k=20", x, 1.0f, 1.0f, 20, 0.0f);
+    check_nucleus_contract("sample host/CUDA top_k=1", x, 1.0f, 1.0f, 1, 0.0f);
+    check_nucleus_contract("sample host/CUDA top_k=8 p=0.95", x, 1.0f, 0.95f, 8, 0.0f);
+    check_nucleus_contract("sample host/CUDA min_p=0.05", x, 1.0f, 1.0f, 0, 0.05f);
+    check_nucleus_contract("sample host/CUDA min_p=0.5 tight", x, 1.0f, 1.0f, 0, 0.5f);
+    check_nucleus_contract("sample host/CUDA qwen38 chain", x, 1.0f, 0.95f, 20, 0.05f);
+    check_nucleus_contract("sample host/CUDA k>vocab is off", x, 1.0f, 0.95f, 100000, 0.0f);
+    check_nucleus_contract("sample host/CUDA chain on ties", tied, 1.0f, 0.95f, 20, 0.05f);
     // CPU argmax + full-softmax probs at a given inv_temp
     auto cpu_argmax = [&]() {
         int bi = 0; for (int i = 1; i < n; i++) if (x[i] > x[bi]) bi = i; return bi;

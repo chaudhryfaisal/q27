@@ -1,0 +1,17 @@
+<parameter=Read>
+<parameter=file_path>
+PATH_1
+</parameter>
+</function>
+<tool_call>
+<parameter=Bash>
+<parameter=command>
+CODE_2:ml`CODE_3`CODE_4:ml`
+  CODE_5:ml`CODE_6:ml`
+  CODE_7:ml`CODE_8:ml`
+  CODE_9:ml`CODE_10:ml
+</parameter>
+<parameter=description>
+TEXT_11
+</parameter>
+</function>

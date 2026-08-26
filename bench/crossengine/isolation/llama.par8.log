@@ -1,0 +1,16 @@
+0.00.081.504 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.279.119 W srv  llama_server: -----------------
+0.00.279.123 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.279.123 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.279.124 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.279.124 W srv  llama_server: -----------------
+0.00.280.493 I srv    load_model: loading model '/mnt/ai/models/qwen36-27b-mtp-gguf/Qwen3.6-27B-MTP-Q5_K_M.gguf'
+0.01.125.649 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 999, abort
+0.04.089.425 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 8379.00 MiB on device 0: cudaMalloc failed: out of memory
+0.04.089.432 E alloc_tensor_range: failed to allocate CUDA0 buffer of size 8786018304
+0.04.093.908 E llama_init_from_model: failed to initialize the context: failed to allocate buffer for rs cache
+0.04.093.917 E cmn  common_init_: failed to create context with model '/mnt/ai/models/qwen36-27b-mtp-gguf/Qwen3.6-27B-MTP-Q5_K_M.gguf'
+0.04.093.924 E cmn  common_init_: failed to create context with model '/mnt/ai/models/qwen36-27b-mtp-gguf/Qwen3.6-27B-MTP-Q5_K_M.gguf'
+0.04.093.931 E srv    load_model: failed to create_context with model '/mnt/ai/models/qwen36-27b-mtp-gguf/Qwen3.6-27B-MTP-Q5_K_M.gguf'
+0.04.093.935 I srv    operator(): operator(): cleaning up before exit...
+0.04.095.084 E srv  llama_server: exiting due to model loading error

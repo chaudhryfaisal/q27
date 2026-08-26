@@ -5,6 +5,7 @@
 //
 // Build+run: g++ -std=c++17 -I src tools/test_toolconstrain.cpp -o build/test_toolconstrain && ./build/test_toolconstrain
 #include "toolconstrain.h"
+#include "api_common.h"
 
 #include <cassert>
 #include <cstdio>
@@ -77,7 +78,7 @@ static FakeTok mk_tok() {
 struct Rig {
     FakeTok tok = mk_tok();
     FakeEngine eng;
-    q27::ToolMaskCache cache;
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
     std::vector<int> host2dev;
     TC tc;
     Rig() {
@@ -265,7 +266,7 @@ static void test_closer_disengages() {
 // entry, so request B could be steered into request A's tool names.
 static void test_r1_allowlist_in_cache_key() {
     FakeTok tok = mk_tok();
-    q27::ToolMaskCache cache;
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
     cache.init(&tok.vocab, T_CLOSER);
     q27::ToolGrammar ga, gb;
     ga.reset({"get_project"});
@@ -294,7 +295,7 @@ static void test_r1_allowlist_in_cache_key() {
 // one pool entry per argument state instead of exhausting the 512-entry pool.
 static void test_r3_no_mask_duplication_across_allowlists() {
     FakeTok tok = mk_tok();
-    q27::ToolMaskCache cache;
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
     cache.init(&tok.vocab, T_CLOSER);
     q27::ToolGrammar ga, gb;
     ga.reset({"get_project"});
@@ -359,6 +360,430 @@ static void test_r2_strict_json() {
     CHECK(!accepts_args("{\"\\uZZ00\": 1}"));
 }
 
+// XML-dialect grammar (ToolGrammarXml): valid bodies accept; drift / chimera
+// / undeclared names / undeclared param keys / garbage `<` inside values all
+// rejected. This is the prevention that would have stopped the live chimera
+// `{"name":"bash",\n</parameter>\n</function>` at the source rather than
+// leaving the parser to refuse an unrecoverable call.
+static void test_xml_grammar_valid_and_prevention() {
+    using q27::ToolGrammarXml;
+    std::vector<std::string> names = {"bash", "Read"};
+    std::vector<std::vector<std::string>> params = {{"command"}, {"file_path"}};
+
+    // 1. valid full call, schema-aware
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(g.advance_str("\n<function=bash>\n<parameter=command>\ngit status\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+        CHECK(g.advance_str("</tool_call>"));
+        CHECK(g.closed());
+    }
+    // 2. valid call, no schema (permissive keys)
+    {
+        ToolGrammarXml g; g.reset(names);
+        CHECK(g.advance_str("\n<function=Read>\n<parameter=file_path>/x.ts</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // 3. undeclared tool name -> dead
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("<function=Delete>\n<parameter=path>/x</parameter>\n</function>\n"));
+    }
+    // 4. undeclared param key for declared tool (schema) -> dead
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("<function=bash>\n<parameter=evil>\nrm -rf /\n</parameter>\n</function>\n"));
+    }
+    // 5. garbage `<...>` inside a value -> dead (only closers legal in VAL)
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("<function=Read>\n<parameter=file_path>\n<result>x</result>\n</parameter>\n</function>\n"));
+    }
+    // 6. JSON chimera head as the first body byte -> dead (grammar never sees JSON)
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("{\"name\":\"bash\",\n</parameter>\n</function>\n"));
+    }
+    // 7. bare `<parameter` before any `<function` -> dead
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("<parameter=command>ls</parameter>"));
+    }
+    // 8. nested `<function>` -> dead
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(!g.advance_str("<function=Read>\n<function=bash>\n</function>\n</function>\n"));
+    }
+    // 9. multi-line value body (the whole point of VAL)
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(g.advance_str("<function=bash>\n<parameter=command>\nline1\nline2\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // 10. tool-name prefix (still building): advance is fine, done is false
+    {
+        ToolGrammarXml g; g.reset(names, params);
+        CHECK(g.advance_str("<function=ba"));
+        CHECK(!g.done());
+    }
+    // 11. signature differs across allowlists once we're in NAME (cache-key
+    //     isolation, R1 for XML). At WS0 (post-reset) the signature carries
+    //     no allowlist component -- must advance first.
+    {
+        ToolGrammarXml ga, gb;
+        ga.reset({"get_project"});
+        gb.reset({"run_tests"});
+        CHECK(ga.advance_str("<function=get"));
+        CHECK(gb.advance_str("<function=run"));
+        CHECK(ga.signature() != gb.signature());
+    }
+}
+
+// XML mask cache: the templated ToolMaskCache<ToolGrammarXml> reuses the
+// same caching machinery; name-allowlist keying must isolate tool sets so
+// request B cannot inherit request A's tool names (review R1, the JSON
+// fix ported verbatim to the XML grammar via the template parameter).
+static void test_xml_cache_allowlist_in_key() {
+    // Build a tiny vocab: the XML bytes we need to keep legal/illegal.
+    // Names: "bash", "Read". Params (schema): bash->command, Read->file_path.
+    std::vector<std::string> vocab = {
+        "bash",       // 0 -- tool name candidate (allowlisted)
+        "Read",       // 1
+        "evil",       // 2 -- undeclared name -> illegal at NAME
+        "<parameter=",// 3
+        "command",    // 4 -- param key for bash
+        "file_path",  // 5 -- param key for Read
+        "badkey",     // 6 -- undeclared key
+        "\n",         // 7
+        "<",          // 8
+        "function",   // 9
+        "=",          // 10
+        ">",          // 11
+        "/",          // 12
+        "parameter",  // 13
+    };
+    // closer: "</tool_call>" -- legal iff done()
+    std::string closer = "</tool_call>";
+    vocab.push_back(closer); // 14
+
+    int closer_id = 14;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache;
+    cache.init(&vocab, closer_id);
+
+    q27::ToolGrammarXml ga; ga.reset({"bash"}, {{"command"}});
+    q27::ToolGrammarXml gb; gb.reset({"Read"}, {{"file_path"}});
+
+    CHECK(ga.advance_str("<function="));
+    CHECK(gb.advance_str("<function="));
+    CHECK(ga.signature() != gb.signature());
+    int ia = cache.get(ga), ib = cache.get(gb);
+    CHECK(ia != ib);
+    // 'bash' (0) legal under ga at its NAME state, illegal under gb
+    const auto& ma = cache.mask(ia);
+    const auto& mb = cache.mask(ib);
+    CHECK(ma[0 >> 5] & (1u << (0 & 31)));
+    CHECK(!(mb[0 >> 5] & (1u << (0 & 31))));
+}
+
+// Constrainer dialect dispatch: the constrainer must carry both grammars /
+// both caches and select via dialect_xml. We verify the wiring (fields set,
+// dialect branches reachable) directly rather than driving scan_round with a
+// JSON-shaped vocab (the FakeTok vocab carries JSON marker bytes, not XML
+// body bytes, so a token-by-token XML scan_round would always drop). The
+// end-to-end prevention is proven by test_xml_grammar_valid_and_prevention
+// against the real grammar; the dispatch itself is a one-line branch in
+// scan_round/on_id/on_pending/on_drafts whose correctness reduces to "the
+// right grammar object is touched," which we check here.
+static void test_xml_constrainer_dialect_dispatch() {
+    FakeTok tok = mk_tok();
+    FakeEngine eng;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &tok;
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&tok.vocab, T_CLOSER);
+    cache_xml.init(&tok.vocab, T_CLOSER);
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+
+    // JSON leg (regression guard): dialect_xml false, cache_xml left unused.
+    tc.begin({"bash"}, {}, /*dialect_xml=*/false);
+    CHECK(!tc.dialect_xml);
+    CHECK(tc.params_per_name.empty());
+
+    // XML leg: dialect_xml true, params_per_name populated.
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    tc.begin({"bash"}, pp, /*dialect_xml=*/true);
+    CHECK(tc.dialect_xml);
+    CHECK(tc.params_per_name.size() == 1);
+    CHECK(tc.params_per_name[0].size() == 1);
+    // The XML grammar must have been reset with the schema so its
+    // parameter-key allowlist is active (this is the prevention).
+    q27::ToolGrammarXml& g = tc.tg_xml;
+    // A legal XML body advances; an undeclared param key rejects.
+    CHECK(g.advance_str("<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"));
+    CHECK(g.done());
+    // schema-aware rejection
+    q27::ToolGrammarXml g2;
+    g2.reset({"bash"}, pp);
+    CHECK(!g2.advance_str("<function=bash>\n<parameter=evil>\nrm -rf /\n</parameter>\n</function>\n"));
+}
+
+
+// Issue #2: shape-valid but SCHEMA-INVALID calls. --constrain-tools guaranteed
+// well-formed XML and nothing else: a <function=write> that never emitted
+// <parameter=path> closed cleanly, so the server returned 200 with
+// arguments={}, logged no drift, and only the CLIENT's schema validation
+// noticed -- the agent dead-looped and the file stayed 0 bytes.
+static void test_xml_required_args_enforced() {
+    using q27::ToolGrammarXml;
+    const std::vector<std::string> names = {"write"};
+    const std::vector<std::vector<std::string>> params = {{"path", "content"}};
+    const std::vector<std::vector<std::string>> required = {{"path", "content"}};
+    auto accepts = [&](const char* body) {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        return g.advance_str(body) && g.done();
+    };
+
+    CHECK(accepts("<function=write>\n<parameter=path>\n/x\n</parameter>\n"
+                  "<parameter=content>\nhi\n</parameter>\n</function>\n"));
+    // order must not matter -- the schema says nothing about it
+    CHECK(accepts("<function=write>\n<parameter=content>\nhi\n</parameter>\n"
+                  "<parameter=path>\n/x\n</parameter>\n</function>\n"));
+    // the live failure: required key never emitted, call closed anyway
+    CHECK(!accepts("<function=write>\n<parameter=content>\nhi\n</parameter>\n</function>\n"));
+    // arguments={} -- the other live shape
+    CHECK(!accepts("<function=write>\n</function>\n"));
+    // duplicate key doubled the value when the content quoted the dialect
+    CHECK(!accepts("<function=write>\n<parameter=content>\na\n</parameter>\n"
+                   "<parameter=content>\nb\n</parameter>\n</function>\n"));
+
+    // OPTIONAL parameters must stay optional
+    {
+        const std::vector<std::vector<std::string>> p = {{"path", "content", "mode"}};
+        const std::vector<std::vector<std::string>> r = {{"path"}};
+        ToolGrammarXml g;
+        g.reset(names, p, r);
+        CHECK(g.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // NO schema -> permissive, exactly as before (callers without the schema
+    // must degrade, not break)
+    {
+        ToolGrammarXml g;
+        g.reset(names);
+        CHECK(g.advance_str("<function=write>\n<parameter=anything>\nv\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // params but NO required list -> shape-only, previous behaviour preserved
+    {
+        ToolGrammarXml g;
+        g.reset(names, params);
+        CHECK(g.advance_str("<function=write>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // the mask cache MUST distinguish emitted-key sets, or a stale mask would
+    // let the model close a call it must not close
+    {
+        ToolGrammarXml a, b;
+        a.reset(names, params, required);
+        b.reset(names, params, required);
+        CHECK(a.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n"));
+        CHECK(b.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n"
+                            "<parameter=content>\nhi\n</parameter>\n"));
+        CHECK(a.signature() != b.signature());
+        // and </function> legality actually differs between them
+        ToolGrammarXml a2 = a, b2 = b;
+        CHECK(!a2.advance_str("</function>"));
+        CHECK(b2.advance_str("</function>"));
+    }
+}
+
+// The schema extractors must actually carry `required` through (it was parsed
+// nowhere before).
+static void test_required_keys_extractor() {
+    using nlohmann::json;
+    json tools = json::array({
+        {{"type","function"},{"function",{{"name","write"},
+          {"parameters",{{"type","object"},
+            {"properties",{{"path",{{"type","string"}}},{"content",{{"type","string"}}}}},
+            {"required",json::array({"path","content"})}}}}}},
+        {{"type","function"},{"function",{{"name","noreq"},
+          {"parameters",{{"type","object"},
+            {"properties",{{"a",{{"type","string"}}}}}}}}}}});
+    auto req = q27::tool_required_keys_per_name(tools);
+    CHECK(req.size() == 2);
+    CHECK(req.size() == 2 && req[0].size() == 2);
+    CHECK(req.size() == 2 && req[1].empty());   // absent `required` -> none
+    auto keys = q27::tool_param_keys_per_name(tools);
+    CHECK(keys.size() == 2 && keys[0].size() == 2);
+}
+
+// signalnine/q27#35: the live corruption. The 3.8 model opened a spurious
+// second <parameter=edits!! in a <function=edit> call; the schema-aware XML
+// grammar accepts the entire valid prefix and dies deterministically at the
+// FIRST '!' (0x21) of the junk key (byte 133 of the exact logged sequence).
+// Regex-embedded in the suite so the sample-time leak (the '!' reaching the
+// stream at all) is a regression someone has to explain, not rediscover.
+static void test_issue35_key_junk_suffix_rejected() {
+    using q27::ToolGrammarXml;
+    const std::vector<std::string> names = {"edit"};
+    const std::vector<std::vector<std::string>> params = {{"edits", "path"}};
+    const std::vector<std::vector<std::string>> required = {{"path"}};
+    // the valid prefix feeds cleanly...
+    {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        CHECK(g.advance_str("<function=edit>\n<parameter=edits>\n"
+                            "[{\"newText\": \"# Plan\"}]\n</parameter>\n"));
+        // ...then the junk KEY suffix dies at '!', exactly as observed
+        CHECK(!g.advance_str("<parameter=edits!!"));
+    }
+    // byte-level: from KEY with key_pref "edits", '!' is the first illegal
+    // byte -- nothing before it, nothing after it, no recovery
+    {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        CHECK(g.advance_str("<function=edit>\n<parameter=edits>\n"
+                            "[]\n</parameter>\n<parameter=edits"));
+        CHECK(!g.advance('!'));
+        CHECK(!g.advance_str("!\""));
+    }
+}
+
+// signalnine/q27#35: Q27_TG_REENGAGE=1 (XML dialect) re-engages the grammar
+// on a bare <function= opener (wrapper-less drift + post-drop recovery), and
+// the re-engaged stream constrains to completion like the wrapped path.
+static void test_issue35_bare_function_reengage() {
+    FakeEngine eng;
+    // tokenizer whose vocab holds the split stream: the bare <function= call
+    // opened in token 0, closed in token 1
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n<parameter=command>\nls\n</param",
+                "eter>\n</function>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, T_CLOSER);
+    cache_xml.init(&t2.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+
+    // re-engage is DEFAULT ON for the XML dialect (no env needed)
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    std::vector<std::vector<std::string>> rq = {{}};
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+
+    int em[2] = {0, 1};
+    int m = tc.scan_round(em, 2);
+    // re-engage at token 0, truncating the round to 1
+    CHECK(m == 1);
+    CHECK(tc.engaged == 1);
+    CHECK(tc.active);
+    // a mask must have been staged via set_tool_constraint
+    bool staged = false;
+    for (int id : eng.constraint_log)
+        if (id >= 0) staged = true;
+    CHECK(staged);
+    // feed the closing token: grammar reaches </function> (bare calls have no
+    // </tool_call>, so active stays on through DONE_ -- the host disengages
+    // at generation end; the machine must at least report done()). skip_feed
+    // suppresses this round's kept tokens, so clear it as the engine does
+    // once the next round's emission begins.
+    tc.skip_feed = 0;
+    tc.on_id(1);
+    CHECK(!tc.active || tc.tg_xml.done());
+
+    // Q27_TG_REENGAGE=0 restores wrapper-only behaviour: no bare re-engage
+    setenv("Q27_TG_REENGAGE", "0", 1);
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+    int em2[1] = {0};
+    CHECK(tc.scan_round(em2, 1) == -1); // no re-engage, no truncation
+    CHECK(!tc.active);
+    unsetenv("Q27_TG_REENGAGE");
+}
+
+// signalnine/q27#35: default-on re-engage is SELF-LIMITING on prose that
+// merely QUOTES the dialect. A bare <function=bash> in an answer engages the
+// grammar (the <function= completion is real), but the first non-conforming
+// byte that follows must auto-disengage and leave NO lingering tool mask --
+// the constraint must not stick to the stream and steer the rest of a prose
+// answer. This is the blast-radius regression for the default-on decision.
+static void test_issue35_bare_prose_self_limits() {
+    FakeEngine eng;
+    // token 0 opens the quoted call; token 1 is ordinary prose the grammar
+    // rejects (at GT1: 'j' is not the '<' it expects after <function=bash>)
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n", "just an example, not a real call\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, T_CLOSER);
+    cache_xml.init(&t2.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    std::vector<std::vector<std::string>> rq = {{}};
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+
+    // the quoted opener DOES engage (default-on), staging a mask...
+    int em[1] = {0};
+    int m = tc.scan_round(em, 1);
+    CHECK(m == 1);
+    CHECK(tc.active);
+    CHECK(!eng.constraint_log.empty() && eng.constraint_log.back() >= 0);
+    // ...but the following prose must auto-disengage and release the mask:
+    // set_tool_constraint(-1) and active back off -- no lingering constraint
+    tc.skip_feed = 0;
+    tc.on_id(1);
+    CHECK(!tc.active);
+    CHECK(!eng.constraint_log.empty() && eng.constraint_log.back() == -1);
+}
+
+// signalnine/q27#35: on_pending_xml must NOT stage/activate a constraint when
+// the constrainer is inactive -- the missing guards let a pending token whose
+// bytes merely LOOK like <function...> (prose quoting the dialect) arm the
+// mask. Regression: purely by calling on_pending_xml while inactive, no
+// set_tool_constraint call may appear in the engine log.
+static void test_issue35_on_pending_xml_guards() {
+    FakeTok tok = mk_tok();
+    FakeEngine eng;
+    FakeTok t2;
+    t2.vocab = {"<function=bash>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&tok.vocab, T_CLOSER);
+    cache_xml.init(&tok.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng;
+    tc.tok = &t2;
+    tc.cache = &cache;
+    tc.cache_xml = &cache_xml;
+    tc.host2dev = &host2dev;
+    tc.enabled = true;
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    tc.begin({"bash"}, pp, /*dialect_xml=*/true);
+    CHECK(!tc.active);
+    eng.constraint_log.clear();
+    // pending token that advances the reset-state grammar into NAME phase
+    tc.on_pending_xml(0);
+    CHECK(eng.constraint_log.empty()); // guarded: no mask staged, no activation
+    CHECK(!tc.active);
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -374,6 +799,15 @@ int main() {
     test_r1_allowlist_in_cache_key();
     test_r2_strict_json();
     test_r3_no_mask_duplication_across_allowlists();
+    test_xml_grammar_valid_and_prevention();
+    test_xml_cache_allowlist_in_key();
+    test_xml_constrainer_dialect_dispatch();
+    test_xml_required_args_enforced();
+    test_required_keys_extractor();
+    test_issue35_key_junk_suffix_rejected();
+    test_issue35_bare_function_reengage();
+    test_issue35_bare_prose_self_limits();
+    test_issue35_on_pending_xml_guards();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

@@ -6,9 +6,11 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -21,6 +23,7 @@
 #include "markdown_lex.h"
 
 #include "stream_split.h"
+#include "drift_capture.h"
 
 namespace q27 {
 using json = nlohmann::json;
@@ -174,8 +177,11 @@ private:
 };
 
 struct Msg {
-    std::string role;     // system | user | assistant
-    std::string content;  // flattened text (think blocks already reconstructed)
+    std::string role;      // system | user | assistant
+    std::string content;   // flattened text (think blocks already reconstructed)
+    std::string reasoning{}; // assistant <think> block from history (jinja-compatible);
+                             // NSDMI so brace-init sites with 2 fields stay valid under
+                             // -Wmissing-field-initializers (metal_server.cpp, -Werror)
 };
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
@@ -270,10 +276,13 @@ inline bool tool_dialect_xml() {
     if (d) return !strcmp(d, "xml");
     return tool_dialect_xml_default();
 }
-// Q27_TOOL_DIALECT=xml swaps the calling instruction for the dialect the
-// checkpoint was trained on (see parse_native_xml_call above). Default stays
-// JSON: 3.6 complied with it well, and the A/B that would justify flipping the
-// default is exactly what this knob exists to run.
+// Q27_TOOL_DIALECT=xml|json overrides either direction. The DEFAULT is now
+// auto-selected from the artifact's general.name (see
+// set_tool_dialect_for_model above): 3.8-family checkpoints boot as XML
+// (their trained format -- the 08-14 A/B showed zero drift rescues under
+// XML vs four under JSON), and 3.6-family boot as JSON (3.6 demonstrably
+// complies with JSON). The knob exists for A/Bs and for fine-tunes whose
+// general.name normalization misses the "qwen38" substring.
 
 // Reasoning-effort instruction (Qwen3.8 chat_template.jinja): with thinking
 // enabled the trained template injects this line at the HEAD of the system
@@ -283,41 +292,356 @@ inline bool tool_dialect_xml() {
 // template has no reasoning_effort, so 3.6-family renders stay untouched.
 // Q27_REASONING_EFFORT: xhigh | low | medium (no line, per the template) |
 // off (legacy pre-2026-08-15 rendering, for A/Bs) -- overrides either way.
-inline std::string reasoning_effort_line() {
+// think-effort level: 0 = medium/off (no instruction line), 1 = low, 2 = xhigh.
+inline int reasoning_effort_env_level() {
+    // froggeric v22.3: the safe default is medium (zero injected tokens) to
+    // avoid burning the reasoning budget; xhigh/low must be explicitly set.
     const char* e = getenv("Q27_REASONING_EFFORT");
+    // NOTE (PR #37 review): the froggeric-template default of "medium" was
+    // deliberately NOT inherited -- the effective default stays xhigh/off per
+    // boot dialect until a measured benchmark arm justifies the change.
+    // medium remains reachable explicitly (env, reasoning_effort field,
+    // <|think_medium|> tag).
     const std::string v = e ? e : (tool_dialect_xml_default() ? "xhigh" : "off");
-    if (v == "xhigh")
+    if (v == "low" || v == "minimal") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // medium / off / none / unknown
+}
+inline std::string reasoning_effort_line_level(int level) {
+    if (level == 2)
         return "Reasoning effort is set to xhigh. Please think carefully through "
                "the task, validate key assumptions, consider plausible alternatives, "
                "and prioritize correctness, consistency, and clarity in the final "
                "answer.";
-    if (v == "low")
+    if (level == 1)
         return "Reasoning effort is set to low. Keep your thinking brief and "
                "focused, moving directly to the conclusion without unnecessary "
                "elaboration.";
     return ""; // medium (template emits nothing) / off (legacy) / unknown
 }
-inline std::string tools_preamble(const json& tools) {
+inline std::string reasoning_effort_line() {
+    return reasoning_effort_line_level(reasoning_effort_env_level());
+}
+
+// v22.3 request-driven template options (items 3/4/5).
+// effort: -1 = env/boot default, else 0 medium, 1 low, 2 xhigh.
+// auto_disable_thinking_with_tools: start thinking OFF when tools are present.
+// tool_format: -1 = boot dialect, 0 json, 1 xml.
+// Default for the two-tier tool-error escalation: OFF per PR #37 review --
+// a direct probe of the detector over realistic benign outputs measured 3/12
+// false positives (grep/diff exit code 1, short 'error: none' summaries), and
+// grep returning 1 on no-match is one of the most common tool results in an
+// agentic loop. Template parity stays one flag away:
+// Q27_TOOL_ERROR_WARNINGS=1 re-enables at boot; a measured arm showing the
+// escalation helps would justify flipping the default back.
+inline bool tool_error_warnings_env_default() {
+    const char* e = getenv("Q27_TOOL_ERROR_WARNINGS");
+    if (!e || !*e) return false;
+    std::string v = e;
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    return v == "1" || v == "on" || v == "true" || v == "yes";
+}
+struct TemplateOpts {
+    int effort = -1;
+    bool auto_disable_thinking_with_tools = false;
+    int tool_format = -1;
+    bool force_disable_thinking = false; // reasoning_effort = none/off
+    // P1b escalation warnings (froggeric Tool Error Recovery). OFF by default
+    // per PR #37 review (measured 3/12 FP on benign outputs);
+    // Q27_TOOL_ERROR_WARNINGS=1 flips the boot default on, and the
+    // per-request tool_error_warnings field overrides either way.
+    bool tool_error_warnings = tool_error_warnings_env_default();
+    // Pre-rendered <tools> declaration lines in the CLIENT's key order with the
+    // template's spacing (see anthropic_tools_decl). nlohmann::json sorts keys,
+    // so without this the model sees {"function":{"description",...,"name"},
+    // "type"} where its training data has {"type": "function", "function":
+    // {"name", "description", "parameters"}}. Empty = legacy sorted dump.
+    std::string tools_decl;
+};
+inline int effort_string_level(std::string v) {
+    for (auto& c : v) c = (char)tolower((unsigned char)c);
+    if (v == "minimal" || v == "low") return 1;
+    if (v == "xhigh" || v == "high" || v == "max" || v == "ultracode" || v == "extreme") return 2;
+    return 0; // none/off/medium/unknown
+}
+inline TemplateOpts template_opts_from_body(const json& body) {
+    TemplateOpts o;
+    auto read = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            const std::string ev = b["reasoning_effort"].get<std::string>();
+            std::string el = ev;
+            for (auto& c : el) c = (char)tolower((unsigned char)c);
+            if (el == "none" || el == "off") o.force_disable_thinking = true; // item 2
+            o.effort = effort_string_level(ev);
+        }
+        if (b.contains("auto_disable_thinking_with_tools") && b["auto_disable_thinking_with_tools"].is_boolean())
+            o.auto_disable_thinking_with_tools = b["auto_disable_thinking_with_tools"].get<bool>();
+        if (b.contains("tool_error_warnings") && b["tool_error_warnings"].is_boolean())
+            o.tool_error_warnings = b["tool_error_warnings"].get<bool>(); // P1b off switch
+        if (b.contains("tool_call_format") && b["tool_call_format"].is_string()) {
+            const std::string f = b["tool_call_format"].get<std::string>();
+            o.tool_format = (f == "json") ? 0 : (f == "xml" ? 1 : -1);
+        }
+    };
+    read(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        read(body["chat_template_kwargs"]);
+    // OpenAI Responses effort shapes: output_config / reasoning blocks.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("effort") && r["effort"].is_string())
+            o.effort = effort_string_level(r["effort"].get<std::string>());
+        if (r.contains("output_effort") && r["output_effort"].is_string())
+            o.effort = effort_string_level(r["output_effort"].get<std::string>());
+    }
+    return o;
+}
+
+// P1a (2026-08-22): the <|think_*|> toggle markers from the qwen3.8
+// chat_template. Stripping: these are BPE-tokenisable control markers the
+// model is trained to read in user/system content; they must not leak into
+// the rendered prompt, and they MUTATE the thinking/effort state forward.
+inline void strip_think_markers(std::string& s) {
+    static const std::string mk[] = {"<|think_off|>", "<|think_on|>",
+                                     "<|think_xhigh|>", "<|think_high|>",
+                                     "<|think_ultracode|>", "<|think_extreme|>",
+                                     "<|think_max|>", "<|think_medium|>",
+                                     "<|think_low|>", "<|think_minimal|>"};
+    for (const auto& m : mk)
+        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+}
+
+// P1a forward-scan of the (flattened) message list for <|think_*|> toggles;
+// returns the final thinking/effort state. Mirrors the template: only
+// system/developer/user roles are scanned (assistant and tool roles are not),
+// and tool responses (user-role, <tool_response>-wrapped) are skipped.
+struct ThinkToggles {
+    bool thinking = true;
+    int effort = 0; // 0 medium, 1 low, 2 xhigh
+};
+inline ThinkToggles scan_think_toggles(const std::vector<Msg>& msgs, bool base_think,
+                                       int base_effort = -1) {
+    ThinkToggles st{base_think, base_effort >= 0 ? base_effort : reasoning_effort_env_level()};
+    for (const Msg& m : msgs) {
+        if (m.role != "system" && m.role != "user") continue;
+        if (m.role == "user" && m.content.rfind("<tool_response>", 0) == 0) continue;
+        const std::string& c = m.content;
+        if (c.find("<|think_off|>") != std::string::npos) st.thinking = false;
+        else if (c.find("<|think_on|>") != std::string::npos) st.thinking = true;
+        else if (c.find("<|think_xhigh|>") != std::string::npos ||
+                 c.find("<|think_high|>") != std::string::npos ||
+                 c.find("<|think_ultracode|>") != std::string::npos ||
+                 c.find("<|think_extreme|>") != std::string::npos ||
+                 c.find("<|think_max|>") != std::string::npos) {
+            st.thinking = true; st.effort = 2;
+        } else if (c.find("<|think_low|>") != std::string::npos ||
+                   c.find("<|think_minimal|>") != std::string::npos) {
+            st.thinking = true; st.effort = 1;
+        } else if (c.find("<|think_medium|>") != std::string::npos) {
+            st.thinking = true; st.effort = 0;
+        }
+    }
+    return st;
+}
+
+// P1b: tool-response failure detection, mirrored from the qwen3.8
+// chat_template (froggeric v22.3). Suppresses code/grep output and
+// exit-code-0, distinguishes strong vs weak error signatures.
+inline bool is_tool_response_failure(const std::string& content) {
+    std::string full = content;
+    for (auto& c : full) c = (char)tolower((unsigned char)c);
+    const std::string head = full.substr(0, 120);
+    const bool is_code_or_grep =
+        full.find("throw new ") != std::string::npos ||
+        full.find("throw error") != std::string::npos ||
+        full.find("console.error") != std::string::npos ||
+        full.find("logger.error") != std::string::npos ||
+        full.find("logging.error") != std::string::npos ||
+        head.find("import ") != std::string::npos ||
+        head.find("def ") != std::string::npos ||
+        head.find("function ") != std::string::npos;
+    const bool exit_zero =
+        head.find("exit code: 0") != std::string::npos ||
+        head.find("process exited with code 0") != std::string::npos;
+    const bool error_field_ok =
+        head.find("\"error\": null") != std::string::npos ||
+        head.find("\"error\":null") != std::string::npos ||
+        head.find("\"error\": false") != std::string::npos ||
+        head.find("\"error\":false") != std::string::npos ||
+        head.find("\"error\": \"\"") != std::string::npos ||
+        head.find("\"error\":\"\"") != std::string::npos;
+    const bool strong_error =
+        (head.find("\"error\":") != std::string::npos && !error_field_ok) ||
+        head.find("\"status\": \"error\"") != std::string::npos ||
+        head.find("\"status\":\"error\"") != std::string::npos ||
+        head.find("traceback (most recent call last):") != std::string::npos ||
+        head.find("command not found") != std::string::npos ||
+        head.find("invalid syntax") != std::string::npos ||
+        head.find("fatal:") != std::string::npos ||
+        ((head.find("exit code: ") != std::string::npos ||
+          head.find("process exited with code") != std::string::npos) && !exit_zero) ||
+        head.find("exception:") == 0 ||
+        head.find("failed to ") == 0;
+    const bool weak_error =
+        head.find("error:") != std::string::npos ||
+        head.find("err!") != std::string::npos;
+    const bool weak_suppressed =
+        head.find("$ ") != std::string::npos ||
+        head.find("took ") != std::string::npos ||
+        content.size() >= 600;
+    return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
+}
+
+// v22.3: strip a leading think block from content when explicit reasoning is
+// present (avoids double-rendering a block the client also sent in text).
+inline void strip_leading_think(std::string& content) {
+    const char* lead_end = nullptr;
+    if (content.rfind("<think>", 0) == 0 && content.find("</think>") != std::string::npos)
+        lead_end = "</think>";
+    else if (content.rfind("<thinking>", 0) == 0 && content.find("</thinking>") != std::string::npos)
+        lead_end = "</thinking>";
+    else if (content.rfind("</think>", 0) == 0) lead_end = "</think>";
+    else if (content.rfind("</thinking>", 0) == 0) lead_end = "</thinking>";
+    if (!lead_end) return;
+    std::string close(lead_end);
+    size_t p = content.find(close);
+    if (p == std::string::npos) return;
+    content = content.substr(p + close.size());
+    size_t i = 0;
+    while (i < content.size() && content[i] == '\n') i++;
+    content = content.substr(i);
+}
+inline std::string tool_response_warning(int failures) {
+    if (failures >= 2)
+        return "\n\n\u26a0\ufe0f SYSTEM WARNING: " + std::to_string(failures) +
+               " consecutive tool errors detected. Your previous approach is "
+               "incorrect. You MUST use a fundamentally different approach or "
+               "corrected arguments.";
+    return "\n\n\u26a0\ufe0f SYSTEM WARNING: The previous tool call returned an "
+           "error. Diagnose the failure and retry with completely corrected "
+           "arguments.";
+}
+// Serialize in insertion order with the chat template's spacing: `": "` and
+// `", "`, no newlines. This is what minja's `tojson` emits (captured from a
+// running llama-server via /apply-template, 2026-08-22, and byte-identical to
+// Python jinja2's). nlohmann's dump() has compact or indented, neither of
+// which is this. Strings go through dump() so escaping matches.
+inline std::string ordered_dump_spaced(const nlohmann::ordered_json& v) {
+    if (v.is_object()) {
+        std::string s = "{"; bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!first) s += ", ";
+            first = false;
+            s += json(it.key()).dump() + ": " + ordered_dump_spaced(it.value());
+        }
+        return s + "}";
+    }
+    if (v.is_array()) {
+        std::string s = "["; bool first = true;
+        for (const auto& e : v) { if (!first) s += ", "; first = false; s += ordered_dump_spaced(e); }
+        return s + "]";
+    }
+    return v.dump();
+}
+
+// The <tools> declaration lines for an Anthropic request, from the RAW body so
+// the client's key order survives (the parsed `json` has already sorted it).
+// Same acceptance rule as anthropic_tools_json: string, non-empty name; missing
+// description -> ""; missing/non-object input_schema -> {}. `keep`, when given,
+// restricts to those names (tool_choice selection) without reordering. Each
+// line is strip_ctrl'd like the legacy dump: descriptions are caller-authored.
+inline std::string anthropic_tools_decl(const std::string& raw_body,
+                                        const std::vector<std::string>* keep = nullptr) {
+    nlohmann::ordered_json body;
+    try { body = nlohmann::ordered_json::parse(raw_body); } catch (...) { return ""; }
+    if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array()) return "";
+    std::string out;
+    for (const auto& t : body["tools"]) {
+        if (!t.is_object() || !t.contains("name") || !t["name"].is_string()) continue;
+        const std::string name = t["name"].get<std::string>();
+        if (name.empty()) continue;
+        if (keep && std::find(keep->begin(), keep->end(), name) == keep->end()) continue;
+        nlohmann::ordered_json fn;
+        fn["name"] = name;
+        fn["description"] = (t.contains("description") && t["description"].is_string())
+                                ? t["description"].get<std::string>() : std::string();
+        fn["parameters"] = (t.contains("input_schema") && t["input_schema"].is_object())
+                               ? t["input_schema"] : nlohmann::ordered_json::object();
+        nlohmann::ordered_json entry;
+        entry["type"] = "function";
+        entry["function"] = fn;
+        out += "\n" + strip_ctrl(ordered_dump_spaced(entry));
+    }
+    return out;
+}
+
+// The <tools> declaration lines for an OpenAI-shaped request. Entries are
+// already in the trained shape, so each accepted one is passed through
+// VERBATIM in the client's key order -- that is what minja's `tool | tojson`
+// renders, extra keys included -- rather than rebuilt the way
+// openai_tools_json() rebuilds them for tool_choice/grammar use. Acceptance is
+// openai_tools_json's rule exactly, so the declaration and `selected.tools`
+// list the same entries in the same order; `keep` applies the tool_choice
+// subset without reordering.
+inline std::string openai_tools_decl(const std::string& raw_body,
+                                     const std::vector<std::string>* keep = nullptr) {
+    nlohmann::ordered_json body;
+    try { body = nlohmann::ordered_json::parse(raw_body); } catch (...) { return ""; }
+    if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array()) return "";
+    std::string out;
+    for (const auto& t : body["tools"]) {
+        if (!t.is_object() || !t.contains("type") || !t["type"].is_string() ||
+            t["type"] != "function") continue;
+        if (!t.contains("function") || !t["function"].is_object()) continue;
+        const auto& fn = t["function"];
+        if (!fn.contains("name") || !fn["name"].is_string() ||
+            fn["name"].get_ref<const std::string&>().empty()) continue;
+        if (fn.contains("description") && !fn["description"].is_string()) continue;
+        if (fn.contains("parameters") && !fn["parameters"].is_object()) continue;
+        const std::string name = fn["name"].get<std::string>();
+        if (keep && std::find(keep->begin(), keep->end(), name) == keep->end()) continue;
+        out += "\n" + strip_ctrl(ordered_dump_spaced(t));
+    }
+    return out;
+}
+
+inline std::string tools_preamble(const json& tools, const std::string& decl = std::string()) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-
     // authored) description strings -- same forgery surface as message
-    // content (review 2026-07-09 P1 #5)
-    for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
+    // content (review 2026-07-09 P1 #5). `decl` is the client-ordered,
+    // template-spaced rendering (already strip_ctrl'd); the sorted dump is
+    // the fallback for callers that have no raw body (Metal, OpenAI path).
+    if (!decl.empty()) s += decl;
+    else for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
     s += "\n</tools>\n\n";
-    if (tool_dialect_xml())
-        s += "For each function call, emit it inside <tool_call></tool_call> tags "
-             "using this exact format with NO suffix:\n\n<tool_call>\n"
-             "<function=example_function_name>\n"
+    if (tool_dialect_xml()) {
+        // The template's text, verbatim (tools/golden/qwen38_tools_request.prompt).
+        // The earlier paraphrase dropped the nesting reminder -- the one rule
+        // every drift shape of 2026-08-20/21 violated -- and we parsed around
+        // that downstream for two days without checking the prompt stated it.
+        s += "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+             "<tool_call>\n<function=example_function_name>\n"
              "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-             "<parameter=example_parameter_2>\nmulti-line values are\nallowed\n</parameter>\n"
-             "</function>\n</tool_call>\n\n<IMPORTANT>\n";
-    else
+             "<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+             "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+             "<IMPORTANT>\nReminder:\n"
+             "- Function calls MUST follow the specified format: an inner <function=...></function> "
+             "block must be nested within <tool_call></tool_call> XML tags\n"
+             "- Required parameters MUST be specified\n"
+             "- You may provide optional reasoning for your function call in natural language "
+             "BEFORE the function call, but NOT after\n"
+             "- If there is no function call available, answer the question like normal with your "
+             "current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+    } else {
         s += "For each function call, return a JSON object with the function name "
              "and arguments inside <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": "
-             "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n";
-    s += "- Required parameters MUST be specified.\n- You may provide optional reasoning "
-         "before the function call, but never after it.\n- If no function call is needed, "
-         "answer normally and do not mention the tool interface.\n</IMPORTANT>";
+             "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n"
+             "- Required parameters MUST be specified.\n- You may provide optional reasoning "
+             "before the function call, but never after it.\n- If no function call is needed, "
+             "answer normally and do not mention the tool interface.\n</IMPORTANT>";
+    }
     return s;
 }
 
@@ -347,11 +671,21 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
                                  bool think = true, size_t* stable_off = nullptr,
                                  size_t* sys_off = nullptr,
                                  const std::string& tool_instruction = {},
-                                 const json* unavailable_tools = nullptr) {
+                                 const json* unavailable_tools = nullptr,
+                                 const TemplateOpts* opts = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
-    if (!msgs.empty() && msgs[0].role == "system") { sys = strip_ctrl(msgs[0].content); start = 1; }
+    // v22.3: merge ALL consecutive leading system/developer messages into one
+    // system block (joined with a blank line), mirroring the template's head
+    // loop -- not just messages[0].
+    while (start < msgs.size() &&
+           (msgs[start].role == "system" || msgs[start].role == "developer")) {
+        std::string part = strip_ctrl(msgs[start].content);
+        if (!sys.empty()) sys += "\n\n";
+        sys += part;
+        start++;
+    }
     // Over-refusal fix (2026-07-13, external review): under the no-think
     // serving default a bare request WITH NO SYSTEM PROMPT gives the model
     // zero context AND zero reasoning budget, so it falls to a defensive
@@ -364,10 +698,21 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
                                !unavailable_tools->empty();
-    // Template order: reasoning_instructions FIRST, then tools, then the
-    // client system content. Thinking-gated exactly like the template
-    // (enable_thinking undefined-or-true).
-    const std::string effort = think ? reasoning_effort_line() : std::string();
+    // P1a: forward-scan the message list for <|think_*|> toggles. The final
+    // thinking/effort state drives BOTH the reasoning_instructions line at the
+    // system head and the generation prompt below (mirrors the template's
+    // stateful ns_state). Template order: reasoning_instructions FIRST, then
+    // tools, then the client system content. Items 3/4: a request-driven base
+    // effort overrides the env/boot default, and auto_disable_thinking_with_tools
+    // starts thinking OFF when tools are present.
+    bool base_think = think;
+    if (opts && opts->auto_disable_thinking_with_tools && tools.is_array() && !tools.empty())
+        base_think = false;
+    if (opts && opts->force_disable_thinking) base_think = false; // reasoning_effort none/off
+    const ThinkToggles tt = scan_think_toggles(msgs, base_think, opts ? opts->effort : -1);
+    const std::string effort = tt.thinking ? reasoning_effort_line_level(tt.effort)
+                                           : std::string();
+    strip_think_markers(sys);
     if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty() ||
         !effort.empty()) {
         p += "<|im_start|>system\n";
@@ -379,7 +724,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
             need_separator=true;
         };
         append_system_part(effort);
-        if (has_tools) append_system_part(tools_preamble(tools));
+        if (has_tools) append_system_part(tools_preamble(tools, opts ? opts->tools_decl : std::string()));
         if (has_unavailable)
             append_system_part(unavailable_tools_preamble(*unavailable_tools));
         append_system_part(sys);
@@ -387,9 +732,57 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         p += "<|im_end|>\n";
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
-    for (size_t i = start; i < msgs.size(); i++)
-        p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
-             "<|im_end|>\n";
+    int tool_failures = 0;
+    // P1b switch: env/boot default unless the request carries an explicit
+    // tool_error_warnings field (TemplateOpts default member is env-seeded,
+    // so this covers both the nullptr and the populated-opts paths).
+    const bool warn_on = opts ? opts->tool_error_warnings
+                              : tool_error_warnings_env_default();
+    for (size_t i = start; i < msgs.size(); i++) {
+        const Msg& m = msgs[i];
+        std::string content = m.content;
+        // P1b: consecutive tool-error tracking. Tool responses reach this
+        // renderer already <tool_response>-wrapped in a user turn.
+        const bool toolresp = m.role == "user" &&
+                              content.rfind("<tool_response>", 0) == 0;
+        if (warn_on && toolresp)
+            tool_failures = is_tool_response_failure(content)
+                                          ? tool_failures + 1 : 0;
+        else if (m.role == "user") tool_failures = 0; // plain user resets
+        strip_think_markers(content);
+        // P2: consecutive tool responses group under ONE user turn, each kept
+        // as its own <tool_response> block (mirrors the template's prev_role
+        // grouping -- no <|im_start|>/<|im_end|> between them).
+        if (toolresp) {
+            const bool prev_toolresp = i > start && msgs[i - 1].role == "user" &&
+                                       msgs[i - 1].content.rfind("<tool_response>", 0) == 0;
+            const bool next_toolresp = i + 1 < msgs.size() && msgs[i + 1].role == "user" &&
+                                       msgs[i + 1].content.rfind("<tool_response>", 0) == 0;
+            if (!prev_toolresp) p += "<|im_start|>user\n";
+            if (tool_failures >= 1) {
+                // warning goes INSIDE the response block, before the closer
+                // (the template emits it between content and </tool_response>)
+                std::string warn = tool_response_warning(tool_failures);
+                size_t close = content.rfind("\n</tool_response>");
+                if (close != std::string::npos) content.insert(close, warn);
+                else content += warn;
+            }
+            p += strip_ctrl(content);
+            p += next_toolresp ? "\n" : "<|im_end|>\n";
+            continue;
+        }
+        // normal (non-tool) message
+        p += "<|im_start|>" + strip_ctrl(m.role) + "\n";
+        // v22.3 E: EVERY assistant history turn is wrapped in <think>...</think>
+        // (even when reasoning is empty -> an empty think block). If the
+        // client also sent the think block in text, strip it so the block is
+        // not double-rendered.
+        if (m.role == "assistant") {
+            strip_leading_think(content);
+            p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
+        }
+        p += strip_ctrl(content) + "<|im_end|>\n";
+    }
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
     // think=false: the empty CLOSED block signals "reasoning done" so the model
@@ -401,18 +794,97 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // StreamSplitter to THINK when think=true so the model's first generated
     // token (already inside the block) routes to the think channel -- mirrors the
     // FORCED tool_choice TOOL pre-seed.
-    if (!think) p += "<think>\n\n</think>\n\n";
+    // P1a: the generation prompt follows the final toggle state, not just the
+    // caller's `think` flag. think=false -> empty CLOSED block; true -> OPEN.
+    if (!tt.thinking) p += "<think>\n\n</think>\n\n";
     else p += "<think>\n";
     return p;
 }
 
-inline std::string tool_call_text(const std::string& name, const json& args) {
-    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
+// P3 request-driven truncation: read max_tool_arg_chars / max_tool_response_chars
+// from the request body (top-level or chat_template_kwargs). 0 when absent.
+inline long body_num(const json& v) {
+    if (v.is_number_float()) return (long)v.get<double>();
+    if (v.is_number_integer()) return v.get<long>();
+    if (v.is_number_unsigned()) return (long)v.get<uint64_t>();
+    return 0;
+}
+inline long request_max_chars(const json& body, const char* key) {
+    if (body.contains(key) && body[key].is_number()) return body_num(body[key]);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto& k = body["chat_template_kwargs"];
+        if (k.contains(key) && k[key].is_number()) return body_num(k[key]);
+    }
+    return -1; // absent -> text helpers fall back to the env vars
+}
+
+inline std::string tool_call_text(const std::string& name, const json& args,
+                                  long max_arg_chars = -1) {
+    // v22.3 (item 7): a raw string argument is echoed verbatim (not JSON-encoded),
+    // matching the template's `_args = tc.arguments` when arguments is a string.
+    std::string a = args.is_string() ? args.get<std::string>() : args.dump();
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (max_arg_chars > 0 && (long)a.size() > max_arg_chars)
+        a = a.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(a.size()) + " chars]";
+    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + a +
            "}\n</tool_call>";
 }
 
-inline std::string tool_response_text(const std::string& out) {
-    return "<tool_response>\n" + out + "\n</tool_response>";
+// v22.3 (item 6): render an assistant tool call in the PROMPT using the active
+// tool dialect. For the XML dialect use the per-parameter form the template
+// emits (<function=NAME><parameter=K>v</parameter>...</function>); otherwise
+// fall back to the JSON tool_call_text.
+inline std::string tool_call_text_dialect(const std::string& name, const json& args,
+                                          long max_arg_chars = -1) {
+    if (max_arg_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    if (!tool_dialect_xml()) return tool_call_text(name, args, max_arg_chars);
+    auto trunc = [&](std::string v) -> std::string {
+        if (max_arg_chars > 0 && (long)v.size() > max_arg_chars)
+            return v.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+                   std::to_string(v.size()) + " chars]";
+        return v;
+    };
+    std::string s = "<tool_call>\n<function=" + name + ">\n";
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            s += "<parameter=" + it.key() + ">\n" +
+                 trunc(it.value().is_string() ? it.value().get<std::string>()
+                                              : it.value().dump()) +
+                 "\n</parameter>\n";
+    } else if (args.is_string()) {
+        s += trunc(args.get<std::string>()) + "\n";
+    } else {
+        s += trunc(args.dump()) + "\n";
+    }
+    s += "</function>\n</tool_call>";
+    return s;
+}
+
+inline std::string tool_response_text(const std::string& out,
+                                      long max_response_chars = -1) {
+    std::string o = out;
+    if (max_response_chars < 0) { // no explicit request value -> env fallback
+        const char* e = getenv("Q27_MAX_TOOL_RESPONSE_CHARS");
+        max_response_chars = e ? atol(e) : 0;
+    }
+    // v22.3 (item 8): truncation applies only when the dialect is NOT json.
+    if (tool_dialect_xml() && max_response_chars > 0 && (long)o.size() > max_response_chars)
+        o = o.substr(0, (size_t)max_response_chars) + "\n[TRUNCATED - original length " +
+            std::to_string(o.size()) + " chars]";
+    // The template runs every message's content through |trim. A tool result
+    // ending in "\n" otherwise renders a blank line inside <tool_response>
+    // that llama.cpp does not (golden test).
+    const size_t a = o.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) o.clear();
+    else o = o.substr(a, o.find_last_not_of(" \t\r\n") - a + 1);
+    return "<tool_response>\n" + o + "\n</tool_response>";
 }
 
 // Per-request thinking resolution, GATED behind the server's --request-think
@@ -496,6 +968,35 @@ inline ThinkCfg resolve_think_cfg(const json& body, bool server_default, bool al
         }
         if (t.contains("budget_tokens")) take_budget(t["budget_tokens"]);
     }
+    // OpenAI Responses: reasoning / output_config blocks. Effort is consumed by
+    // TemplateOpts (prompt line); here we handle disabled/enabled + budget.
+    for (const char* key : {"reasoning", "output_config"}) {
+        if (!body.contains(key) || !body[key].is_object()) continue;
+        const auto& r = body[key];
+        if (r.contains("disabled") && r["disabled"].is_boolean()) {
+            c.enabled = !r["disabled"].get<bool>();
+            c.enabled_set = true;
+        } else if (r.contains("enabled") && r["enabled"].is_boolean()) {
+            c.enabled = r["enabled"].get<bool>();
+            c.enabled_set = true;
+        }
+        if (r.contains("budget_tokens")) take_budget(r["budget_tokens"]);
+        if (r.contains("output_budget_tokens")) take_budget(r["output_budget_tokens"]);
+    }
+    // some clients send a flat top-level budget_tokens
+    if (body.contains("budget_tokens")) take_budget(body["budget_tokens"]);
+    // item 2: reasoning_effort none/off disables thinking end-to-end (engine
+    // think mode, not just the prompt render).
+    auto effort_disable = [&](const json& b) {
+        if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string()) {
+            std::string ev = b["reasoning_effort"].get<std::string>();
+            for (auto& ch : ev) ch = (char)tolower((unsigned char)ch);
+            if (ev == "none" || ev == "off") { c.enabled = false; c.enabled_set = true; }
+        }
+    };
+    effort_disable(body);
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        effort_disable(body["chat_template_kwargs"]);
     return c;
 }
 
@@ -518,6 +1019,21 @@ inline bool resolve_think(const json& body, bool server_default, bool allow_requ
 // fraction ever exists, it should replace this.
 static constexpr double THINK_BUDGET_FRAC = 0.5;
 
+// Q27_THINK_BUDGET_FRAC overrides it, read once (server-lifetime knob, one leg
+// per run). Added 2026-08-20 to answer the comment above on its own terms: the
+// fraction is a judgement call and the note asks for a measured one to replace
+// it, which is impossible while it is a compile-time constant. Out-of-range or
+// unparseable values fall back to the default rather than half-applying.
+inline double think_budget_frac() {
+    static const double v = [] {
+        const char* e = getenv("Q27_THINK_BUDGET_FRAC");
+        if (!e) return THINK_BUDGET_FRAC;
+        const double d = atof(e);
+        return (d > 0.0 && d < 1.0) ? d : THINK_BUDGET_FRAC;
+    }();
+    return v;
+}
+
 // Resolve the server budget for a request whose public cap is `n_max`.
 // `flag` is --think-budget: <0 = use the fractional default, 0 = unbounded,
 // >0 = an explicit absolute cap. The fractional default applies only when the
@@ -527,7 +1043,7 @@ static constexpr double THINK_BUDGET_FRAC = 0.5;
 inline int think_budget_default(int flag, int n_max) {
     if (flag == 0) return -1;
     if (flag > 0) return flag;
-    return n_max > 0 ? (int)(THINK_BUDGET_FRAC * n_max) : -1;
+    return n_max > 0 ? (int)(think_budget_frac() * n_max) : -1;
 }
 
 inline int think_budget_for_request(bool prompt_starts_in_think, const ThinkCfg& cfg,
@@ -1438,6 +1954,29 @@ inline std::string ctx_limit_error_message(int n_prompt, int n_max_prompt) {
 
 // Anthropic tools -> qwen tools json for the system preamble (the
 // /v1/messages request mapping; count_tokens must count the same bytes).
+// Both tool-list shapes the server hands the parser (OpenAI function
+// entries and bare Anthropic entries).
+inline void declared_tool_names(const json* tools, DriftNames& names) {
+    if (!tools || !tools->is_array()) return;
+    for (const auto& t : *tools) {
+        if (!t.is_object()) continue;
+        if (t.contains("function") && t["function"].is_object() &&
+            t["function"].contains("name") && t["function"]["name"].is_string())
+            names.insert(t["function"]["name"].get<std::string>());
+        else if (t.contains("name") && t["name"].is_string())
+            names.insert(t["name"].get<std::string>());
+    }
+}
+
+// Drift corpus: remember what this request declared (see drift_capture.h).
+// No-op unless Q27_DRIFT_CORPUS is set.
+inline void drift_register_tools(const json& tools) {
+    if (!drift_corpus_path()) return;
+    DriftNames names;
+    declared_tool_names(&tools, names);
+    drift_register_names(names);
+}
+
 inline json anthropic_tools_json(const json& body) {
     json out = json::array();
     if (body.contains("tools") && body["tools"].is_array())
@@ -1456,6 +1995,7 @@ inline json anthropic_tools_json(const json& body) {
                                          {"description", description},
                                          {"parameters", parameters}}}});
         }
+    drift_register_tools(out);
     return out;
 }
 
@@ -1463,6 +2003,9 @@ inline json anthropic_tools_json(const json& body) {
 // model markers, tool_result wrapped in <tool_response>)
 inline std::vector<Msg> anthropic_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (body.contains("system")) {
         std::string sys;
         if (body["system"].is_string()) sys = body["system"];
@@ -1475,7 +2018,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 if (b.is_object() && b.value("type", "") == "text") sys += b.value("text", "");
         if (!sys.empty()) {
             normalize_cc_billing_header(sys);
-            msgs.push_back({"system", sys});
+            msgs.push_back({"system", sys, {}});
         }
     }
     if (!body.contains("messages")) return msgs;
@@ -1488,7 +2031,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         std::string role = m.value("role", "user"), think, content;
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
-        if (!m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (!m.contains("content")) { msgs.push_back({role, content, {}}); continue; }
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
@@ -1498,9 +2041,10 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                 else if (ty == "thinking") think += part.value("thinking", "");
                 else if (ty == "tool_use") {
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_call_text(part.value("name", ""),
-                                              part.contains("input") ? part["input"]
-                                                                     : json::object());
+                    content += tool_call_text_dialect(part.value("name", ""),
+                                                      part.contains("input") ? part["input"]
+                                                                             : json::object(),
+                                                      max_arg);
                 } else if (ty == "tool_result") {
                     std::string rc;
                     if (part.contains("content")) {
@@ -1511,12 +2055,13 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                                     rc += b.value("text", "");
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
-                    content += tool_response_text(rc);
+                    content += tool_response_text(rc, max_resp);
                 }
             }
-        if (role == "assistant" && !think.empty())
-            content = "<think>\n" + think + "\n</think>\n" + content;
-        msgs.push_back({role, content});
+        // reasoning block is emitted by the renderer (chatml_prompt), not
+        // flattened here -- keeps the jinja's format and per-message logic
+        // (preserve_reasoning / <|think_*|> toggles) in one place.
+        msgs.push_back({role, content, think});
     }
     return msgs;
 }
@@ -1548,6 +2093,7 @@ inline json openai_tools_json(const json& body) {
                                                             ? fn["parameters"]
                                                             : json::object()}}}});
         }
+    drift_register_tools(out);
     return out;
 }
 
@@ -1568,12 +2114,15 @@ inline json openai_tools_json(const json& body) {
 //     matching the /v1/responses bridge.
 inline std::vector<Msg> openai_msgs(const json& body) {
     std::vector<Msg> msgs;
+    // P3: request-driven truncation limits (top-level or chat_template_kwargs)
+    const long max_arg = request_max_chars(body, "max_tool_arg_chars");
+    const long max_resp = request_max_chars(body, "max_tool_response_chars");
     if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
     for (auto& m : body["messages"]) {
         if (!m.is_object()) continue;
         std::string role = m.value("role", "user");
         if (role == "developer") role = "system";
-        std::string content;
+        std::string content, reasoning;
         if (m.contains("content")) {
             if (m["content"].is_string()) content = m["content"];
             else if (m["content"].is_array())
@@ -1582,7 +2131,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                         content += part.value("text", "");
         }
         if (role == "tool") {
-            msgs.push_back({"user", tool_response_text(content)});
+            msgs.push_back({"user", tool_response_text(content, max_resp), {}});
             continue;
         }
         if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
@@ -1603,10 +2152,18 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                     } else args = fn["arguments"];
                 }
                 if (!content.empty() && content.back() != '\n') content += "\n";
-                content += tool_call_text(name, args);
+                content += tool_call_text_dialect(name, args, max_arg);
             }
         }
-        msgs.push_back({role, content});
+        if (role == "assistant" && m.contains("reasoning_content")) {
+            const json& rc = m["reasoning_content"];
+            if (rc.is_string()) reasoning = rc.get<std::string>();
+            else if (rc.is_array())
+                for (auto& part : rc)
+                    if (part.is_object() && part.value("type", "") == "text")
+                        reasoning += part.value("text", "");
+        }
+        msgs.push_back({role, content, reasoning});
     }
     return msgs;
 }
@@ -2027,6 +2584,90 @@ inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice
     return selected;
 }
 
+// Per-tool parameter-key extraction, aligned with OpenAIToolSelection::names.
+// Used by the XML-dialect toolgram (--constrain-tools on Qwen3.8) to build
+// its schema-aware parameter-key allowlist: only declared property names are
+// legal as <parameter=...> keys, which is what stops the model from
+// emitting undeclared keys in its XML tool body. Returns one vector per tool,
+// in the same order as `selected.names`; tools whose parameters block is
+// missing/malformed get an empty list (the grammar then accepts any key for
+// that tool -- a permissive fallback for malformed schemas rather than a
+// silent rejection of the whole request).
+inline std::vector<std::vector<std::string>>
+tool_param_keys_per_name(const OpenAIToolSelection& selected) {
+    std::vector<std::vector<std::string>> out;
+    out.reserve(selected.tools.size());
+    for (const auto& t : selected.tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("properties") &&
+            t["function"]["parameters"]["properties"].is_object()) {
+            for (auto it = t["function"]["parameters"]["properties"].begin();
+                 it != t["function"]["parameters"]["properties"].end(); ++it) {
+                keys.push_back(it.key());
+            }
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+
+// json-array overload (for callers that already moved `tools` out of the
+// selection; the two backends' selected-tools arrays are both aligned with
+// tool_names_v).
+inline std::vector<std::vector<std::string>>
+tool_param_keys_per_name(const json& tools) {
+    std::vector<std::vector<std::string>> out;
+    if (!tools.is_array()) return out;
+    out.reserve(tools.size());
+    for (const auto& t : tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("properties") &&
+            t["function"]["parameters"]["properties"].is_object()) {
+            for (auto it = t["function"]["parameters"]["properties"].begin();
+                 it != t["function"]["parameters"]["properties"].end(); ++it) {
+                keys.push_back(it.key());
+            }
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+
+// REQUIRED-argument lists, aligned with tool_names_v exactly like
+// tool_param_keys_per_name above. Split out rather than folded into that
+// function because the allowlist and the required set answer different
+// questions: "may this key appear?" vs "must it have appeared before the call
+// may close?". Only the first was ever threaded into the grammar, which is why
+// --constrain-tools emitted schema-invalid calls with a well-formed shape
+// (issue #2): a <function=write> that never produced <parameter=path> closed
+// cleanly, the server returned 200, no drift was logged, and the client's
+// schema validation was the only thing that noticed.
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const json& tools) {
+    std::vector<std::vector<std::string>> out;
+    if (!tools.is_array()) return out;
+    out.reserve(tools.size());
+    for (const auto& t : tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("required") &&
+            t["function"]["parameters"]["required"].is_array()) {
+            for (const auto& k : t["function"]["parameters"]["required"])
+                if (k.is_string()) keys.push_back(k.get<std::string>());
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const OpenAIToolSelection& selected) {
+    json arr = json::array();
+    for (const auto& t : selected.tools) arr.push_back(t);
+    return tool_required_keys_per_name(arr);
+}
+
 // Anthropic counts every declaration even when tool_choice narrows eligibility.
 // The inactive block keeps that accounting while leaving only selected schemas
 // in the callable interface. This choice-specific system prompt is intentional:
@@ -2116,33 +2757,258 @@ inline bool tool_strict() {
 // the cause rather than the symptoms. Value typing follows the template's own
 // serialization: non-strings are written with tojson, so a value that parses
 // as non-string JSON is used parsed, anything else stays a raw string.
+// ONE RECOGNIZER FOR THE `<function...>` OPENER FAMILY (2026-08-20
+// consolidation). Four spellings of the same opener were observed in the wild
+// inside two days, and each one had arrived as its own branch or its own drift
+// mode:
+//
+//   <function=Bash>          the trained form
+//   <function="Bash">        trained, name quoted        (killed sessions at 50K)
+//   <function name="Bash">   HTML-attribute syntax       (drift mode 19)
+//   <function name=Bash>     attribute, unquoted         (not yet seen)
+//
+// Every one of them was a session-killer: the call lands in the text channel,
+// Claude Code sees a final turn with no tool_use, and exits `completed` with
+// the work unfinished. Adding a case per spelling was losing the race -- the
+// model has many ways to write a name and only one of them was trained.
+//
+// So the opener is parsed by GRAMMAR rather than by literal: "<function", an
+// optional `name` key, an `=`, an optionally quoted identifier, then `>`. That
+// covers all four above, including the one nobody has reported yet.
+//
+// `<function>` with no name is deliberately NOT claimed: that is mode 16's
+// JSON-wrapped shape and it has its own recovery.
+inline bool parse_function_opener(const std::string& seg, size_t b, std::string& name,
+                                  size_t& after) {
+    if (seg.compare(b, 9, "<function") != 0) return false;
+    size_t i = b + 9;
+    const size_t gt = seg.find('>', i);
+    if (gt == std::string::npos) return false;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    if (seg.compare(i, 4, "name") == 0) { // optional attribute key
+        i += 4;
+        while (i < gt && isspace((unsigned char)seg[i])) i++;
+    }
+    if (i >= gt || seg[i] != '=') return false; // `<function>` -> mode 16's
+    i++;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    name = seg.substr(i, gt - i);
+    after = gt + 1;
+    return true;
+}
+
+// Both spellings of the PARAMETER tag, mirroring parse_function_opener above:
+//   <parameter=KEY>         the trained form
+//   <parameter name="KEY">  the attribute form, quoted or not
+// The function opener absorbed both spellings in 0f46684; the parameter tag
+// only ever accepted the first, so the same drift habit one level down dropped
+// the call (2026-08-21, from the surviving misses of the parity sweep).
+inline bool parse_parameter_opener(const std::string& seg, size_t b, std::string& key,
+                                   size_t& after) {
+    if (seg.compare(b, 10, "<parameter") != 0) return false;
+    size_t i = b + 10;
+    const size_t gt = seg.find('>', i);
+    if (gt == std::string::npos) return false;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    if (seg.compare(i, 4, "name") == 0) { i += 4; while (i < gt && isspace((unsigned char)seg[i])) i++; }
+    if (i >= gt || seg[i] != '=') return false;
+    i++;
+    while (i < gt && isspace((unsigned char)seg[i])) i++;
+    key = seg.substr(i, gt - i);
+    while (!key.empty() && isspace((unsigned char)key.back())) key.pop_back();
+    if (key.size() >= 2 && (key.front() == '"' || key.front() == '\'') &&
+        key.back() == key.front())
+        key = key.substr(1, key.size() - 2);
+    after = gt + 1;
+    return true;
+}
+
+// Every spelling of a bare native opener the parser accepts -- see the
+// table's users at bare_native_opener_position (the streaming holdback) and
+// the batch scanner in parse_bare_tool_calls_impl. One table, three readers.
+inline size_t bare_native_opener_len_at(const std::string& text,size_t i) {
+    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    for(const char* o:k) {
+        const size_t n=std::char_traits<char>::length(o);
+        if(text.compare(i,n,o)==0) return n;
+    }
+    return 0;
+}
+
 inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     size_t b = seg.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos || seg.compare(b, 10, "<function=") != 0) return false;
-    size_t ns = b + 10;
-    size_t ne = seg.find('>', ns);
-    if (ne == std::string::npos) return false;
-    tc.name = seg.substr(ns, ne - ns);
+    if (b == std::string::npos) return false;
+    // Junk ahead of the opener (2026-08-25, pylint-6903): `<tool_use>\n<tool>\n
+    // <parameter_name>\n<parameter_name>Read\n</parameter>\n<parameter=...` --
+    // wrapper-ish tags the model invented, and a name tag opened twice, the
+    // first one empty. Skip them; the opener that carries a name decides.
+    for (;;) {
+        bool skipped = false;
+        for (const char* junk : {"<tool_use>", "<tool>", "<tool_calls>"}) {
+            const size_t n = strlen(junk);
+            if (seg.compare(b, n, junk) == 0) {
+                b = seg.find_first_not_of(" \t\r\n", b + n);
+                if (b == std::string::npos) return false;
+                skipped = true;
+            }
+        }
+        const size_t nl = bare_native_opener_len_at(seg, b);
+        if (nl && seg.compare(b, 10, "<function=") != 0) {
+            const size_t q = seg.find_first_not_of(" \t\r\n", b + nl);
+            if (q != std::string::npos && seg[q] == '<' && bare_native_opener_len_at(seg, q)) {
+                b = q;   // an empty name tag, then the real one
+                skipped = true;
+            }
+        }
+        if (!skipped) break;
+    }
+    size_t p;
+    size_t name_tag = 0;
+    if (parse_function_opener(seg, b, tc.name, p)) {
+        // name normalization below strips the quoting; the grammar above
+        // already absorbed the attribute-vs-equals spelling.
+    } else if ((name_tag = bare_native_opener_len_at(seg, b)) != 0) {
+        // XML drift mode 18 (issue #24): the model drops the `<function=`
+        // opener and writes the bare trained `<name>` tag --
+        //   <name>task\n</parameter>\n<parameter=description>\n...
+        // Structurally the XML twin of JSON mode 10 (dropped `{"name":"`
+        // opener, 601d7c3): the payload is intact, only the opener is gone,
+        // and refusing it dumps a real tool call into the text channel where
+        // the agent reads it as prose and stops. The name runs to end-of-line
+        // rather than to a '>' -- the tag is already closed. Any stray
+        // `</parameter>` before the first real `<parameter=` is ignored by the
+        // scan below, which searches forward for the opener.
+        size_t ns = b + name_tag;
+        // Tolerate the name on the NEXT line after `<name>` -- a real
+        // emission (and this harness's mangled tool transport) can open
+        // `<name>` and drop the identifier on the following line. The old
+        // code read "up to the first newline", yielding an EMPTY name and
+        // refusing the whole call. Mirror parse_function_opener's leading-
+        // whitespace skip so `<name>\nbash\n<parameter=...>` -> name="bash".
+        while (ns < seg.size() && isspace((unsigned char)seg[ns])) ns++;
+        size_t ne = seg.find('\n', ns);
+        if (ne == std::string::npos) ne = seg.size();
+        tc.name = seg.substr(ns, ne - ns);
+        while (!tc.name.empty() &&
+               (isspace((unsigned char)tc.name.back()) || tc.name.back() == '>'))
+            tc.name.pop_back();
+        // `<function=` is self-evidently a call, so it may carry zero
+        // parameters. A bare `<name>` is weaker evidence -- ordinary prose can
+        // open that way -- so require corroborating dialect structure before
+        // claiming the whole segment as a tool call.
+        if (seg.find("<parameter=", ne) == std::string::npos &&
+            seg.find("</function>", ne) == std::string::npos)
+            return false;
+        p = ne;
+    } else {
+        return false;
+    }
+    // NAME NORMALIZATION (2026-08-20). Observed live, killing sessions at
+    // ~50K tokens: `<function="Bash">` -- the trained opener with the name
+    // QUOTED. It matches the `<function=` branch above, so the dialect is
+    // recognised, but the name comes out as the six characters "Bash" WITH the
+    // quotes, matches no declared tool, and the whole call is refused. The
+    // structure was never the problem; two quote characters were.
+    //
+    // Applied to every branch rather than just that one: a name is a tool
+    // identifier, and no declared tool has leading or trailing quotes or
+    // whitespace in it, so stripping them cannot turn a valid name into a
+    // different valid name.
+    while (!tc.name.empty() && isspace((unsigned char)tc.name.front())) tc.name.erase(0, 1);
+    while (!tc.name.empty() && isspace((unsigned char)tc.name.back())) tc.name.pop_back();
+    if (tc.name.size() >= 2 && (tc.name.front() == '"' || tc.name.front() == '\'') &&
+        tc.name.back() == tc.name.front()) {
+        tc.name = tc.name.substr(1, tc.name.size() - 2);
+    }
     if (tc.name.empty()) return false;
     tc.arguments = json::object();
-    size_t p = ne + 1;
-    static const std::string PO = "<parameter=", PC = "</parameter>";
+    static const std::string PO = "<parameter", PC = "</parameter>";
+    // Next position at or after `from` that opens a parameter in EITHER
+    // spelling. Used for the scan and for the two later-parameter checks, so
+    // all three agree on what counts as a parameter.
+    auto next_param = [&seg](size_t from, std::string* k, size_t* aft) -> size_t {
+        for (size_t c = seg.find(PO, from); c != std::string::npos; c = seg.find(PO, c + 10)) {
+            std::string kk;
+            size_t aa;
+            if (parse_parameter_opener(seg, c, kk, aa)) {
+                if (k) *k = kk;
+                if (aft) *aft = aa;
+                return c;
+            }
+        }
+        return std::string::npos;
+    };
     while (true) {
-        size_t ps = seg.find(PO, p);
+        std::string key;
+        size_t after = 0;
+        size_t ps = next_param(p, &key, &after);
         if (ps == std::string::npos) break;
-        size_t ks = ps + PO.size();
-        size_t ke = seg.find('>', ks);
-        if (ke == std::string::npos) return false;
-        const std::string key = seg.substr(ks, ke - ks);
-        size_t vs = ke + 1;
+        size_t vs = after;
         if (vs < seg.size() && seg[vs] == '\n') vs++;
-        size_t ve = seg.find(PC, vs);
+        // The XML dialect has no escape mechanism, so a value may legitimately
+        // contain `</parameter>` -- editing this parser's own tests, a doc
+        // about tool calling, a prompt template. Taking the FIRST closer
+        // truncated there and silently lost the rest of the value. Take the
+        // LAST closer before this parameter's boundary instead: an earlier one
+        // followed by more of the same value was content. Same collision #31
+        // solved for `</tool_call>` a layer up, resolved the same way -- by
+        // waiting for the evidence rather than guessing at first sight.
+        //
+        // The boundary is the next parameter opener or `</function>`, whichever
+        // comes first, so this cannot reach across into a later parameter's
+        // closer. No closer at all before that boundary still means an
+        // unterminated mid-stream parameter, which the branch below refuses as
+        // genuine mangling exactly as before -- that check is subsumed here
+        // rather than dropped.
+        size_t ve = std::string::npos;
         {
-            // A closer that belongs to a LATER parameter is not ours: an
-            // unterminated mid-stream parameter is genuine mangling, refuse.
-            size_t next_po = seg.find(PO, vs);
-            if (ve != std::string::npos && next_po != std::string::npos && next_po < ve)
-                return false;
+            // The bound is the next PARAMETER OPENER and nothing else. Using
+            // `</function>` as well looked tighter and was wrong: a value
+            // containing `</function>` (editing a template, a doc, this
+            // parser's own tests) bounded the search before its real closer,
+            // and the parameter read as unterminated mid-stream -- refused.
+            // The opener is sufficient, because a later call's `</parameter>`
+            // is always preceded by that call's own `<parameter=`.
+            const size_t next_po = next_param(vs, nullptr, nullptr);
+            const size_t bnd = next_po == std::string::npos ? seg.size() : next_po;
+            // For the LAST parameter the bound is end-of-segment, and the
+            // model does not always stop at its closer. The drift corpus
+            // (2026-08-25, Qwen3.8 suite + SWE-bench captures) has three
+            // shapes of what follows: a truncated second closer and a stray
+            // parameter closer (`</parameter>\n</function>\n</functio\n
+            // </parameter>`), a doubled closer then a stray one, and prose
+            // then a stray closer pair (`</function>\nSome prose\n
+            // </parameter>\n</function>`). Under the last-closer rule every
+            // one of them swallowed the tail into the value -- harmless on a
+            // description, dialect markup written into a file on `content`.
+            //
+            // So for the last parameter: the FIRST closer followed by
+            // `</function>` ended it. A value whose own last line is
+            // `</parameter>` (the #31 collision the last-closer rule exists
+            // for) still reads whole, because its closer is the one
+            // `</function>` follows. What is given up is a value that itself
+            // contains `</parameter>\n</function>` and then MORE content: its
+            // bytes are identical to the observed garble, the garble has been
+            // seen and that value has not, and losing a tail is the safer
+            // failure. Non-last parameters are unchanged: their bound is the
+            // next opener.
+            auto starts_with_fn = [&](size_t from, size_t to) {
+                while (from < to && isspace((unsigned char)seg[from])) from++;
+                return from + 11 <= to && seg.compare(from, 11, "</function>") == 0;
+            };
+            std::vector<size_t> cands;
+            for (size_t c = seg.find(PC, vs); c != std::string::npos && c < bnd;
+                 c = seg.find(PC, c + PC.size()))
+                cands.push_back(c);
+            if (!cands.empty()) {
+                ve = cands.back();
+                if (next_po == std::string::npos) {   // the last parameter
+                    for (size_t i = 0; i < cands.size(); i++) {
+                        const size_t to = i + 1 < cands.size() ? cands[i + 1] : bnd;
+                        if (starts_with_fn(cands[i] + PC.size(), to)) { ve = cands[i]; break; }
+                    }
+                }
+            }
         }
         bool unterminated = ve == std::string::npos;
         if (unterminated) {
@@ -2153,12 +3019,22 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
             // first full suite fell through. Close at end-of-span, but only
             // for the LAST parameter: an unterminated one followed by another
             // <parameter= would be genuine mangling and still refuses.
-            if (seg.find(PO, vs) != std::string::npos) return false;
+            if (next_param(vs, nullptr, nullptr) != std::string::npos) return false;
             size_t fe = seg.find("</function>", vs);
             ve = fe == std::string::npos ? seg.size() : fe;
         }
         size_t vend = ve;
-        while (vend > vs && (seg[vend - 1] == '\n' || seg[vend - 1] == ' ')) vend--;
+        // Strip EXACTLY the delimiter newline, mirroring the single leading
+        // '\n' consumed above. This was a greedy trim over every trailing '\n'
+        // and ' ', which silently rewrote the value -- invisible to Bash and
+        // Read, fatal to Edit, whose oldString has to match the file byte for
+        // byte. Reported live as "File Edit sometime still acting up": it broke
+        // exactly when the edited region ended in whitespace. Everything
+        // between the delimiters is content.
+        if (vend > vs && seg[vend - 1] == '\n') {
+            vend--;
+            if (vend > vs && seg[vend - 1] == '\r') vend--;  // CRLF: both bytes
+        }
         std::string val = seg.substr(vs, vend - vs);
         if (key.empty()) return false;
         json parsed;
@@ -2178,12 +3054,120 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         else tc.arguments[key] = val;
         if (unterminated) break;
         p = ve + PC.size();
+        // The call closed: `</function>` right after this closer. Anything
+        // after that is not this call's parameter -- observed 2026-08-25 as
+        // `</function>\n<parameter=TaskUpdate>\n</function>`, an aborted
+        // second call, which the scan below used to read as a parameter
+        // named TaskUpdate and hand to the client as an argument. A value
+        // that merely CONTAINS `</function>` is unaffected: the check is on
+        // what follows a closer, not on the value.
+        {
+            size_t q = p;
+            while (q < seg.size() && isspace((unsigned char)seg[q])) q++;
+            if (seg.compare(q, 11, "</function>") == 0) break;
+        }
     }
     tc.ok = true;   // zero-parameter calls are legal
     return true;
 }
 
-inline ToolCall parse_tool_call(const std::string& seg) {
+// ---- Drift-corpus capture (Q27_DRIFT_CORPUS=<file>) ------------------------
+// One redacted JSONL record per dialect-bearing turn, tagged with what the
+// chain did: recovered:<modes>, strict, unrescued, suppressed. The redaction
+// and record format live in src/drift_capture.h; this is the plumbing that
+// knows WHERE a turn is. Everything is behind the env var -- with it unset the
+// parse path is byte-identical to before.
+//
+// depth: parse_bare_tool_calls re-enters itself (the mode-10 probe, the
+// dialect retry) and parse_tool_call runs on segments inside it. Only the
+// outermost call is a turn, so the bare chain captures at depth 1 and the
+// strict parser only at depth 0.
+inline thread_local int drift_parse_depth = 0;
+inline thread_local DriftContext drift_ctx;
+inline thread_local const json* drift_tools = nullptr;
+// The streaming handlers hand a wrapped body that failed the strict parser to
+// the bare chain as the same bytes (server.cu emit_tool: parse_tool_call on
+// strip_ws2(tool_buf), then classify_bare on c.raw, which IS that string).
+// Remembering the miss lets that record say `wrapped` without server.cu
+// having to say so. One-shot: the next top-level bare parse on the thread
+// consumes it whether or not the bytes match, so it cannot go stale.
+inline thread_local std::string drift_last_strict_miss;
+// Which recovery produced the result: a mode number, "native", "xmlclose",
+// or the final block's mode flags. Set by the impl at each success site,
+// read by the parse_bare_tool_calls wrapper that writes the record.
+inline thread_local std::string drift_mode_hint;
+// Records written on this thread; lets a caller tell whether the chain it
+// drove produced one (the reasoning holdback may never invoke the parser).
+inline thread_local size_t drift_records_written = 0;
+
+struct DriftParseScope {
+    DriftParseScope() { drift_parse_depth++; }
+    ~DriftParseScope() { drift_parse_depth--; }
+};
+struct DriftCtxScope {
+    DriftContext saved;
+    const json* saved_tools;
+    DriftCtxScope(bool wrapped, bool in_think, const json* tools)
+        : saved(drift_ctx), saved_tools(drift_tools) {
+        drift_ctx.wrapped = saved.wrapped || wrapped;
+        drift_ctx.in_think = saved.in_think || in_think;
+        if (tools) drift_tools = tools;
+    }
+    ~DriftCtxScope() { drift_ctx = saved; drift_tools = saved_tools; }
+};
+
+// Wider than looks_like_intended_tool_call on purpose. That predicate gates a
+// WARNING, so it demands a closer the model never opened; the corpus wants
+// every turn carrying dialect residue, because a dropped-opener turn that
+// nothing recovered (`Read", "file_path": ...`, no {"name", no </function>)
+// is exactly the miss this corpus exists to surface. Over-capture is cheap:
+// the record is redacted and dedup collapses it.
+inline bool drift_bearing(const std::string& text, const json* tools) {
+    static const char* const kMarks[] = {"{\"name\"", "{\"tool_call\"", "\"arguments\"",
+                                         "<tool_call>", "</tool_call>", "<function=", "</function>",
+                                         "<parameter=", "</parameter>", "<tool_name>"};
+    for (const char* m : kMarks)
+        if (text.find(m) != std::string::npos) return true;
+    // the mode-10 signature: a declared tool name at the start of a line with
+    // the string's closing quote and the comma still attached
+    // (`Read", "file_path": ...`). Anchored to the line start, so a name
+    // quoted in prose (`I will Read" the file and Bash", then`) is not one.
+    DriftNames names;
+    declared_tool_names(tools, names);
+    for (const auto& name : names) {
+        const std::string needle = name + "\"";
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+            if (at != 0 && text[at - 1] != '\n') continue;
+            size_t p = at + needle.size();
+            while (p < text.size() && text[p] == ' ') p++;
+            if (p < text.size() && text[p] == ',') return true;
+        }
+    }
+    return false;
+}
+
+// A tool name survives redaction only when declared. The strict parser is
+// called from the streaming handlers without the request's tool list; there
+// the process-wide registry (fed by the request parsers above) stands in: a
+// name is kept only if some request this process served declared it. Before
+// the first such request, names are placeholders -- the safe direction.
+inline void capture_drift(const std::string& text, const std::string& outcome,
+                          const json* tools) {
+    const char* path = drift_corpus_path();
+    if (!path) return;
+    if (!tools) tools = drift_tools;
+    DriftNames names;
+    if (tools) {
+        declared_tool_names(tools, names);
+        drift_register_names(names);
+    } else {
+        names = drift_registered_names();
+    }
+    write_drift_record(path, text, outcome, drift_ctx, &names);
+    drift_records_written++;
+}
+
+inline ToolCall parse_tool_call_impl(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
     if (tool_strict()) {
@@ -2220,6 +3204,27 @@ inline ToolCall parse_tool_call(const std::string& seg) {
             tc.arguments = json::parse(tc.arguments.get<std::string>());
         tc.ok = !tc.name.empty() && tc.arguments.is_object();
     } catch (...) { tc.ok = false; }
+    return tc;
+}
+
+// The strict parser only ever sees a wrapped body (the splitter's TOOL
+// segment), from resolve_ordered_tool_segments and the four streaming
+// handlers alike, so this is the one place a `strict` outcome is recorded.
+// A miss is remembered so the bare-chain record for the same bytes can say
+// `wrapped`. No declared-tool set reaches here from the streaming handlers;
+// capture_drift falls back to the thread's context (set by the non-stream
+// resolver) and otherwise keeps identifier-like tool names verbatim.
+inline ToolCall parse_tool_call(const std::string& seg) {
+    ToolCall tc = parse_tool_call_impl(seg);
+    if (drift_parse_depth == 0 && drift_corpus_path()) {
+        if (tc.ok) {
+            DriftCtxScope wrapped(true, false, nullptr);
+            capture_drift(seg, "strict", nullptr);
+            drift_last_strict_miss.clear();
+        } else {
+            drift_last_strict_miss = seg;
+        }
+    }
     return tc;
 }
 
@@ -2329,6 +3334,183 @@ inline size_t bare_unresolved_inline_probe_start(
         ?0:std::string::npos;
 }
 
+// A bare native-dialect opener in streamed TEXT. The splitter routes a
+// <tool_call>-wrapped call to TOOL, so any <function= that reaches the text
+// holdback has no wrapper: the model dropped the opener (Qwen3-Coder does
+// this; llama.cpp's grammar comments say so, and its grammar cannot emit the
+// shape, which is why the 2026-08-22 leftover count was 0/293 there and
+// 11/498 here). Same display-context rule as bare_object_position: a fenced
+// or inline-code mention is prose.
+// Every spelling of a bare native opener the parser accepts. ONE table, read
+// by the streaming holdback's detector (what arms a candidate), its probe
+// (what partial tail to hold across a chunk boundary) and the bare chain's
+// batch scanner (where a span starts), so a spelling the parser learns is a
+// spelling the stream sees. Mode 18's `<name>` was accepted by the parser
+// for a month while the holdback knew only `<function=`, so it worked off
+// stream only; `<parameter_name>` (2026-08-25, pylint-6903) went to a
+// client as text for the same reason and ended the session.
+inline size_t bare_native_opener_position(const std::string& text,
+                                          JsonStringLexState string_state={},
+                                          MarkdownFenceLexState fence_state={},
+                                          bool end_is_final=true) {
+    for(size_t i=0;i<text.size();i++) {
+        if(text[i]=='<' && bare_native_opener_len_at(text,i) &&
+           bare_context_is_executable(
+               text,i,string_state,fence_state,end_is_final)) return i;
+        consume_bare_text_context(string_state,fence_state,text[i]);
+    }
+    return std::string::npos;
+}
+// Start of the longest suffix that can still become an opener, so a chunk
+// boundary inside one does not leak its head as visible text.
+inline size_t bare_native_opener_probe_start(
+    const std::string& text,JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={}) {
+    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    size_t best=std::string::npos;
+    for(const char* o:k) {
+        const size_t n=std::char_traits<char>::length(o);
+        const size_t cap=std::min(text.size(),n-1);
+        for(size_t len=cap;len;--len) {
+            const size_t start=text.size()-len;
+            if(text.compare(start,len,o,len)!=0) continue;
+            if(best==std::string::npos || start<best) best=start;
+            break;
+        }
+    }
+    if(best==std::string::npos) return best;
+    if(!bare_text_position_is_executable(text,best,string_state,fence_state,false))
+        return std::string::npos;
+    return best;
+}
+
+// A mode-22 opener in streamed bare TEXT: `<parameter=NAME>` where NAME is a
+// declared tool, followed by another `<parameter=` (a real argument) or by
+// `</function>` (a zero-argument call). The parameter-as-opener shape reaches
+// the text holdback the same way `<function=` does -- the splitter only routes
+// a `<tool_call>`-wrapped call to TOOL -- but the holdback never armed on it,
+// so a bare mode-22 batch streamed out as text and never fired (issue #38,
+// cosmicnag, 2026-08-26). The no-required zero-arg gate is applied later by the
+// parser; arming is enough. `<parameter=key>` whose key is not a declared tool
+// (an ordinary parameter) does not arm.
+template<class NameSet>
+inline size_t bare_mode22_opener_position(const std::string& text,const NameSet& names,
+                                          JsonStringLexState string_state={},
+                                          MarkdownFenceLexState fence_state={},
+                                          bool end_is_final=true) {
+    for(size_t i=0;i<text.size();i++) {
+        if(text[i]=='<' && text.compare(i,11,"<parameter=")==0) {
+            std::string key; size_t after=0;
+            if(parse_parameter_opener(text,i,key,after) && names.find(key)!=names.end()) {
+                const size_t nb=text.find_first_not_of(" \t\r\n",after);
+                const bool param_next=nb!=std::string::npos && text.compare(nb,11,"<parameter=")==0;
+                const bool zero_arg=nb!=std::string::npos && text.compare(nb,11,"</function>")==0;
+                if((param_next||zero_arg||(end_is_final&&nb==std::string::npos)) &&
+                   bare_context_is_executable(text,i,string_state,fence_state,end_is_final))
+                    return i;
+            }
+        }
+        consume_bare_text_context(string_state,fence_state,text[i]);
+    }
+    return std::string::npos;
+}
+// Start of a trailing `<parameter=...` that could STILL become a mode-22
+// opener once more bytes arrive, so its head is held rather than leaked. Unlike
+// `<function=` (an unambiguous 11-char prefix that arms immediately), a
+// `<parameter=` is ambiguous with an ordinary parameter, so it is held only
+// while unresolved: a partial `<parameter` prefix, a `<parameter=NAME` whose
+// tag or declared-ness is not yet decidable, or a `<parameter=NAME>` (declared)
+// whose boundary token has not arrived. A closed tag with an undeclared name,
+// or a declared name followed by a real value, is not an opener and is not
+// held.
+template<class NameSet>
+inline size_t bare_mode22_opener_probe_start(
+    const std::string& text,const NameSet& names,
+    JsonStringLexState string_state={},MarkdownFenceLexState fence_state={}) {
+    static const std::string O="<parameter=";
+    size_t hold=std::string::npos;
+    // (1) a trailing partial prefix of "<parameter="
+    for(size_t len=std::min(text.size(),O.size()-1);len;--len) {
+        const size_t start=text.size()-len;
+        if(text.compare(start,len,O.c_str(),len)==0) { hold=start; break; }
+    }
+    // (2) the last complete "<parameter=" whose opener-ness is undecided
+    const size_t p=text.rfind(O);
+    if(p!=std::string::npos) {
+        std::string key; size_t after=0;
+        if(!parse_parameter_opener(text,p,key,after)) {
+            hold=(hold==std::string::npos?p:std::min(hold,p));   // tag not closed
+        } else if(names.find(key)!=names.end()) {
+            const size_t nb=text.find_first_not_of(" \t\r\n",after);
+            bool decided=false;
+            if(nb!=std::string::npos && text[nb]!='<') decided=true;  // a value -> ordinary param
+            else if(nb!=std::string::npos) {
+                // a '<' has started: decided only once it is long enough to be
+                // classified as `<parameter=` / `</function>` or ruled out
+                const size_t avail=text.size()-nb;
+                decided = avail>=11 ||
+                          (text.compare(nb,std::min(avail,(size_t)11),"<parameter=",std::min(avail,(size_t)11))!=0 &&
+                           text.compare(nb,std::min(avail,(size_t)11),"</function>",std::min(avail,(size_t)11))!=0);
+            }
+            if(!decided) hold=(hold==std::string::npos?p:std::min(hold,p));
+        }
+    }
+    if(hold==std::string::npos) return hold;
+    if(!bare_text_position_is_executable(text,hold,string_state,fence_state,false))
+        return std::string::npos;
+    return hold;
+}
+// End of a bare native-dialect candidate: the first </function> that closes
+// a parameter (or an empty call), plus one stray </tool_call> right after it.
+// A </function> inside a value is preceded by value bytes, not </parameter>,
+// so it does not end the call -- the same boundary the parser's value-closer
+// search keeps. npos while the candidate is still open, including while the
+// bytes after the closer could still become </tool_call>.
+struct IncrementalBareNativeEnd {
+    size_t cursor=0;
+    void begin() { cursor=0; }
+    static bool closes_call(const std::string& text,size_t closer) {
+        size_t b=closer;
+        while(b>0 && (text[b-1]==' ' || text[b-1]=='\t' ||
+                      text[b-1]=='\r' || text[b-1]=='\n')) b--;
+        static const std::string PC="</parameter>";
+        if(b>=PC.size() && text.compare(b-PC.size(),PC.size(),PC)==0)
+            return true;
+        const size_t gt=text.find('>');
+        return gt!=std::string::npos && gt+1==b &&
+               text.find("<parameter=")==std::string::npos;
+    }
+    size_t advance(const std::string& text,bool final) {
+        static const std::string FC="</function>",TC="</tool_call>";
+        for(size_t p=text.find(FC,cursor);p!=std::string::npos;
+            p=text.find(FC,p+1)) {
+            if(!closes_call(text,p)) continue;
+            size_t e=p+FC.size();
+            size_t q=e;
+            while(q<text.size() && (text[q]==' ' || text[q]=='\t' ||
+                                    text[q]=='\r' || text[q]=='\n')) q++;
+            const size_t avail=text.size()-q;
+            if(avail>=TC.size()) {
+                if(text.compare(q,TC.size(),TC)==0) e=q+TC.size();
+            } else if(!final && text.compare(q,avail,TC,0,avail)==0) {
+                return std::string::npos;
+            }
+            return e;
+        }
+        cursor=text.size()>=FC.size()?text.size()-FC.size()+1:0;
+        return std::string::npos;
+    }
+};
+// First </function> in [from, end) that closes a call (see
+// IncrementalBareNativeEnd::closes_call); npos when none does. Callers fall
+// back to the first literal closer so a call missing its </parameter> still
+// bounds where it always did; only a closer INSIDE a value moves.
+inline size_t native_function_closer(const std::string& text,size_t from=0) {
+    static const std::string FC="</function>";
+    for(size_t p=text.find(FC,from);p!=std::string::npos;p=text.find(FC,p+1))
+        if(IncrementalBareNativeEnd::closes_call(text,p)) return p;
+    return std::string::npos;
+}
 // Return the byte after the first balanced top-level object, or npos while
 // the candidate is incomplete. Braces inside JSON strings do not count.
 struct IncrementalBareJsonEnd {
@@ -2444,6 +3626,127 @@ inline bool bare_candidate_repair_eligible(
     return object<text.size() && text[object]=='{';
 }
 
+// ---- Dialect residue -------------------------------------------------------
+// The bytes a model leaves around a call that are neither the call nor text:
+// a doubled <tool_call> opener, the closer/opener between two calls it ran
+// together, a stray closer ahead of the wrapper, a truncated closer at the
+// end. Shown to a client they read as garbage -- issue #38, third round:
+// "</function>\n<tool_call>" in the visible content ahead of a call that
+// then worked.
+
+// Length of a residue token at s[i] within [i,end): a complete closer or
+// wrapper token, or a truncated closer (`</functio`) that ends where a token
+// would -- at whitespace, at the next tag, or at `end`. 0 if none.
+inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t end,
+                                      bool params_are_residue = true) {
+    // a mode-22 opener with nothing inside it up to the bound --
+    // `<parameter=TaskUpdate>\n</function>`, the model starting a call and
+    // abandoning it -- is residue: mode 22 refuses a zero-parameter opener,
+    // so there is no call to make and no value to show. NOT `<function=`:
+    // `<function=TaskList>\n</function>` is a legal zero-parameter call.
+    if (params_are_residue && s.compare(i, 11, "<parameter=") == 0) {
+        const size_t gt = s.find('>', i);
+        if (gt != std::string::npos && gt < end) {
+            size_t q = gt + 1;
+            while (q < end) {
+                if (isspace((unsigned char)s[q])) { q++; continue; }
+                size_t n = 0;
+                for (const char* tk : {"</function>", "</parameter>", "</tool_call>"}) {
+                    const size_t m = strlen(tk);
+                    if (q + m <= end && s.compare(q, m, tk) == 0) { n = m; break; }
+                }
+                if (!n) break;
+                q += n;
+            }
+            if (q == end) return gt + 1 - i;
+        }
+    }
+    // an EMPTY name tag -- `<name>` or `<parameter_name>` with only whitespace
+    // before the next tag or the bound -- is residue: the tag that carries the
+    // name follows it (pylint-6903 opened the tag twice)
+    for (const char* nt : {"<name>", "<parameter_name>"}) {
+        const size_t n = strlen(nt);
+        if (i + n <= end && s.compare(i, n, nt) == 0) {
+            size_t q = i + n;
+            while (q < end && isspace((unsigned char)s[q])) q++;
+            if (q == end || s[q] == '<') return n;
+        }
+    }
+    // the `{"tool_call":` JSON-keyed opener head, when it wraps an object: the
+    // xmlclose retry blanks it to make the batch parse, and it is residue in
+    // front of the first recovered call, not text (drift corpus ea9ead21)
+    if (s.compare(i, 13, "{\"tool_call\":") == 0) {
+        // the wrapped object can begin exactly at `end` (it IS the call being
+        // absorbed), so check the full string, not [i,end)
+        const size_t q = s.find_first_not_of(" \t\r\n", i + 13);
+        if (q != std::string::npos && q < s.size() && s[q] == '{') return 13;
+    }
+    for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
+                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>"}) {
+        const size_t n = strlen(tk);
+        if (i + n <= end && s.compare(i, n, tk) == 0) return n;
+        size_t l = 0;
+        while (i + l < end && l < n - 1 && s[i + l] == tk[l]) l++;
+        if (l >= 2 && (i + l == end || isspace((unsigned char)s[i + l]) || s[i + l] == '<')) return l;
+    }
+    return 0;
+}
+
+// The maximal suffix of `s` made of whitespace and residue tokens. `start` is
+// where it begins (s.size() if none); `complete` says a whole token is in it;
+// `partial` says it ends in a truncated token, which a later chunk may finish.
+struct DialectResidueSuffix { size_t start; bool complete; bool partial; };
+inline DialectResidueSuffix dialect_residue_suffix(const std::string& s,
+                                                  bool params_are_residue = true) {
+    DialectResidueSuffix r{0, false, false};
+    size_t i = 0;
+    while (i < s.size()) {
+        if (isspace((unsigned char)s[i])) { i++; continue; }
+        const size_t n = dialect_residue_token_at(s, i, s.size(), params_are_residue);
+        if (!n) { i++; r.start = i; r.complete = false; r.partial = false; continue; }
+        // a truncated token only counts at the very end
+        const bool whole = i + n < s.size() || s.compare(i, n, "</function>") == 0 ||
+                           s.compare(i, n, "</parameter>") == 0 || s.compare(i, n, "</tool_call>") == 0 ||
+                           s.compare(i, n, "<tool_call>") == 0;
+        if (whole) r.complete = true; else r.partial = true;
+        i += n;
+    }
+    if (r.start == s.size()) { r.complete = false; r.partial = false; }
+    return r;
+}
+
+// Widen each recovered call's span over the residue next to it -- only when
+// at least one token is absorbed, so ordinary whitespace shape stays, and
+// never across a neighbouring call. Text between content and residue stays
+// text; the whitespace between residue and the call goes with the residue.
+inline void absorb_dialect_residue(const std::string& text, std::vector<ToolCall>& calls) {
+    for (size_t k = 0; k < calls.size(); k++) {
+        ToolCall& c = calls[k];
+        if (c.source_begin == std::string::npos || c.source_end == std::string::npos) continue;
+        const size_t ub = k + 1 < calls.size() ? calls[k + 1].source_begin : text.size();
+        size_t i = c.source_end, last_tok_end = c.source_end;
+        bool tok = false;
+        while (i < ub) {
+            if (isspace((unsigned char)text[i])) { i++; continue; }
+            const size_t n = dialect_residue_token_at(text, i, ub);
+            if (!n) break;
+            i += n; last_tok_end = i; tok = true;
+        }
+        if (tok) c.source_end = i == ub ? ub : last_tok_end;
+        const size_t lb = k ? calls[k - 1].source_end : 0;
+        size_t j = lb, content_end = lb, first_tok = std::string::npos;
+        while (j < c.source_begin) {
+            if (isspace((unsigned char)text[j])) { j++; continue; }
+            const size_t n = dialect_residue_token_at(text, j, c.source_begin);
+            if (!n) { j++; content_end = j; first_tok = std::string::npos; continue; }
+            if (first_tok == std::string::npos) first_tok = j;
+            j += n;
+        }
+        if (first_tok != std::string::npos) c.source_begin = content_end == lb ? lb : first_tok;
+        c.raw = text.substr(c.source_begin, c.source_end - c.source_begin);
+    }
+}
+
 // Streaming handlers cannot retract text after it reaches the wire. Hold only
 // plausible wrapper-less call prefixes, classify complete strict candidates,
 // and defer a balanced-but-malformed candidate until final tolerant recovery.
@@ -2466,14 +3769,42 @@ struct BareToolTextHoldback {
     bool input_final=false;
     bool input_allow_repair=false;
     bool ordinary_call_seen=false;
+    bool native=false; // holding a wrapper-less <function=...> candidate
+    // Dialect residue that sat right before the candidate (a stray
+    // `</function>`, a doubled opener). Not emitted when the candidate is
+    // armed: it is classified together with the candidate, where the parser
+    // folds it into an accepted call's span, and it goes back in front of a
+    // candidate that is released as text. Issue #38, third round.
+    std::string pre_residue;
     IncrementalBareJsonEnd scan;
+    IncrementalBareNativeEnd native_scan;
     JsonStringLexState string_state;
     MarkdownFenceLexState fence_state;
 
     template<class EmitText>
     void emit_visible(const std::string& text,EmitText&& emit_text) {
+        if(text.empty()) return;
+        // held residue turned out to precede ordinary text: it was the
+        // model's own text after all, so it goes out in front of it
+        if(!pre_residue.empty()) {
+            std::string held;
+            held.swap(pre_residue);
+            consume_bare_text_context(string_state,fence_state,held);
+            emit_text(held);
+        }
         consume_bare_text_context(string_state,fence_state,text);
-        if(!text.empty()) emit_text(text);
+        emit_text(text);
+    }
+    // Emit a head of non-candidate text, keeping its trailing dialect
+    // residue back: what follows decides whether it was garbage ahead of a
+    // call (folded into the call by the parser) or text (re-attached above).
+    template<class EmitText>
+    void emit_head(std::string head,EmitText&& emit_text) {
+        const DialectResidueSuffix r=dialect_residue_suffix(head);
+        std::string tail;
+        if(r.complete || r.partial) { tail=head.substr(r.start); head.erase(r.start); }
+        emit_visible(head,emit_text);
+        pre_residue+=tail;
     }
 
     template<class EmitText,class EmitCandidate>
@@ -2485,18 +3816,22 @@ struct BareToolTextHoldback {
         auto visible=[&](const std::string& text) {
             emit_visible(text,emit_text);
         };
+        std::string source=pre_residue;
+        source+=pending;
+        pre_residue.clear();
         const BareToolCandidateResult result=
-            emit_candidate(pending,allow_repair,visible);
+            emit_candidate(source,allow_repair,visible);
         if(!result.parsed) {
             if(defer_failure) {
-                deferred=std::move(pending);
+                deferred=std::move(source);
                 deferred_mode10=candidate_mode10;
-            } else visible(pending);
+            } else visible(source);
         }
         if(!candidate_mode10 && result.accepted) ordinary_call_seen=true;
         pending.clear();
         holding=false;
         mode10=false;
+        native=false;
         string_state.reset();
         return !result.parsed && defer_failure;
     }
@@ -2521,9 +3856,14 @@ struct BareToolTextHoldback {
                 const size_t mode10_pos=ordinary_call_seen?std::string::npos:
                     bare_mode10_signature_position(
                         remaining,names,string_state,fence_state,input_final);
-                const size_t opener=object_pos==std::string::npos?mode10_pos:
-                    mode10_pos==std::string::npos?object_pos:
-                    std::min(object_pos,mode10_pos);
+                const size_t native_pos=bare_native_opener_position(
+                    remaining,string_state,fence_state,input_final);
+                const size_t mode22_pos=bare_mode22_opener_position(
+                    remaining,names,string_state,fence_state,input_final);
+                size_t opener=object_pos;
+                if(mode10_pos<opener) opener=mode10_pos;
+                if(native_pos<opener) opener=native_pos;
+                if(mode22_pos<opener) opener=mode22_pos;
                 if(opener==std::string::npos) {
                     size_t keep=input_final || ordinary_call_seen?std::string::npos:
                         bare_mode10_probe_start(
@@ -2534,22 +3874,34 @@ struct BareToolTextHoldback {
                         if(inline_keep!=std::string::npos)
                             keep=keep==std::string::npos?inline_keep:
                                  std::min(keep,inline_keep);
+                        const size_t native_keep=bare_native_opener_probe_start(
+                            remaining,string_state,fence_state);
+                        if(native_keep!=std::string::npos)
+                            keep=keep==std::string::npos?native_keep:
+                                 std::min(keep,native_keep);
+                        const size_t m22_keep=bare_mode22_opener_probe_start(
+                            remaining,names,string_state,fence_state);
+                        if(m22_keep!=std::string::npos)
+                            keep=keep==std::string::npos?m22_keep:
+                                 std::min(keep,m22_keep);
                     }
-                    if(keep==std::string::npos) emit_visible(remaining,emit_text);
+                    if(keep==std::string::npos) emit_head(remaining,emit_text);
                     else {
-                        emit_visible(remaining.substr(0,keep),emit_text);
+                        emit_head(remaining.substr(0,keep),emit_text);
                         probe=remaining.substr(keep);
                     }
                     return;
                 }
-                if(opener) emit_visible(remaining.substr(0,opener),emit_text);
+                if(opener) emit_head(remaining.substr(0,opener),emit_text);
                 pending=remaining.substr(opener);
                 holding=true;
                 mode10=mode10_pos==opener;
-                scan.begin(mode10);
+                native=!mode10 && object_pos!=opener &&
+                       (native_pos==opener || mode22_pos==opener);
+                if(native) native_scan.begin(); else scan.begin(mode10);
                 remaining.clear();
             }
-            if(!mode10 && !plausible_bare_tool_prefix(pending)) {
+            if(!mode10 && !native && !plausible_bare_tool_prefix(pending)) {
                 std::string retry=std::move(pending);
                 pending.clear();
                 holding=false;
@@ -2557,11 +3909,22 @@ struct BareToolTextHoldback {
                 remaining=retry.substr(1);
                 continue;
             }
-            const size_t end=scan.advance(pending);
+            const size_t end=native?native_scan.advance(pending,input_final)
+                                   :scan.advance(pending);
             if(end==std::string::npos) return;
             std::string trailing=pending.substr(end);
             pending.resize(end);
-            const bool defer_failure=!input_final &&
+            if(native) {
+                // the scanner swallowed a stray </tool_call> so it would not
+                // surface as prose; the candidate itself has no wrapper
+                static const std::string TC="</tool_call>";
+                size_t b=pending.size();
+                while(b>0 && (pending[b-1]==' ' || pending[b-1]=='\t' ||
+                              pending[b-1]=='\r' || pending[b-1]=='\n')) b--;
+                if(b>=TC.size() && pending.compare(b-TC.size(),TC.size(),TC)==0)
+                    pending.resize(b-TC.size());
+            }
+            const bool defer_failure=!input_final && !native &&
                 bare_candidate_repair_eligible(pending,names,mode10);
             if(flush_candidate(input_final && input_allow_repair,
                                emit_text,emit_candidate,defer_failure)) {
@@ -2603,10 +3966,187 @@ struct BareToolTextHoldback {
         flush_candidate(allow_repair,emit_text,emit_candidate);
     }
 
+    // The holdback has a call candidate in flight: armed (holding), speculatively
+    // held in `probe`, mid-parse in `pending`, or a deferred-failure repair.
+    // Used by the router so it will not strip a trailing `</function>` (a
+    // candidate's own closer) into residue while a candidate is open.
+    bool pending_candidate() const {
+        return holding || !probe.empty() || !pending.empty() || !deferred.empty();
+    }
+
     void reset_context() {
         string_state.reset();
         fence_state.reset();
         ordinary_call_seen=false;
+        pre_residue.clear();
+    }
+};
+
+// ---- Streaming tool routing shared by the SSE handlers ---------------------
+// Issue #38, reopened (cosmicnag, 2026-08-25). The /v1/messages and
+// /v1/chat/completions SSE handlers each carried a hand-copied twin of the
+// per-chunk routing below. 152d3a2 gave one twin a reasoning holdback and
+// missed the other, so on /v1/chat/completions a call emitted inside <think>
+// still streamed out as reasoning_content and never fired; and even the fixed
+// twin never blanked the <tool_call> wrapper before classifying reasoning, so
+// only the bare shape recovered there. Twins drift. This is the one copy,
+// tested through the real StreamSplitter (tools/test_openai_bridge.cpp).
+
+// Inside reasoning a literal <tool_call> wrapper survives the splitter (it
+// scans THINK for </think> only) and the display lexer treats it as an inert
+// container, so the holdback never arms on the call inside it. The non-stream
+// THINK branch blanks the two wrapper tokens (length-preserving) before
+// classification; this does the same for a stream, where a token can straddle
+// two chunks: the longest tail that is a proper prefix of either token is held
+// until the next chunk decides what it was.
+struct ThinkWrapperBlanker {
+    std::string held;
+    static const char* const* tokens() {
+        static const char* const k[2] = {"<tool_call>", "</tool_call>"};
+        return k;
+    }
+    std::string feed(const std::string& t) {
+        held += t;
+        for (int i = 0; i < 2; i++) {
+            const char* tk = tokens()[i];
+            const size_t n = std::char_traits<char>::length(tk);
+            for (size_t at = held.find(tk); at != std::string::npos; at = held.find(tk, at + n))
+                held.replace(at, n, std::string(n, ' '));
+        }
+        size_t keep = 0;
+        for (int i = 0; i < 2; i++) {
+            const char* tk = tokens()[i];
+            const size_t n = std::char_traits<char>::length(tk);
+            for (size_t k = std::min(n - 1, held.size()); k > keep; k--)
+                if (held.compare(held.size() - k, k, tk, k) == 0) { keep = k; break; }
+        }
+        std::string out = held.substr(0, held.size() - keep);
+        held.erase(0, held.size() - keep);
+        return out;
+    }
+    std::string flush() { std::string out; out.swap(held); return out; }
+};
+
+// The per-request routing state a streaming handler keeps between splitter
+// segments: the TEXT holdback, the reasoning holdback (never shared with TEXT:
+// the display-context lexer state is per-channel, and a fence opened in prose
+// must not silence a call in reasoning), the wrapper blanker for reasoning,
+// and the wrapped segment being collected. The handler supplies what differs
+// between endpoints -- how a text delta, a reasoning delta, a complete
+// wrapped segment and a bare-chain classification are emitted.
+struct StreamToolRouter {
+    BareToolTextHoldback bare_text;
+    BareToolTextHoldback think_text;
+    ThinkWrapperBlanker think_blank;
+    // A TEXT chunk's trailing dialect residue (a stray `</function>`, a
+    // truncated closer), held until the next segment says what it was:
+    // garbage ahead of a wrapper (dropped), or the model's own text (shown).
+    std::string text_residue;
+    std::string tool_buf;
+    bool has_tools = false;
+    // Drift corpus: the holdback decides whether the parser runs at all, so a
+    // turn whose text carries dialect markup in a shape no opener matches
+    // (`<tool_use>\n<tool>\n<parameter_name>Read...`, seen live 2026-08-25)
+    // would never be recorded. Keep the turn's text, bounded, and record it
+    // at finish when nothing else did. Only with Q27_DRIFT_CORPUS set.
+    std::string text_seen;
+    size_t records_at_start = drift_records_written;
+    static constexpr size_t kTextSeenCap = 64 * 1024;
+
+    template<class Names, class EmitText, class Classify>
+    void release_text_residue(const Names& names, EmitText&& emit_text, Classify&& classify) {
+        if (text_residue.empty()) return;
+        std::string held;
+        held.swap(text_residue);
+        bare_text.route(held, names, emit_text, classify);
+    }
+
+    template<class Names, class EmitThink, class Classify>
+    void settle_think(const Names& names, EmitThink&& emit_think, Classify&& classify,
+                      bool allow_repair = false) {
+        const std::string tail = think_blank.flush();
+        if (!tail.empty()) think_text.route(tail, names, emit_think, classify);
+        think_text.finish(allow_repair, names, emit_think, classify);
+        think_text.reset_context();
+    }
+    template<class Names, class EmitText, class Classify>
+    void settle_text(const Names& names, EmitText&& emit_text, Classify&& classify,
+                     bool allow_repair = false) {
+        bare_text.finish(allow_repair, names, emit_text, classify);
+        bare_text.reset_context();
+    }
+
+    // One splitter segment. emit_tool consumes tool_buf (a complete wrapped
+    // segment); classify is the bare-chain callback both holdbacks use.
+    template<class Names, class EmitText, class EmitThink, class EmitTool, class Classify>
+    void segment(StreamSplitter::Chan ch, const std::string& t, bool forced_control_token,
+                 const Names& names, EmitText&& emit_text, EmitThink&& emit_think,
+                 EmitTool&& emit_tool, Classify&& classify) {
+        if (ch == StreamSplitter::TOOL) {
+            if (tool_buf.empty()) {
+                text_residue.clear();   // residue ahead of a wrapper is garbage
+                settle_text(names, emit_text, classify);
+                settle_think(names, emit_think, classify);
+            }
+            tool_buf += t;
+            return;
+        }
+        if (!tool_buf.empty()) emit_tool();
+        if (t.empty()) return;
+        if (ch == StreamSplitter::THINK) {
+            release_text_residue(names, emit_text, classify);
+            settle_text(names, emit_text, classify);
+            if (has_tools) think_text.route(think_blank.feed(t), names, emit_think, classify);
+            else emit_think(t);
+            return;
+        }
+        // leaving reasoning: settle any held candidate as thinking before
+        // the channel changes
+        settle_think(names, emit_think, classify);
+        // Only decoder-injected close whitespace is parser control. Ordinary
+        // leading whitespace, including after a natural close, is content.
+        if (forced_control_token && strip_ws2(t).empty()) return;
+        if (!has_tools) { emit_text(t); return; }
+        if (drift_corpus_path() && text_seen.size() < kTextSeenCap) text_seen += t;
+        std::string chunk;
+        chunk.swap(text_residue);
+        chunk += t;
+        // Hold a chunk's trailing dialect residue back only when NO candidate
+        // is open: once the holdback is holding one, a trailing `</function>`
+        // is that call's own closer, not a stray to drop (issue #38 bare
+        // mode-22). And a `<parameter=` opener is never held (the holdback's
+        // probe holds a partial one), so a bare mode-22 opener reaches route().
+        if (!bare_text.pending_candidate()) {
+            const DialectResidueSuffix r =
+                dialect_residue_suffix(chunk, /*params_are_residue=*/false);
+            if (r.complete || r.partial) {
+                text_residue = chunk.substr(r.start);
+                chunk.erase(r.start);
+            }
+        }
+        if (!chunk.empty()) bare_text.route(chunk, names, emit_text, classify);
+    }
+
+    // Generation end, after the splitter flush and the wrapped-tail handling.
+    // A turn that ended still inside <think> can hold a complete call; without
+    // this it is lost exactly as issue #38 reported.
+    template<class Names, class EmitText, class EmitThink, class Classify>
+    void finish(bool allow_repair, const Names& names, EmitText&& emit_text,
+                EmitThink&& emit_think, Classify&& classify) {
+        settle_think(names, emit_think, classify, allow_repair);
+        // a complete closer with nothing after it is residue; a truncated one
+        // could have been the model's own text, and is shown
+        // ...but a trailing `</function>` while the holdback is still holding
+        // is the candidate's own closer (bare mode-22, issue #38); keep it so
+        // release_text_residue feeds it to the candidate.
+        if (!bare_text.pending_candidate() &&
+            dialect_residue_suffix(text_residue, /*params_are_residue=*/false).complete)
+            text_residue.clear();
+        release_text_residue(names, emit_text, classify);
+        settle_text(names, emit_text, classify, allow_repair);
+        if (drift_corpus_path() && drift_records_written == records_at_start &&
+            drift_bearing(text_seen, nullptr))
+            capture_drift(text_seen, "unrescued", nullptr);
     }
 };
 
@@ -3052,12 +4592,369 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
     return false;
 }
 
+inline bool only_dialect_control_bytes(const std::string& s) {
+    size_t i=0;
+    bool saw_marker=false;
+    while(i<s.size()) {
+        if(isspace((unsigned char)s[i])) { i++; continue; }
+        if(s.compare(i,11,"<tool_call>")==0) { i+=11; saw_marker=true; continue; }
+        if(s.compare(i,12,"</tool_call>")==0) { i+=12; saw_marker=true; continue; }
+        // A TRUNCATED marker at the very end is residue too: the model emitted
+        // `<tool_call` and stopped, so there is no name, no arguments, nothing
+        // to execute -- but it became the user's whole visible answer, which is
+        // the failure #32 fixed for the complete marker. Only as the FINAL
+        // token, and only long enough to identify (a bare "<t" could begin
+        // anything), so a marker followed by prose is still shown.
+        {
+            const std::string rest = s.substr(i);
+            for (const char* m : {"<tool_call>", "</tool_call>"}) {
+                const size_t n = strlen(m);
+                if (rest.size() >= 4 && rest.size() < n &&
+                    strncmp(m, rest.c_str(), rest.size()) == 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+    return saw_marker; // pure whitespace is not this function's business
+}
+
+// Would parse_tool_call() silently discard part of this wrapped body?
+// parse_native_xml_call reads ONE call and stops, so a segment carrying several
+// calls loses every one after the first, and trailing prose after the last
+// </function> disappears with them. Measured 2026-08-21: a 14-call turn came
+// back as 1 call. Where this returns true the segment goes through the same
+// batch-aware chain that TEXT uses instead.
+inline bool wrapped_body_exceeds_one_call(const std::string& body) {
+    size_t openers = 0;
+    for (size_t c = body.find("<function"); c != std::string::npos;
+         c = body.find("<function", c + 9)) {
+        std::string nm;
+        size_t after;
+        if (parse_function_opener(body, c, nm, after) && ++openers > 1) return true;
+    }
+    if (openers == 0) return false;
+    // A mode-22 opener after a closed call -- `</function>\n<parameter=Bash>\n
+    // <parameter=command>...` -- is a second call the strict parser would
+    // silently drop (it reads one call and stops). An opener with nothing
+    // inside (`<parameter=TaskUpdate>\n</function>`) is an aborted call and
+    // stays here, where the strict parser now stops at `</function>` and the
+    // tail is dropped as residue.
+    for (size_t fc = body.find("</function>"); fc != std::string::npos; fc = body.find("</function>", fc + 11)) {
+        size_t q = body.find_first_not_of(" \t\r\n", fc + 11);
+        if (q == std::string::npos) break;
+        std::string k;
+        size_t after;
+        if (!parse_parameter_opener(body, q, k, after)) continue;
+        size_t r = body.find_first_not_of(" \t\r\n", after);
+        std::string k2;
+        size_t after2;
+        if (r != std::string::npos && parse_parameter_opener(body, r, k2, after2)) return true;
+    }
+    const size_t last = body.rfind("</function>");
+    if (last == std::string::npos) return false;
+    return body.find_first_not_of(" \t\r\n", last + 11) != std::string::npos;
+}
+
+// First position at or after `from` where either spelling of a parameter tag
+// opens. The drift modes below scan for parameters with their own literals, and
+// a mode that only knows `<parameter=` cannot see `<parameter name="KEY">` --
+// which would leave the attribute form working only for calls that ALSO carry a
+// well-formed <function...> opener, i.e. the case least in need of rescue.
+inline size_t find_parameter_opener(const std::string& s, size_t from,
+                                    std::string* key = nullptr, size_t* after = nullptr) {
+    for (size_t c = s.find("<parameter", from); c != std::string::npos;
+         c = s.find("<parameter", c + 10)) {
+        std::string k;
+        size_t a;
+        if (parse_parameter_opener(s, c, k, a)) {
+            if (key) *key = k;
+            if (after) *after = a;
+            return c;
+        }
+    }
+    return std::string::npos;
+}
+
+// Blank the XML dialect's markers where they sit OUTSIDE a JSON string.
+//
+// The model sometimes terminates a JSON call body with `</parameter></function>`
+// instead of its final `}` -- the arguments are complete, the terminator is
+// simply in the other dialect. The EOF brace repair only fires when the
+// candidate is last in the text (right: bytes after a truncated call mean the
+// model moved on, and repairing then invents content), so that residue blocked
+// a call that had lost nothing.
+//
+// Outside a JSON string these tokens can never be valid JSON, so replacing them
+// with spaces cannot change any parse that already succeeded. Spaces rather than
+// deletion, so every source offset is preserved and the call spans stay valid --
+// a shifted span is how a mode-20 batch used to throw std::out_of_range out of
+// the request handler. Inside a string they are content and are left alone.
+inline std::string blank_dialect_closers_outside_strings(const std::string& s) {
+    static const char* const kClosers[] = {"</parameter>", "</function>", "</tool_call>"};
+    std::string out = s;
+    // Only bytes WE blanked may be overwritten by the brace repair below.
+    // Writing a '}' over any convenient space corrupts real content -- it
+    // turned `"content": "hello"` into `"content":}"hello"` the first time
+    // this was written.
+    std::vector<bool> blanked(s.size(), false);
+    size_t blanked_end = std::string::npos;   // end of the last blanked marker
+    bool in_str = false, esc = false;
+    for (size_t i = 0; i < out.size(); i++) {
+        const char c = out[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        // A `{"tool_call":` JSON-keyed opener (drift mode 4) whose value is an
+        // OBJECT, so `{"tool_call":\n{"name":...}}\n</tool_call>\n{"name":...}`
+        // -- the model wraps the first call of a batch in the opener and never
+        // closes its brace, which leaves the whole batch one malformed blob and
+        // the main scan recovered only the last call (drift corpus ea9ead21).
+        // Blanking the head (its brace included) makes the inner objects
+        // top-level, and the JSON batch scan reads them all. Only here, in the
+        // last-resort retry, so a well-formed single mode-4 call -- handled
+        // upstream -- never reaches it.
+        if (c == '{' && out.compare(i, 13, "{\"tool_call\":") == 0) {
+            const size_t q = out.find_first_not_of(" \t\r\n", i + 13);
+            if (q != std::string::npos && out[q] == '{') {
+                for (size_t k = 0; k < 13; k++) { out[i + k] = ' '; blanked[i + k] = true; }
+                i += 12;
+                blanked_end = i + 1;
+                continue;
+            }
+        }
+        if (c != '<') continue;
+        bool hit = false;
+        for (const char* t : kClosers) {
+            const size_t n = strlen(t);
+            if (out.compare(i, n, t) == 0) {
+                for (size_t k = 0; k < n; k++) { out[i + k] = ' '; blanked[i + k] = true; }
+                i += n - 1;
+                blanked_end = i + 1;
+                hit = true;
+                break;
+            }
+        }
+        if (hit) continue;
+        // The OPENER, but ONLY when it directly follows closer residue. A
+        // batch reads `...}\n</parameter>\n</function>\n<tool_call>\n{...`, and
+        // leaving the opener stopped the scan at the first call. Blanking it
+        // unconditionally is NOT safe: an invalid call followed by a valid one
+        // with a bare `<tool_call>` between them has an ambiguous boundary, and
+        // test_chat_completions_integration refuses that case ON PURPOSE --
+        // merging them would execute a call the model never framed. Requiring
+        // closer residue immediately before keeps the two apart.
+        if (out.compare(i, 11, "<tool_call>") == 0 && blanked_end != std::string::npos &&
+            out.find_first_not_of(" \t\r\n", blanked_end) == i) {
+            for (size_t k = 0; k < 11; k++) { out[i + k] = ' '; blanked[i + k] = true; }
+            i += 10;
+            blanked_end = i + 1;
+        }
+    }
+    // Second pass: put the missing braces back, into the spaces the first pass
+    // just made. Only the LAST unbalanced candidate is eligible for the EOF
+    // brace repair, so a BATCH of these nested instead of separating -- object
+    // two opened inside object one and the scanner saw a single malformed blob.
+    // Writing `}` over a preceding space closes each object where the model
+    // should have, and keeps the length identical so the spans stay valid.
+    int depth = 0;
+    in_str = false;
+    esc = false;
+    for (size_t i = 0; i < out.size(); i++) {
+        const char c = out[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') {
+            // a new top-level call starting while the previous one is still
+            // open is the batch case: close the previous one first
+            if (depth > 0 && out.compare(i, 7, "{\"name\"") == 0) {
+                // Walk back over whitespace, but only WRITE into bytes we
+                // blanked: the newlines between the markers are the model's
+                // own and must stay, while the blanked marker bytes are free.
+                size_t sp = i;
+                while (sp > 0 && depth > 0 &&
+                       (blanked[sp - 1] || out[sp - 1] == ' ' || out[sp - 1] == '\n' ||
+                        out[sp - 1] == '\r' || out[sp - 1] == '\t')) {
+                    if (blanked[sp - 1] && out[sp - 1] == ' ') { out[sp - 1] = '}'; depth--; }
+                    sp--;
+                }
+            }
+            depth++;
+        } else if (c == '}') {
+            if (depth > 0) depth--;
+        }
+    }
+    // and the final one, into its trailing spaces
+    for (size_t i = out.size(); i > 0 && depth > 0; i--) {
+        if (blanked[i - 1] && out[i - 1] == ' ') { out[i - 1] = '}'; depth--; continue; }
+        if (out[i - 1] == ' ' || out[i - 1] == '\n' || out[i - 1] == '\r' ||
+            out[i - 1] == '\t')
+            continue;                       // model whitespace: skip, do not use
+        break;                              // real content: stop, never overwrite it
+    }
+
+    // Third pass: the XML tag-closer landing inside a JSON KEY.
+    //     {"name": "Write", "arguments>
+    //     {"file_path": ..., "content": ...}
+    // The model typed `>` where JSON needs `":`, leaving the key's string
+    // unterminated so nothing downstream parses. `>` becomes the closing quote
+    // and the newline after it becomes the colon: two single-character
+    // substitutions, so no byte moves and the spans stay valid.
+    //
+    // Engages only on `"IDENT>` whose next non-space byte opens a value, which
+    // is why a '>' inside a legitimate string value is untouched -- there the
+    // key's quote already closed and we are not at a key boundary.
+    for (size_t i = 0; i + 1 < out.size(); i++) {
+        if (out[i] != '"') continue;
+        size_t j = i + 1;
+        while (j < out.size() && (isalnum((unsigned char)out[j]) || out[j] == '_')) j++;
+        if (j == i + 1 || j >= out.size() || out[j] != '>') continue;
+        const size_t nb = out.find_first_not_of(" \t\r\n", j + 1);
+        if (nb == std::string::npos || (out[nb] != '{' && out[nb] != '[' && out[nb] != '"'))
+            continue;
+        size_t colon = std::string::npos;
+        for (size_t k = j + 1; k < nb; k++)
+            if (out[k] == '\n' || out[k] == ' ') { colon = k; break; }
+        if (colon == std::string::npos) continue;   // nowhere to put the ':'
+        out[j] = '"';
+        out[colon] = ':';
+        i = nb;
+    }
+    return out;
+}
+
+// A declared tool whose name differs from `nm` only in case. The model's own
+// name for a tool ("task" for Task) is not a different tool, and refusing on
+// case alone loses a call for nothing. UNIQUE match only: an ambiguous registry
+// still refuses, because guessing between two real tools is worse than not
+// calling one.
+inline std::string canonical_declared_name(const json* tools, const std::string& nm) {
+    if (!tools || !tools->is_array() || nm.empty()) return "";
+    auto lower = [](std::string x) {
+        for (auto& ch : x) ch = (char)tolower((unsigned char)ch);
+        return x;
+    };
+    const std::string target = lower(nm);
+    std::string hit;
+    int n = 0;
+    for (const auto& t : *tools) {
+        if (!t.contains("function")) continue;
+        const std::string dn = t["function"].value("name", std::string());
+        if (dn.empty()) continue;
+        if (dn == nm) return dn;              // exact wins outright
+        if (lower(dn) == target) { hit = dn; n++; }
+    }
+    return n == 1 ? hit : std::string();
+}
+
+// Did the model INTEND a tool call that nothing recovered? Used only for the
+// UN-RESCUED warning and the Q27_DRIFT_CORPUS capture, so a false negative here
+// costs a silent drop rather than a wrong call -- which is exactly what it cost:
+// this used to test for {"name" / {"tool_call" alone, so drift mode 22, made
+// entirely of XML tags, produced no log line and no corpus entry for two days.
+// A report of "no rescue logs" was accurate and told us nothing.
+//
+// The XML forms are gated on a `</function>` the model never opened, the same
+// evidence mode 21 requires. Prose that merely quotes a tag (a markdown table
+// of probe commands, say) has no closer and stays unflagged.
+inline bool looks_like_intended_tool_call(const std::string& text_in) {
+    if (text_in.find("{\"name\"") != std::string::npos ||
+        text_in.find("{\"tool_call\"") != std::string::npos)
+        return true;
+    if (text_in.find("</function>") == std::string::npos) return false;
+    return text_in.find("<parameter=") != std::string::npos ||
+           text_in.find("<function") != std::string::npos ||
+           text_in.find("<tool_name>") != std::string::npos;
+}
+
+// HALLUCINATED-RESULT RULE (2026-08-21, unified).
+//
+// Qwen3.8 does not only degrade its tool-call wrapper -- it also invents tool
+// RESULTS wearing the very same tags:
+//
+//   <tool_calls>\n<result>\n<name>Read</name>\n<output>\nfile contents\n</output>
+//   \n<tool_name>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>
+//
+// Promoting that to a call feeds the model's own fiction back as though a tool
+// had produced it, so every dialect recovery has to refuse it. The original
+// guard was a WHOLE-STRING `find("<result>")` over the entire segment, which
+// is both too weak and too strong:
+//
+//   too strong -- a legitimate call preceded by an unrelated, already-CLOSED
+//   `<output>make: up to date</output>` (a quoted result from a prior step,
+//   ordinary prose in an agent transcript) was thrown away wholesale. That is
+//   the production leak behind "sometimes I still see <parameter= / </function>
+//   in the output": the real call was sitting right there and the guard
+//   vetoed the whole recovery chain.
+//
+//   too weak -- it says nothing about WHERE the tags sit, so it cannot
+//   distinguish the two cases at all; it just refuses both.
+//
+// The discriminator is STRUCTURAL, not lexical: does the result element
+// *contain* the candidate call?
+//
+//   (a) a <result>/<output> tag INSIDE the span  -> invented output is being
+//       passed off as a parameter value; refuse.
+//   (b) the span begins INSIDE an unclosed <result>/<output> element -> the
+//       "call" is part of the invented result block; refuse.
+//   otherwise -> every result block is closed before the call starts, so it is
+//       prior context, not a wrapper around this call; ACCEPT.
+//
+// (b) is what catches the real hallucinated shapes above: the model opens
+// <result> and never closes it, so the <tool_name>/<parameter= span it later
+// emits is enclosed by it. (a) catches the inverse -- a well-formed-looking
+// call whose parameter VALUE is a fabricated <result>.
+//
+// Nesting is handled by depth counting rather than a last-open scan, so a
+// closed block followed by an open one still reads as enclosed.
+inline bool hallucinated_result_around(const std::string& s, size_t begin, size_t end) {
+    if (begin == std::string::npos) return false;
+    if (end == std::string::npos || end > s.size()) end = s.size();
+    static const char* const kTags[2][2] = {{"<result>", "</result>"},
+                                            {"<output>", "</output>"}};
+    for (const auto& tg : kTags) {
+        const std::string open = tg[0], close = tg[1];
+        // (a) either tag of the pair occurring within [begin, end)
+        for (const std::string& t : {open, close}) {
+            size_t p = s.find(t, begin);
+            if (p != std::string::npos && p < end) return true;
+        }
+        // (b) unbalanced open before begin == the span is enclosed by it
+        long depth = 0;
+        size_t i = 0;
+        while (i < begin) {
+            size_t o = s.find(open, i), c = s.find(close, i);
+            if (o >= begin && c >= begin) break; // (npos included)
+            if (o < c) { depth++; i = o + open.size(); }
+            else { if (depth > 0) depth--; i = c + close.size(); }
+        }
+        if (depth > 0) return true;
+    }
+    return false;
+}
+
+inline thread_local bool in_dialect_retry = false;
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
                                                    bool allow_o10 = true,
                                                    bool allow_eof_repair = true,
-                                                   std::string* remaining_text = nullptr) {
+                                                   std::string* remaining_text = nullptr);
+inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_in,
+                                                        std::string* prefix,
+                                                        const json* tools,
+                                                        bool allow_o10,
+                                                        bool allow_eof_repair,
+                                                        std::string* remaining_text) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -3065,9 +4962,10 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // campaign can count suppressed rescues against the tolerant leg.
         if (prefix) *prefix = "";
         if (remaining_text) *remaining_text = text_in;
-        if (text_in.find("{\"name\"") != std::string::npos ||
-            text_in.find("{\"tool_call\"") != std::string::npos ||
-            text_in.find("</content>") != std::string::npos)
+        const bool plausible = text_in.find("{\"name\"") != std::string::npos ||
+                               text_in.find("{\"tool_call\"") != std::string::npos ||
+                               text_in.find("</content>") != std::string::npos;
+        if (plausible)
             fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %.200s\n",
                     text_in.c_str());
         return out;
@@ -3163,6 +5061,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] drift mode 14: recovered %zu <tool_name> call(s)\n",
                         xml_calls.size());
+                drift_mode_hint = "14";
                 return xml_calls;
             }
         }
@@ -3233,6 +5132,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     if (remaining_text) *remaining_text = "";
                     fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
                             nm.c_str());
+                    drift_mode_hint = "15";
                     return std::vector<ToolCall>{std::move(tc)};
                 }
             }
@@ -3259,8 +5159,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         static const std::string FN_OPEN = "<function>";
         size_t p = text_in.find(FN_OPEN);
         if (p != std::string::npos && tools && tools->is_array() &&
-            text_in.find("<result>") == std::string::npos &&
-            text_in.find("<output>") == std::string::npos) {
+            !hallucinated_result_around(text_in, p, text_in.size())) {
             size_t ob = text_in.find('{', p + FN_OPEN.size());
             if (ob != std::string::npos) {
                 std::string body = text_in.substr(ob);
@@ -3288,6 +5187,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 16: recovered <function>-wrapped %s\n",
                                     nm.c_str());
+                            drift_mode_hint = "16";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
                         break;
@@ -3308,32 +5208,271 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     //         {"name": "Write",\n<parameter=file_path>\n/x\n</parameter>\n<parameter=content>\n...
     // (a) reuses parse_native_xml_call on the spanned substring. (b) extracts
     // the name from the JSON head and hands the rest to the XML parameter
-    // walk. Both engage only on a declared name; anything carrying <result> or
-    // <output> stays text (the hallucinated-result rule).
-    if (tools && tools->is_array() &&
-        text_in.find("<result>") == std::string::npos &&
-        text_in.find("<output>") == std::string::npos) {
+    // walk. Both engage only on a declared name.
+    //
+    // Hallucinated-result protection (2026-08-21): the outer whole-string
+    // find for <result>/<output> that used to gate this entire block is gone;
+    // each mode below now applies hallucinated_result_around() to its OWN
+    // candidate span. See that helper for why enclosure -- not mere presence
+    // -- is the correct test.
+    if (tools && tools->is_array()) {
         auto declared = [&](const std::string& nm) {
             for (const auto& t : *tools)
                 if (t.contains("function") &&
                     t["function"].value("name", std::string()) == nm) return true;
             return false;
         };
-        // (a) bare <function=NAME>
-        size_t fb = text_in.find("<function=");
-        if (fb != std::string::npos) {
-            ToolCall tc;
-            std::string span = text_in.substr(fb);
-            size_t fe = span.find("</function>");
-            if (fe != std::string::npos) span = span.substr(0, fe + 11);
-            if (parse_native_xml_call(span, tc) && declared(tc.name)) {
+        // A declared tool whose schema lists NO required parameters -- so a
+        // zero-argument call is schema-valid. Used to tell a real zero-arg
+        // mode-22 call (`<parameter=memex_recall>\n</function>`, issue #38)
+        // from an aborted one (`<parameter=TaskUpdate>\n</function>`, where
+        // taskId is required and a zero-arg call would be refused by the
+        // client): the first fires, the second stays residue.
+        auto no_required_params = [&](const std::string& nm) {
+            for (const auto& t : *tools) {
+                if (!t.contains("function") ||
+                    t["function"].value("name", std::string()) != nm) continue;
+                const json params = t["function"].value("parameters", json::object());
+                const json req = params.value("required", json::array());
+                return !req.is_array() || req.empty();
+            }
+            return false;
+        };
+        // (a) a bare opener with no <tool_call> wrapper, in ANY of its
+        // spellings. One scan for "<function" and let parse_function_opener
+        // decide -- before the consolidation this was two searches that between
+        // them still missed <function="NAME">.
+        // BATCHED, because a model that plans emits SEVERAL calls in one turn,
+        // separated by stray <tool_call> markers. Recovering only the first and
+        // returning turned the other thirteen into prose that the agent then
+        // read back as its own answer -- measured 2026-08-21 on
+        // bench-task-queue, where a 14-call turn yielded 1 call and 3480 bytes
+        // of leaked dialect, and the session ended there. Modes 14, 20 and 22
+        // were already batch-capable; this path was the odd one out.
+        // Set when a `<function ...>` opener names a tool that is NOT declared.
+        // Inference downstream must then refuse: mode 21 exists for emissions
+        // with no usable name, not to override one that is present and wrong.
+        // Substituting a tool whose keys happen to fit calls something the
+        // model never asked for.
+        bool named_undeclared = false;
+        {
+            std::vector<ToolCall> batch;
+            size_t cur = 0, first_begin = std::string::npos;
+            // A span starts at any opener spelling the parser accepts (the
+            // table behind bare_native_opener_len_at). A name-tag spelling
+            // (`<name>`, `<parameter_name>`) counts only when the name it
+            // carries is declared: `<name>` is ordinary prose often enough
+            // that an undeclared one must not start -- and break -- a batch.
+            // An opener in the batch, in ANY of its spellings. mode22_name is
+            // set (and mode22_params points at the first real parameter) when
+            // the opener is the mode-22 `<parameter=NAME>` spelling: a call
+            // whose name wears a parameter tag. Reporting it here rather than
+            // in the separate mode-22 pass lets ONE batch mix the spellings --
+            // `<function=X>` then `<parameter=Y>`, the shape a planning turn
+            // emits when it drifts mid-batch (drift corpus 03a8a851, b645b48f).
+            std::string mode22_name;
+            size_t mode22_params = std::string::npos;
+            auto next_opener = [&](size_t from, std::string* m22_name = nullptr,
+                                   size_t* m22_params = nullptr) -> size_t {
+                if (m22_name) m22_name->clear();
+                if (m22_params) *m22_params = std::string::npos;
+                for (size_t c = text_in.find('<', from); c != std::string::npos;
+                     c = text_in.find('<', c + 1)) {
+                    std::string nm_probe;
+                    size_t after_probe;
+                    if (parse_function_opener(text_in, c, nm_probe, after_probe)) return c;
+                    // mode-22 opener: `<parameter=NAME>` (declared) whose next
+                    // non-space byte opens the first REAL parameter -- mode 22's
+                    // own gate, so an ordinary `<parameter=key>` value is not
+                    // mistaken for a call opener.
+                    {
+                        std::string pn;
+                        size_t pgt = 0;
+                        if (find_parameter_opener(text_in, c, &pn, &pgt) == c) {
+                            const size_t nxt = find_parameter_opener(text_in, pgt);
+                            std::string canon = declared(pn) ? pn : canonical_declared_name(tools, pn);
+                            const size_t nb = text_in.find_first_not_of(" \t\r\n", pgt);
+                            if (!canon.empty() && nxt != std::string::npos && nb == nxt) {
+                                if (m22_name) *m22_name = canon;
+                                if (m22_params) *m22_params = nxt;   // a real parameter follows
+                                return c;
+                            }
+                            // Zero-argument mode-22 call: the opener is followed
+                            // by `</function>` (no parameter), and the tool takes
+                            // no required args (issue #38, memex_recall). The
+                            // aborted-call case -- a required-args tool opened and
+                            // left empty -- has parameters missing and stays
+                            // residue. m22_params points at the `</function>`, so
+                            // the synthesized span is `<function=NAME>\n</function>`.
+                            if (!canon.empty() && nb != std::string::npos &&
+                                text_in.compare(nb, 11, "</function>") == 0 &&
+                                no_required_params(canon)) {
+                                if (m22_name) *m22_name = canon;
+                                if (m22_params) *m22_params = nb;
+                                return c;
+                            }
+                        }
+                    }
+                    const size_t nl = bare_native_opener_len_at(text_in, c);
+                    if (!nl || text_in.compare(c, 10, "<function=") == 0) continue;
+                    size_t q = text_in.find_first_not_of(" \t\r\n", c + nl);
+                    if (q == std::string::npos) continue;
+                    if (text_in[q] == '<' && bare_native_opener_len_at(text_in, q)) continue;  // empty; the next tag decides
+                    size_t e = q;
+                    while (e < text_in.size() && !isspace((unsigned char)text_in[e]) && text_in[e] != '<') e++;
+                    std::string nm = text_in.substr(q, e - q);
+                    while (!nm.empty() && (nm.back() == '>' || nm.back() == '"' || nm.back() == '\'')) nm.pop_back();
+                    if (declared(nm) || !canonical_declared_name(tools, nm).empty()) return c;
+                }
+                return std::string::npos;
+            };
+            for (;;) {
+                size_t fb = next_opener(cur, &mode22_name, &mode22_params);
+                if (fb == std::string::npos) break;
+                const bool synth = !mode22_name.empty();
+                // A zero-argument mode-22 call (issue #38): mode22_params points
+                // AT its `</function>`, so the call ends right there. Build the
+                // span directly -- searching for the closer would run past this
+                // call's `</function>` to the NEXT call's and sweep its
+                // parameters in.
+                const bool synth_zero_arg =
+                    synth && text_in.compare(mode22_params, 11, "</function>") == 0;
+                if (synth_zero_arg) {
+                    ToolCall tc;
+                    if (!parse_native_xml_call("<function=" + mode22_name + ">\n</function>", tc)) break;
+                    tc.name = mode22_name;
+                    tc.source_begin = fb;
+                    tc.source_end = mode22_params + 11;
+                    if (first_begin == std::string::npos) first_begin = fb;
+                    cur = tc.source_end;
+                    batch.push_back(std::move(tc));
+                    if (cur >= text_in.size()) break;
+                    continue;
+                }
+                // For a mode-22 opener the call body starts at the first real
+                // parameter; for every other spelling the span is the opener
+                // and what follows, exactly as before.
+                std::string span = text_in.substr(synth ? mode22_params : fb);
+                const size_t body_at = synth ? mode22_params : fb;
+                size_t fe = native_function_closer(span);
+                if (fe == std::string::npos) fe = span.find("</function>");
+                size_t span_end = text_in.size();
+                if (fe != std::string::npos) {
+                    span = span.substr(0, fe + 11);
+                    span_end = body_at + fe + 11;
+                } else {
+                    // No </function> at all. Running to end-of-text sweeps the
+                    // NEXT call's parameters into this one, and
+                    // parse_native_xml_call refuses an unterminated final
+                    // parameter when another <parameter= follows -- correctly,
+                    // because within ONE call that is mangling. In a batch the
+                    // next <parameter= belongs to the next call. Bounding the
+                    // span at the next call boundary keeps that refusal
+                    // meaningful: the boundary is what distinguishes "the model
+                    // started another call" from "the model mangled this one".
+                    size_t nb = next_opener(std::max(fb, body_at) + 1);
+                    // BOTH markers bound the call. `</tool_call>` is the one
+                    // that matters: a batch separated by `</tool_call>\n<tool_call>`
+                    // ends each call at the CLOSER, and searching only for the
+                    // opener swept the closer into the value (find("<tool_call>")
+                    // does not match inside "</tool_call>").
+                    for (const char* m : {"</tool_call>", "<tool_call>"}) {
+                        const size_t p = text_in.find(m, fb + 1);
+                        if (p != std::string::npos && (nb == std::string::npos || p < nb)) nb = p;
+                    }
+                    if (nb != std::string::npos) {
+                        span = text_in.substr(body_at, nb - body_at);
+                        span_end = nb;
+                    }
+                }
+                // A mode-22 span carries no `<function=NAME>` head -- it starts
+                // at the first parameter. Synthesize the head so the one parser
+                // reads it, exactly as the standalone mode-22 pass does; the
+                // source span still points at the original `<parameter=NAME>`.
+                if (synth) span = "<function=" + mode22_name + ">\n" + span;
+                // Hallucinated-result rule (2026-08-21): a <result>/<output>
+                // element enclosing this span -- or inside it -- means the
+                // "call" is part of invented result output. Break the batch
+                // rather than promoting fiction to a call; other modes apply
+                // the same guard to their own spans. Uses the BOUNDED end, so
+                // the guard inspects this call's span and not its successors'.
+                if (hallucinated_result_around(text_in, fb, span_end)) break;
+                ToolCall tc;
+                // Stop at the first span that will not resolve rather than
+                // skipping it: keep what was actually read, never invent the
+                // rest. An unparseable FIRST span leaves the batch empty and
+                // falls through to the modes below exactly as before.
+                if (!parse_native_xml_call(span, tc)) break;
+                if (synth) tc.name = mode22_name;   // declared by construction
+                else if (!declared(tc.name)) {
+                    // `<function name="NAME>` -- the quote opens and never
+                    // closes before '>', so the name arrives as `"NAME`. Strip
+                    // an unmatched quote ONLY when what remains names a
+                    // DECLARED tool: that reads the name the caller offered
+                    // rather than guessing one, the same rule mode 22 uses.
+                    std::string alt = tc.name;
+                    while (!alt.empty() && (alt.front() == '"' || alt.front() == '\''))
+                        alt.erase(alt.begin());
+                    while (!alt.empty() && (alt.back() == '"' || alt.back() == '\''))
+                        alt.pop_back();
+                    // `<function=name>` with the real name on the FOLLOWING
+                    // line. The opener carries a placeholder where the name
+                    // belongs -- the same habit mode 18 already tolerates for
+                    // `<name>`, one tag over. Only the next line, only when it
+                    // names a declared tool.
+                    if (!declared(alt) && (alt == "name" || alt == "tool_name" ||
+                                           alt == "function")) {
+                        const size_t og = span.find('>');
+                        if (og != std::string::npos) {
+                            size_t ls = span.find_first_not_of(" \t\r\n", og + 1);
+                            if (ls != std::string::npos) {
+                                size_t le = span.find_first_of("\r\n<", ls);
+                                std::string cand = span.substr(
+                                    ls, (le == std::string::npos ? span.size() : le) - ls);
+                                while (!cand.empty() && isspace((unsigned char)cand.back()))
+                                    cand.pop_back();
+                                if (declared(cand)) alt = cand;
+                            }
+                        }
+                    }
+                    // A name that differs only in CASE is the model's own name
+                    // for the tool; refusing on case alone loses a call for
+                    // nothing. Unique match only, so an ambiguous registry
+                    // still refuses.
+                    if (!declared(alt)) {
+                        const std::string canon = canonical_declared_name(tools, alt);
+                        if (!canon.empty()) alt = canon;
+                    }
+                    if (alt == tc.name || !declared(alt)) { named_undeclared = true; break; }
+                    tc.name = alt;
+                }
                 tc.source_begin = fb;
-                tc.source_end = fe != std::string::npos ? fb + fe + 11
-                                                        : text_in.size();
-                if (prefix) *prefix = text_in.substr(0, fb);
+                tc.source_end = span_end;
+                if (first_begin == std::string::npos) first_begin = fb;
+                cur = tc.source_end;
+                batch.push_back(std::move(tc));
+                if (cur >= text_in.size()) break;
+            }
+            if (!batch.empty()) {
+                // Absorb a separator that carries no content into the preceding
+                // call's span. append_text slices on these spans, so a gap left
+                // between two calls is emitted as VISIBLE TEXT -- which would
+                // put the raw <tool_call> marker back in front of the user, the
+                // exact leak the batch exists to stop.
+                for (size_t i = 0; i + 1 < batch.size(); i++) {
+                    const size_t gb = batch[i].source_end, ge = batch[i + 1].source_begin;
+                    if (ge <= gb) continue;
+                    const std::string gap = text_in.substr(gb, ge - gb);
+                    if (only_dialect_control_bytes(gap) ||
+                        gap.find_first_not_of(" \t\r\n") == std::string::npos)
+                        batch[i].source_end = ge;
+                }
+                if (prefix) *prefix = text_in.substr(0, first_begin);
                 if (remaining_text) *remaining_text = "";
-                fprintf(stderr, "[q27] bare native-dialect call recovered: %s\n", tc.name.c_str());
-                return std::vector<ToolCall>{std::move(tc)};
+                fprintf(stderr, "[q27] bare native-dialect call(s) recovered: %zu\n",
+                        batch.size());
+                drift_mode_hint = "native";
+                return batch;
             }
         }
         // (b) the chimera
@@ -3346,7 +5485,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 size_t q2 = q1 == std::string::npos ? q1 : text_in.find('"', q1 + 1);
                 if (q2 != std::string::npos && q2 < pp) {
                     const std::string nm = text_in.substr(q1 + 1, q2 - q1 - 1);
-                    if (declared(nm)) {
+                    if (declared(nm) &&
+                        !hallucinated_result_around(text_in, jb, text_in.size())) {
                         // reuse the XML walk by synthesizing a well-formed span;
                         // a missing final </parameter> is tolerated by closing at EOF
                         std::string span = "<function=" + nm + ">\n" + text_in.substr(pp);
@@ -3361,10 +5501,251 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 17: chimera json-head/xml-params %s\n",
                                     nm.c_str());
+                            drift_mode_hint = "17";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
                     }
                 }
+            }
+        }
+        // (c) DRIFT MODE 20 (2026-08-19, same A/B as mode 19): a BATCH of calls
+        // in which the tool NAME is structurally absent --
+        //   <tool_calls>\n<tool_name>\n<parameter=file_path>\n/x\n</parameter>\n</function>
+        //   <tool>\n<tool_name>\n<parameter=file_path>\n/y\n</parameter>\n</function>
+        // Plural `<tool_calls>` opener, an EMPTY `<tool_name>` where the name
+        // belongs, `<tool>` as a separator, and closers that do not match their
+        // openers. Mode 14 owns `<tool_name>NAME</tool_name>`; this fires only
+        // when the tag is empty, so the two cannot collide.
+        //
+        // With no name in the bytes, the only way back is to infer it from the
+        // parameter keys -- which is exactly what infer_tool_name() already does
+        // for JSON mode 6, including its refuse-on-tie rule. A wrong tool is
+        // worse than an un-rescued one, so inference failure leaves it as text.
+        //
+        // hallucinated_result_around() is what keeps this off the
+        // HALLUCINATED-RESULT shape (<tool_calls><result><name>X</name>
+        // <output>...<tool_name><parameter=...), which mode 16 pins with a
+        // negative fixture: those are invented tool OUTPUT, and promoting them
+        // to calls would feed the model's own fiction back as if a tool had
+        // produced it. That shape leaves <result> UNCLOSED, so the per-call
+        // span below reads as enclosed by it and is refused -- while a batch
+        // that merely follows a closed <output> block still recovers.
+        {
+            static const std::string TN = "<tool_name>";
+            std::vector<ToolCall> batch;
+            size_t scan = 0;
+            while (true) {
+                size_t tn = text_in.find(TN, scan);
+                if (tn == std::string::npos) break;
+                size_t after = text_in.find_first_not_of(" \t\r\n", tn + TN.size());
+                scan = tn + TN.size();
+                // empty tag only: a named <tool_name> belongs to mode 14
+                if (after == std::string::npos ||
+                    text_in.compare(after, 11, "<parameter=") != 0)
+                    continue;
+                size_t end = native_function_closer(text_in, after);
+                if (end == std::string::npos) end = text_in.find("</function>", after);
+                size_t alt = text_in.find(TN, after);
+                if (end == std::string::npos || (alt != std::string::npos && alt < end))
+                    end = alt == std::string::npos ? text_in.size() : alt;
+                else
+                    end += 11;
+                std::string span = "<function=q27_unnamed>\n" +
+                                   text_in.substr(after, end - after);
+                if (span.find("</function>") == std::string::npos) span += "\n</function>";
+                ToolCall tc;
+                if (hallucinated_result_around(text_in, tn, end)) {
+                    fprintf(stderr, "[q27] drift mode 20: hallucinated <result>/<output> "
+                                    "block encloses the call, refusing\n");
+                    continue;
+                }
+                if (!parse_native_xml_call(span, tc) || tc.arguments.empty()) continue;
+                const std::string nm = infer_tool_name(*tools, tc.arguments);
+                if (nm.empty() || !declared(nm)) continue;
+                tc.name = nm;
+                tc.ok = true;
+                // STAMP PER-CALL spans (review 2026-08-20): the prior code
+                // only set batch.front().source_begin and batch.back().source_end,
+                // leaving middle calls with source_begin == npos. The unclosed-tail
+                // recovery (recover_unclosed_tool_tail) and the closed-wrapper
+                // resolver (resolve_ordered_tool_segments) both compute
+                // `raw.substr(cursor, c.source_begin - cursor)`; an npos middle
+                // call underflows to SIZE_MAX and substr throws out_of_range
+                // inside the request handler. Stamp every call so the gaps
+                // between calls and the trailing text after the last call are
+                // represented correctly.
+                tc.source_begin = tn;
+                tc.source_end = end;
+                batch.push_back(std::move(tc));
+                scan = end;
+            }
+            if (!batch.empty()) {
+                if (prefix) *prefix = text_in.substr(0, batch.front().source_begin);
+                // trailing text after the last call's region stays visible as
+                // text (the prior override glued it to the last call's source_end)
+                if (remaining_text) *remaining_text = text_in.substr(batch.back().source_end);
+                fprintf(stderr, "[q27] drift mode 20: recovered %zu nameless <tool_name> call(s)\n",
+                        batch.size());
+                drift_mode_hint = "20";
+                return batch;
+            }
+        }
+        // (d) DRIFT MODE 21 (2026-08-20, issue #24 follow-up): the parameters
+        // arrive with NO opener of any kind. Not `<function=`, not the mode-19
+        // attribute spelling, not mode-18's bare `<name>`, not mode-20's empty
+        // `<tool_name>` -- the emission simply starts at the first
+        // `<parameter=KEY>` and ends at `</function>`:
+        //
+        //   <parameter=filePath>\n/code/x.go\n</parameter>
+        //   <parameter=newString>\n...\n</parameter>\n</function>
+        //
+        // One degradation further than mode 20: there the tag was present and
+        // empty, here there is no tag at all, so the name has to come entirely
+        // from the parameter keys. Same infer_tool_name() with the same
+        // refuse-on-tie rule, which also means a model that mangles the KEY
+        // spelling (camelCase where the schema declares snake_case) is
+        // correctly NOT rescued -- guessing a tool from keys that match nothing
+        // is how you execute the wrong call.
+        //
+        // The `</function>` requirement is the guard against eating prose: a
+        // paragraph can mention <parameter= in passing, but a closing tag it
+        // never opened is dialect, not English.
+        {
+            size_t ps = find_parameter_opener(text_in, 0);
+            size_t fe = ps == std::string::npos ? std::string::npos
+                                                : native_function_closer(text_in, ps);
+            if (ps != std::string::npos && fe == std::string::npos)
+                fe = text_in.find("</function>", ps);
+            if (fe != std::string::npos) {
+                // Scoped hallucinated-result guard (2026-08-21). The span is
+                // [ps, fe+11) -- the parameter list itself. A <result>/<output>
+                // tag inside it, or an unclosed one enclosing it, is invented
+                // output and refused; one that opened AND closed before ps is
+                // prior context and must not veto this call. (The first attempt
+                // at this scoped it only at the END, so a closed block earlier
+                // in the tail still killed the call -- the very leak it meant
+                // to fix.)
+                const size_t span_end = fe + 11;
+                if (hallucinated_result_around(text_in, ps, span_end)) {
+                    fprintf(stderr,
+                            "[q27] drift mode 21: hallucinated <result>/<output> "
+                            "block in the parameter span, refusing\n");
+                } else {
+                std::string span =
+                    "<function=q27_unnamed>\n" + text_in.substr(ps, fe + 11 - ps);
+                ToolCall tc;
+                if (!named_undeclared && parse_native_xml_call(span, tc) &&
+                    !tc.arguments.empty()) {
+                    // A parameter literally named `name` whose value names a
+                    // DECLARED tool is the tool (2026-08-22, two live misses):
+                    //   <parameter=name>\nBash</parameter>\n<parameter=command>...
+                    // Read it and drop the key, rather than inferring from
+                    // {name, command} -- which ties Bash against Monitor under
+                    // the real registry and refuses. Openerless path only: an
+                    // explicit <function=X> keeps `name` as an ordinary argument.
+                    std::string nm;
+                    auto nit = tc.arguments.find("name");
+                    if (nit != tc.arguments.end() && nit->is_string()) {
+                        std::string cand = nit->get<std::string>();
+                        const size_t a = cand.find_first_not_of(" \t\r\n");
+                        cand = a == std::string::npos ? "" :
+                               cand.substr(a, cand.find_last_not_of(" \t\r\n") - a + 1);
+                        const std::string canon = declared(cand) ? cand
+                                                  : canonical_declared_name(tools, cand);
+                        if (!canon.empty()) { nm = canon; tc.arguments.erase(nit); }
+                    }
+                    if (nm.empty()) nm = infer_tool_name(*tools, tc.arguments);
+                    if (!nm.empty() && declared(nm)) {
+                        tc.name = nm;
+                        tc.ok = true;
+                        tc.source_begin = ps;
+                        tc.source_end = fe + 11;
+                        if (prefix) *prefix = text_in.substr(0, ps);
+                        if (remaining_text) *remaining_text = "";
+                        fprintf(stderr,
+                                "[q27] drift mode 21: openerless parameter list -> %s\n",
+                                nm.c_str());
+                        drift_mode_hint = "21";
+                        return std::vector<ToolCall>{std::move(tc)};
+                    }
+                }
+                }
+            }
+        }
+        // (e) DRIFT MODE 22 (2026-08-20, chaudhryfaisal on issue #24,
+        // corroborated the same day by the dialect survey on a different client
+        // and schema): the tool NAME arrives as the first <parameter=...>,
+        // unclosed, with the real parameters after it --
+        //
+        //   <parameter=bash>\n<parameter=command>\nls /code\n</parameter>\n</function>
+        //
+        // Sideways from mode 21 rather than one step further down: the name IS
+        // in the bytes, wearing a parameter's tag. Because that leading tag
+        // never closes, the parameter walk fails outright and mode 21 is left
+        // with zero arguments to infer from -- which is why this died in
+        // SILENCE, with no rescue line and no Q27_DRIFT_CORPUS entry.
+        //
+        // Engages only on a DECLARED tool name in a tag carrying NO value: the
+        // next non-space byte must open the first real parameter. That reads a
+        // name the caller offered instead of inferring one, so an undeclared
+        // name falls through to mode 21 rather than being invented into a call.
+        //
+        // Runs AFTER mode 21 deliberately. A MIXED emission (survey capture
+        // 001: a {"function=Read> call followed by a <parameter=Bash> one) is
+        // rescued by mode 21 as the FIRST call, and generation order is worth
+        // more than the second call -- running this first would return Bash and
+        // drop the Read the model asked for first.
+        {
+            static const std::string PO = "<parameter=";
+            static const std::string FC = "</function>";
+            std::vector<ToolCall> batch;
+            size_t first_begin = std::string::npos, cur = 0;
+            for (;;) {
+                std::string nm;
+                size_t gt1 = 0;
+                const size_t ps = find_parameter_opener(text_in, cur, &nm, &gt1);
+                if (ps == std::string::npos) break;
+                const size_t gt = gt1 - 1;   // the '>' itself
+                const size_t nxt = find_parameter_opener(text_in, gt + 1);
+                // `<parameter=task>` against a declared `Task`: same tool, the
+                // model's own casing.
+                if (!declared(nm)) {
+                    const std::string canon = canonical_declared_name(tools, nm);
+                    if (!canon.empty()) nm = canon;
+                }
+                if (nxt == std::string::npos || !declared(nm) ||
+                    text_in.find_first_not_of(" \t\r\n", gt + 1) != nxt) {
+                    cur = gt + 1;   // a parameter, not an opener
+                    continue;
+                }
+                const size_t fe = text_in.find(FC, nxt);
+                if (fe == std::string::npos) break;
+                ToolCall tc;
+                const std::string span =
+                    "<function=" + nm + ">\n" + text_in.substr(nxt, fe + FC.size() - nxt);
+                if (hallucinated_result_around(text_in, ps, fe + FC.size())) {
+                    fprintf(stderr, "[q27] drift mode 22: hallucinated <result>/<output> "
+                                    "block encloses the call, refusing\n");
+                    cur = fe + FC.size();
+                    continue;
+                }
+                if (parse_native_xml_call(span, tc) && !tc.arguments.empty()) {
+                    tc.name = nm;
+                    tc.ok = true;
+                    tc.source_begin = ps;
+                    tc.source_end = fe + FC.size();
+                    if (first_begin == std::string::npos) first_begin = ps;
+                    batch.push_back(std::move(tc));
+                }
+                cur = fe + FC.size();
+            }
+            if (!batch.empty()) {
+                if (prefix) *prefix = text_in.substr(0, first_begin);
+                if (remaining_text) *remaining_text = "";
+                fprintf(stderr, "[q27] drift mode 22: parameter-as-opener -> %zu call(s)\n",
+                        batch.size());
+                drift_mode_hint = "22";
+                return batch;
             }
         }
     }
@@ -3960,26 +6341,102 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m8) modes[mi++] = '8';
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
-    } else if (text_in.find("{\"name\"") != std::string::npos ||
-               text_in.find("{\"tool_call\"") != std::string::npos) {
+        drift_mode_hint = modes;
+    }
+    // LAST RESORT, once: the JSON dialect with its terminator written in XML.
+    // Only reached when nothing else recovered, and only when blanking actually
+    // changes the bytes, so it cannot alter a successful parse. The recursion
+    // guard keeps it to a single retry.
+    if (out.empty() && !in_dialect_retry) {
+        const std::string blanked = blank_dialect_closers_outside_strings(text_in);
+        if (blanked != text_in) {
+            in_dialect_retry = true;
+            auto again = parse_bare_tool_calls(blanked, prefix, tools, allow_o10,
+                                               allow_eof_repair, remaining_text);
+            in_dialect_retry = false;
+            if (!again.empty()) {
+                fprintf(stderr, "[q27] drift: JSON call terminated in the XML dialect -> %zu\n",
+                        again.size());
+                drift_mode_hint = "xmlclose";
+                return again;
+            }
+        }
+    }
+    if (!out.empty()) {
+    } else if (looks_like_intended_tool_call(text_in)) {
         // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
         // mode-6 args didn't confidently match any tool). Longer window so the call
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
         fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
                 tools ? (int)tools->size() : -1, text_in.c_str());
-        // Corpus capture: Q27_DRIFT_CORPUS=<file> appends the FULL untruncated
-        // miss (the stderr line caps at 400 chars, which is why issue #4's
-        // payload wasn't visible). Each miss is a replayable fixture for
-        // tools/test_tool_drift_corpus.cpp -- turns an unknown drift mode into
-        // a permanent regression the next time it recurs. NUL-separated
-        // records so embedded newlines don't confuse the reader.
-        if (const char* cp = getenv("Q27_DRIFT_CORPUS")) {
-            if (FILE* f = fopen(cp, "ab")) {
-                fwrite(text_in.data(), 1, text_in.size(), f);
-                fputc('\0', f);
-                fclose(f);
+        // The corpus record for this miss (Q27_DRIFT_CORPUS, full and
+        // redacted, where the stderr line caps at 400 chars -- issue #4's
+        // payload was invisible for that reason) is written by the
+        // parse_bare_tool_calls wrapper below, alongside every success.
+    }
+    return out;
+}
+
+// The capture wrapper. Every recovery mode returns from the impl at its own
+// site, so the record is made here, from the result: recovered:<mode> (the
+// impl leaves the mode in drift_mode_hint), suppressed (the strict leg), or
+// unrescued (dialect residue, nothing recovered -- drift_bearing is wider than
+// the UN-RESCUED warning's bar on purpose; that bar is unchanged). Depth 1
+// only: the mode-10 probe and the dialect retry re-enter through this same
+// wrapper and are not turns; an inner call's hint is always overwritten by
+// the outer call's own success site, so the hint names the outer mode.
+// Nothing may call parse_bare_tool_calls_impl directly. With
+// Q27_DRIFT_CORPUS unset this is the old function with one extra integer
+// increment.
+//
+// Records are per top-level parse, which is per turn on the non-stream
+// TEXT/TOOL path. The holdbacks (reasoning here, streaming in server.cu)
+// classify per candidate, and re-classify a deferred candidate at finish
+// with repair enabled, so one candidate can yield `unrescued` and then
+// `recovered:*`. corpus_dedup.py folds those into one shape with both
+// outcomes counted; `count` there is captures, not turns.
+inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+                                                   std::string* prefix,
+                                                   const json* tools,
+                                                   bool allow_o10,
+                                                   bool allow_eof_repair,
+                                                   std::string* remaining_text) {
+    DriftParseScope drift_scope;
+    bool from_strict_miss = false;
+    if (drift_parse_depth == 1) {
+        drift_mode_hint.clear();
+        from_strict_miss = !drift_last_strict_miss.empty() && drift_last_strict_miss == text_in;
+        drift_last_strict_miss.clear();
+    }
+    DriftCtxScope drift_miss(from_strict_miss, false, nullptr);
+    auto out = parse_bare_tool_calls_impl(text_in, prefix, tools, allow_o10,
+                                          allow_eof_repair, remaining_text);
+    // Every recovery mode returns from the impl at its own site, so the span
+    // widening over adjacent dialect residue -- and the remaining-text that
+    // depends on the spans -- happens here, once, for all of them.
+    if (!out.empty()) {
+        absorb_dialect_residue(text_in, out);
+        if (remaining_text) {
+            std::string remainder;
+            remainder.reserve(text_in.size());
+            size_t cursor = 0;
+            for (const auto& call : out) {
+                if (call.source_begin == std::string::npos || call.source_begin < cursor) { cursor = std::string::npos; break; }
+                remainder.append(text_in, cursor, call.source_begin - cursor);
+                cursor = call.source_end;
+            }
+            if (cursor != std::string::npos) {
+                remainder.append(text_in, cursor, std::string::npos);
+                *remaining_text = std::move(remainder);
             }
         }
+    }
+    if (drift_parse_depth == 1 && drift_corpus_path()) {
+        if (!out.empty())
+            capture_drift(text_in, "recovered:" + (drift_mode_hint.empty()
+                                                       ? std::string("?") : drift_mode_hint), tools);
+        else if (looks_like_intended_tool_call(text_in) || drift_bearing(text_in, tools))
+            capture_drift(text_in, tool_strict() ? "suppressed" : "unrescued", tools);
     }
     return out;
 }
@@ -4024,6 +6481,31 @@ struct OrderedToolOutput {
     }
 };
 
+// A TOOL body that recovered NOTHING and consists only of dialect control
+// bytes carries no information for the user -- showing it just leaks protocol.
+//
+// The shape that made this necessary (2026-08-22, live): the model emitted the
+// opener TWICE and then hit EOS --
+//
+//   <tool_call>          <- structural; the splitter erases it, enters TOOL
+//   <tool_call>          <- inside TOOL only "</tool_call>" delimits, so this
+//   (EOS)                   is BODY CONTENT, not a marker
+//
+// unfinished_tool_wrapper() reports false (it detects length/budget truncation,
+// not EOS-inside-wrapper), so the unclosed-tail path never runs. emit_tool()
+// then fails to parse, the drift chain finds nothing, and the fallback prints
+// ToolCall::raw -- which IS the literal string "<tool_call>". The user's
+// visible answer for the whole turn was that one marker.
+//
+// Deliberately NARROW: whitespace plus <tool_call>/</tool_call> only. Dialect
+// tags that can carry a payload (<function=...>, <parameter=...>) are NOT
+// stripped, because a body containing those is a malformed CALL whose bytes the
+// user may need to see -- that is drift, and drift stays visible. This only
+// suppresses residue that is provably content-free.
+//
+// The turn is lost either way; this decides what the user sees, and callers log
+// so the loss is not silent.
+
 inline std::string take_unclosed_final_tool_segment(
     std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
     bool wrapper_incomplete) {
@@ -4032,6 +6514,117 @@ inline std::string take_unclosed_final_tool_segment(
     std::string raw=std::move(segments.back().second);
     segments.pop_back();
     return raw;
+}
+
+// Route an UNCLOSED-<tool_call> tail (wrapper stripped, generation truncated)
+// through the drift chain. Complements bb60661, which routed a CLOSED-wrapped
+// TOOL segment through parse_bare_tool_calls but deliberately left the unclosed
+// one as raw text. Same safety bar that commit documented:
+//
+//   "no EOF repair, because a closed wrapper means drift rather than
+//    truncation, and an unclosed one is removed upstream by
+//    take_unclosed_final_tool_segment. Executing half a Write stays refused."
+//
+// allow_eof_repair=false inside means only bytes the parser accepts as a
+// well-formed call execute: an inner call whose JSON/XML is COMPLETE (its
+// </tool_call> merely never arrived because the generation was cut) recovers on
+// mode 1 / the native dialect, while a value genuinely cut mid-parse (a
+// partial Write) is rejected and shown as text. That is the same refusal
+// boundary that protects the closed-wrapper path, just reached from the tail.
+//
+// emit_call returns true when the call was accepted (recovered++), false to
+// leave its bytes as text (ineligible / refused -- never re-runs the chain, so
+// tool_choice / disable_parallel_tool_use rejections can't be resurrected).
+// Returns the number of accepted calls.
+template<class EmitText, class EmitCall>
+inline size_t recover_unclosed_tool_tail(const std::string& raw,
+    const json* tools, EmitText emit_text, EmitCall emit_call) {
+    if(raw.empty()) return 0;
+    if(!tools || !tools->is_array() || tools->empty()){
+        emit_text(raw); return 0;
+    }
+    std::string pre; // parse_bare_tool_calls writes here; we use cursor/source_begin instead (see comment above)
+    DriftCtxScope drift_wrapped(true,false,tools);
+    auto calls=parse_bare_tool_calls(raw,&pre,tools,true,false,nullptr);
+    if(calls.empty()){ emit_text(raw); return 0; }
+    size_t cursor=0,recovered=0;
+    for(auto& c:calls){
+        // defense-in-depth (review 2026-08-20): mode 20 now stamps per-call
+        // spans, but if any future drift mode returns a batch with a missing
+        // source_begin (npos) or a span that overlaps the cursor we've already
+        // emitted, raw.substr(cursor, c.source_begin-cursor) would underflow
+        // to SIZE_MAX and throw out_of_range inside the request handler.
+        // Refuse to emit such a call -- dump the remaining tail as text and
+        // stop -- rather than crash.
+        if (c.source_begin == std::string::npos || c.source_begin < cursor) {
+            emit_text(raw.substr(cursor));
+            break;
+        }
+        emit_text(raw.substr(cursor,c.source_begin-cursor));
+        cursor=c.source_end;
+        if(emit_call(c)) recovered++;
+        else emit_text(c.raw);
+    }
+    emit_text(raw.substr(cursor));
+    return recovered;
+}
+
+// A finished reasoning block that may hold a complete tool call (issue #38).
+// The whole-block consumers -- the non-stream resolver below and both
+// /v1/responses legs, which accumulate reasoning and emit it once -- call
+// this rather than each carrying the logic (the streaming SSE handlers use
+// StreamToolRouter for the chunked case). The <tool_call> wrapper tokens are
+// blanked, length-preserving, because the display lexer reads a literal one
+// as an inert container and would never arm on the call inside it; fences
+// and inline code are untouched, so a fenced example or an inline-code
+// mention stays reasoning -- calling the parser directly here WOULD execute
+// a fenced example (verified when 152d3a2 landed). accept(call) takes the
+// call or refuses it; refused bytes stay reasoning. Returns the reasoning
+// that remains when something was taken, else the input untouched.
+template<class Accept>
+inline std::string recover_calls_from_reasoning(const std::string& reasoning,
+                                                const json* tools, size_t& taken,
+                                                Accept&& accept) {
+    taken=0;
+    if(!tools || !tools->is_array() || tools->empty() ||
+       !looks_like_intended_tool_call(reasoning)) return reasoning;
+    DriftNames names;
+    declared_tool_names(tools,names);
+    std::string scan=reasoning;
+    for(const char* marker : {"<tool_call>","</tool_call>"}) {
+        const size_t n=std::char_traits<char>::length(marker);
+        for(size_t at=scan.find(marker);at!=std::string::npos;at=scan.find(marker,at+1))
+            scan.replace(at,n,std::string(n,' '));
+    }
+    DriftCtxScope drift_think(false,true,tools);
+    const size_t drift_before=drift_records_written;
+    BareToolTextHoldback hb;
+    std::string kept;
+    auto visible=[&](const std::string& text){ kept+=text; };
+    auto classify=[&](const std::string& source,bool allow_repair,auto&& emit_visible) {
+        std::string prefix,residual;
+        auto calls=parse_bare_tool_calls(source,&prefix,tools,true,allow_repair,&residual);
+        if(calls.empty()) return BareToolCandidateResult{};
+        size_t cursor=0; bool any=false;
+        for(auto& call:calls) {
+            if(call.source_begin==std::string::npos || call.source_begin<cursor) break;
+            const size_t begin=call.source_begin,end=call.source_end;
+            emit_visible(source.substr(cursor,begin-cursor));
+            cursor=end;
+            if(call.ok && accept(call)) { taken++; any=true; }
+            else emit_visible(source.substr(begin,end-begin));
+        }
+        emit_visible(source.substr(cursor));
+        return BareToolCandidateResult{true,any};
+    };
+    hb.route(scan,names,visible,classify);
+    hb.finish(false,names,visible,classify);
+    // The holdback decides whether the parser runs at all; when it found no
+    // candidate the corpus would otherwise never see a reasoning block that
+    // passed the intent check.
+    if(!taken && drift_corpus_path() && drift_records_written==drift_before)
+        capture_drift(reasoning,"unrescued",tools);
+    return taken?kept:reasoning;
 }
 
 // Resolve generated text and wrapped calls in generation order. This matters
@@ -4052,6 +6645,14 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         if(calls.empty()) { out.append_visible_text(raw); return; }
         size_t cursor=0;
         for(auto& call:calls) {
+            // defense-in-depth (review 2026-08-20): see recover_unclosed_tool_tail.
+            // If any drift mode hands us a call with an unset source_begin
+            // (npos) or an overlapping span, substr() would throw; dump the
+            // remaining tail as visible text and stop.
+            if (call.source_begin == std::string::npos || call.source_begin < cursor) {
+                out.append_visible_text(raw.substr(cursor));
+                break;
+            }
             out.append_visible_text(raw.substr(cursor,call.source_begin-cursor));
             cursor=call.source_end;
             if(eligible(call.name,out.calls.size())) {
@@ -4070,21 +6671,82 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         append_text(pending_text,final_segment && allow_eof_repair);
         pending_text.clear();
     };
+    // trailing dialect residue ahead of a wrapped segment, or at the end of
+    // the turn, is garbage rather than text (see absorb_dialect_residue)
+    auto drop_trailing_residue=[&]() {
+        if(!tools) return;
+        const DialectResidueSuffix r=dialect_residue_suffix(pending_text);
+        if(r.complete) pending_text.erase(r.start);
+    };
     for(const auto& segment:segments) {
         if(segment.first==StreamSplitter::TEXT) {
             pending_text+=segment.second;
             continue;
         }
+        if(segment.first==StreamSplitter::TOOL) drop_trailing_residue();
         flush_pending_text(false);
         if(segment.first==StreamSplitter::THINK) {
-            out.reasoning+=segment.second;
+            // Issue #38: a complete tool call can arrive INSIDE reasoning, and
+            // reasoning used to pass straight through to out.reasoning, so the
+            // call was never parsed -- it reached the client as visible think
+            // text and never fired. recover_calls_from_reasoning applies the
+            // same display-context rules the TEXT branch uses; bytes that are
+            // not a call are reasoning exactly as before.
+            size_t taken=0;
+            const std::string kept=recover_calls_from_reasoning(
+                segment.second,tools,taken,[&](ToolCall& call) {
+                    if(!eligible(call.name,out.calls.size())) return false;
+                    out.append_tool_call(std::move(call));
+                    return true;
+                });
+            out.reasoning+=kept;
+            if(taken) {
+                out.recovered+=taken;
+                fprintf(stderr,"[tool-fallback] %zu call(s) recovered from "
+                               "reasoning (nonstream)\n",taken);
+            }
             continue;
         }
-        ToolCall call=parse_tool_call(strip_ws2(segment.second));
-        if(call.ok && eligible(call.name,out.calls.size()))
-            out.append_tool_call(std::move(call));
-        else out.append_visible_text(call.raw);
+        const std::string body=strip_ws2(segment.second);
+        DriftCtxScope drift_wrapped(true,false,tools);
+        // A wrapped segment is not guaranteed to hold exactly one call. When it
+        // holds more, or carries text after the last one, the strict parser
+        // would take the first and drop the remainder silently -- which is how
+        // a model's whole 14-call plan became prose it then read back as its
+        // own answer. Hand those to the batch-aware chain instead.
+        if(tools && wrapped_body_exceeds_one_call(body)) { append_text(body,false); continue; }
+        ToolCall call=parse_tool_call(body);
+        if(call.ok) {
+            if(eligible(call.name,out.calls.size())) out.append_tool_call(std::move(call));
+            // A parsed call the caller REJECTED stays text and is not offered a
+            // second chance below: re-running the chain on it would resurrect
+            // exactly what tool_choice/parallel-calls just refused.
+            else out.append_visible_text(call.raw);
+            continue;
+        }
+        // parse_tool_call refused. Everything it knows is the strict JSON form
+        // and the trained XML dialect; the whole drift catalogue (modes 10, 11,
+        // 13, 14, 15, 17, 20, 21) lives in parse_bare_tool_calls and used to be
+        // reachable ONLY from the TEXT branch above. So a model that emitted
+        // the <tool_call> wrapper correctly and then drifted INSIDE it was
+        // unrecoverable no matter how many modes were catalogued -- three modes
+        // shipped in one week with passing tests and could never fire here.
+        // Same chain, same eligibility, same recovered counter as text.
+        //
+        // No EOF repair: the wrapper closed, so this is drift, not truncation.
+        // A wrapper that did NOT close was already removed by
+        // take_unclosed_final_tool_segment before this loop.
+        if(only_dialect_control_bytes(body)) {
+            fprintf(stderr,"[q27] tool body was dialect control bytes only "
+                           "(%zu B, e.g. a repeated <tool_call> opener) -- "
+                           "turn produced no call; suppressed from visible text\n",
+                    body.size());
+            capture_drift(body,"suppressed",tools);
+            continue;
+        }
+        append_text(body,false);
     }
+    drop_trailing_residue();
     flush_pending_text(true);
     return out;
 }
