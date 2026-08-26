@@ -214,4 +214,6 @@ jobs:
           CLONE_DIR: ${{ steps.vars.outputs.clone_dir }}
         run: |
           docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
-          rm -rf "$CLONE_DIR"
+          # Build artifacts inside CLONE_DIR were written as root by the
+          # container, so the (non-root) runner user can't rm them directly.
+          sudo rm -rf "$CLONE_DIR"
