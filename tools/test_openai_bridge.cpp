@@ -2943,6 +2943,43 @@ static void test_dialect_residue_is_not_text() {
     CHECK(res.text.find("<tool_call>") == std::string::npos);
 }
 
+// The streaming holdback arms on every bare opener spelling the parser
+// accepts, not just `<function=` (pylint-6903 emitted `<parameter_name>`;
+// mode 18 is `<name>`). Both were parser-recognised for weeks while the
+// stream knew only `<function=`, so they worked off stream only.
+static void test_stream_router_arms_on_every_opener_spelling() {
+    for (const std::string& opener : {std::string("<parameter_name>read"), std::string("<name>read")}) {
+        const std::string shape = opener + "\n</parameter>\n<parameter=path>\n/w/x.py\n";
+        for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+            auto r = stream_turn(shape, false, chunk);
+            CHECK(r.calls.size() == 1);
+            if (!r.calls.empty()) CHECK(r.calls[0].name == "read");
+            CHECK(q27::strip_ws2(r.text).empty());
+        }
+    }
+    // The pylint-6903 shape opens with `<tool_use>`, which is a markdown HTML
+    // block, so the display-context rule (a fenced or HTML example must not
+    // fire) correctly refuses to arm mid-block: it streams as text. That is
+    // not a silent drop -- the router records it to the corpus at finish
+    // (test_drift_hook), and the OFFLINE chain, which has no display gate on
+    // the native scan, recovers it (test_tool_drift). Pinned here so a future
+    // change to displayed_html is a deliberate one.
+    const std::string html_block =
+        "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>read\n</parameter>\n<parameter=path>\n/w/x.py\n";
+    auto h = stream_turn(html_block, false, 7);
+    CHECK(h.calls.empty());
+    // the safety cases: a fenced example and <name> as prose stay text
+    const std::string fenced =
+        "example:\n```\n<name>read\n</parameter>\n<parameter=path>\n/w\n</parameter>\n</function>\n```\ndone";
+    auto f = stream_turn(fenced, false, 7);
+    CHECK(f.calls.empty());
+    CHECK(f.text == fenced);
+    const std::string prose = "Use the <name> tag for the display name.";
+    auto pr = stream_turn(prose, false, 7);
+    CHECK(pr.calls.empty());
+    CHECK(pr.text == prose);
+}
+
 // The whole-block helper both /v1/responses legs and the non-stream resolver
 // call: a finished reasoning block with a call in it.
 static void test_recover_calls_from_reasoning() {
@@ -2993,6 +3030,7 @@ int main() {
     test_stream_router_without_tools_passes_reasoning_through();
     test_think_wrapper_blanker_straddles_chunks();
     test_recover_calls_from_reasoning();
+    test_stream_router_arms_on_every_opener_spelling();
     test_dialect_residue_is_not_text();
     test_tools_passthrough();
     test_tools_absent();

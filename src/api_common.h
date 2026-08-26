@@ -2823,14 +2823,51 @@ inline bool parse_parameter_opener(const std::string& seg, size_t b, std::string
     return true;
 }
 
+// Every spelling of a bare native opener the parser accepts -- see the
+// table's users at bare_native_opener_position (the streaming holdback) and
+// the batch scanner in parse_bare_tool_calls_impl. One table, three readers.
+inline size_t bare_native_opener_len_at(const std::string& text,size_t i) {
+    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    for(const char* o:k) {
+        const size_t n=std::char_traits<char>::length(o);
+        if(text.compare(i,n,o)==0) return n;
+    }
+    return 0;
+}
+
 inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     size_t b = seg.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return false;
+    // Junk ahead of the opener (2026-08-25, pylint-6903): `<tool_use>\n<tool>\n
+    // <parameter_name>\n<parameter_name>Read\n</parameter>\n<parameter=...` --
+    // wrapper-ish tags the model invented, and a name tag opened twice, the
+    // first one empty. Skip them; the opener that carries a name decides.
+    for (;;) {
+        bool skipped = false;
+        for (const char* junk : {"<tool_use>", "<tool>", "<tool_calls>"}) {
+            const size_t n = strlen(junk);
+            if (seg.compare(b, n, junk) == 0) {
+                b = seg.find_first_not_of(" \t\r\n", b + n);
+                if (b == std::string::npos) return false;
+                skipped = true;
+            }
+        }
+        const size_t nl = bare_native_opener_len_at(seg, b);
+        if (nl && seg.compare(b, 10, "<function=") != 0) {
+            const size_t q = seg.find_first_not_of(" \t\r\n", b + nl);
+            if (q != std::string::npos && seg[q] == '<' && bare_native_opener_len_at(seg, q)) {
+                b = q;   // an empty name tag, then the real one
+                skipped = true;
+            }
+        }
+        if (!skipped) break;
+    }
     size_t p;
+    size_t name_tag = 0;
     if (parse_function_opener(seg, b, tc.name, p)) {
         // name normalization below strips the quoting; the grammar above
         // already absorbed the attribute-vs-equals spelling.
-    } else if (seg.compare(b, 6, "<name>") == 0) {
+    } else if ((name_tag = bare_native_opener_len_at(seg, b)) != 0) {
         // XML drift mode 18 (issue #24): the model drops the `<function=`
         // opener and writes the bare trained `<name>` tag --
         //   <name>task\n</parameter>\n<parameter=description>\n...
@@ -2841,7 +2878,7 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         // rather than to a '>' -- the tag is already closed. Any stray
         // `</parameter>` before the first real `<parameter=` is ignored by the
         // scan below, which searches forward for the opener.
-        size_t ns = b + 6;
+        size_t ns = b + name_tag;
         // Tolerate the name on the NEXT line after `<name>` -- a real
         // emission (and this harness's mangled tool transport) can open
         // `<name>` and drop the identifier on the following line. The old
@@ -3304,36 +3341,47 @@ inline size_t bare_unresolved_inline_probe_start(
 // shape, which is why the 2026-08-22 leftover count was 0/293 there and
 // 11/498 here). Same display-context rule as bare_object_position: a fenced
 // or inline-code mention is prose.
-inline const char* const BARE_NATIVE_OPENER="<function=";
+// Every spelling of a bare native opener the parser accepts. ONE table, read
+// by the streaming holdback's detector (what arms a candidate), its probe
+// (what partial tail to hold across a chunk boundary) and the bare chain's
+// batch scanner (where a span starts), so a spelling the parser learns is a
+// spelling the stream sees. Mode 18's `<name>` was accepted by the parser
+// for a month while the holdback knew only `<function=`, so it worked off
+// stream only; `<parameter_name>` (2026-08-25, pylint-6903) went to a
+// client as text for the same reason and ended the session.
 inline size_t bare_native_opener_position(const std::string& text,
                                           JsonStringLexState string_state={},
                                           MarkdownFenceLexState fence_state={},
                                           bool end_is_final=true) {
-    const size_t n=std::char_traits<char>::length(BARE_NATIVE_OPENER);
     for(size_t i=0;i<text.size();i++) {
-        if(text[i]=='<' && text.compare(i,n,BARE_NATIVE_OPENER)==0 &&
+        if(text[i]=='<' && bare_native_opener_len_at(text,i) &&
            bare_context_is_executable(
                text,i,string_state,fence_state,end_is_final)) return i;
         consume_bare_text_context(string_state,fence_state,text[i]);
     }
     return std::string::npos;
 }
-// Start of the longest suffix that can still become "<function=", so a chunk
-// boundary inside the opener does not leak its head as visible text.
+// Start of the longest suffix that can still become an opener, so a chunk
+// boundary inside one does not leak its head as visible text.
 inline size_t bare_native_opener_probe_start(
     const std::string& text,JsonStringLexState string_state={},
     MarkdownFenceLexState fence_state={}) {
-    const size_t n=std::char_traits<char>::length(BARE_NATIVE_OPENER);
-    const size_t cap=std::min(text.size(),n-1);
-    for(size_t len=cap;len;--len) {
-        const size_t start=text.size()-len;
-        if(text.compare(start,len,BARE_NATIVE_OPENER,len)!=0) continue;
-        if(!bare_text_position_is_executable(
-               text,start,string_state,fence_state,false))
-            return std::string::npos;
-        return start;
+    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    size_t best=std::string::npos;
+    for(const char* o:k) {
+        const size_t n=std::char_traits<char>::length(o);
+        const size_t cap=std::min(text.size(),n-1);
+        for(size_t len=cap;len;--len) {
+            const size_t start=text.size()-len;
+            if(text.compare(start,len,o,len)!=0) continue;
+            if(best==std::string::npos || start<best) best=start;
+            break;
+        }
     }
-    return std::string::npos;
+    if(best==std::string::npos) return best;
+    if(!bare_text_position_is_executable(text,best,string_state,fence_state,false))
+        return std::string::npos;
+    return best;
 }
 // End of a bare native-dialect candidate: the first </function> that closes
 // a parameter (or an empty call), plus one stray </tool_call> right after it.
@@ -3535,7 +3583,19 @@ inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t en
             if (q == end) return gt + 1 - i;
         }
     }
-    for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>"}) {
+    // an EMPTY name tag -- `<name>` or `<parameter_name>` with only whitespace
+    // before the next tag or the bound -- is residue: the tag that carries the
+    // name follows it (pylint-6903 opened the tag twice)
+    for (const char* nt : {"<name>", "<parameter_name>"}) {
+        const size_t n = strlen(nt);
+        if (i + n <= end && s.compare(i, n, nt) == 0) {
+            size_t q = i + n;
+            while (q < end && isspace((unsigned char)s[q])) q++;
+            if (q == end || s[q] == '<') return n;
+        }
+    }
+    for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
+                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>"}) {
         const size_t n = strlen(tk);
         if (i + n <= end && s.compare(i, n, tk) == 0) return n;
         size_t l = 0;
@@ -5046,14 +5106,32 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
         {
             std::vector<ToolCall> batch;
             size_t cur = 0, first_begin = std::string::npos;
-            for (;;) {
-                size_t fb = std::string::npos;
-                std::string nm_probe;
-                size_t after_probe;
-                for (size_t c = text_in.find("<function", cur); c != std::string::npos;
-                     c = text_in.find("<function", c + 9)) {
-                    if (parse_function_opener(text_in, c, nm_probe, after_probe)) { fb = c; break; }
+            // A span starts at any opener spelling the parser accepts (the
+            // table behind bare_native_opener_len_at). A name-tag spelling
+            // (`<name>`, `<parameter_name>`) counts only when the name it
+            // carries is declared: `<name>` is ordinary prose often enough
+            // that an undeclared one must not start -- and break -- a batch.
+            auto next_opener = [&](size_t from) -> size_t {
+                for (size_t c = text_in.find('<', from); c != std::string::npos;
+                     c = text_in.find('<', c + 1)) {
+                    std::string nm_probe;
+                    size_t after_probe;
+                    if (parse_function_opener(text_in, c, nm_probe, after_probe)) return c;
+                    const size_t nl = bare_native_opener_len_at(text_in, c);
+                    if (!nl || text_in.compare(c, 10, "<function=") == 0) continue;
+                    size_t q = text_in.find_first_not_of(" \t\r\n", c + nl);
+                    if (q == std::string::npos) continue;
+                    if (text_in[q] == '<' && bare_native_opener_len_at(text_in, q)) continue;  // empty; the next tag decides
+                    size_t e = q;
+                    while (e < text_in.size() && !isspace((unsigned char)text_in[e]) && text_in[e] != '<') e++;
+                    std::string nm = text_in.substr(q, e - q);
+                    while (!nm.empty() && (nm.back() == '>' || nm.back() == '"' || nm.back() == '\'')) nm.pop_back();
+                    if (declared(nm) || !canonical_declared_name(tools, nm).empty()) return c;
                 }
+                return std::string::npos;
+            };
+            for (;;) {
+                size_t fb = next_opener(cur);
                 if (fb == std::string::npos) break;
                 std::string span = text_in.substr(fb);
                 size_t fe = native_function_closer(span);
@@ -5072,13 +5150,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     // span at the next call boundary keeps that refusal
                     // meaningful: the boundary is what distinguishes "the model
                     // started another call" from "the model mangled this one".
-                    size_t nb = std::string::npos;
-                    for (size_t c = text_in.find("<function", fb + 9); c != std::string::npos;
-                         c = text_in.find("<function", c + 9)) {
-                        std::string nm2;
-                        size_t a2;
-                        if (parse_function_opener(text_in, c, nm2, a2)) { nb = c; break; }
-                    }
+                    size_t nb = next_opener(fb + 1);
                     // BOTH markers bound the call. `</tool_call>` is the one
                     // that matters: a batch separated by `</tool_call>\n<tool_call>`
                     // ends each call at the CLOSER, and searching only for the

@@ -1970,6 +1970,54 @@ static void test_last_parameter_garbled_tail() {
        "garbled tail: the same value as a non-last parameter still reads whole");
 }
 
+// A NAME TAG NOBODY HAD SEEN (2026-08-25, SWE-bench pylint-6903, corpus
+// 220c72b4): junk wrapper tags, a name tag opened twice with the first one
+// empty, then a real parameter and EOS --
+//
+//   <tool_use>\n<tool>\n<parameter_name>\n<parameter_name>Read\n</parameter>\n<parameter=file_path>\n/w/x.py\n
+//
+// Mode 18's `<name>` cousin. It went to the client as text and ended the
+// session because the streaming holdback only ever armed on `<function=`:
+// the parser and the stream now read openers off ONE table.
+static void test_parameter_name_opener() {
+    json tools = json::array({tool("Read", {{"file_path", true}}), tool("Write", {{"file_path", true}, {"content", true}})});
+    const std::string shape =
+        "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>Read\n</parameter>\n<parameter=file_path>\n/w/x.py\n";
+    {
+        q27::ToolCall tc;
+        ok(q27::parse_native_xml_call(shape, tc) && tc.name == "Read" &&
+               tc.arguments.value("file_path", std::string()) == "/w/x.py",
+           "parameter_name opener: the strict parser reads through the junk");
+    }
+    {
+        std::string pre, remaining;
+        auto v = q27::parse_bare_tool_calls(shape, &pre, &tools, true, true, &remaining);
+        ok(v.size() == 1 && v[0].name == "Read" && v[0].arguments.value("file_path", std::string()) == "/w/x.py",
+           "parameter_name opener: the bare chain recovers it");
+        ok(v.size() == 1 && q27::strip_ws2(remaining).empty(),
+           "parameter_name opener: the junk tags are residue, not remaining text");
+    }
+    {
+        // the same bytes as TEXT through the resolver: one call, nothing shown
+        auto out = resolve_stream(shape, &tools);
+        ok(out.calls.size() == 1 && q27::strip_ws2(out.text).empty(),
+           "parameter_name opener: resolver -> one call, no text");
+    }
+    {
+        // safety: `<name>` in prose is still prose, and a <name> inside a value
+        // does not split a real call into a batch
+        std::string pre, remaining;
+        auto none = q27::parse_bare_tool_calls("Use the <name> tag for the display name in your XML.",
+                                               &pre, &tools, true, true, &remaining);
+        ok(none.empty(), "parameter_name opener: <name> in prose is not a call");
+        auto one = q27::parse_bare_tool_calls(
+            "<function=Write>\n<parameter=file_path>\n/w/a.xml\n</parameter>\n<parameter=content>\n<name>foo</name>\n</parameter>\n</function>",
+            &pre, &tools, true, true, &remaining);
+        ok(one.size() == 1 && one[0].arguments.value("content", std::string()) == "<name>foo</name>",
+           "parameter_name opener: a <name> inside a value stays in the value");
+    }
+}
+
 // AN ABORTED SECOND CALL (2026-08-25, drift corpus 831ac625): the model
 // closes a call, opens another with the mode-22 spelling, and stops --
 //
@@ -2422,6 +2470,7 @@ int main() {
     test_value_containing_closer();
     test_last_parameter_garbled_tail();
     test_aborted_second_call();
+    test_parameter_name_opener();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
     test_xml_bleed_into_json_key();
