@@ -1,0 +1,18 @@
+{"arm": "A", "label": "vllm", "ctx": 95, "tps": 78.9, "ttft": 0.073, "gen": 512, "n": 3}
+{"arm": "A", "label": "vllm", "ctx": 3384, "tps": 78.7, "ttft": 0.257, "gen": 512, "n": 3}
+{"arm": "A", "label": "vllm", "ctx": 6595, "tps": 78.5, "ttft": 0.527, "gen": 512, "n": 3}
+{"arm": "A", "label": "vllm", "ctx": 13161, "tps": 77.6, "ttft": 1.16, "gen": 512, "n": 3}
+{"arm": "A", "label": "vllm", "ctx": 25700, "tps": 76.4, "ttft": 2.708, "gen": 512, "n": 3}
+{"arm": "A", "label": "vllm", "ctx": 51207, "tps": 73.7, "ttft": 7.149, "gen": 512, "n": 3}
+{"arm": "B", "label": "vllm", "turn": 1, "ctx": 2405, "ttft": 0.184, "tps": 78.7}
+{"arm": "B", "label": "vllm", "turn": 2, "ctx": 4781, "ttft": 0.273, "tps": 78.6}
+{"arm": "B", "label": "vllm", "turn": 3, "ctx": 7241, "ttft": 0.224, "tps": 78.4}
+{"arm": "B", "label": "vllm", "turn": 4, "ctx": 9659, "ttft": 0.322, "tps": 78.1}
+{"arm": "B", "label": "vllm", "turn": 5, "ctx": 12077, "ttft": 0.28, "tps": 77.6}
+{"arm": "B", "label": "vllm", "turn": 6, "ctx": 14453, "ttft": 0.386, "tps": 77.5}
+{"arm": "B", "label": "vllm", "turn": 7, "ctx": 16913, "ttft": 0.319, "tps": 77.4}
+{"arm": "B", "label": "vllm", "turn": 8, "ctx": 19289, "ttft": 0.459, "tps": 77.2}
+{"arm": "B", "label": "vllm", "turn": 9, "ctx": 21749, "ttft": 0.39, "tps": 76.6}
+{"arm": "B", "label": "vllm", "turn": 10, "ctx": 24168, "ttft": 0.526, "tps": 76.5}
+{"arm": "B", "label": "vllm", "turn": 11, "ctx": 26545, "ttft": 0.439, "tps": 76.3}
+{"arm": "B", "label": "vllm", "turn": 12, "ctx": 28964, "ttft": 0.581, "tps": 76.1}

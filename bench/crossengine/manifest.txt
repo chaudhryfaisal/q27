@@ -10,3 +10,11 @@ arms: quality
 legs: q38,llama38
 q27 commit: 95886ec
 llama.cpp: 01818e49 Q5_K_M + qwen38_sysinline.jinja
+
+run: 2026-08-27T21:00:00-07:00 .. 2026-08-28  (long-context arm + vLLM spec-on agentic re-run)
+arms: longctx (decode-vs-context + incremental loop), agentic (vllm38 spec-on, think-on + no-think)
+legs: q38 (wsum b743d26b), q38q4s, llama38 (01818e49 Q5_K_M), ninfer38 (converted this run), vllm38 nvfp4 specOFF+specON
+q27 commit: 9b10e16
+vllm image: nightly 0.26.1rc1.dev1177+ga9a17e709
+driver: 580.119.02
+writeup: LONGCTX.md

@@ -1,0 +1,18 @@
+{"arm": "A", "label": "q27-def", "ctx": 101, "tps": 144.8, "ttft": 0.097, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27-def", "ctx": 3280, "tps": 152.9, "ttft": 0.925, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27-def", "ctx": 6384, "tps": 178.6, "ttft": 1.772, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27-def", "ctx": 12738, "tps": 177.8, "ttft": 3.576, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27-def", "ctx": 25707, "tps": 165.7, "ttft": 7.6, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27-def", "ctx": 51216, "tps": 164.5, "ttft": 16.75, "gen": 512, "n": 3}
+{"arm": "B", "label": "q27-def", "turn": 1, "ctx": 2448, "ttft": 0.708, "tps": 192.0}
+{"arm": "B", "label": "q27-def", "turn": 2, "ctx": 4783, "ttft": 0.707, "tps": 128.1}
+{"arm": "B", "label": "q27-def", "turn": 3, "ctx": 7202, "ttft": 0.745, "tps": 179.5}
+{"arm": "B", "label": "q27-def", "turn": 4, "ctx": 9579, "ttft": 0.753, "tps": 159.2}
+{"arm": "B", "label": "q27-def", "turn": 5, "ctx": 11914, "ttft": 0.756, "tps": 128.1}
+{"arm": "B", "label": "q27-def", "turn": 6, "ctx": 14291, "ttft": 0.781, "tps": 151.5}
+{"arm": "B", "label": "q27-def", "turn": 7, "ctx": 16752, "ttft": 0.809, "tps": 195.0}
+{"arm": "B", "label": "q27-def", "turn": 8, "ctx": 19213, "ttft": 0.829, "tps": 171.2}
+{"arm": "B", "label": "q27-def", "turn": 9, "ctx": 21590, "ttft": 0.827, "tps": 158.1}
+{"arm": "B", "label": "q27-def", "turn": 10, "ctx": 23968, "ttft": 0.841, "tps": 132.5}
+{"arm": "B", "label": "q27-def", "turn": 11, "ctx": 26304, "ttft": 0.84, "tps": 224.8}
+{"arm": "B", "label": "q27-def", "turn": 12, "ctx": 28640, "ttft": 0.857, "tps": 148.2}

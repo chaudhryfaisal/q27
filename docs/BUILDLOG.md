@@ -15425,3 +15425,37 @@ but the correctness case for it is now "keep it from regressing," not "it is
 wrong today." The honest next step is more real-session capture (this corpus
 is one model over two days of benchmark and scripted traffic), not more
 parser edits against a corpus that agrees.
+
+## 2026-08-28 (a): cross-engine long-context arm, and the vLLM spec verdict retested
+
+New arm in bench/crossengine: a client-side long-context bench
+(harness/xengine_longctx.py -- cold decode-vs-context sweep plus a 12-turn
+incremental tool loop, same instrument for every OpenAI-compatible engine)
+run over q27 (default + q4s), llama.cpp 01818e49, ninfer (3.8 converted via
+their tools/convert/qwen3_8_27b, 72 s), and vLLM nightly, all serving
+Qwen3.8-27B-MTP on the 5090, think-on, matched sampler, q27 digest-verified.
+Writeup with tables: bench/crossengine/LONGCTX.md; raw records
+longctx.*.jsonl / agentic.vllm38specON.*.jsonl next to it.
+
+The three results, compressed: decode does not erode with context on ANY
+engine (2K -> 51K flat-to-gently-declining; the hybrid-GDN fixed-size state,
+not an engine feature -- q27's own [req] telemetry puts the pure
+forward-pass decline at ~12% to 50K). q27 leads decode (~150-180 t/s;
+q4s == default, so not a quant artifact) while vLLM leads cold prefill by
+~2.5x -- the axes trade off. And the 08-17 "vLLM MTP corrupts, run spec
+OFF" verdict is STALE on the current nightly: with the head enabled via
+hf-overrides (the 3.8 nvfp4 checkpoint carries mtp.* tensors but not the
+config field), spec-on is coherent and worth +60% decode (78 -> ~115-138),
+which narrows q27's decode lead over vLLM from ~2x to ~1.2-1.3x. Retested
+under real agentic load: 24 Claude Code SWE-bench sessions (think-on +
+no-think), ~294K tokens, no hard corruption -- but 1 of 24 sessions fell
+into a repetition loop (198K chars, 0.03 unique-word ratio), so spec-on
+stays uncleared for serving until a spec-off control of the same shape.
+
+Walls paid for, so they stay paid: min_p silently zeroes vLLM's SSE stream
+under spec-decode (server warns, then streams nothing); Claude Code's
+`reasoning effort: high` is REJECTED by the 3.8 chat template (accepts only
+xhigh/medium/low -- alias `high` in a patched template); vLLM 400s any
+request with prompt + max_tokens > max-model-len, and Claude Code sends
+max_tokens=64000 as a ceiling, so agentic sessions die at ~42.5K prompt on a
+106496 maxlen while q27 and ninfer clamp instead.
