@@ -600,7 +600,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         // think trace. A long *thinking* request should still set max_tokens
         // explicitly (a grad-level trace wants 16K+). jint/jbool: a
         // present-but-null field reads as absent (see parse_sample).
-        int n_max = (int)q27::jint(body, "max_tokens", 8192);
+        int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Chat);
         bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the

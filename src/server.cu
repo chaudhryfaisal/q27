@@ -1901,7 +1901,7 @@ int main(int argc, char** argv) {
         // think trace. A long *thinking* request should still set max_tokens
         // explicitly (a grad-level trace wants 16K+). jint/jbool: a
         // present-but-null field reads as absent (see parse_sample).
-        int n_max = (int)q27::jint(body, "max_tokens", 8192);
+        int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Chat);
         bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
@@ -2633,7 +2633,7 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
-        int n_max = (int)q27::jint(body, "max_tokens", 8192); // unified default (see /v1/chat/completions)
+        int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Messages); // unified default (see /v1/chat/completions)
         bool stream = q27::jbool(body, "stream", false);
         auto tk0 = std::chrono::steady_clock::now();
         q27::ToolChoice tchoice;
@@ -3310,7 +3310,7 @@ int main(int argc, char** argv) {
                 merged.push_back(m);
         }
 
-        int n_max = (int)q27::jint(body, "max_output_tokens", 8192); // unified default (see /v1/chat/completions)
+        int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Responses); // unified default (see /v1/chat/completions)
         // P16 does not apply to this shape (no stable_off / sys_off is computed
         // here), but the engine field is per-engine state -- set it so a
         // previous request's value cannot leak into this one.

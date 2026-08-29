@@ -55,6 +55,24 @@ inline long jint(const json& b, const char* key, long dflt) {
     if (v <= -2147483648.0) return -2147483648L;
     return (long)v;
 }
+
+// Output-cap field with alias tolerance (issue #39). Modern OpenAI clients
+// spell the cap max_completion_tokens; older ones max_tokens; Responses uses
+// max_output_tokens. Reading exactly one spelling silently truncates every
+// other client at the default. Precedence mirrors the Metal arm's
+// max_tokens() helper (metal_server.cpp): aliases first, each endpoint's
+// OFFICIAL field last so it wins when several are present. jint semantics
+// (null/wrong-type reads as absent) are this arm's deliberate tolerance.
+enum class CapApi { Chat, Messages, Responses };
+inline long request_max_tokens(const json& b, long dflt, CapApi api) {
+    long v = jint(b, "max_output_tokens", dflt);
+    v = jint(b, "max_completion_tokens", v);
+    v = jint(b, "max_tokens", v);
+    if (api == CapApi::Chat)      v = jint(b, "max_completion_tokens", v);
+    else if (api == CapApi::Responses) v = jint(b, "max_output_tokens", v);
+    // Messages: max_tokens is the official field and was applied last already.
+    return v;
+}
 inline bool jbool(const json& b, const char* key, bool dflt) {
     if (!b.is_object()) return dflt;
     const auto it = b.find(key);
