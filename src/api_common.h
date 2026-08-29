@@ -3417,15 +3417,31 @@ inline size_t bare_mode22_opener_position(const std::string& text,const NameSet&
                                           MarkdownFenceLexState fence_state={},
                                           bool end_is_final=true) {
     for(size_t i=0;i<text.size();i++) {
-        if(text[i]=='<' && text.compare(i,11,"<parameter=")==0) {
+        if(text[i]=='<' && text.compare(i,10,"<parameter")==0 &&
+           text.compare(i,11,"<parameter_")!=0) {
             std::string key; size_t after=0;
-            if(parse_parameter_opener(text,i,key,after) && names.find(key)!=names.end()) {
-                const size_t nb=text.find_first_not_of(" \t\r\n",after);
-                const bool param_next=nb!=std::string::npos && text.compare(nb,11,"<parameter=")==0;
-                const bool zero_arg=nb!=std::string::npos && text.compare(nb,11,"</function>")==0;
-                if((param_next||zero_arg||(end_is_final&&nb==std::string::npos)) &&
-                   bare_context_is_executable(text,i,string_state,fence_state,end_is_final))
-                    return i;
+            if(parse_parameter_opener(text,i,key,after)) {
+                if(names.find(key)!=names.end()) {
+                    // parameter-as-opener (mode 22): NAME is a declared tool.
+                    const size_t nb=text.find_first_not_of(" \t\r\n",after);
+                    const bool param_next=nb!=std::string::npos && text.compare(nb,10,"<parameter")==0;
+                    const bool zero_arg=nb!=std::string::npos && text.compare(nb,11,"</function>")==0;
+                    if((param_next||zero_arg||(end_is_final&&nb==std::string::npos)) &&
+                       bare_context_is_executable(text,i,string_state,fence_state,end_is_final))
+                        return i;
+                } else if(text.find("</parameter>",after)!=std::string::npos) {
+                    // openerless parameter list (mode 21 class, issue #38
+                    // 2026-08-29): an ordinary parameter key -- any spelling
+                    // parse_parameter_opener accepts, including the HTML-attr
+                    // form `<parameter name="command">` -- arms only once the
+                    // visible text carries a `</parameter>` closer, the
+                    // evidence a markdown mention of the tag never has. The
+                    // parser's mode-21 chain (name inference + declared gate)
+                    // decides whether a call comes out; a non-call candidate
+                    // is re-emitted as text by the flush path.
+                    if(bare_context_is_executable(text,i,string_state,fence_state,end_is_final))
+                        return i;
+                }
             }
         }
         consume_bare_text_context(string_state,fence_state,text[i]);
@@ -3445,15 +3461,18 @@ template<class NameSet>
 inline size_t bare_mode22_opener_probe_start(
     const std::string& text,const NameSet& names,
     JsonStringLexState string_state={},MarkdownFenceLexState fence_state={}) {
-    static const std::string O="<parameter=";
+    static const std::string O="<parameter";
     size_t hold=std::string::npos;
-    // (1) a trailing partial prefix of "<parameter="
+    // (1) a trailing partial prefix of "<parameter"
     for(size_t len=std::min(text.size(),O.size()-1);len;--len) {
         const size_t start=text.size()-len;
         if(text.compare(start,len,O.c_str(),len)==0) { hold=start; break; }
     }
-    // (2) the last complete "<parameter=" whose opener-ness is undecided
-    const size_t p=text.rfind(O);
+    // (2) the last complete "<parameter..." tag whose opener-ness is undecided
+    //     (any spelling parse_parameter_opener accepts; NOT <parameter_name>,
+    //     which belongs to the native opener table)
+    size_t p=text.rfind(O);
+    if(p!=std::string::npos && text.compare(p,11,"<parameter_")==0) p=std::string::npos;
     if(p!=std::string::npos) {
         std::string key; size_t after=0;
         if(!parse_parameter_opener(text,p,key,after)) {
@@ -3464,13 +3483,18 @@ inline size_t bare_mode22_opener_probe_start(
             if(nb!=std::string::npos && text[nb]!='<') decided=true;  // a value -> ordinary param
             else if(nb!=std::string::npos) {
                 // a '<' has started: decided only once it is long enough to be
-                // classified as `<parameter=` / `</function>` or ruled out
+                // classified as `<parameter` / `</function>` or ruled out
                 const size_t avail=text.size()-nb;
                 decided = avail>=11 ||
-                          (text.compare(nb,std::min(avail,(size_t)11),"<parameter=",std::min(avail,(size_t)11))!=0 &&
+                          (text.compare(nb,std::min(avail,(size_t)10),"<parameter",std::min(avail,(size_t)10))!=0 &&
                            text.compare(nb,std::min(avail,(size_t)11),"</function>",std::min(avail,(size_t)11))!=0);
             }
             if(!decided) hold=(hold==std::string::npos?p:std::min(hold,p));
+        } else if(text.find("</parameter>",after)==std::string::npos) {
+            // ordinary key: a parameter LIST is still possible until its first
+            // closer arrives; hold the tag rather than leak the head of a call
+            // (a prose mention that never closes is re-emitted at finish).
+            hold=(hold==std::string::npos?p:std::min(hold,p));
         }
     }
     if(hold==std::string::npos) return hold;

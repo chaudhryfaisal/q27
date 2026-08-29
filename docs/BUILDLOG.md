@@ -15459,3 +15459,36 @@ xhigh/medium/low -- alias `high` in a patched template); vLLM 400s any
 request with prompt + max_tokens > max-model-len, and Claude Code sends
 max_tokens=64000 as a ceiling, so agentic sessions die at ~42.5K prompt on a
 106496 maxlen while q27 and ninfer clamp instead.
+
+## 2026-08-29 (a): output-cap aliases (issue #39) and drift round 5 (issue #38)
+
+Two cosmicnag reports, both fixed on one branch.
+
+**#39, max_completion_tokens silently ignored.** The CUDA server read exactly
+one cap field per endpoint, so a modern client spelling the cap
+max_completion_tokens fell back to the 8192 default and truncated at a
+cap-hit indistinguishable from an honest 8192 request. The Metal arm already
+carried the alias logic; `q27::request_max_tokens` (api_common.h) now mirrors
+its precedence on the CUDA arm -- aliases first, each endpoint's OFFICIAL
+field applied last so it wins when several are present (chat:
+max_completion_tokens, messages: max_tokens, responses: max_output_tokens) --
+with this arm's jint tolerance (null/wrong type reads as absent) rather than
+Metal's strict throws. All three handlers switched; the integration harness
+moved in lockstep (extract_check byte-match); precedence unit test in
+test_openai_bridge.
+
+**#38 round 5, the openerless HTML-attribute call.** The paste: prose, an
+opener mangled to a bare `>`, `<parameter name="command">` -- the QUOTED
+HTML-attribute spelling -- mixed with `<parameter=description>` in the same
+call, closed by a lone `</function>`. Non-stream already recovered it
+(parse_parameter_opener accepts the attr spelling; mode 21 infers Bash from
+the signature), but the streaming holdback had no detector that arms on a
+bare parameter tag whose key is not a tool name, so live traffic leaked the
+whole call as text and the agent halted. bare_mode22_opener_position now
+matches any `<parameter` spelling and arms the ordinary-key case only on
+parameter-list evidence -- a `</parameter>` closer visible ahead -- with the
+probe holding the undecided tail; a quoted pair whose keys infer no declared
+tool is re-emitted as text by the flush path (both directions are tracked
+tests). Verified through the real splitter+router at chunk sizes 1/3/7/64;
+test-tools green, corpus-check 159/159, gcc+ASan fuzz 250k clean, server.cu
+compiles under nvcc.

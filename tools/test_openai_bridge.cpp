@@ -3088,6 +3088,53 @@ static void test_stream_router_bare_mode22_standalone_zero_arg() {
 // followed by a real value (an ordinary parameter), a prose mention, a fenced
 // example, or a partial tag at end of stream. Each must yield zero calls and
 // surface its text verbatim.
+// issue #38 round 5 (2026-08-29, cosmicnag): a nameless openerless call in
+// the HTML-attribute spelling, streamed bare -- prose, a mangled opener
+// remnant, `<parameter name="command">` (quoted attr) mixed with
+// `<parameter=description>`, closed by a bare `</function>`. Non-stream
+// recovered it via mode 21 (signature-inferred Bash); the streaming holdback
+// never armed and the whole call leaked as text, halting the agent.
+static json mode21_stream_tools() {
+    return json::parse(R"([
+      {"type":"function","function":{"name":"Bash","parameters":{"type":"object",
+        "properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}},
+      {"type":"function","function":{"name":"read","parameters":{"type":"object",
+        "properties":{"path":{"type":"string"}},"required":["path"]}}}])");
+}
+static void test_stream_router_openerless_html_attr_params() {
+    const json tools = mode21_stream_tools();
+    const std::string gen =
+        "Let me redo both checks.\n\n>\n"
+        "<parameter name=\"command\">hf models list --format json\n</parameter>\n"
+        "<parameter=description>\nSum branch file sizes\n</parameter>\n</function>\n";
+    for (size_t chunk : {size_t(1), size_t(3), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.size() == 1);
+        if (!r.calls.empty()) {
+            CHECK(r.calls[0].name == "Bash");
+            CHECK(r.calls[0].arguments.value("command", std::string()).find("hf models list") == 0);
+            CHECK(r.calls[0].arguments.value("description", std::string()) == "Sum branch file sizes");
+        }
+        CHECK(r.text.find("<parameter") == std::string::npos);   // nothing leaked
+        CHECK(r.text.find("Let me redo both checks.") != std::string::npos);  // prose kept
+    }
+}
+
+// The arming evidence gate the other way: an undeclared parameter pair QUOTED
+// in prose (tag + closer present, but the keys infer no declared tool) must
+// come back out as text, not a call and not a swallow.
+static void test_stream_router_quoted_parameter_pair_stays_text() {
+    const json tools = mode21_stream_tools();
+    const std::string gen =
+        "The syntax is <parameter=frobnicate>value</parameter> in that dialect.\nDone.";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.empty());
+        CHECK(r.text.find("<parameter=frobnicate>value</parameter>") != std::string::npos);
+        CHECK(r.text.find("Done.") != std::string::npos);
+    }
+}
+
 static void test_stream_router_parameter_tag_that_is_not_a_call() {
     const json tools = mode22_zero_arg_tools();
     struct Case { const char* gen; const char* must_contain; } cases[] = {
@@ -3178,7 +3225,25 @@ static void test_think_wrapper_blanker_straddles_chunks() {
     CHECK(b.feed("<tool_call></tool_call>") == std::string(23, ' '));
 }
 
+// issue #39: output-cap alias tolerance. The official field per endpoint
+// wins over foreign/legacy aliases; absent/null reads as absent.
+static void test_request_max_tokens_aliases() {
+    using q27::request_max_tokens; using q27::CapApi;
+    json b1 = {{"max_completion_tokens", 65536}};
+    CHECK(request_max_tokens(b1, 8192, CapApi::Chat) == 65536);      // the report's repro
+    CHECK(request_max_tokens(b1, 8192, CapApi::Messages) == 65536);  // alias accepted
+    json b2 = {{"max_tokens", 1000}, {"max_completion_tokens", 2000}};
+    CHECK(request_max_tokens(b2, 8192, CapApi::Chat) == 2000);       // official wins on chat
+    CHECK(request_max_tokens(b2, 8192, CapApi::Messages) == 1000);   // official wins on messages
+    json b3 = {{"max_tokens", 1000}, {"max_output_tokens", 3000}};
+    CHECK(request_max_tokens(b3, 8192, CapApi::Responses) == 3000);  // official wins on responses
+    CHECK(request_max_tokens(json::object(), 8192, CapApi::Chat) == 8192); // default
+    json b4 = {{"max_completion_tokens", nullptr}};
+    CHECK(request_max_tokens(b4, 8192, CapApi::Chat) == 8192);       // null = absent
+}
+
 int main() {
+    test_request_max_tokens_aliases();
     test_stream_router_wrapped_call_in_reasoning();
     test_stream_router_bare_call_in_reasoning();
     test_stream_router_four_calls_in_one_think_block();
@@ -3194,6 +3259,8 @@ int main() {
     test_stream_router_bare_mode22_in_reasoning();
     test_stream_router_bare_mode22_standalone_zero_arg();
     test_stream_router_parameter_tag_that_is_not_a_call();
+    test_stream_router_openerless_html_attr_params();
+    test_stream_router_quoted_parameter_pair_stays_text();
     test_dialect_residue_is_not_text();
     test_tools_passthrough();
     test_tools_absent();
