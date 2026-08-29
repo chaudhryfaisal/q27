@@ -1,0 +1,18 @@
+{"arm": "A", "label": "llama38", "ctx": 94, "tps": 91.5, "ttft": 0.26, "gen": 512, "n": 3}
+{"arm": "A", "label": "llama38", "ctx": 3329, "tps": 95.7, "ttft": 1.323, "gen": 512, "n": 3}
+{"arm": "A", "label": "llama38", "ctx": 6595, "tps": 87.2, "ttft": 2.419, "gen": 512, "n": 3}
+{"arm": "A", "label": "llama38", "ctx": 12730, "tps": 94.9, "ttft": 4.562, "gen": 512, "n": 3}
+{"arm": "A", "label": "llama38", "ctx": 25700, "tps": 85.1, "ttft": 9.13, "gen": 512, "n": 3}
+{"arm": "A", "label": "llama38", "ctx": 50355, "tps": 76.8, "ttft": 20.534, "gen": 512, "n": 3}
+{"arm": "B", "label": "llama38", "turn": 1, "ctx": 2447, "ttft": 1.768, "tps": 119.9}
+{"arm": "B", "label": "llama38", "turn": 2, "ctx": 4865, "ttft": 0.918, "tps": 127.8}
+{"arm": "B", "label": "llama38", "turn": 3, "ctx": 7283, "ttft": 0.939, "tps": 80.9}
+{"arm": "B", "label": "llama38", "turn": 4, "ctx": 9743, "ttft": 0.974, "tps": 124.7}
+{"arm": "B", "label": "llama38", "turn": 5, "ctx": 12203, "ttft": 0.999, "tps": 105.3}
+{"arm": "B", "label": "llama38", "turn": 6, "ctx": 14621, "ttft": 1.015, "tps": 130.9}
+{"arm": "B", "label": "llama38", "turn": 7, "ctx": 17039, "ttft": 1.045, "tps": 102.0}
+{"arm": "B", "label": "llama38", "turn": 8, "ctx": 19499, "ttft": 1.084, "tps": 145.6}
+{"arm": "B", "label": "llama38", "turn": 9, "ctx": 21917, "ttft": 1.09, "tps": 94.0}
+{"arm": "B", "label": "llama38", "turn": 10, "ctx": 24294, "ttft": 1.106, "tps": 107.0}
+{"arm": "B", "label": "llama38", "turn": 11, "ctx": 26629, "ttft": 1.123, "tps": 102.8}
+{"arm": "B", "label": "llama38", "turn": 12, "ctx": 29090, "ttft": 1.206, "tps": 92.7}
