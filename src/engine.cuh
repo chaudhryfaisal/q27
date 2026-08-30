@@ -685,6 +685,16 @@ struct Engine {
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
     // cannot reconstruct (docs/acceptance-gate-design.md).
     long gate_lane_fired[W_MAX] = {}, gate_lane_acc[W_MAX] = {}; // [j 1..W_MAX-1]; 0 unused
+    // Live token counters (2026-08-30, /metrics): incremented as tokens are
+    // PRODUCED (decode per delivered token in post_round, prefill at the
+    // success exit of generate_prefill), so a scrape sees decode/prefill
+    // progress during generation instead of only at request completion (the
+    // completion-based totals live in GenStats/gs). Unlabeled: the engine
+    // does not know the API shape. Relaxed ordering -- a monotonic counter
+    // for monitoring, stale by at most one poll is fine.
+    std::atomic<unsigned long long> live_decoded{0};
+    std::atomic<unsigned long long> live_prefill_computed{0};
+    std::atomic<unsigned long long> live_prefill_cached{0};
     // Phase 2 (sampling): the sampled set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph = nullptr;
@@ -4326,7 +4336,10 @@ struct Engine {
                 finish_decode(t, "client-stop");
                 return false;
             }
-            if (!t.round_forced) t.emitted++;
+            if (!t.round_forced) {
+                t.emitted++;
+                live_decoded.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         t.round_forced = false;
         if (!t.sampling && on_pending) on_pending(last_pending);
@@ -4628,6 +4641,12 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
+        // Live prefill counters: computed = gs.pf (NP - cached base), cached
+        // = gs.hit (prefix restored from snapshot/ckpt/disk). Mirrors the
+        // completion-based split (prompt - hit - pfx / hit + pfx) so the
+        // sparkDash cached/uncached tiles stay live during prefill.
+        live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
+        live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;
         return true;
     }

@@ -96,6 +96,11 @@ struct GaugeSnapshot {
     int prefix_cache_entries = -1; // -1 = prefix cache disabled -> omit
     ull spec_draft = 0;            // cumulative MTP lanes fired (engines)
     ull spec_accepted = 0;         // cumulative MTP lanes accepted
+    // Live engine token counters (summed across slots): progress visible
+    // DURING generation, unlike the completion-based per-api counters.
+    ull live_decoded = 0;
+    ull live_prefill_computed = 0;
+    ull live_prefill_cached = 0;
     double uptime_seconds = 0.0;
 };
 
@@ -229,6 +234,19 @@ struct Metrics {
         emit_counter_scalar("q27_spec_accepted_tokens_total",
                             "Cumulative MTP draft lanes accepted (accept gate).",
                             g.spec_accepted);
+        // Live (in-progress) token counters, unlabeled. These move while a
+        // request is generating, so rate()/delta() consumers see real-time
+        // tok/s instead of a completion-time step. At rest they equal the
+        // per-api totals above.
+        emit_counter_scalar("q27_decode_tokens_processed_total",
+                            "Tokens delivered during decode (live, cumulative).",
+                            g.live_decoded);
+        emit_counter_scalar("q27_prefill_computed_tokens_processed_total",
+                            "Prefill tokens computed (live, cumulative).",
+                            g.live_prefill_computed);
+        emit_counter_scalar("q27_prefill_cached_tokens_processed_total",
+                            "Prefill tokens served from cache (live, cumulative).",
+                            g.live_prefill_cached);
         // q27 never preempts: admission is a FIFO queue, so this counter is
         // honest at 0 (sparkDash's Preempts tile reads it, tooltip: "zero is
         // normal when the server is comfortable").

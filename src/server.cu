@@ -1892,6 +1892,12 @@ int main(int argc, char** argv) {
                     g.spec_draft += (q27::metrics::ull)e.gate_lane_fired[j];
                     g.spec_accepted += (q27::metrics::ull)e.gate_lane_acc[j];
                 }
+                // Live engine counters (atomics, relaxed reads -- monotonic).
+                g.live_decoded += e.live_decoded.load(std::memory_order_relaxed);
+                g.live_prefill_computed +=
+                    e.live_prefill_computed.load(std::memory_order_relaxed);
+                g.live_prefill_cached +=
+                    e.live_prefill_cached.load(std::memory_order_relaxed);
             }
         }
         if (pfx_cache.enabled()) g.prefix_cache_entries = (int)pfx_cache.size();
