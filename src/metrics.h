@@ -100,6 +100,10 @@ struct Histogram {
                 b[i] = bucket[i].load(std::memory_order_relaxed);
             const ull c = count.load(std::memory_order_relaxed);
             const long long s = sum_us.load(std::memory_order_relaxed);
+            // Acquire fence between the data reads and the re-check: on a
+            // weakly-ordered host it keeps the relaxed data loads from
+            // sliding past the closing seq read (no-op on x86).
+            std::atomic_thread_fence(std::memory_order_acquire);
             if (seq.load(std::memory_order_acquire) == s1) {
                 apply(b, c, s);
                 return true;
@@ -188,7 +192,8 @@ struct Metrics {
         counters.queue_wait_us[api] += (ull)std::llround(qw_ms * 1000.0);
         ttft[api].observe(pf_ms / 1000.0);
         e2e[api].observe(e2e_ms / 1000.0);
-        itl[api].observe(dec > 0 ? dec_ms / (1000.0 * dec) : 0.0);
+        if (dec > 0) // zero-decode requests (refused/aborted) have no ITL
+            itl[api].observe(dec_ms / (1000.0 * dec));
     }
 
     std::string render(const GaugeSnapshot& g) const {
@@ -263,7 +268,11 @@ struct Metrics {
                     snprintf(buf, sizeof buf, "%s_bucket{api=\"%s\",le=\"+Inf\"} %llu\n", name,
                              kApiNames[a], cum);
                     s += buf;
-                    snprintf(buf, sizeof buf, "%s_sum{api=\"%s\"} %g\n%s_count{api=\"%s\"} %llu\n",
+                    // %.6f, not %g: the sum grows unboundedly, and 6
+                    // significant digits would round away small deltas at
+                    // large totals (same rationale as queue_wait above).
+                    snprintf(buf, sizeof buf,
+                             "%s_sum{api=\"%s\"} %.6f\n%s_count{api=\"%s\"} %llu\n",
                              name, kApiNames[a], (double)s_us / 1e6, name,
                              kApiNames[a], c);
                     s += buf;
