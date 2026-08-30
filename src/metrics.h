@@ -229,6 +229,11 @@ struct Metrics {
         emit_counter_scalar("q27_spec_accepted_tokens_total",
                             "Cumulative MTP draft lanes accepted (accept gate).",
                             g.spec_accepted);
+        // q27 never preempts: admission is a FIFO queue, so this counter is
+        // honest at 0 (sparkDash's Preempts tile reads it, tooltip: "zero is
+        // normal when the server is comfortable").
+        emit_counter_scalar("q27_preemptions_total",
+                            "Cumulative preemptions (q27 never preempts; FIFO queue).", 0);
         emit_gauge("q27_spec_accept_ratio",
                    "Cumulative MTP accept ratio (accepted / drafted).",
                    g.spec_draft > 0 ? (double)g.spec_accepted / (double)g.spec_draft : 0.0);

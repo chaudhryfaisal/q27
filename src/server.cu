@@ -1857,8 +1857,10 @@ int main(int argc, char** argv) {
 
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json j = {{"object", "list"},
-                  {"data", json::array({{{"id", served_name}, {"object", "model"},
-                                         {"owned_by", "q27"}}})}};
+                  {"data", json::array({{{"id", served_name},
+                                         {"object", "model"},
+                                         {"owned_by", "q27"},
+                                         {"max_model_len", max_slot_ctx}}})}};
         res.set_content(j.dump(), "application/json");
     });
 
