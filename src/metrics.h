@@ -5,10 +5,11 @@
 // derive rates with rate()/delta()); latency percentiles come from
 // histograms (cumulative buckets, +Inf == count by construction).
 //
-// Naming: q27_* series only, no ds4_/vllm_ compatibility aliases -- the
-// stock sparkDash parser keys on those exact prefixes and will not pick
-// these up; a Prometheus/Grafana setup (or an extended sparkDash parser)
-// is the intended consumer.
+// Naming: q27_* series only, no ds4_/vllm_ compatibility aliases. The
+// semantics are q27's own (computed/cached prefill split, gate-lane MTP
+// accounting, FIFO no-preemption), versioned by this engine; borrowing
+// another project's metric names to reuse its dashboards would couple
+// this wire format to prefixes it does not own and drift against.
 //
 // Thread contract: observe() runs on request threads, render() on the
 // httplib serving thread. Everything shared is std::atomic; histograms
@@ -60,8 +61,8 @@ struct Histogram {
     // Seqlock: even = quiescent, odd = an observe() is mid-update. The
     // reader (render) retries until it reads all fields under an unchanged
     // seq, so one scrape can never see a torn update -- in particular the
-    // +Inf-bucket == count invariant that Prometheus consumers (and the
-    // sparkDash parser) refuse to work without. Writers CAS into the odd
+    // +Inf-bucket == count invariant that Prometheus consumers refuse to
+    // work without. Writers CAS into the odd
     // state; the critical section is three relaxed atomics (nanoseconds),
     // so both the writer spin and the reader retry are negligible.
     std::atomic<long long> seq = 0;
@@ -314,8 +315,8 @@ struct Metrics {
                             "Prefill tokens served from cache (live, cumulative).",
                             g.live_prefill_cached);
         // q27 never preempts: admission is a FIFO queue, so this counter is
-        // honest at 0 (sparkDash's Preempts tile reads it, tooltip: "zero is
-        // normal when the server is comfortable").
+        // honestly 0. Non-zero would mean a code path regressed into
+        // preemption; dashboards should treat 0 as healthy, not missing.
         emit_counter_scalar("q27_preemptions_total",
                             "Cumulative preemptions (q27 never preempts; FIFO queue).", 0);
         emit_gauge("q27_spec_accept_ratio",

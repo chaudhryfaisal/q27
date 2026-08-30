@@ -106,6 +106,12 @@ this trade; q27 currently sits at the permissive end.
   documented together in the README for that reason.
 - `--api-key` comparison is constant-time (`secure_compare`), deliberately
   without early exit on length or first difference.
+- `--enable-metrics` (default off) adds an auth-exempt `GET /metrics`,
+  reachable without a key for the same reason `/health` is: pollers scrape
+  without credentials. It exposes operational metadata only -- request and
+  token counters, latency histograms, occupancy gauges, uptime -- never
+  prompt text or generated content. Without the flag the route does not
+  exist (404).
 - No auth by default is a loopback-only assumption. Do not expose the port.
 
 ## Reporting

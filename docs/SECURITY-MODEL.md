@@ -368,3 +368,17 @@ forges each case). A malicious file in the cache directory cannot make the
 server continue a conversation whose tokens the requester did not supply --
 though anyone who can WRITE to that directory can already do far worse to the
 process, and is outside the model here as elsewhere.
+
+## Addendum 2026-08-30: the /metrics surface
+
+`--enable-metrics` (default off) adds an auth-exempt `GET /metrics`
+(Prometheus text exposition; see `docs/metrics-endpoint.md`). Disposition:
+metadata-only telemetry -- request and token counters, latency histograms,
+occupancy gauges, server uptime. No prompt text, no generated tokens, no
+conversation state reaches the endpoint, and the prefix cache's on-disk
+content is not readable through it. It widens the unauthenticated surface
+the same way `/health` does -- an on-path observer learns that this is a
+q27 server and how busy it is -- so it stays opt-in and rides on the same
+loopback / api-key posture as everything else. When the flag is absent the
+route is not registered at all (404). Nothing in this addendum re-activates
+or weakens the dispositions above.

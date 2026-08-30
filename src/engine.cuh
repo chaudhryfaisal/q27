@@ -4672,8 +4672,9 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
         // Live prefill counters: computed = gs.pf (NP - cached base), cached
         // = gs.hit (prefix restored from snapshot/ckpt/disk). Mirrors the
-        // completion-based split (prompt - hit - pfx / hit + pfx) so the
-        // sparkDash cached/uncached tiles stay live during prefill.
+        // completion-based split (prompt - hit - pfx / hit + pfx) so
+        // consumers of that split see progress during prefill, not only at
+        // request end.
         live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
         live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;

@@ -1816,9 +1816,9 @@ int main(int argc, char** argv) {
     // default is unchanged). /health and /metrics are intentionally exempt:
     // infra health checks (load balancers, container orchestrators) need
     // /health reachable without distributing the secret to that
-    // infrastructure, and sparkDash-style pollers scrape /metrics without
-    // credentials (a 401/403 would mark the backend "protected" and show
-    // nothing). Every other endpoint requires a valid key. Runs before route
+    // infrastructure, and monitoring pollers scrape /metrics without
+    // credentials (an auth wall here would break every unauthenticated
+    // scraper). Every other endpoint requires a valid key. Runs before route
     // dispatch, so an invalid/missing key never reaches slot allocation,
     // tokenization, or any generation work.
     if (!api_keys.empty()) {
