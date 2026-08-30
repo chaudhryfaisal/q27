@@ -3141,6 +3141,18 @@ struct Engine {
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         if (sampled) {
             last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
+            // Accept-gate telemetry for FUSED sampled rounds (monitoring
+            // only; sampled rounds never feed dctl/EMA -- fixed ceiling 4).
+            if (gate_cap >= 0) {
+                int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
+                gate_cap_hist[cap]++;
+                gate_n_hist[n]++;
+                if (n <= W_MAX) gate_joint[cap][n]++;
+                for (int j = 1; j <= cap; j++) {
+                    gate_lane_fired[j]++;
+                    if (n >= j + 1) gate_lane_acc[j]++;
+                }
+            }
         } else {
             last_pending = oc[OUTCOME_INTS - 1];
             sfx_valid = true;
@@ -3192,6 +3204,7 @@ struct Engine {
             samp_first = false;
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
         }
+        int gated_cap = -1; // accept-gate telemetry: set in the gated branches below
         if (pmin_theta > 0.f) {
             // P14 confidence-gated sampled round -- mirror spec_round's gated
             // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
@@ -3224,6 +3237,7 @@ struct Engine {
                 for (int k = launched; k < W && k < md_used; k++)
                     CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
+                gated_cap = cap;
             } else {
                 // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
                 cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo : draft_graph;
@@ -3236,6 +3250,7 @@ struct Engine {
                 assert(cap <= 4);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
+                gated_cap = cap;
             }
             // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
             // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
@@ -3249,6 +3264,20 @@ struct Engine {
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[6];
         fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
+        // Accept-gate telemetry for sampled rounds (monitoring only; sampled
+        // rounds never feed dctl/EMA -- the sampled ceiling is fixed at 4).
+        // Mirrors the greedy block in spec_round/commit_outcome so the
+        // /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
+        // under sampled traffic too.
+        if (gated_cap >= 0) {
+            gate_cap_hist[gated_cap]++;
+            gate_n_hist[n]++;
+            if (n <= W_MAX) gate_joint[gated_cap][n]++;
+            for (int j = 1; j <= gated_cap; j++) {
+                gate_lane_fired[j]++;
+                if (n >= j + 1) gate_lane_acc[j]++;
+            }
+        }
         return n;
     }
     int last_pending = -1;
