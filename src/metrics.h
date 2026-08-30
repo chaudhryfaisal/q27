@@ -11,9 +11,11 @@
 // is the intended consumer.
 //
 // Thread contract: observe() runs on request threads, render() on the
-// httplib serving thread. Everything shared is std::atomic; the gauge
-// snapshot (inflight slots, KV pool, spec counters) is assembled by the
-// caller under the server's route_m.
+// httplib serving thread. Everything shared is std::atomic; histograms
+// add a seqlock (observe CAS-in/release, render retries on a torn read)
+// so one scrape is always internally consistent (+Inf == count). The
+// gauge snapshot (inflight slots, KV pool, spec counters) is assembled
+// by the caller under the server's route_m.
 #pragma once
 
 #include <algorithm>
@@ -55,6 +57,14 @@ struct Histogram {
     std::atomic<ull> bucket[kMaxBuckets] = {};
     std::atomic<ull> count = 0;
     std::atomic<long long> sum_us = 0;
+    // Seqlock: even = quiescent, odd = an observe() is mid-update. The
+    // reader (render) retries until it reads all fields under an unchanged
+    // seq, so one scrape can never see a torn update -- in particular the
+    // +Inf-bucket == count invariant that Prometheus consumers (and the
+    // sparkDash parser) refuse to work without. Writers CAS into the odd
+    // state; the critical section is three relaxed atomics (nanoseconds),
+    // so both the writer spin and the reader retry are negligible.
+    std::atomic<long long> seq = 0;
 
     void init(const double* e, int n_) { edges = e; n = n_; }
 
@@ -63,19 +73,57 @@ struct Histogram {
         int i = 0;
         while (i < n && seconds > edges[i]) i++;
         if (i >= kMaxBuckets) i = kMaxBuckets - 1; // belt: never OOB
-        bucket[i]++;
-        count++;
-        sum_us += (long long)std::llround(seconds * 1e6);
+        const long long us = std::llround(seconds * 1e6);
+        for (;;) {
+            long long s = seq.load(std::memory_order_acquire);
+            if (s & 1) continue; // another observe() in flight
+            if (seq.compare_exchange_weak(s, s + 1, std::memory_order_acquire))
+                break;
+        }
+        bucket[i].fetch_add(1, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+        sum_us.fetch_add(us, std::memory_order_relaxed);
+        seq.fetch_add(1, std::memory_order_release); // even: quiescent
+    }
+
+    // Read all fields under a stable seq and hand them to apply(). Retries
+    // up to 3 times on a torn read; if still torn, falls through to a
+    // best-effort read (one poll shows a null quantile, the next heals --
+    // never wrong data).
+    template <typename F>
+    bool snapshot(F&& apply) const {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            const long long s1 = seq.load(std::memory_order_acquire);
+            if (s1 & 1) continue; // in flight: retry
+            ull b[kMaxBuckets] = {};
+            for (int i = 0; i < kMaxBuckets; i++)
+                b[i] = bucket[i].load(std::memory_order_relaxed);
+            const ull c = count.load(std::memory_order_relaxed);
+            const long long s = sum_us.load(std::memory_order_relaxed);
+            if (seq.load(std::memory_order_acquire) == s1) {
+                apply(b, c, s);
+                return true;
+            }
+        }
+        ull b[kMaxBuckets] = {};
+        for (int i = 0; i < kMaxBuckets; i++) b[i] = bucket[i].load(std::memory_order_relaxed);
+        const ull c = count.load(std::memory_order_relaxed);
+        const long long s = sum_us.load(std::memory_order_relaxed);
+        apply(b, c, s);
+        return false;
     }
 };
 
-// Bucket edges per histogram family (seconds).
-static constexpr double kTtftEdgesS[] = {0.010, 0.050, 0.100, 0.250, 0.500,
-                                        1.0,   2.5,   5.0}; // prefill wall
-static constexpr double kE2eEdgesS[] = {0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
-                                        10.0,  30.0,  60.0}; // arrival -> gen done
+// Bucket edges per histogram family (seconds). The tails (TTFT to 60 s, E2E
+// to 300 s, ITL to 100 ms) cover extreme-but-real observations -- e.g. a
+// 60k-token prefill taking ~25 s -- so p95 stays inside finite buckets
+// instead of landing in the +Inf tail (which consumers report as "no data").
+static constexpr double kTtftEdgesS[] = {0.010, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5,
+                                         5.0,  10.0,  30.0,  60.0}; // prefill wall
+static constexpr double kE2eEdgesS[] = {0.100, 0.250, 0.500, 1.0, 2.5, 5.0,  10.0, 30.0,
+                                        60.0,  300.0};               // arrival -> gen done
 static constexpr double kItlEdgesS[] = {0.001, 0.002, 0.003, 0.004, 0.005, 0.008,
-                                        0.010, 0.015}; // dec_ms / dec per request
+                                        0.010, 0.015, 0.020, 0.050, 0.100}; // dec_ms / dec per request
 
 // Cumulative per-api counters (ull sums; queue wait stored as microseconds).
 struct Counters {
@@ -157,7 +205,12 @@ struct Metrics {
                     snprintf(buf, sizeof buf, "%s{api=\"%s\"} %llu\n", name, kApiNames[a],
                              (ull)val);
                 else
-                    snprintf(buf, sizeof buf, "%s{api=\"%s\"} %g\n", name, kApiNames[a],
+                    // %.6f (not %g): keeps microsecond resolution in seconds.
+                    // %g = 6 significant digits would round away microsecond
+                    // deltas once the total passes ~10 s, corrupting rate()
+                    // on long-running servers (queue wait is the only scaled
+                    // counter today; the total reaches 1e6 s only at ~11 days).
+                    snprintf(buf, sizeof buf, "%s{api=\"%s\"} %.6f\n", name, kApiNames[a],
                              val);
                 s += buf;
             }
@@ -196,21 +249,25 @@ struct Metrics {
             s += buf;
             for (int a = 0; a < ApiCount; a++) {
                 const Histogram& hh = h[a];
-                ull cum = 0;
-                for (int i = 0; i < hh.n; i++) {
-                    cum += hh.bucket[i].load();
-                    snprintf(buf, sizeof buf, "%s_bucket{api=\"%s\",le=\"%.3f\"} %llu\n", name,
-                             kApiNames[a], hh.edges[i], cum);
+                // Seqlock snapshot: the emitted +Inf/count pair is always
+                // from one quiescent moment (see Histogram::snapshot).
+                hh.snapshot([&](const ull* b, ull c, long long s_us) {
+                    ull cum = 0;
+                    for (int i = 0; i < hh.n; i++) {
+                        cum += b[i];
+                        snprintf(buf, sizeof buf, "%s_bucket{api=\"%s\",le=\"%.3f\"} %llu\n",
+                                 name, kApiNames[a], hh.edges[i], cum);
+                        s += buf;
+                    }
+                    cum += b[hh.n];
+                    snprintf(buf, sizeof buf, "%s_bucket{api=\"%s\",le=\"+Inf\"} %llu\n", name,
+                             kApiNames[a], cum);
                     s += buf;
-                }
-                cum += hh.bucket[hh.n].load();
-                snprintf(buf, sizeof buf, "%s_bucket{api=\"%s\",le=\"+Inf\"} %llu\n", name,
-                         kApiNames[a], cum);
-                s += buf;
-                snprintf(buf, sizeof buf, "%s_sum{api=\"%s\"} %g\n%s_count{api=\"%s\"} %llu\n",
-                         name, kApiNames[a], (double)hh.sum_us.load() / 1e6, name,
-                         kApiNames[a], hh.count.load());
-                s += buf;
+                    snprintf(buf, sizeof buf, "%s_sum{api=\"%s\"} %g\n%s_count{api=\"%s\"} %llu\n",
+                             name, kApiNames[a], (double)s_us / 1e6, name,
+                             kApiNames[a], c);
+                    s += buf;
+                });
             }
         };
 
