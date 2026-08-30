@@ -334,6 +334,15 @@ tier above it (`--prefix-cache-ram-gb`) is off by default on measured grounds.
 containers) all add keys; both `Authorization: Bearer` and `x-api-key` work.
 Binding non-loopback with no key warns but is not refused.
 
+**Metrics**: `--enable-metrics` (opt-in, default off) exposes `GET /metrics`
+in Prometheus text exposition -- per-API request/token counters, prefill
+computed/cached split, TTFT/E2E/ITL latency histograms, live token counters
+(dashboard tok/s moves *during* generation, not only at request end),
+KV/prefix-cache/inflight gauges, and the MTP accept-ratio lanes. Auth-exempt
+like `/health`; 404 and zero bookkeeping cost when the flag is absent.
+Series reference and consumer recipes:
+[docs/metrics-endpoint.md](docs/metrics-endpoint.md).
+
 **Thinking**: the default profile is no-think (prefills an empty
 `<think></think>`); `--think` flips it. Per-request control is opt-in behind
 `--request-think` so a harness that sends `enable_thinking:true` cannot

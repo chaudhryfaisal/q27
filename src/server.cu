@@ -35,6 +35,7 @@
 #include "tokenizer.h"
 #include "api_common.h"
 #include "conductor.h"
+#include "metrics.h"
 #include "toolgram.h"
 #include "toolconstrain.h"
 #include "../third_party/httplib.h"
@@ -293,7 +294,8 @@ int main(int argc, char** argv) {
                 "  Any configured key is accepted via 'Authorization: Bearer <key>'\n"
                 "  (OpenAI/llama.cpp convention) or 'x-api-key: <key>' (Anthropic\n"
                 "  convention, what Claude Code sends) on every endpoint except\n"
-                "  /health.\n"
+                "  /health and /metrics (both are infra-reachable by design;\n"
+                "  /metrics is opt-in via --enable-metrics, default off).\n"
                 "  Multi-slot memory (defaults ON, both revert with =0):\n"
                 "  Q27_KV_POOL -- process-wide paged KV pool; Q27_PF_ARENA --\n"
                 "  one shared prefill scratch arena instead of ~0.75 GB per slot\n"
@@ -333,6 +335,7 @@ int main(int argc, char** argv) {
     bool kv_fp16 = false;
     bool constrain_tools = false;
     bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
+    bool enable_metrics = false; // --enable-metrics: expose GET /metrics (Prometheus, opt-in)
     // --think-budget: cap on tokens generated inside a <think> block. <0
     // (default) = THINK_BUDGET_FRAC for prompt-seeded thinking only, preserving
     // speculative width on ordinary no-think requests; 0 = unbounded; >0 = an
@@ -366,6 +369,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) g_default_top_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) g_default_min_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
+        else if (!strcmp(argv[i], "--enable-metrics")) enable_metrics = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
         else if (!strcmp(argv[i], "--prefix-cache") && i + 1 < argc) pfx_cfg.root = argv[++i];
@@ -1264,6 +1268,11 @@ int main(int argc, char** argv) {
             no_interleave ? "OFF (Q27_NO_INTERLEAVE)" : "round-granularity");
     std::atomic<long> req_counter{0};
 
+    // Prometheus text metrics (GET /metrics when --enable-metrics, q27_*
+    // series only). Accumulated per request where the [req] line fires
+    // (no-op while disabled); gauges assembled under route_m.
+    q27::metrics::Metrics g_metrics;
+
     // R0 telemetry: one [req] stderr line per generation request, self-contained
     // so real-work anatomy (queue wait, tokenize, prefill reuse, decode, client
     // write time, conversation interleave) is measurable from the log alone.
@@ -1420,6 +1429,13 @@ int main(int argc, char** argv) {
                 // feature is off (same rule as the md/gch/ph optionals above).
                 g.pfx > 0 ? (snprintf(pfxbuf, sizeof pfxbuf, " pfx=%d", g.pfx), pfxbuf) : "",
                 phbuf, sfxbuf, extra.c_str());
+        // Prometheus metrics: accumulate this request at the [req] point,
+        // where gs is final (end=error included -- it lands in this line).
+        // E2E is wall from request arrival (rt.t0 - tok_ms) to here.
+        if (enable_metrics) // --enable-metrics: skip all metric bookkeeping
+            g_metrics.observe(q27::metrics::api_from_str(rt.api),
+                              g.end && !std::strcmp(g.end, "error"), g.prompt, g.hit, g.pfx,
+                              g.dec, qw_ms, g.pf_ms, rt.tok_ms + ms_since(rt.t0), g.dec_ms);
     };
     // R1b routing: claim a FREE engine (Slot::busy=false) that can take the
     // prompt, or block until one frees. Tiers among free engines unchanged
@@ -1797,15 +1813,18 @@ int main(int argc, char** argv) {
 
     // Opt-in API key auth (no-op, zero overhead beyond one empty-vector
     // check per request, when api_keys is empty -- the loopback-only
-    // default is unchanged). /health is intentionally exempt: infra health
-    // checks (load balancers, container orchestrators) need it reachable
-    // without distributing the secret to that infrastructure. Every other
-    // endpoint requires a valid key. Runs before route dispatch, so an
-    // invalid/missing key never reaches slot allocation, tokenization, or
-    // any generation work.
+    // default is unchanged). /health and /metrics are intentionally exempt:
+    // infra health checks (load balancers, container orchestrators) need
+    // /health reachable without distributing the secret to that
+    // infrastructure, and monitoring pollers scrape /metrics without
+    // credentials (an auth wall here would break every unauthenticated
+    // scraper). Every other endpoint requires a valid key. Runs before route
+    // dispatch, so an invalid/missing key never reaches slot allocation,
+    // tokenization, or any generation work.
     if (!api_keys.empty()) {
         srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
             if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            if (req.path == "/metrics") return httplib::Server::HandlerResponse::Unhandled;
             std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
                                                          req.get_header_value("x-api-key"));
             if (q27::api_key_valid(provided, api_keys))
@@ -1843,9 +1862,53 @@ int main(int argc, char** argv) {
 
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json j = {{"object", "list"},
-                  {"data", json::array({{{"id", served_name}, {"object", "model"},
-                                         {"owned_by", "q27"}}})}};
+                  {"data", json::array({{{"id", served_name},
+                                         {"object", "model"},
+                                         {"owned_by", "q27"},
+                                         {"max_model_len", max_slot_ctx}}})}};
         res.set_content(j.dump(), "application/json");
+    });
+
+    // Prometheus text exposition, registered only with --enable-metrics
+    // (no Prometheus server required -- scrapers hit this directly).
+    // Auth-exempt like /health (see the pre-routing
+    // comment). Gauges that read engine/server state are snapshotted under
+    // route_m: slot busy flags and the KV pool mutate there, so the brief
+    // critical section keeps the picture coherent. Spec lane counters
+    // (gate_lane_fired/acc) are plain longs written by decode threads
+    // without atomics -- reads here are approximately atomic on x86-64 and
+    // monotonic, so a scrape can at worst see a marginally stale value
+    // (documented, accepted for monitoring).
+    if (enable_metrics)
+    srv.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
+        q27::metrics::GaugeSnapshot g;
+        g.uptime_seconds = ms_since(srv_t0) / 1000.0;
+        g.slots_total = n_slots;
+        {
+            std::lock_guard<std::mutex> lk(route_m);
+            for (const auto& s : slots)
+                if (s.busy) g.requests_inflight++;
+            if (kv_pool.enabled()) {
+                const long free = kv_pool.free_pages(0) + kv_pool.free_pages(1);
+                const long total = kv_pool.npages[0] + kv_pool.npages[1];
+                g.kv_usage_perc = total > 0 ? 1.0 - (double)free / (double)total : 0.0;
+            }
+            for (const auto& s : slots) {
+                const Engine& e = *s.eng;
+                for (int j = 1; j < Q27_W_MAX; j++) {
+                    g.spec_draft += (q27::metrics::ull)e.gate_lane_fired[j];
+                    g.spec_accepted += (q27::metrics::ull)e.gate_lane_acc[j];
+                }
+                // Live engine counters (atomics, relaxed reads -- monotonic).
+                g.live_decoded += e.live_decoded.load(std::memory_order_relaxed);
+                g.live_prefill_computed +=
+                    e.live_prefill_computed.load(std::memory_order_relaxed);
+                g.live_prefill_cached +=
+                    e.live_prefill_cached.load(std::memory_order_relaxed);
+            }
+        }
+        if (pfx_cache.enabled()) g.prefix_cache_entries = (int)pfx_cache.size();
+        res.set_content(g_metrics.render(g), "text/plain; version=0.0.4");
     });
 
     // ---------------- OpenAI chat/completions ----------------

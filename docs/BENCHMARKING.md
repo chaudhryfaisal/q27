@@ -262,7 +262,10 @@ to match).
 | **llama mainline** (no spec) | 62.0 t/s | 120 s | 12/12 | 12/12 |
 
 (vLLM decode is aggregate from `/metrics` deltas — `generation_tokens_total` /
-`inter_token_latency_seconds_sum`; the others are per-`[req]` telemetry.)
+`inter_token_latency_seconds_sum`; the others are per-`[req]` telemetry.
+q27 now exposes the same delta-accounting surface on its own `/metrics`
+under `--enable-metrics` — `q27_*_tokens_processed_total` and the
+`q27_*_seconds` histograms; see docs/metrics-endpoint.md.)
 
 The five engines decompose the gap cleanly (all same model + MTP head available):
 

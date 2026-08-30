@@ -685,6 +685,16 @@ struct Engine {
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
     // cannot reconstruct (docs/acceptance-gate-design.md).
     long gate_lane_fired[W_MAX] = {}, gate_lane_acc[W_MAX] = {}; // [j 1..W_MAX-1]; 0 unused
+    // Live token counters (2026-08-30, /metrics): incremented as tokens are
+    // PRODUCED (decode per delivered token in post_round, prefill at the
+    // success exit of generate_prefill), so a scrape sees decode/prefill
+    // progress during generation instead of only at request completion (the
+    // completion-based totals live in GenStats/gs). Unlabeled: the engine
+    // does not know the API shape. Relaxed ordering -- a monotonic counter
+    // for monitoring, stale by at most one poll is fine.
+    std::atomic<unsigned long long> live_decoded{0};
+    std::atomic<unsigned long long> live_prefill_computed{0};
+    std::atomic<unsigned long long> live_prefill_cached{0};
     // Phase 2 (sampling): the sampled set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph = nullptr;
@@ -3131,6 +3141,18 @@ struct Engine {
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         if (sampled) {
             last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
+            // Accept-gate telemetry for FUSED sampled rounds (monitoring
+            // only; sampled rounds never feed dctl/EMA -- fixed ceiling 4).
+            if (gate_cap >= 0) {
+                int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
+                gate_cap_hist[cap]++;
+                gate_n_hist[n]++;
+                if (n <= W_MAX) gate_joint[cap][n]++;
+                for (int j = 1; j <= cap; j++) {
+                    gate_lane_fired[j]++;
+                    if (n >= j + 1) gate_lane_acc[j]++;
+                }
+            }
         } else {
             last_pending = oc[OUTCOME_INTS - 1];
             sfx_valid = true;
@@ -3182,6 +3204,7 @@ struct Engine {
             samp_first = false;
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
         }
+        int gated_cap = -1; // accept-gate telemetry: set in the gated branches below
         if (pmin_theta > 0.f) {
             // P14 confidence-gated sampled round -- mirror spec_round's gated
             // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
@@ -3214,6 +3237,7 @@ struct Engine {
                 for (int k = launched; k < W && k < md_used; k++)
                     CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k], stm));
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
+                gated_cap = cap;
             } else {
                 // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
                 cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo : draft_graph;
@@ -3226,6 +3250,7 @@ struct Engine {
                 assert(cap <= 4);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
+                gated_cap = cap;
             }
             // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
             // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
@@ -3239,6 +3264,20 @@ struct Engine {
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[6];
         fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
+        // Accept-gate telemetry for sampled rounds (monitoring only; sampled
+        // rounds never feed dctl/EMA -- the sampled ceiling is fixed at 4).
+        // Mirrors the greedy block in spec_round/commit_outcome so the
+        // /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
+        // under sampled traffic too.
+        if (gated_cap >= 0) {
+            gate_cap_hist[gated_cap]++;
+            gate_n_hist[n]++;
+            if (n <= W_MAX) gate_joint[gated_cap][n]++;
+            for (int j = 1; j <= gated_cap; j++) {
+                gate_lane_fired[j]++;
+                if (n >= j + 1) gate_lane_acc[j]++;
+            }
+        }
         return n;
     }
     int last_pending = -1;
@@ -4326,7 +4365,10 @@ struct Engine {
                 finish_decode(t, "client-stop");
                 return false;
             }
-            if (!t.round_forced) t.emitted++;
+            if (!t.round_forced) {
+                t.emitted++;
+                live_decoded.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         t.round_forced = false;
         if (!t.sampling && on_pending) on_pending(last_pending);
@@ -4628,6 +4670,13 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
+        // Live prefill counters: computed = gs.pf (NP - cached base), cached
+        // = gs.hit (prefix restored from snapshot/ckpt/disk). Mirrors the
+        // completion-based split (prompt - hit - pfx / hit + pfx) so
+        // consumers of that split see progress during prefill, not only at
+        // request end.
+        live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
+        live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;
         return true;
     }
