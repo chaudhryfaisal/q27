@@ -15492,3 +15492,64 @@ tool is re-emitted as text by the flush path (both directions are tracked
 tests). Verified through the real splitter+router at chunk sizes 1/3/7/64;
 test-tools green, corpus-check 159/159, gcc+ASan fuzz 250k clean, server.cu
 compiles under nvcc.
+
+## 2026-08-30 (a): `/metrics` (Prometheus), live token counters, sampled-path accept telemetry
+
+One serving-telemetry branch (`feat/metrics-endpoint`), everything opt-in
+behind a new `--enable-metrics` flag (default off: the route is not
+registered -- 404, `/health` untouched -- and per-request bookkeeping is
+skipped entirely).
+
+**The endpoint.** `GET /metrics` renders the Prometheus text exposition from
+a new `src/metrics.h`: per-API (`api=` chat/completions/messages/responses)
+counters -- requests, errors, prompt tokens, the prefill computed/cached
+split (ds4 convention: the headline prefill number is computed tokens), decode
+tokens, queue-wait -- plus three latency histograms (TTFT = `pf_ms`; E2E =
+arrival -> generation-complete at the `[req]` point, not last byte; ITL =
+per-request `dec_ms/dec`, observed only when `dec > 0`), and gauges
+(inflight slots, slots total, KV-pool occupancy, prefix-cache entries,
+uptime). One observation per generation request at the `[req]` point,
+`end=error` included, so `/metrics` counts match the log line-for-line.
+`/v1/models` also grew `max_model_len` (max slot ctx) in this branch.
+
+**Live token counters.** `gs.dec`/`gs.prompt` stamp only at generation
+completion, so completion-based totals are step functions: a poller watching
+a 2000-token decode reads 0 t/s the whole way and +2000 at the end. The
+engine now carries `live_decoded` / `live_prefill_computed` /
+`live_prefill_cached` atomics -- bumped at the single delivery point
+(`post_round` per delivered token; `generate_prefill`'s success exit for
+prefill, so failed prefills count nothing) -- exposed unlabeled as
+`q27_*_tokens_processed_total`. At rest they equal the labeled totals; under
+load a poller sees real-time tok/s (measured 79 -> 115 t/s during
+generation where the step counter showed 0, then 1023).
+
+**Sampled-path accept telemetry.** The MTP lane counters
+(`gate_lane_fired/acc` -> `q27_spec_accept_ratio`) were greedy-only:
+`spec_sample_round` deliberately updated nothing, so a sampled-only profile
+(`--temp 1.0`, the measured recipe) read a constant 0 despite speculating
+~2.3 tokens/round. Both sampled paths (solo `spec_sample_round`, fused
+`commit_outcome(sampled=true)`) now mirror the greedy lane accounting --
+monitoring-only, no dctl/EMA feed (sampled ceiling fixed at 4, adaptive
+depth is greedy-only). Sampled traffic measures 0.42-0.74 by mix.
+
+**Four review catches, all fixed on-branch.** (1) Histogram scrapes could
+tear: `observe()` bumps separate atomics and `render()` read them
+line-by-line, so a completion mid-render left `+Inf != _count` and consumers
+dropped the quantiles (three null tiles for one poll under traffic).
+Histograms are seqlocked now -- writer CAS-es into an odd seq (critical
+section: three relaxed atomics), reader retries on a torn read; verified
+115/115 invariant-clean scrapes under continuous traffic across three
+rounds. (2) Histogram tails were too short for real work -- a 24 s 60k-token
+prefill landed in the `+Inf` tail, which consumers report as no data: TTFT
+now to 60 s, E2E to 300 s, ITL to 100 ms. (3) `queue_wait` and the
+`_sum` lines rendered at six significant digits (`%g`), which rounds away
+microsecond deltas once totals grow and corrupts `rate()` on long-running
+servers: `%.6f`. (4) The Makefile server rules did not depend on
+`src/metrics.h`, so header-only edits silently produced stale binaries --
+hit in practice during the review.
+
+`q27_preemptions_total` is an honest constant 0: admission is FIFO, running
+requests are never preempted; dashboards should treat 0 as healthy. Design
+reference: `docs/metrics-endpoint.md`. Security posture of the new
+auth-exempt route dispositioned in the SECURITY-MODEL addendum of the same
+date.
