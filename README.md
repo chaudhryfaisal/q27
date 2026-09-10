@@ -24,6 +24,22 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   prefix reuse, not raw decode -- ninfer decodes faster and still takes 2-7x
   the wall time. **Where q27 loses:** ninfer's NVFP4 peaks 1.57x higher at 8
   concurrent streams (834 vs 531 t/s). Logged at the same rate as the wins.
+  *(Dated 2026-09-06: ninfer shipped an agent prefix-reuse fix; on the same
+  artifact and harness, current master measures 51 s/inst at 91.3% reuse --
+  [bench/crossengine/NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md).
+  Dated 2026-09-09: with both engines on DFlash2 drafters and ~97% reuse the
+  wall ordering has flipped -- ninfer 36 s/inst, q27 108 s -- at decode
+  rates within 6%; q27's sessions run 25 turns and 18K output tokens per
+  instance against ninfer's 15 and 6K
+  ([bench/crossengine/agentic-2026-09-09/](bench/crossengine/agentic-2026-09-09/README.md)).
+  Attributed the same day: on one identical prompt with 24 seeds, q27's
+  per-turn reasoning matches llama.cpp serving a Q8_0 of the model, and
+  ninfer's NVFP4 arm is the one that reasons 1.5x shorter -- the shorter
+  sessions are ninfer's quant or sampler, not a q27 deficit. Two q27
+  defects were found and fixed on the way (the served model name made
+  Claude Code drop prior thinking blocks; the `<tools>` block had been
+  rendered compact and key-sorted since 08-22) without moving the gap:
+  [bench/crossengine/agentic-2026-09-09-echo/](bench/crossengine/agentic-2026-09-09-echo/README.md).)*
 - **Self-speculation as the whole design**: trained-in MTP ladder + free
   suffix drafter through one shared-KV MMA verify -- 5.3-5.8 accepted tokens
   per weight read on live traffic (231-246 t/s aggregate on a 5090).
@@ -144,37 +160,57 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-08-28)
+## State of the engine (2026-09-09)
 
-One binary serves Claude Code, Codex, and OpenAI clients at 231-246 t/s
-aggregate live decode on a 5090 (90-116 t/s at 262K context on a 3090), with
-continuous batching on by default. Current release:
-[v0.10.0](https://github.com/signalnine/q27/releases).
+One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
+DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
+persistent prefix cache that hits on real agentic traffic, and a tool-call
+parser measured against a labelled corpus of the model's own drift. Current
+release: [v0.11.1](https://github.com/signalnine/q27/releases).
 
-Headline numbers, each dated in [BENCHMARKING.md](docs/BENCHMARKING.md) and
-the BUILDLOG:
+Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
+under [bench/crossengine/](bench/crossengine/):
 
-- Live Claude-Code traffic: **231.3 t/s aggregate** (9 scored trials, 430
-  requests); per-request median 225, p75 277, peak 378.
-- 2-slot continuous batching: **1.41x** aggregate over FIFO; zero-config spot
-  check 234-239 t/s.
-- Concurrency ladder at 8 slots / 16K: **530.6 t/s** aggregate (08-19).
-- Prefix reuse on real agentic traffic: 88.7-92.1% of prompt tokens,
-  effective prefill 24-31K tok/s against a cold ~3,300.
-- Restart TTFT with the persistent prefix cache: 8.15 s -> **1.20 s** on a
-  26,700-token prompt, bitwise-identical continuations.
+- Claude Code traffic, 12 SWE-bench instances, medium effort (the only
+  level both engines render): **q27 207 t/s** aggregate decode (219 median,
+  3.89 tok/round, 96.9% prefix reuse) vs ninfer's DFlash2 arm 221 (240,
+  4.19, 96.8%). Wall per instance 108 s vs 36 s: q27's sessions run 25 turns
+  and 18K output tokens per instance against 15 and 6K. Attributed on
+  09-09: per-turn reasoning on an identical prompt puts every q27 arm on
+  the llama.cpp Q8_0 reference (median 276-340 chars vs 314) and ninfer
+  1.5x under it (209), so the trajectory length is ninfer's NVFP4 arm
+  reasoning less than the model, not q27 reasoning more; the model-name
+  echo and the tools-declaration fix that came out of the investigation are
+  on master.
+- Production at Claude Code's default effort (xhigh): DFlash2 is +22%
+  aggregate decode over the MTP ladder on the same instances; the
+  prefix-cache tiers with the shared system-block cut took the prefill wall
+  from 255 s to 110 s on a 12-instance run (09-08).
+- Decode round at K=7: 17.8 ms = draft 2.5 + verify 15.1 + host 0.2 ms;
+  wider K loses on the round wall at every depth measured (09-08).
+- Concurrency ladder at 8 slots / 16K: **530.6 t/s** aggregate (08-19, the
+  MTP ladder; DFlash2 serving is single-slot today).
 - 3090 (24GB): **102.2 t/s** median live CC decode at 131K context.
 - Cross-engine long-context (08-27, Qwen3.8, all four engines):
   decode does not erode with context on ANY engine -- q27 leads decode
   (~150-180 t/s), vLLM leads cold prefill ~2.5x. Tables and the vLLM
   spec-decode retest: [bench/crossengine/LONGCTX.md](bench/crossengine/LONGCTX.md).
 
+Speed parity is not task parity: a quality table over the 09-08 campaigns
+found three of twelve tasks per DFlash2 arm dying on their first turn from
+tool calls the streaming parser never saw. That is fixed in v0.11.0
+(undeclared-name pass-through, the wrapper-family openers; 12/12 non-empty
+on 09-09), and the table now ships with every campaign readout
+([bench/swebench/quality_table.py](bench/swebench/quality_table.py)).
+
 fp4 note, because the story inverted twice: block-scaled fp4 MMA does exist on
 consumer Blackwell (sm_120a only; under plain sm_120 the failure is
 indistinguishable from missing silicon), runs at 780-868 TFLOPS here
 (`tools/microbench_mxf4`), and still loses at decode -- nvfp4 moves 1.06x the
 bytes of Q4_G64 for the same weights, and decode is a byte count, not a FLOP
-count.
+count. TMA bulk-tensor copies exist there too (09-08) and lifted a bitwise
+W4A8 prefill GEMM to 1.33-1.39x of the incumbent, short of the 1.6x that
+would have justified the port.
 
 ## Why this model is a good target
 
@@ -200,11 +236,14 @@ order-dependent recurrent summary that cannot be paged, shared by hash, or
 rebuilt from cached blocks. A block cache covers 17/65 layers; without the
 matching GDN state those blocks are dead weight.
 
-Measured consequence (08-17 four-engine run): ninfer gets **0% reuse** on real
-Claude-Code traffic -- 541 requests, every one a `full_reset` -- and pays
-97-327 s/instance against q27's 47 while *decoding faster*. Not a
-misconfiguration: their design admits two resume offsets and documents
-arbitrary prefix reuse as a non-goal. llama.cpp reaches 93.9% by checkpointing
+Measured consequence (08-17 four-engine run): ninfer got **0% reuse** on real
+Claude-Code traffic -- 541 requests, every one a `full_reset` -- and paid
+97-327 s/instance against q27's 47 while *decoding faster*. At the time this
+was by design: two resume offsets, arbitrary prefix reuse a documented
+non-goal. That position changed -- their 2026-09-03 exact-identity reuse fix
+measures **91.3% reuse and 51 s/inst** on the same artifact and harness
+([NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md)); the hybrid-GDN
+analysis above stands, the ninfer example is now historical. llama.cpp reaches 93.9% by checkpointing
 recurrent state per slot at ~1 GiB each, which caps it at 6 slots on 32 GB.
 vLLM reaches 89.8% (fixed upstream since the 07-15 run measured 0%).
 
@@ -329,6 +368,37 @@ CLI binary keeps reference defaults so the bitwise canonicals are untouched.
 see [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). The pinned host-RAM
 tier above it (`--prefix-cache-ram-gb`) is off by default on measured grounds.
 
+**DFlash2 drafter (the production decode path since 2026-09-08).** The
+drafter is z-lab's
+[Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+(3.8 GB bf16, Apache-2.0). Ready-made packs are in the
+[signalnine/Qwen3.8-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.8-27B-MTP-q27)
+model repo next to the tiers (`qwen38-dflash2-q8-serve.d2w`, 2.1 GB, and the
+Q4 pack, 1.2 GB; md5s in its CHECKSUMS.md5). To build one yourself:
+
+```
+pip install torch safetensors numpy
+python3 tools/dflash2_pack.py /path/to/Qwen3.8-27B-DFlash2 qwen38-dflash2-q8-serve.d2w --q8
+```
+
+The serving pack carries only the drafter (about 2.1 GB): the engine
+supplies the embedding and the head from its own Q8 tensors. `--q8` is the
+production choice (bitwise with the fp16 pack on the acceptance gate);
+without it the matmuls go Q4 (1.2 GB, -1.5 to -3.6% tok/round measured).
+`--with-target <hf_dir>` adds the fp16 embed and head for the CLI's
+`q27 --dflash2` path and the numerics A/Bs; serving never needs it. Then:
+
+```
+Q27_DFLASH2=qwen38-dflash2-q8-serve.d2w Q27_BATCH=0 Q27_DFLASH2_RESERVE_GB=3 \
+  ./build/q27-server model.q27 model.tok --port 8080 --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
+```
+
+`Q27_BATCH=0` because DFlash2 serving is single-slot today, and the reserve
+keeps the KV pool from taking the VRAM the drafter needs. K=7 is the
+measured default (`Q27_DFLASH2_K`; wider loses on the round wall).
+[tools/launch_q27_38.sh](tools/launch_q27_38.sh) is the exact production
+recipe, prefix-cache tiers included.
+
 **Auth**: off by default -- loopback-only binding is the safety net.
 `--api-key KEY`, `--api-key-file PATH`, or `Q27_API_KEY` (preferred in
 containers) all add keys; both `Authorization: Bearer` and `x-api-key` work.
@@ -392,7 +462,35 @@ is each engine's own defaults; n=1 per instance. Full methodology:
 [docs/BENCHMARKING.md](docs/BENCHMARKING.md); harness and raw data:
 [bench/swebench/](bench/swebench/) and [bench/crossengine/](bench/crossengine/).
 
-**Real agentic traffic** (2026-08-17):
+**Real agentic traffic, DFlash2 era** (2026-09-09, both engines on block
+drafters, effort pinned to medium, q27 on the production recipe with a
+fresh cache root; [readout](bench/crossengine/agentic-2026-09-09/README.md)):
+
+| engine | decode agg / median | tok/round | prefix reuse | wall/inst | turns, out tok /inst | gold |
+|---|--:|--:|--:|--:|--:|--:|
+| **q27** production (Q8 pack, K=7) | 207.2 / 219.4 t/s | 3.89 | 96.9% | 108 s | 25.0, 18.2K | 9/12 |
+| ninfer DFlash2 k=7 (NVFP4) | 220.6 / 240.1 t/s | 4.19 | 96.8% | **36 s** | 15.0, 6.2K | 11/12 |
+
+Decode within 6%, reuse equal, wall 3x apart because q27's sessions take
+1.7x the turns and 3x the output tokens -- consistent across the 09-07,
+09-08 and 09-09 runs. n=1 per instance, and a same-day control showed
+that n=1 swings the aggregate by +-3 turns. Attributed
+([readout](bench/crossengine/agentic-2026-09-09-echo/README.md)): on one
+identical turn-0 prompt, 24 seeds per arm, q27's per-turn thinking
+(production, ladder, fp16 KV, q6 tier: median 276-340 chars) is
+indistinguishable from llama.cpp serving a Q8_0 of the same model (314,
+p 0.3-0.7), while ninfer's NVFP4 arm reasons a median 209 (p=0.0003
+against the reference). The shorter sessions are ninfer's quant or
+sampler making the model terser than it is at 8 bits; per-token cost at
+equal reasoning is the comparable number, and there the engines are
+within 6%. Drafter, KV dtype, tier and the sampler chain are excluded on
+q27. Two q27 defects surfaced and were fixed without moving the gap: the
+served model name in responses made Claude Code drop prior thinking blocks
+(now echoes the requested model), and the serving path's `<tools>` block
+had been the compact key-sorted dump since 08-22 (now the template's
+client-ordered spaced form, +5% prompt tokens on a 28-tool request).
+
+**Real agentic traffic** (2026-08-17, ninfer before its prefix-reuse fix):
 
 | engine | decode | wall/inst | prefix reuse | gold |
 |---|--:|--:|--:|--:|
@@ -445,6 +543,27 @@ real coding while MTP nearly doubled stock llama.cpp.
 
 ## Open items
 
+- **DFlash2 serving is single-slot.** The batched decode path (8 slots,
+  530 t/s aggregate) is the MTP ladder's; the drafter's fused commits
+  bypass the ring mirrors, so batching it is real integration work, and the
+  serial SWE-bench harness cannot show whether sustained concurrency exists
+  to pay for it (queue wait was 2.3% of a 12-instance run).
+- **Cache persistence stops at 65536 tokens.** A 69.7K-token conversation
+  re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
+  costs pinned staging memory per slot. Not yet measured against 128K
+  admission.
+- **Wall per instance is not the cross-engine number.** The 09-09 turn
+  and token gap is ninfer reasoning less than the model at 8 bits (see the
+  09-09-echo readout); which of its NVFP4 weights, int8 KV or sampler does
+  it is unmeasured here. Compare per-token cost at equal reasoning, and
+  run a same-day control before reading a 12-instance turn count.
+- **The request replay has no corpus yet.** `Q27_REQ_LOG` and
+  `bench/replay/` are gated (two fresh boots agree on every output); a
+  recorded multi-session Claude Code log is the missing input for a
+  binary-vs-binary A/B that does not ride on the harness's trajectory noise.
+- **W4A8 prefill GEMM on the shelf**: bitwise at 1.33-1.39x of the incumbent
+  with TMA fills, short of the 1.6x bar; `tools/gemm_w4a8_spike.cu` holds
+  it if a 1.35x is ever wanted as-is.
 - **Graph-cache cap under churn**: live CC draws 44+ keys against the bench's
   28; cap 64 covers today, revisit `Q27_BATCH_GRAPH_CAP` if multi-tenant
   churn widens the alphabet.
@@ -465,7 +584,7 @@ measured-and-parked levers in [docs/notes.md](docs/notes.md).
 ## History
 
 The full chronological record -- every DONE block with its numbers, every
-negative result, the progress table (43.4 -> 177.4 t/s single-stream) --
+negative result, the progress table (43.4 -> 219.5 t/s single-stream) --
 lives in [docs/BUILDLOG.md](docs/BUILDLOG.md). The BUILDLOG is the ledger,
 not git history. Design docs and phase plans: [docs/plans/](docs/plans/).
 Standing risk register and parked levers: [docs/notes.md](docs/notes.md).

@@ -770,6 +770,13 @@ static bool prefill_xg64() {
     return !(e && !strcmp(e, "32"));
 }
 
+// The g32 activation quantization (nat/eo/scale/isum) is consumed only by the
+// dp4a prefill (Q27_PREFILL=dp4a) and the exact legacy MMA leg (Q27_PF_XG=32);
+// the default g64 MMA route reads nat64/s64 alone. qxT skips the g32 launch
+// when nothing will read it (2026-09-08: 9.7 ms of a 265 ms 1024-token chunk,
+// 3.7%, measured with nsys). Re-read per call like the route flags it mirrors.
+bool prefill_g32_needed() { return !(prefill_use_mma() && prefill_xg64()); }
+
 // Q27_PF_NT: force a fixed prefill GEMM token-tile width (16/32/64/128) for A/B;
 // 0/unset = auto-dispatch by T. Re-read per launch, same policy as prefill_xg64.
 static int prefill_nt() {
@@ -953,32 +960,97 @@ void splitk_scratch_reserve(SplitKScratch* sk) {
     sk->cap = cap;
 }
 
-// F16 weights (ssm alpha/beta: 48x5120). Block per (row, token) with the same
-// 256-thread strided walk + shared-memory tree as the serial k_gemv_f16, so
-// reductions are bitwise-identical to the single-token path.
-__global__ void k_gemm_f16_T(const __half* __restrict__ W, const float* __restrict__ xT,
-                             float* __restrict__ y, int64_t rows, int64_t cols) {
-    int64_t r = blockIdx.x;
-    int t = blockIdx.y;
-    const __half* wr = W + r * cols;
-    const float* x = xT + (size_t)t * cols;
-    float acc = 0.f;
-    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x)
-        acc += __half2float(wr[c]) * x[c];
-    __shared__ float sh[256];
-    sh[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
+// F16 weights (ssm alpha/beta: 48x5120). Every output is bitwise the serial
+// k_gemv_f16: 256 strided partial sums (thread t owns columns t, t+256, ...,
+// accumulated in increasing order) folded by block_reduce<256>'s tree
+// (sh[i] += sh[i+s] for s = 128, 64, ..., 1).
+//
+// 2026-09-08 retile: the old block-per-(row, token) grid re-read the 10 KB
+// weight row and the 20 KB activation row for every output (1.5 GB of L2
+// traffic per launch, 212 us x 96 per 1024-token chunk = 7.5% of prefill).
+// Two intermediate retiles were no faster: rows walked inside a block were
+// barrier-latency-bound (9 __syncthreads per row), and a lane-strided
+// layout needed 160 two-byte loads per row and spilled. Now ONE WARP owns
+// one token and the tree runs in registers with a layout chosen for the
+// loads: lane l holds the partials of threads 8l..8l+7, i.e. its 8 chains
+// read 8 CONSECUTIVE columns per 256-column step -- one 16-B weight load and
+// two float4 activation loads per step. Tree levels 128/64/32/16/8 pair
+// thread i with i+s = lanes l and l+16/8/4/2/1 (shuffle-downs, all 8 chains),
+// levels 4/2/1 pair chains j and j+4/2/1 inside the lane -- the same pairs in
+// the same level order as the smem tree, so the result is bit-identical.
+// The token's activation row stays in registers across all rows; the weight
+// row is read once per warp. blockIdx.y splits rows so small T fills SMs.
+constexpr int F16T_COLS = 5120;             // N_EMBD; 20 steps of 256 columns
+constexpr int F16T_NK = F16T_COLS / 256;
+__global__ void __launch_bounds__(256)
+k_gemm_f16_T(const __half* __restrict__ W, const float* __restrict__ xT, float* __restrict__ y,
+             int64_t rows, int64_t cols, int T, int rg) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int t = blockIdx.x * 8 + warp;
+    if (t >= T) return;
+    const int64_t r_lo = (int64_t)blockIdx.y * rg;
+    const int64_t r_hi = r_lo + rg < rows ? r_lo + rg : rows;
+    float xv[F16T_NK][8];  // xv[k][j] = x[8*lane + j + 256*k]
+    {
+        const float* x = xT + (size_t)t * cols + 8 * lane;
+#pragma unroll
+        for (int k = 0; k < F16T_NK; k++) {
+            const float4 a = *(const float4*)(x + 256 * k);
+            const float4 b = *(const float4*)(x + 256 * k + 4);
+            xv[k][0] = a.x; xv[k][1] = a.y; xv[k][2] = a.z; xv[k][3] = a.w;
+            xv[k][4] = b.x; xv[k][5] = b.y; xv[k][6] = b.z; xv[k][7] = b.w;
+        }
     }
-    if (threadIdx.x == 0) y[(size_t)t * rows + r] = sh[0];
+    for (int64_t r = r_lo; r < r_hi; r++) {
+        const __half* wr = W + r * cols + 8 * lane;
+        float p[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) p[j] = 0.f;
+#pragma unroll
+        for (int k = 0; k < F16T_NK; k++) {
+            const uint4 w = *(const uint4*)(wr + 256 * k);
+            const __half2* h2 = (const __half2*)&w;
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float2 wf = __half22float2(h2[q]);
+                p[2 * q] += wf.x * xv[k][2 * q];
+                p[2 * q + 1] += wf.y * xv[k][2 * q + 1];
+            }
+        }
+        // tree levels s = 128, 64, 32, 16, 8: thread i pairs with i+s -> lane
+        // l with l + s/8, for every chain j
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) p[j] += __shfl_down_sync(0xffffffffu, p[j], off);
+        }
+        // levels s = 4, 2, 1: chains j and j + s inside the lane
+#pragma unroll
+        for (int j = 0; j < 4; j++) p[j] += p[j + 4];
+#pragma unroll
+        for (int j = 0; j < 2; j++) p[j] += p[j + 2];
+        p[0] += p[1];
+        if (lane == 0) y[(size_t)t * rows + r] = p[0];
+    }
 }
 
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st) {
-    dim3 grid((unsigned)rows, (unsigned)T);
-    k_gemm_f16_T<<<grid, 256, 0, st>>>(W, xT, y, rows, cols);
+    if (cols != F16T_COLS) {
+        fprintf(stderr, "gemm_f16_T: cols %ld != %d\n", (long)cols, F16T_COLS);
+        exit(1);
+    }
+    const int nbt = (T + 7) / 8;
+    // enough blocks for ~2 waves: split rows across blocks when the token
+    // grid alone underfills (T=1024 -> 128 x 3 groups of 16 rows; T=37 ->
+    // 5 x 48 single-row groups)
+    int ngroups = (2 * cur_nsm() + nbt - 1) / nbt;
+    if (ngroups < 1) ngroups = 1;
+    if (ngroups > rows) ngroups = (int)rows;
+    const int rg = (int)((rows + ngroups - 1) / ngroups);
+    ngroups = (int)((rows + rg - 1) / rg);
+    dim3 grid((unsigned)nbt, (unsigned)ngroups);
+    k_gemm_f16_T<<<grid, 256, 0, st>>>(W, xT, y, rows, cols, T, rg);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2663,60 +2735,73 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
     constexpr int SK = 128;
     constexpr int GDN_CH = 10240;
     constexpr int NH = 48;
-    extern __shared__ float smem[];
-    float* S = smem;                       // [128][128]
-    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
-    const int h = blockIdx.x;
-    const int j = threadIdx.x & (SK - 1);
-    const int it = threadIdx.x >> 7;
+    // 2026-09-07 register-resident state + column-tile split. The [128][128]
+    // fold state chains in registers (float sreg[32] per thread), the
+    // k_delta_step (blocks.cu) pattern. AND: the 128 v-columns are independent
+    // (pred_j, dj, o_j read only column j), so split them into CT tiles of CW
+    // columns -> gridDim CT*48 fills more SMs (the head-per-block grid was 48
+    // blocks on ~170 SMs). Each block owns one head's CW-column slice, all 128
+    // rows (4 row-tiles), so the per-column arithmetic AND the part[0..3]
+    // reduction order are unchanged -> bitwise-identical (gated by ninv_test's
+    // FOLD leg vs the serial delta_step reference + E2E byte-identity).
+    constexpr int CT = 4, CW = SK / CT; // 4 column-tiles x 32 columns
+    __shared__ float sq[SK], sk[SK], part[4][CW], dj[CW];
+    const int h = blockIdx.x / CT;
+    const int ct = blockIdx.x % CT;
+    const int lane = threadIdx.x;    // 0..127 (blockDim.x == 128)
+    const int cc = lane & (CW - 1);  // column within this tile, 0..CW-1
+    const int it = lane >> 5;        // row-tile 0..3 (CW==32 -> lane>>5)
+    const int j = ct * CW + cc;      // actual v-column 0..127
     const int i0 = it * 32;
     const int qk = h % 16;
     const float scale = rsqrtf((float)SK);
 
     float* Sgh = Sg + (size_t)h * SK * SK;
-    for (int i = i0; i < i0 + 32; i++) S[i * SK + j] = Sgh[i * SK + j];
-    __syncthreads();
+    float sreg[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) sreg[k] = Sgh[(size_t)(i0 + k) * SK + j];
 
     for (int t = 0; t < T; t++) {
         const float* conv = convT + (size_t)t * GDN_CH;
-        if (it == 0) {
-            sq[j] = conv[qk * SK + j] * scale;
-            sk[j] = conv[2048 + qk * SK + j];
-        }
+        // sq/sk are row-indexed in the reductions, so every block loads the
+        // FULL 128 (all 128 lanes cooperate: lane -> entry lane).
+        sq[lane] = conv[qk * SK + lane] * scale;
+        sk[lane] = conv[2048 + qk * SK + lane];
         __syncthreads();
         const float decay = expf(gT[(size_t)t * NH + h]);
         float pred = 0.f;
 #pragma unroll 8
-        for (int i = i0; i < i0 + 32; i++) {
-            float s = S[i * SK + j] * decay;
-            S[i * SK + j] = s;
-            pred += sk[i] * s;
+        for (int k = 0; k < 32; k++) {
+            float s = sreg[k] * decay;
+            sreg[k] = s;
+            pred += sk[i0 + k] * s;
         }
-        part[it][j] = pred;
+        part[it][cc] = pred;
         __syncthreads();
         if (it == 0) {
-            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float p = part[0][cc] + part[1][cc] + part[2][cc] + part[3][cc];
             float vj = conv[4096 + h * SK + j];
-            dj[j] = betaT[(size_t)t * NH + h] * (vj - p);
+            dj[cc] = betaT[(size_t)t * NH + h] * (vj - p);
         }
         __syncthreads();
-        float d = dj[j];
+        float d = dj[cc];
         float acc = 0.f;
 #pragma unroll 8
-        for (int i = i0; i < i0 + 32; i++) {
-            float s = S[i * SK + j] + sk[i] * d;
-            S[i * SK + j] = s;
-            acc += sq[i] * s;
+        for (int k = 0; k < 32; k++) {
+            float s = sreg[k] + sk[i0 + k] * d;
+            sreg[k] = s;
+            acc += sq[i0 + k] * s;
         }
-        part[it][j] = acc;
+        part[it][cc] = acc;
         __syncthreads();
         if (it == 0)
             oT[(size_t)t * (NH * SK) + h * SK + j] =
-                part[0][j] + part[1][j] + part[2][j] + part[3][j];
+                part[0][cc] + part[1][cc] + part[2][cc] + part[3][cc];
         __syncthreads();
     }
 
-    for (int i = i0; i < i0 + 32; i++) Sgh[i * SK + j] = S[i * SK + j];
+#pragma unroll
+    for (int k = 0; k < 32; k++) Sgh[(size_t)(i0 + k) * SK + j] = sreg[k];
 }
 
 // P6: column-split scan. S columns are independent (pred_j, dj and o_j read
@@ -3211,14 +3296,8 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
 // through delta_scan_T: the WY default reorders reductions = format change.
 void delta_scan_seq(float* S_global, const float* convT, const float* gT, const float* betaT,
                     float* oT, int T, cudaStream_t st) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        128 * 128 * 4));
-        attr_set = true;
-    }
-    k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+    // register-resident state: only the static sq/sk/part/dj smem now.
+    k_delta_scan_T<<<48 * 4, 128, 0, st>>>(S_global, convT, gT, betaT, oT, T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3237,14 +3316,8 @@ void delta_scan_T(float* S_global, const float* convT, const float* gT, const fl
     }
     const int cs = delta_scan_nsplit(T);
     if (cs == 1) {
-        static bool attr_set = false;
-        if (!attr_set) {
-            CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            128 * 128 * 4));
-            attr_set = true;
-        }
-        k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+        // register-resident state: only the static sq/sk/part/dj smem now.
+        k_delta_scan_T<<<48 * 4, 128, 0, st>>>(S_global, convT, gT, betaT, oT, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

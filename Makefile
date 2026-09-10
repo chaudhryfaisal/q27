@@ -10,9 +10,9 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 
 .PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
-build/q27: src/engine.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+build/q27: src/engine.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
-	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
+	$(NVCC) $(NVCCFLAGS) src/engine.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 build:
 	mkdir -p build
@@ -82,6 +82,10 @@ build/test_chat_completions_integration: tools/test_chat_completions_integration
 
 build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
+# the same turn through the STREAMING path (holdback + splitter), which is
+# what a live client sees; a batch-recovered shape can still die here
+build/stream_probe: tools/stream_probe.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/stream_probe.cpp -o $@
 
 build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@
@@ -194,9 +198,9 @@ build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu
 build/mma16_bench: tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
 
-build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
-                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/sampling.h | build
-	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
+build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/dflash2.cu \
+                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/sampling.h src/dflash2.h | build
+	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/dflash2.cu -o $@
 
 build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/test_argmax_tie.cu src/blocks.cu -o $@
@@ -213,11 +217,11 @@ build/test_manifest: tools/test_manifest.cu src/engine.cuh src/kv_pool.h src/pre
 	        build/pf4.o -o $@
 
 
-build/q27-server: src/server.cu src/engine.cuh src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+build/q27-server: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
-	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
 clean:
@@ -250,6 +254,17 @@ build/pf4.o: src/pf4.cu src/pf4.h | build
 build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
                        src/prefill.cuh src/kernels.cuh src/vgemm.cuh src/device_model.h src/loader.h src/cuda_common.h | build
 	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
+
+# Vendor-ceiling probe for the prefill GEMM shapes (cuBLASLt int8/fp8/fp16);
+# docs/perf-attribution-prefill-2026-09-08.md section 4. Run: build/cublaslt_peak 0
+build/cublaslt_peak: tools/cublaslt_peak.cu | build
+	$(NVCC) -O2 -arch=sm_120a tools/cublaslt_peak.cu -lcublasLt -lcublas -o $@
+
+# W4A8 prefill GEMM spike (prefill plan phase 2, BUILDLOG 2026-09-08 (h)):
+# bitwise gate vs gemm_q4_T on the projection shapes + timing of the variants.
+# Run: build/gemm_w4a8_spike [--time] [--shape ffn_gate] [--only VARIANT] [--notest]
+build/gemm_w4a8_spike: tools/gemm_w4a8_spike.cu src/prefill.cu src/kernels.cu src/prefill.cuh src/kernels.cuh | build
+	$(NVCC) $(MXF4FLAGS) -lineinfo -I src tools/gemm_w4a8_spike.cu src/prefill.cu src/kernels.cu -o $@
 
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
@@ -470,3 +485,6 @@ test-metal:
 test-metal-canonical:
 	@echo "test-metal-canonical requires macOS" >&2; exit 1
 endif
+
+build/dflash2_smoke: tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
+	$(NVCC) $(NVCCFLAGS) tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@

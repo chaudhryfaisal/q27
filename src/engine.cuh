@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
+#include <set>
 #include <functional>
 #include <cassert>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "prefill.cuh"
 #include "cuda_common.h"
 #include "depthctl.h"
+#include "dflash2.h"
 #include "suffixdraft.h"
 #include "device_model.h"
 #include "kernels.cuh"
@@ -385,7 +387,7 @@ struct Engine {
     // per-step {thresh,M,logZ}. All idle for greedy requests.
     q27k::SampleParams samp{0.f, 1.f, 0ull};
     q27k::SampleParams* d_samp = nullptr;
-    float* d_nuc = nullptr;  // [5][4]: {thresh,M,logZ,mass} per verify lane
+    float* d_nuc = nullptr;  // [W_PLUMB][4]: {thresh,M,logZ,mass} per verify lane
     int* d_spec = nullptr;   // [3]: {n, stop_lane, exclude_token} (Phase-2 verdict)
     bool samp_first = false; // first sampled token comes from the retained prefill logits
     // MTP draft head state (stage 1: host-driven acceptance measurement)
@@ -483,7 +485,7 @@ struct Engine {
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
     //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
-    //   sample_graph + spec_sample_graph + verify_sample_graph_w[2..5]
+    //   sample_graph + spec_sample_graph + verify_sample_graph_w[2..gate_maxd+1]
     //   -- serves ONLY temperature>0 requests. =0 skips capture; the server
     //   refuses temp>0 with a 400 and generate() refuses as the belt.
     //   capture_constrained (default true; the server clears it when booted
@@ -560,7 +562,8 @@ struct Engine {
     //                              -> gated greedy round (spec_round), both
     //                                 Q27_DEXIT on and off. Widths 9..12 are
     //                                 suffix-only (captured in P1).
-    //   verify_sample_graph_w[6]   per-width SAMPLED verify, [W=2..5].
+    //   verify_sample_graph_w[]    per-width SAMPLED verify, [W=2..gate_maxd+1]
+    //                              (widened with the sampled ladder 2026-09-07).
     //                              -> gated sampled round (spec_sample_round),
     //                                 both Q27_DEXIT on and off.
     //   draft_step_graph[7]        per-draft-STEP graphs, [step=0..gate_maxd-1].
@@ -628,7 +631,17 @@ struct Engine {
     // widest LAUNCHABLE verify: the gated width, or the suffix width when
     // the drafter is armed wider (Q27_SUFFIX_W; sfx_width() is declared
     // further down -- in-class bodies see the complete class).
-    int verify_w_max() const { return suffix_on ? sfx_width() : gate_maxd + 1; }
+    // DFlash2 rounds verify at width d2_k+1 regardless of the ladder config
+    // (gpt-6-astra completion review 2026-09-07, P1: with Q27_MAXD=4 +
+    // Q27_SUFFIX=0 + K=7 the reserve was 6 while d2 verify writes 8 KV
+    // lanes -- a prompt admitted at max_ctx-6 overran the caches; the exact
+    // depth-5-era bug class, pre-existing on greedy d2 and newly reachable
+    // by sampled requests).
+    int verify_w_max() const {
+        int w = suffix_on ? sfx_width() : gate_maxd + 1;
+        if (d2_on && d2_k + 1 > w) w = d2_k + 1;
+        return w;
+    }
     int ctx_round_reserve() const { return std::max(gate_maxd, verify_w_max() - 1) + 2; }
     // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
     // between 4 and 5 from realized acceptance, so agentic streaks get depth-5
@@ -699,9 +712,10 @@ struct Engine {
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph = nullptr;
     // P14: per-width sampled verify graphs (sampled analog of verify_graph_w).
-    // [W=2..5]; the sampled+gated round drafts depth-4, reads the 4
-    // draft margins, caps the accept walk at W-1, and launches this at width W.
-    cudaGraphExec_t verify_sample_graph_w[6] = {}; // [W<=5] (sampled ceiling stays 4)
+    // [W=2..gate_maxd+1] since the sampled-ladder widening; the sampled+gated
+    // round drafts to gate_maxd under the theta gate, caps the accept walk at
+    // W-1, and launches this at width W.
+    cudaGraphExec_t verify_sample_graph_w[W_MAX + 1] = {}; // [W=2..gate_maxd+1] (sampled ladder)
     // P14 draft early-exit: one graph per draft STEP (k=0..gate_maxd-1), so the
     // gated rounds can stop drafting at the first sub-theta margin (llama's
     // p_min stops DRAFTING; the P12 gate only narrowed verify). Steps 0..k
@@ -990,12 +1004,13 @@ struct Engine {
         // prompt > 65536 with --ctx > 65536 wrote OOB (CUDA-review #1). NP is
         // already bounded <= max_ctx by the generate() guard, so this is exact.
         A((void**)&d_gen, (size_t)max_ctx * 4);
-        A((void**)&d_amax, 8);
+        A((void**)&d_amax, 16); // 2 u64: argmax pack + the d2 stop-fallback latch
         A((void**)&d_samp, sizeof(q27k::SampleParams));
-        // d_nuc: 5 lanes x {thresh,M,logZ,mass}. Plain path uses lane 0; the
-        // sampled spec round (Phase 2) fills all 5 verify lanes. d_spec holds the
+        // d_nuc: W_PLUMB lanes x {thresh,M,logZ,mass} (plumb-wide per the lane
+        // rule; sampled verify fills vw lanes, up to gate_maxd+1 since the
+        // sampled-ladder widening). Plain path uses lane 0. d_spec holds the
         // rejection-sampling verdict {n, stop_lane, exclude_token}.
-        A((void**)&d_nuc, 5 * 4 * 4);
+        A((void**)&d_nuc, W_PLUMB * 4 * 4);
         A((void**)&d_spec, 3 * 4);
         A((void**)&d_draft_margin, 7 * 4); // maxd7: up to 7 draft margins
         A((void**)&d_am_blk1, 128 * 8);    // P14: fused draft argmax+margin scratch
@@ -1539,7 +1554,12 @@ struct Engine {
     // P0a) -- when non-null, the residual stream h is copied after each
     // DFLASH_TAP layer. Host-side branch only: build_graph captures with
     // taps == nullptr, so the graphed paths are byte-identical.
-    static constexpr int DFLASH_TAPS[5] = {1, 16, 31, 46, 61}; // z-lab target_layer_ids; P0a measured the +-1 convention equal (AL 2.10 vs 2.18)
+    // DFlash2 (v2) tap ids from the checkpoint's dflash_config -- NOT the
+    // z-lab generic formula, which gives the v1 ids {1,16,31,46,61} this
+    // constant used to hold (v1 P0a measured the +-1 convention equal,
+    // AL 2.10 vs 2.18). Convention: residual stream AFTER layer il's second
+    // add = HF hidden_states[il+1] (docs/plans/2026-09-06-dflash2-integration.md).
+    static constexpr int DFLASH_TAPS[5] = {5, 19, 33, 47, 61};
     void token_launches(float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
@@ -1937,6 +1957,16 @@ struct Engine {
     // P0 batching: qx5/mm5 read per-lane state through the view (solo:
     // pointer-identical to the members), so the fused round can hand them a
     // union view without touching the weight-sweep code again.
+    // Fused norm + quantize of the normed x1 (2026-09-08): the verify forward's
+    // rmsnorm3 -> qx5(x1) pairs collapse to one launch each (bitwise:
+    // test_rmsnorm3q). Callers pass x1q=true to the pre functions so they
+    // skip their own qx5(x1); the conductor's fused driver keeps the default.
+    void rmsnorm3q5(const LaneView& v, const q27k::CP3& x, const float* w, const q27k::P3& y,
+                    int cols) {
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) q.q[i] = v.xq[i];
+        q27k::rmsnorm3q(x, w, y, q, cols, EPS, v.stm, v.vw);
+    }
     void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
@@ -1999,18 +2029,17 @@ struct Engine {
     // (addendum A8). The fused driver never calls the composed pairs, only
     // pre/mix/post individually (P1 Task 8: mix takes an explicit stream --
     // the conductor's -- while width stays member vw, the granted width).
-    void gdn_pre(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void gdn_pre(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_qkv.weight"), v.qkv);
         mm5(v, T(il, "attn_gate.weight"), v.z);
-        q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         LANESV(v, x1),
-                         LANESV(v, alpha), GDN_HEADS,
-                         N_EMBD, v.stm, v.vw);
-        q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         LANESV(v, x1),
-                         LANESV(v, betar), GDN_HEADS,
-                         N_EMBD, v.stm, v.vw);
+        // alpha + beta gate projections in ONE launch (2026-09-08): same body
+        // per output as two gemv_f16_3 launches -> bitwise; 48 fewer nodes
+        q27k::gemv_f16_3x2((const __half*)T(il, "ssm_alpha.weight").data,
+                           (const __half*)T(il, "ssm_beta.weight").data,
+                           LANESV(v, x1),
+                           LANESV(v, alpha), LANESV(v, betar), GDN_HEADS,
+                           N_EMBD, v.stm, v.vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
         q27k::gdn_gates3(LANESV(v, alpha),
@@ -2099,22 +2128,24 @@ struct Engine {
         qx5(v, v.og, GDN_V);
         mm5(v, T(il, "ssm_out.weight"), v.y);
     }
-    void gdn_pair(int il, const LaneView& v) {
-        gdn_pre(il, v);
+    void gdn_pair(int il, const LaneView& v, bool x1q = false) {
+        gdn_pre(il, v, x1q);
         gdn_mix(il, stm);
         gdn_post(il, v);
     }
 
-    void attn_pre(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void attn_pre(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_q.weight"), v.qg);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
-        for (int L = 0; L < v.vw; L++)
-            q27k::rmsnorm_heads(v.qg[L], qn, v.qg[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, v.stm);
+        // lane-packed norms (2026-09-08): one launch per norm instead of vw
+        // -- bitwise per (head, lane), 224 fewer graph nodes at width 8
+        q27k::rmsnorm_heads3(LANESV(v, qg), qn, LANESV(v, qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM,
+                             EPS, v.stm, v.vw);
         mm5(v, T(il, "attn_k.weight"), v.kbuf);
-        for (int L = 0; L < v.vw; L++)
-            q27k::rmsnorm_heads(v.kbuf[L], kn, v.kbuf[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, v.stm);
+        q27k::rmsnorm_heads3(LANESV(v, kbuf), kn, LANESV(v, kbuf), N_KV, HEAD_DIM, HEAD_DIM, EPS,
+                             v.stm, v.vw);
         mm5(v, T(il, "attn_v.weight"), v.vbuf);
         // rope reads the view's per-lane positions (WIP3 -> IP3: same
         // pointers, const-qualified for the kernel wrapper)
@@ -2164,8 +2195,8 @@ struct Engine {
         qx5(v, v.attnout, N_HEAD * HEAD_DIM);
         mm5(v, T(il, "attn_output.weight"), v.y);
     }
-    void attn_pair(int il, const LaneView& v) {
-        attn_pre(il, v);
+    void attn_pair(int il, const LaneView& v, bool x1q = false) {
+        attn_pre(il, v, x1q);
         attn_mix(il, stm);
         attn_post(il, v);
     }
@@ -2173,8 +2204,8 @@ struct Engine {
     // ffn_pair is all-"pre" (design 2026-07-14): every op is a per-lane
     // weight/elementwise sweep on the view, no sequence state, so it needs no
     // mix seam -- the P1 fused round calls it whole on the union view.
-    void ffn_pair(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void ffn_pair(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "ffn_gate.weight"), v.ffn_g);
         mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
         q27k::silu_mul3(LANESV(v, ffn_g),
@@ -2247,7 +2278,11 @@ struct Engine {
         for (int k = 0; k + 1 < W_PLUMB; k++) t.p[k + 1] = d_draft_L[k];
         return t;
     }
-    void spec_verify_forward(const LaneView& v) {
+    // taps (DFlash2 P1c, default nullptr): retain each lane's residual stream
+    // after the DFLASH_TAPS layers into taps[lane][5][N_EMBD] -- host-side
+    // branch only, same pattern as token_launches, so every graph capture
+    // (taps == nullptr) and the conductor's fused mirror are byte-identical.
+    void spec_verify_forward(const LaneView& v, float* taps = nullptr) {
         // P0 batching: the CALLER builds the view (solo: solo_view() -- a
         // vw/stm snapshot taken exactly when the members were read before),
         // so the P1 fused round can hand this same forward a union view.
@@ -2265,20 +2300,27 @@ struct Engine {
             Yc LANESV(v, y);
         q27k::P3 Hm LANESV(v, h),
             X1m LANESV(v, x1);
+        int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
-            if (attn_layer[il]) attn_pair(il, v);
-            else gdn_pair(il, v);
+            rmsnorm3q5(v, Hc, an, X1m, N_EMBD); // norm + quantize x1, one launch
+            if (attn_layer[il]) attn_pair(il, v, true);
+            else gdn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
-            ffn_pair(il, v);
+            rmsnorm3q5(v, Hc, pn, X1m, N_EMBD);
+            ffn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
+            if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
+                for (int t = 0; t < v.vw; t++)
+                    CUDA_CHECK(cudaMemcpyAsync(taps + ((size_t)t * 5 + tap_k) * N_EMBD,
+                                               v.h[t], (size_t)N_EMBD * 4,
+                                               cudaMemcpyDeviceToDevice, v.stm));
+                tap_k++;
+            }
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
-        qx5(v, v.x1, N_EMBD);
+        rmsnorm3q5(v, Hc, on, X1m, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
         // lane t's logits live at v.lg[t] (solo: logits2 + t*VOCAB, alloc is
@@ -2338,8 +2380,10 @@ struct Engine {
         // P14: width-vw sampled verify -- nucleus stats + accept walk over the
         // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
-        // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
-        // unchanged: it keys on n<=vw and its src select covers n in 1..5.
+        // lane. Sampled-ladder widening: vw now runs 2..gate_maxd+1 (was <=5);
+        // drafts/x1 ride the same lane packs the greedy tail passes, so the
+        // launch sequence at the old widths is value-identical (gate: seeded
+        // depth-4 runs match the pre-widening binary token-for-token).
         // One launch, one block per lane (2026-08-18): bitwise identical per
         // lane, but the lanes no longer serialize as vw single-block kernels
         // each occupying one SM of 170.
@@ -2348,16 +2392,38 @@ struct Engine {
             for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
             q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
         }
-        q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
+        q27k::IP3 drafts{};
+        for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
+        q27k::spec_accept(logits2, d_nuc, drafts, d_samp, d_P,
                           d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
-        q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
-                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD,
-                             v.stm);
+        q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
+                             N_EMBD, v.stm);
     }
     void spec_verify_launches_sampled(const LaneView& v) {
         spec_verify_forward(v);
         spec_verify_tail_sampled(v);
+    }
+    // DFlash2 sampled tail (2026-09-07): the drafter's walk SAMPLED its path
+    // (q retained in d2->d_qrow over d2->d_cand), so lane k accepts with
+    // min(1, p/q) and the correction is drawn from max(p - q, 0) -- the
+    // sparse-q rejection rule (ninfer draw_rank + speculative_sparse_warp_
+    // accept). Same nucleus stats + finish as the ladder's sampled tail; only
+    // the accept/stop kernels differ. Lives only in the d2 sampled graph.
+    void spec_verify_tail_sampled_d2(const LaneView& v) {
+        {
+            q27k::CP3 lgs{};
+            for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
+            q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
+        }
+        q27k::IP3 drafts{};
+        for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
+        q27k::d2_spec_accept(logits2, d_nuc, drafts, d2->d_cand, d2->d_qrow, d_samp, d_P,
+                             d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+        q27k::d2_sample_stop(logits2, d_nuc, d_spec, d2->d_cand, d2->d_qrow, d_samp, d_P, VOCAB,
+                             v.vw - 1, d_token, d_amax, v.stm);
+        q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
+                             N_EMBD, v.stm);
     }
 
     void spec_round_launches() {
@@ -2631,23 +2697,29 @@ struct Engine {
         } else {
         q27k::SampleParams warm{1.f, 1.f, 0ull};
         CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
-        dmax = 4; vw = 5; // sampling stays depth-4 (5-lane) in this phase
+        // Sampled-ladder widening: warm at the WIDEST sampled shapes (depth
+        // gate_maxd, width gate_maxd+1) so the wide sampled-tail launches
+        // never lazy-load inside capture; the ungated monolithic round stays
+        // depth-4/width-5 below (its capture resets dmax/vw first).
+        dmax = gate_maxd; vw = gate_maxd + 1;
         seed_positions();
         spec_sample_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         reset_gdn_mtp();
         { // M1b: one sampled capture (see the greedy set's note)
+            dmax = 4; vw = 5; // ungated sampled round: unchanged depth-4/width-5
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_sample_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
             inst_or_advise(&spec_sample_graph, gr, "sampled round");
             CUDA_CHECK(cudaGraphDestroy(gr));
-            // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
-            // verify_graph_w loop. The sampled tail is always depth-4, so the
-            // widest sampled verify is width-5 (W<=5) regardless of gate_maxd.
-            // Same buffers as the monolithic sampled verify; only vw shrinks.
-            for (int W = 2; W <= 5; W++) {
+            dmax = gate_maxd;
+            // P14: per-width sampled verify graphs, mirroring the greedy
+            // verify_graph_w loop. Widened with the sampled ladder: the gated
+            // sampled round drafts to gate_maxd, so W runs 2..gate_maxd+1
+            // (was 2..5). Same buffers as the monolithic sampled verify.
+            for (int W = 2; W <= gate_maxd + 1; W++) {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -2717,7 +2789,7 @@ struct Engine {
                 gate_maxd + 1,
                 (maxd_auto && (!dexit_on || capture_constrained)) ? "; +P13 depth-4 draft"
                                                                   : "",
-                sampled_graphs ? "; +P14 sampled per-width verify 2..5"
+                sampled_graphs ? "; +sampled per-width verify 2..maxd+1"
                                : "; sampled set SKIPPED (Q27_SAMPLED=0)",
                 gate_maxd - 1,
                 pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd,
@@ -2726,15 +2798,297 @@ struct Engine {
                                               : " (auto: floats 4..5)")
                           : "",
                 dexit_on ? 1 : 0);
+        d2_setup(); // DFlash2 serving (Q27_DFLASH2): after the zoo is captured
     }
 
     // one speculative round; returns tokens emitted (1..gate_maxd+1).
     // All position math + acceptance runs on device; host reads 36 bytes.
+    // ---- DFlash2 serving (Q27_DFLASH2=<pack.d2w>, single-slot only) ----
+    // A per-engine drafter with a sliding context ring. Wired into decode_step
+    // in place of spec_round. Cold-start per turn (the ring is reset at
+    // prefill; warm turns restore target state but not the drafter's prefix
+    // taps -- a known first-trial limitation). Output stays verify-decided, so
+    // byte-identical to the ladder's greedy regardless of drafter quality.
+    q27d2::Dflash2* d2 = nullptr;
+    float* d2_vtaps = nullptr;
+    float* d2_pf_taps = nullptr; // [PF_T][5*N_EMBD] prefill-window tap scratch
+    cudaGraphExec_t d2_verify_exec = nullptr;
+    // Sampled twin (2026-09-07 lever 2): same tap-capturing forward, the
+    // rejection-sampling tail the sampled ladder widened to width 8. Lets
+    // DFlash2 serve temperature>0 requests -- it was greedy-only before.
+    cudaGraphExec_t d2_verify_sample_exec = nullptr;
+    // The last prompt token's forward WITH tap capture, as a graph (2026-09-08,
+    // gpt-6-astra small-turn advisory item 1). Under the ladder that step is
+    // step_with -> graph_exec; under DFlash2 it ran token_launches(d2_vtaps)
+    // eagerly so the taps reach the ring -- 963 launches, ~5 ms of submission
+    // overhead on top of the 8.3 ms weight stream, on EVERY turn including
+    // pf=1 turns that have no batched work at all (nsys, BUILDLOG (k)). Same
+    // launch sequence, same numerics; the one-row ring ingest stays outside
+    // (host bookkeeping). Q27_D2_TOKGRAPH=0 keeps the eager path for A/B.
+    cudaGraphExec_t d2_token_exec = nullptr;
+    long gs_fold_last = 0; // lever B: prefills whose last token rode in a batched chunk
+    bool d2_on = false;
+    int d2_k = 7;
+    int d2_pending = 0, d2_pos = 0;
+    static constexpr int D2_SEED_WINDOW = 2048; // prompt-tail tokens seeded into the ring
+    void d2_setup() {
+        const char* pk = getenv("Q27_DFLASH2");
+        if (!pk) return;
+        if (const char* k = getenv("Q27_DFLASH2_K")) d2_k = atoi(k);
+        const int d2_w = d2_k + 1;
+        // Bound by BOTH the engine verify width and the drafter's own row
+        // capacity (D2_WMAX rows of candidates/q/positions) -- a wider W_MAX
+        // build must not index past the drafter's buffers.
+        const int d2_kmax = std::min(W_MAX, q27d2::D2_WMAX) - 1;
+        if (d2_k < 1 || d2_k > d2_kmax) {
+            fprintf(stderr, "Q27_DFLASH2_K=%d out of range (1..%d)\n", d2_k, d2_kmax);
+            exit(1);
+        }
+        d2 = new q27d2::Dflash2();
+        d2->load(pk);
+        const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
+                                                                         : "output.weight";
+        const DevTensor& hw = dm.get(vh);
+        d2->set_engine_head(hw.data, (const __half*)hw.scales, hw.dtype == DType::Q4_G64);
+        // reuse the engine's Q8 token embedding for the drafter's anchor/mask
+        // rows (the serving pack ships no fp16 target.embed). MUST precede
+        // alloc(), which caches the mask-token embedding.
+        const DevTensor& ew = dm.get("token_embd.weight");
+        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+        d2->alloc(4096); // sliding ring (window 2048 + headroom)
+        set_round_width(d2_w);
+        CUDA_CHECK(cudaMalloc((void**)&d2_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d2_pf_taps, (size_t)PF_T * 5 * N_EMBD * 4));
+        LaneView v = solo_view();
+        v.vw = d2_w;
+        // DEFAULT since 2026-09-08 (Q27_D2_VGEMM=0 restores the gemv): the d2
+        // verify's big tensors take the deterministic MMA path (k_vgemm, flat
+        // in width; see vgemm.cuh) instead of the register-bound
+        // gemv_q4_n<8>. Measured on the paired seeded instrument: verify 16.8
+        // -> 15.1 ms, round 18.9 -> 17.35, +11% t/s, tok/round unchanged.
+        // View-local: the ladder, the CLI (engine.cu captures its own d2
+        // verify at gemm_min 9) and the canonical bitwise gates keep gemm_min
+        // = 9. This IS a numerics-family change for the d2 SERVING path (fp32
+        // accumulation order of the int8 products), deterministic run-to-run
+        // (no atomics) and outside the canonical contract by construction --
+        // serving greedy was already not width-invariant across depth configs.
+        if (const char* vg = getenv("Q27_D2_VGEMM"); !vg || atoi(vg)) v.gemm_min = d2_w;
+        cudaGraph_t g;
+        CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+        spec_verify_forward(v, d2_vtaps);
+        spec_verify_tail(v);
+        CUDA_CHECK(cudaStreamEndCapture(stm, &g));
+        CUDA_CHECK(cudaGraphInstantiate(&d2_verify_exec, g, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(g));
+        // Sampled verify twin: capture only when the sampled kernel set was
+        // warmed (build_spec_graphs' sampled phase runs before d2_setup;
+        // Q27_SAMPLED=0 boots refuse temperature>0 requests, so no graph is
+        // needed there). The tail kernels are runtime-width, warmed at width
+        // gate_maxd+1 >= any d2_w <= 8; wider K reuses the greedy warm's
+        // forward widths.
+        // Sampled selector walk (default; Q27_D2_WALK=greedy restores the
+        // argmax walk + one-hot tail for A/B): the drafter draws its path from
+        // softmax(E/T) and the verify tail rejects against that sparse q.
+        if (const char* wm = getenv("Q27_D2_WALK")) d2_walk_sampled = strcmp(wm, "greedy") != 0;
+        if (const char* rk = getenv("Q27_D2_RING")) d2_ring_keep = strcmp(rk, "reset") != 0;
+        if (sampled_graphs) {
+            if (d2_walk_sampled) {
+                d2->set_sampler(d_samp); // before capture_draft (twin graph)
+                // Warm the sparse-q tail kernels eagerly before capture (the
+                // ladder's sampled warm only exercised its own tail; first
+                // launches must not happen inside capture). Every index the
+                // tail derives from data is made valid first: draft slots
+                // (token ids -> logits rows) zeroed, d_cand zeroed at alloc,
+                // d_qrow zeroed at alloc; logits/nucleus contents may be
+                // stale floats (lanes past the ladder's warm width) but are
+                // only compared, never indexed by.
+                for (int k = 0; k + 1 < W_PLUMB; k++)
+                    CUDA_CHECK(cudaMemsetAsync(d_draft_L[k], 0, 4, stm));
+                spec_verify_tail_sampled_d2(v);
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+            }
+            cudaGraph_t gsmp;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_verify_forward(v, d2_vtaps);
+            if (d2_walk_sampled) spec_verify_tail_sampled_d2(v);
+            else spec_verify_tail_sampled(v);
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gsmp));
+            CUDA_CHECK(cudaGraphInstantiate(&d2_verify_sample_exec, gsmp, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gsmp));
+        }
+        d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
+        if (const char* tg = getenv("Q27_D2_TOKGRAPH"); !tg || atoi(tg)) {
+            // token_launches' kernels were warmed by build_graph; the five tap
+            // copies are plain D2D memcpy nodes. Position/token come from
+            // device state (d_pos, d_token), so one graph serves every turn.
+            cudaGraph_t gt;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            token_launches(d2_vtaps);
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gt));
+            CUDA_CHECK(cudaGraphInstantiate(&d2_token_exec, gt, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gt));
+        }
+        d2_timing = getenv("Q27_D2_TIMING") != nullptr;
+        // side stream for the commit-fold (post_round) so it overlaps the next
+        // draft graph; Q27_D2_FOLD=sync keeps the fold on stm for A/B.
+        if (const char* fs = getenv("Q27_D2_FOLD"); !fs || strcmp(fs, "sync") != 0) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&d2_fold_stm, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&d2_fold_ev, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(d2_fold_ev, d2_fold_stm)); // valid to wait on from the start
+        }
+        d2_on = true;
+        fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s, walk %s\n",
+                d2_k, d2_w, vh, d2_walk_sampled ? "sampled" : "greedy");
+    }
+    bool d2_walk_sampled = true; // sampled rounds draw the selector path (Q27_D2_WALK)
+    cudaStream_t d2_fold_stm = nullptr; // side stream for post_round's fold (nullptr = on stm)
+    cudaEvent_t d2_fold_ev = nullptr;   // fold done; the next verify / prefill wait on it
+    // Called once the prefix hit is known (before the prefill loops): align
+    // the drafter ring with this turn. d2_seq is the token sequence the ring's
+    // rows were built from (positions 0..ctx_end); rows for positions below
+    // the common prefix of d2_seq and the new prompt are still exact (a tap
+    // at position p depends only on tokens [0, p]), capped at `base` because
+    // prefill re-seeds [base, NP) and the ring must not hold those positions
+    // twice. Everything else is dropped. Until 2026-09-07 this was an
+    // unconditional reset, so a prefix-cache warm turn (pf = a few tokens)
+    // started the drafter with 1-5 context rows: tok/round 3.28 cold -> 3.05
+    // warm on identical requests. Q27_D2_RING=reset restores that for A/B.
+    // The rule is lineage-agnostic: a hit restored from the RAM/disk tiers
+    // over a ring built from another conversation gets LCP ~ 0 -> reset.
+    bool d2_ring_keep = true;
+    std::vector<int> d2_seq;
+    void d2_prefill_align(const std::vector<int>& prompt, int base) {
+        if (!d2_on) return;
+        int keep = 0;
+        if (d2_ring_keep) {
+            const size_t n = std::min(d2_seq.size(), prompt.size());
+            size_t L = 0;
+            while (L < n && d2_seq[L] == prompt[L]) L++;
+            keep = std::min((int)L, base);
+        }
+        d2->rollback_to(keep);
+        if (d2_timing)
+            fprintf(stderr, "[d2] ring align: keep %d rows (lcp-capped %d, base %d, seq %zu)\n",
+                    d2->ctx_n, keep, base, d2_seq.size());
+        d2_seq = prompt;
+    }
+    // Seed the ring from one prefill chunk's taps: ingest the tokens in this
+    // chunk that fall inside the last-D2_SEED_WINDOW of the prompt. taps holds
+    // the chunk's [Tc][5*N_EMBD] residuals (captured by prefill_chunk).
+    void d2_seed_chunk(int c0, int Tc, int NP) {
+        if (!d2_on) return;
+        const int lo = std::max(c0, NP - D2_SEED_WINDOW);
+        const int hi = c0 + Tc; // exclusive
+        if (lo >= hi) return;
+        const int off = lo - c0;             // first in-window token within the chunk
+        const int cnt = hi - lo;
+        int hpos[/*PF_T*/ 4096];
+        for (int i = 0; i < cnt && i < 4096; i++) hpos[i] = lo + i;
+        d2->ingest(d2_pf_taps + (size_t)off * 5 * N_EMBD, hpos, std::min(cnt, 4096), stm);
+    }
+    // Called at the end of prefill: snapshot the pending token + committed
+    // position for the decode loop (the ring is already seeded).
+    void d2_prefill_done(int NP) {
+        if (!d2_on) return;
+        d2_pos = NP - 1;
+        CUDA_CHECK(cudaMemcpy(&d2_pending, d_token, 4, cudaMemcpyDeviceToHost));
+        last_pending = d2_pending;
+    }
+    // One DFlash2 decode round -- spec_round's contract (d_token=pending,
+    // d_P=last committed, h_next set on entry; emits up to n tokens, updates
+    // d_P/d_token/last_pending, sets fold_pending for post_round's fold).
+    // optional per-phase timing (Q27_D2_TIMING=1): CUDA events around draft /
+    // verify / ingest, accumulated and printed by the server req log.
+    bool d2_timing = false;
+    cudaEvent_t d2_ev[4] = {};
+    double d2_t_draft = 0, d2_t_verify = 0, d2_t_ingest = 0;
+    long d2_t_n = 0;
+    double d2_t_fold = 0, d2_t_wall = 0;
+    int dflash2_round(int* emit, bool sampling = false) {
+        if (d2_timing && !d2_ev[0]) for (auto& e : d2_ev) cudaEventCreate(&e);
+        auto wall0 = std::chrono::steady_clock::now();
+        // Sampled bootstrap (lever 2): mirror spec_sample_round's samp_first --
+        // the first sampled token is drawn from the retained prefill logits
+        // (kind 0, no forward). d2_prefill_done snapshotted the GREEDY argmax
+        // into d2_pending; the draw replaces both d_token and the host mirror
+        // the drafter anchors on.
+        if (sampling && samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+            CUDA_CHECK(cudaMemcpyAsync(&d2_pending, d_token, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            last_pending = d2_pending;
+        }
+        if (d2_timing) cudaEventRecord(d2_ev[0], stm);
+        flush_fold(stm); // belt: fold the previous round before this verify reads state
+        if (d2_timing) cudaEventRecord(d2_ev[1], stm);
+        // proposals -> d2->d_prop (device); sampled rounds draw the walk
+        d2->draft(d2_pending, d2_pos + 1, d2_k, stm, nullptr, sampling && d2_walk_sampled);
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome, stm);
+        for (int k = 0; k < d2_k; k++)
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], d2->d_prop + k, 4,
+                                       cudaMemcpyDeviceToDevice, stm));
+        if (d2_timing) cudaEventRecord(d2_ev[2], stm);
+        // Sampled rounds verify through the rejection tail (accept walk over
+        // the same d_draft_L lanes; distribution-preserving per the sampled
+        // ladder's gates); greedy rounds keep the equality-chain tail.
+        // The previous round's fold may still be running on the side stream
+        // (post_round); the verify reads committed GDN state, so wait here
+        // -- after the draft graph, which is what the overlap buys.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0));
+        CUDA_CHECK(cudaGraphLaunch(sampling ? d2_verify_sample_exec : d2_verify_exec, stm));
+        if (d2_timing) cudaEventRecord(d2_ev[3], stm);
+        int oc[OUTCOME_INTS];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        const int n = oc[0];
+        // Per-lane accept telemetry: a d2 round always verifies all d2_k
+        // lanes, so every lane "fires"; lane j accepted iff n >= j+1. Feeds
+        // the [req] gnh/glf/gla counters so a d2 acceptance profile reads off
+        // the journal exactly like the ladder's (per-lane localization vs
+        // ninfer's accepted_per_position).
+        gate_n_hist[n]++;
+        for (int j = 1; j <= d2_k; j++) {
+            gate_lane_fired[j]++;
+            if (n >= j + 1) gate_lane_acc[j]++;
+        }
+        // ingest the accepted lanes' taps into the drafter ring
+        int ipos[W_MAX];
+        for (int k = 0; k < n; k++) ipos[k] = d2_pos + 1 + k;
+        d2->ingest(d2_vtaps, ipos, n, stm);
+        for (int k = 0; k < n; k++) d2_seq.push_back(oc[1 + k]); // ring rows <-> tokens
+        if (d2_timing) {
+            float fo, dr, ve;
+            cudaEventElapsedTime(&fo, d2_ev[0], d2_ev[1]);
+            cudaEventElapsedTime(&dr, d2_ev[1], d2_ev[2]);
+            cudaEventElapsedTime(&ve, d2_ev[2], d2_ev[3]);
+            d2_t_fold += fo; d2_t_draft += dr; d2_t_verify += ve;
+            d2_t_wall +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0)
+                    .count();
+            d2_t_n++;
+            if (d2_t_n % 200 == 0)
+                fprintf(stderr,
+                        "[d2timing] %ld rounds: wall %.2f = fold %.2f + draft %.2f + verify %.2f "
+                        "+ host %.2f ms/round\n",
+                        d2_t_n, d2_t_wall / d2_t_n, d2_t_fold / d2_t_n, d2_t_draft / d2_t_n,
+                        d2_t_verify / d2_t_n,
+                        (d2_t_wall - d2_t_fold - d2_t_draft - d2_t_verify) / d2_t_n);
+        }
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        d2_pending = oc[OUTCOME_INTS - 1];
+        last_pending = d2_pending;
+        d2_pos += n;
+        fold_pending = n - 1; // post_round folds after on_round truncation
+        return n;
+    }
+
     int spec_round(int* emit) {
         // M1 belt: decode_step/post_round folds every round, but direct-call
         // rigs (CLI spec loop, smoke harnesses) drive spec_round without
         // post_round -- fold the previous round's commit before this round's
         // verify reads committed state. No-op when already folded.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         flush_fold(stm);
         int md_used = -1;  // P13: draft-depth ceiling actually used this round
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
@@ -3012,7 +3366,11 @@ struct Engine {
     // loop; also carries draft_and_gate's gated-config precondition.
     int draft_md_used(bool sampled) const {
         assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
-        return sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+        // Sampled-ladder widening: sampled rounds ride the SAME P13 adaptive
+        // ceiling as greedy (they feed dctl too -- see spec_sample_round's
+        // gated branch for why fixed gate_maxd lost).
+        (void)sampled;
+        return maxd_auto ? dctl.cur : gate_maxd;
     }
     // why: the conductor launches step k on EVERY active member's stm before
     // syncing any of them -- graph launch + margin D2H only, deliberately NO
@@ -3048,7 +3406,7 @@ struct Engine {
     // gated dexit config (pmin_theta > 0, dexit_on, no tool split).
     // sampled=true mirrors spec_sample_round's gated dexit branch instead:
     // first-token bootstrap from the retained prefill logits (samp_first) and
-    // the FIXED sampled ceiling 4 (the sampled tail is 4-draft this phase),
+    // the shared P13 adaptive ceiling (sampled rounds feed dctl too),
     // so a sampled member's fused round consumes the identical drafts +
     // Philox keys its solo round would.
     // out_cap/out_md (Task 9): this round's margin-run depth and drafting
@@ -3104,9 +3462,9 @@ struct Engine {
     // gate_cap/gate_n/lane histograms, and the dctl ladder update (Task 9:
     // Q27_MAXD=auto members MUST feed dctl exactly like spec_round or the
     // adaptive ceiling drifts between solo and fused serving). Sampled
-    // (spec_sample_round): the sampled outcome layout differs -- pending at
-    // oc[6], no suffix arming, and NO dctl/histogram updates (the sampled
-    // ceiling is fixed at 4; spec_sample_round updates nothing either).
+    // (spec_sample_round): same outcome layout since the sampled-ladder
+    // widening -- pending at oc[OUTCOME_INTS-1]; no suffix arming, and NO
+    // dctl updates (the sampled ceiling is the fixed gate_maxd).
     // oc = this engine's d_outcome, already on host (the conductor does one
     // D2H + sync per round for the whole batch). gate_cap/md_used come from
     // draft_and_gate's out-params (-1 = suffix/none, skips the gated block).
@@ -3140,9 +3498,11 @@ struct Engine {
         }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         if (sampled) {
-            last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
-            // Accept-gate telemetry for FUSED sampled rounds (monitoring
-            // only; sampled rounds never feed dctl/EMA -- fixed ceiling 4).
+            // Sampled outcome uses the greedy layout since the widening.
+            last_pending = oc[OUTCOME_INTS - 1];
+            // Accept-gate telemetry + P13 dctl feed for FUSED sampled rounds
+            // (sampled-ladder widening: sampled rounds ride the same adaptive
+            // ceiling as greedy; same trim clamp as the greedy branch above).
             if (gate_cap >= 0) {
                 int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
                 gate_cap_hist[cap]++;
@@ -3152,6 +3512,7 @@ struct Engine {
                     gate_lane_fired[j]++;
                     if (n >= j + 1) gate_lane_acc[j]++;
                 }
+                if (maxd_auto) dctl.update(md_used, cap, n);
             }
         } else {
             last_pending = oc[OUTCOME_INTS - 1];
@@ -3176,6 +3537,7 @@ struct Engine {
     // next. No MTP, no spec: correctness-first per the design (Phase 2 adds spec
     // rejection sampling for speed).
     int sample_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         if (samp_first) {
             samp_first = false;
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
@@ -3196,6 +3558,7 @@ struct Engine {
     // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
     // h_next is the prefill hidden. Tools are off under sampling, so no split path.
     int spec_sample_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         flush_fold(stm); // M1 belt: see spec_round
         // First token from the retained prefill logits (kind 0, no forward) --
         // BEFORE any spec round, on both the gated and ungated branches, so the
@@ -3205,18 +3568,25 @@ struct Engine {
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
         }
         int gated_cap = -1; // accept-gate telemetry: set in the gated branches below
+        int md_used_r = -1; // this round's drafting ceiling (gated branches; feeds dctl)
         if (pmin_theta > 0.f) {
             // P14 confidence-gated sampled round -- mirror spec_round's gated
-            // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
-            // depth-4: draft_graph is depth-4 when gate_maxd==4; under
-            // gate_maxd==5 (auto or fixed) draft_graph_lo is the depth-4
-            // draft (captured whenever gate_maxd==5). Cap the accept walk at 4.
+            // branch. Sampled-ladder widening (2026-09-07): the ceiling floats
+            // over the SAME P13 dctl ladder as greedy (4..gate_maxd on
+            // saturation evidence; sampled rounds feed dctl below). A fixed
+            // gate_maxd ceiling was tried first and LOST 5-10% on think
+            // traffic (xe sweep 2026-09-07): our draft steps are SEQUENTIAL
+            // (~0.45 ms each), so unconditional deep drafting burns more than
+            // the ~0.14/0.07/0.05-accept tail lanes pay -- ninfer affords
+            // fixed-7 only because its DFlash2 forward drafts all 7 at once.
+            // Q27_MAXD=4 restores the old sampled behavior exactly.
             // Tools are off under sampling, so no split path.
-            const int md_used = 4; // sampled ceiling is 4; cap <= 4 by construction
+            const int md_used = maxd_auto ? dctl.cur : gate_maxd;
+            md_used_r = md_used;
             if (dexit_on) {
                 // P14 draft early-exit, sampled flavor: per-step draft graphs
-                // are depth-independent (steps 0..3 here), margins and caps are
-                // value-identical to the monolithic depth-4 draft, and the
+                // are depth-independent (steps 0..md_used-1), margins and caps
+                // are value-identical to the monolithic gated draft, and the
                 // accept walk consumes the identical drafts + Philox keys -- so
                 // emitted bytes and round counts match Q27_DEXIT=0 exactly.
                 int cap = 0, launched = 0;
@@ -3229,7 +3599,7 @@ struct Engine {
                     if (h_draft_margin[k] < pmin_theta) break;
                     cap++;
                 }
-                assert(cap <= 4);
+                assert(cap <= md_used);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 // Width-floor top-up (see spec_round): a width-W sampled verify
                 // walks max_draft=W-1 drafts, so W draft rows must exist. Only
@@ -3239,44 +3609,52 @@ struct Engine {
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
                 gated_cap = cap;
             } else {
-                // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
-                cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo : draft_graph;
+                // Q27_DEXIT=0: monolithic gated draft (A/B baseline) -- the
+                // same graph choice as greedy's mono branch since the
+                // sampled-ladder widening (was always the depth-4
+                // draft_graph_lo).
+                cudaGraphExec_t dg =
+                    (maxd_auto && md_used == 4) ? draft_graph_lo : draft_graph;
                 CUDA_CHECK(cudaGraphLaunch(dg, stm));
                 CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
                                            cudaMemcpyDeviceToHost, stm));
                 CUDA_CHECK(cudaStreamSynchronize(stm));
                 int cap = 0;
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
-                assert(cap <= 4);
+                assert(cap <= md_used);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
                 gated_cap = cap;
             }
-            // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
-            // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
         } else {
             CUDA_CHECK(cudaGraphLaunch(spec_sample_graph, stm));
         }
-        int oc[7];
-        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
+        // Sampled outcome uses the greedy layout since the widening:
+        // [0]=n, [1..W_PLUMB]=emitted, [OUTCOME_INTS-1]=new pending.
+        int oc[OUTCOME_INTS];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
-        last_pending = oc[6];
+        last_pending = oc[OUTCOME_INTS - 1];
         fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
-        // Accept-gate telemetry for sampled rounds (monitoring only; sampled
-        // rounds never feed dctl/EMA -- the sampled ceiling is fixed at 4).
-        // Mirrors the greedy block in spec_round/commit_outcome so the
-        // /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
+        // Accept-gate telemetry + P13 dctl feed for sampled rounds. Since the
+        // sampled-ladder widening, sampled gated rounds update the adaptive
+        // ceiling exactly like greedy (same (md, cap, n) semantics; realized
+        // sampled acceptance is what the ladder should ride on sampled
+        // traffic). Mirrors the greedy block in spec_round/commit_outcome so
+        // the /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
         // under sampled traffic too.
         if (gated_cap >= 0) {
             gate_cap_hist[gated_cap]++;
             gate_n_hist[n]++;
             if (n <= W_MAX) gate_joint[gated_cap][n]++;
+            mprobe_log(gated_cap, n, md_used_r);
             for (int j = 1; j <= gated_cap; j++) {
                 gate_lane_fired[j]++;
                 if (n >= j + 1) gate_lane_acc[j]++;
             }
+            if (maxd_auto) dctl.update(md_used_r, gated_cap, n);
         }
         return n;
     }
@@ -3414,7 +3792,10 @@ struct Engine {
 
     // ---- batched prefill (M6): T-token chunk versions of the blocks ----
     void qxT(const float* x, int cols, int T) {
-        q27k::quantize_x(x, (int64_t)T * cols, xqT, stm);
+        // g32 only for the routes that read it (dp4a, Q27_PF_XG=32); the
+        // default g64 MMA route never does and the launch was 3.7% of a
+        // 1024-token chunk (2026-09-08).
+        if (q27k::prefill_g32_needed()) q27k::quantize_x(x, (int64_t)T * cols, xqT, stm);
         // g64 requant for the MMA GEMM (unconditional: the kernel is noise
         // next to the GEMMs and keeping nat64 always-fresh means every
         // dispatch choice downstream is safe)
@@ -3526,10 +3907,15 @@ struct Engine {
     // Forward a chunk of T prompt tokens starting at absolute position `base`.
     // Leaves hT = final residual for each token. Updates conv rings, GDN state,
     // attention KV caches in place.
-    void prefill_chunk(const int* d_toks, int base, int T) {
+    // taps (DFlash2 prefill warming, default nullptr): scatter the residual
+    // stream after the DFLASH_TAPS layers into taps[T][5*N_EMBD] so the drafter
+    // ring can be seeded with the prompt tail. Host branch only (memcpy, no
+    // compute change) -- prefill stays byte-identical when taps == nullptr.
+    void prefill_chunk(const int* d_toks, int base, int T, float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
                               N_EMBD, T, hT, stm);
+        int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm_T(hT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
                             EPS, stm);
@@ -3544,6 +3930,13 @@ struct Engine {
                             N_EMBD, T, EPS, stm);
             ffn_T(il, T);
             q27k::add_inplace(hT, yT, (int64_t)T * N_EMBD, stm);
+            if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
+                // scatter hT [T][N_EMBD] into taps[t][tap_k][N_EMBD] (stride 5*N_EMBD)
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    taps + (size_t)tap_k * N_EMBD, (size_t)5 * N_EMBD * 4, hT,
+                    (size_t)N_EMBD * 4, (size_t)N_EMBD * 4, T, cudaMemcpyDeviceToDevice, stm));
+                tap_k++;
+            }
         }
     }
 
@@ -3758,6 +4151,20 @@ struct Engine {
     // can hit -- the stable prefix ends inside the first user message, which is
     // exactly what differs between conversations.
     int pfx_sys_len = 0;
+    // P16b shared cut: the length the system-block entry is actually cut
+    // against this request -- sys_len, or the longest prefix an indexed entry
+    // shares with this prompt when that is shorter (engine-set per prefill).
+    int pfx_sys_cut = 0;
+    // whether THIS prefill may write a system entry at the cut (cold: always;
+    // restored: promotion or exploration, see generate_prefill)
+    bool pfx_sys_ok = false;
+    // restored prefixes (hash of prompt[0,base)) this engine has already
+    // written an exploratory sys_len entry from -- one per prefix per
+    // process, which bounds the useless-entry cost when a client's
+    // per-session tail is longer than a chunk. Keyed by the prefix, not the
+    // length: two clients whose entries happen to be cut at the same L are
+    // different explorations (the probe's two shapes collided on 6144).
+    std::set<uint64_t> pfx_explored;
     double pfx_read_ms = 0;  // last disk-read cost, logged with the import split
     double pfx_alloc_ms = 0; // pinned-staging allocation, counted separately
     q27::PrefixRam* pram = nullptr;   // P16c host-RAM tier (null/off = disk only)
@@ -3908,21 +4315,43 @@ struct Engine {
                (pfx_last_persist == 0 || L - pfx_last_persist >= pcache->cfg().step_tokens) &&
                !pcache->has(prompt, L);
     }
+    // System entries (P16b, and its promotion from a restored base) skip the
+    // step gate: that gate spaces a CONVERSATION's entries 8192 tokens apart
+    // to stop one chain writing a blob per turn, but a system entry is hit by
+    // every new session of the client, so it pays for itself one chunk past
+    // whatever this request restored (gpt-6-astra 2026-09-08 (p), item 3:
+    // "the shared 8192-token step gate" was one of the three promotion
+    // blockers). Everything else is the shared policy.
+    bool pfx_should_persist_sys(const std::vector<int>& prompt, int L, int base) const {
+        return pcache && pcache->enabled() && !pfx_busy.load() &&
+               L >= pcache->cfg().min_tokens && L <= pcache->cfg().max_tokens &&
+               L - base >= (int)PF_T && !pcache->has(prompt, L);
+    }
     // P16b: the LAST prefill-chunk boundary at or before the system block ends.
     // Cutting ON a chunk boundary is deliberate -- stopping the loop at an
     // arbitrary sys_len would re-chunk the prefill, and chunk size is not a
     // free variable (PF_T is tuned, and a different reduction order could move
     // results). At most PF_T-1 tokens of the block get re-prefilled on a hit,
-    // which costs ~0.3 s against the ~6 s the entry saves.
+    // which costs ~0.3 s against the ~6 s the entry saves. `pfx_sys_ok` is
+    // decided per request by the shared-cut block in generate_prefill (cold
+    // prefills always; restored ones only when promotion or exploration
+    // applies); the boundary must be one this prefill actually reaches
+    // (> base), so a restored request never claims a boundary inside its
+    // restored prefix.
     bool pfx_sys_cut_here(int base, int boundary) const {
-        return base == 0 && pfx_sys_len > 0 && boundary <= pfx_sys_len &&
-               boundary + (int)PF_T > pfx_sys_len;
+        return pfx_sys_ok && pfx_sys_cut > 0 && boundary > base && boundary <= pfx_sys_cut &&
+               boundary + (int)PF_T > pfx_sys_cut;
     }
 
     // Stage the state for [0,L) and hand it to a background writer. The D2H
     // (~50 ms at 1 GB) is on the critical path; the file write is not.
     void pfx_persist(const std::vector<int>& prompt, int L) {
         pfx_wait_writer();  // never reassign a joinable std::thread
+        // Claim the key before the D2H export: another engine (slot) may have
+        // chosen the same boundary for the same tokens (the shared system cut
+        // makes that likely); only one of them exports and writes, the other
+        // skips this boundary. write() releases the claim.
+        if (!pcache->reserve(prompt, L)) return;
         // Export into a RAM-tier slot when the tier is on and one is free, so
         // the blob we just built is resident for the next restore at no extra
         // copy; the writer then streams it to disk from there. `slot` is
@@ -3931,7 +4360,10 @@ struct Engine {
         q27::PrefixRam::BlobPtr slot;
         if (pram && pram->enabled()) slot = pram->acquire(pfx_bytes(L));
         char* dst = slot ? slot->p : (pfx_wstage_ensure(L) ? pfx_wstage : nullptr);
-        if (!dst) return;
+        if (!dst) {  // nothing to stage into: give the claim back so a later pass can retry
+            pcache->release(prompt, L);
+            return;
+        }
         auto t0 = std::chrono::steady_clock::now();
         pfx_export(L, dst);
         const double ms = std::chrono::duration<double, std::milli>(
@@ -4139,6 +4571,11 @@ struct Engine {
                                    cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         last_pending = t.forced_id;
+        // Keep the DFlash2 drafter's host anchor in step (found during lever
+        // 2): d2 rounds draft from d2_pending, and a stale anchor after a
+        // forced install conditioned proposals on the wrong token (acceptance
+        // loss only -- verify reads d_token -- but real).
+        if (d2_on) d2_pending = t.forced_id;
     }
 
     // Replace the model-predicted pending token only at a coherent boundary.
@@ -4332,7 +4769,19 @@ struct Engine {
                     t.budget_cancelled = true;
                     t.cancel.store(true);
                 }
+                // DFlash2 mirrors ride the round outcome (dflash2_round already
+                // ingested n lanes' taps and advanced d2_pos): a truncation
+                // rolls the committed stream back to m, so drop the phantom
+                // ring rows, re-anchor the position, and re-sync the pending
+                // mirror (pre-existing greedy-path bug, found in the lever-2
+                // review pass 2026-09-07).
+                if (d2_on && m < n) {
+                    d2->rollback(n - m);
+                    d2_pos -= (n - m);
+                    d2_seq.resize(d2_seq.size() - std::min<size_t>(n - m, d2_seq.size()));
+                }
                 last_pending = refinish_round(m, n, t.Ph + m);
+                if (d2_on) d2_pending = last_pending;
                 n = m;
             }
         }
@@ -4343,7 +4792,20 @@ struct Engine {
         // here after the conductor's one host sync, so the cstm-side arena
         // writes have landed; the fold on stm is ordered before the next
         // round's draft on stm, and cstm waits on draft_done.)
-        flush_fold(stm);
+        if (d2_fold_stm) {
+            // DFlash2 serving (2026-09-07): fold on a SIDE stream so it
+            // overlaps the next round's draft graph, which never touches
+            // the GDN state or the record arena. The host synced stm at the
+            // outcome read, so every arena write of this verify has landed;
+            // the next verify (the only reader of committed S) waits on
+            // d2_fold_ev before it launches (dflash2_round), and prefill
+            // waits on it too. ~0.38 ms/round of fold kernels leave the
+            // critical path.
+            flush_fold(d2_fold_stm);
+            CUDA_CHECK(cudaEventRecord(d2_fold_ev, d2_fold_stm));
+        } else {
+            flush_fold(stm);
+        }
         // suffix index tracks the committed stream (post-truncation n);
         // the pending token rides along virtually in propose_with.
         if (suffix_on)
@@ -4397,6 +4859,11 @@ struct Engine {
             n = sample_round(em);
             install_forced_pending(t);
             em[0] = t.forced_id;
+        } else if (d2_on && !(t.sampling && t.force_plain_sample)) {
+            // Lever 2 (2026-09-07): DFlash2 serves sampled requests through the
+            // rejection-verify twin; Q27_SAMPLE_PLAIN still forces the plain
+            // sampler (the spec==non-spec distribution A/B lever).
+            n = dflash2_round(em, t.sampling);
         } else {
             n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
                            : spec_round(em);
@@ -4433,6 +4900,11 @@ struct Engine {
             sfx.reset(prompt);
             sfx_valid = false;
         }
+        // DFlash2 ring alignment happens once the prefix hit is known (both
+        // branches below call d2_prefill_align). A side-stream fold from the
+        // previous request's last round must land before this prefill reads
+        // or resets the GDN state.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0));
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -4513,6 +4985,12 @@ struct Engine {
                 if (dst && pcache->read_state(pe, dst, pfx_bytes(pe.L))) {
                     base = pe.L;
                     pfx_hit = true;
+                    // LRU by ACCESS: a restore re-stamps the entry, so the
+                    // one system entry every new session hits is not the
+                    // first to age out under the byte budget ((p) item 3;
+                    // measured 09-08: the shared 21504 entry was the
+                    // second-oldest of 28 at 23 of 40 GB).
+                    pcache->touch(pe);
                     if (slot) {
                         pram->publish(slot, prompt, pe.L);
                         pfx_ram_hit = slot;
@@ -4530,12 +5008,81 @@ struct Engine {
                 }
             }
             if (base == 0) pfx_last_persist = 0; // new chain: allow a fresh persist
+            // P16b shared cut (2026-09-08): cut the system-block entry at the
+            // longest prefix an indexed entry shares with this prompt, not at
+            // sys_len. Sessions of one client agree on the block up to a
+            // per-session tail (Claude Code's gitStatus: five sessions shared
+            // exactly 22460 of 22544-22578 tokens), so the sys_len cut was hit
+            // by nobody -- every first turn re-persisted its own entry. The
+            // first session ever still cuts at sys_len (nothing to share
+            // with), the second cuts where it agrees with the first, the third
+            // hits. Cold prefills only; a restored or snapshotted base never
+            // writes a system entry (pfx_sys_cut_here requires base == 0).
+            pfx_sys_cut = pfx_sys_len;
+            pfx_sys_ok = false;
+            // PROMOTION (2026-09-08 (p) item 3): the cold-only rule above
+            // could never move a client's entry FORWARD. Once an old, short
+            // entry is an exact prefix of every new session (the client's
+            // block grew, or an early line changed and the second session
+            // cut at the old shared length), every session restores it and
+            // re-prefills the rest of the block for ever: base != 0, so no
+            // system entry, and the conversation entry sits behind the 8192
+            // step gate. Two rules for a request restored from the disk/RAM
+            // tier whose block extends at least a chunk past the restore:
+            //   promote  -- an indexed entry agrees with this prompt >= one
+            //               chunk beyond base: cut there (the shared length
+            //               some other session already proved).
+            //   explore  -- nothing does, but the block runs >= a chunk past
+            //               every known divergence point: write ONE sys_len
+            //               entry so the next session can measure the shared
+            //               length against it. Once per restored prefix per
+            //               engine (pfx_explored); a
+            //               block whose known divergence sits within a chunk
+            //               of sys_len (the per-session gitStatus tail) is
+            //               never explored -- that entry would be a prefix of
+            //               nobody, which is the (g) finding all over again.
+            // Same-conversation restores (P8 snapshot, P9 checkpoint) are
+            // not eligible: their block is already covered or in the past.
+            const bool sys_eligible = pcache && pcache->enabled() &&
+                                      pfx_sys_len >= pcache->cfg().min_tokens &&
+                                      (base == 0 || (pfx_hit && pfx_sys_len >= base + (int)PF_T));
+            if (sys_eligible) {
+                const int shared = pcache->shared_prefix(prompt, pfx_sys_len);
+                // the cut lands on the last chunk boundary <= shared; that
+                // boundary is what pfx_should_persist measures against
+                // min_tokens, so check IT (review P3: an unaligned min_tokens
+                // could otherwise trade a usable sys_len cut for an unusable one)
+                const int shared_b = (shared / (int)PF_T) * (int)PF_T;
+                const char* how = "cold";
+                if (base == 0) {
+                    pfx_sys_ok = true;
+                    if (shared_b >= pcache->cfg().min_tokens && shared < pfx_sys_len)
+                        pfx_sys_cut = shared;
+                } else if (shared >= base + (int)PF_T) {
+                    pfx_sys_ok = true;
+                    how = "promote";
+                    if (shared < pfx_sys_len) pfx_sys_cut = shared;
+                } else if (pfx_sys_len - std::max(shared, base) >= (int)PF_T &&
+                           pfx_explored
+                               .insert(q27::pfx_fnv1a64(prompt.data(), (size_t)base * sizeof(int)))
+                               .second) {
+                    pfx_sys_ok = true;
+                    how = "explore";
+                } else {
+                    how = "skip";
+                }
+                if (shared > 0 || base > 0)
+                    fprintf(stderr, "[pfx] system block %d tokens, shares %d with an indexed entry"
+                            " (restored %d) -> %s, cut at %d\n", pfx_sys_len, shared, base, how,
+                            pfx_sys_ok ? (pfx_sys_cut / (int)PF_T) * (int)PF_T : 0);
+            }
             gs.pfx = pfx_hit ? base : 0;
             fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d pfx=%d\n", NP, base,
                     snap_toks.size(), ck, gs.pfx);
             gs.hit = base;
             gs.ckpt = ck;
             gs.pf = NP - base;
+            d2_prefill_align(prompt, base); // DFlash2: keep ring rows below the hit
             // P9 alias fix (audit, 2026-07-12): re-prefilling [base..NP)
             // overwrites those KV rows with THIS conversation. Any cached
             // state whose coverage extends past base and does not match the
@@ -4597,15 +5144,24 @@ struct Engine {
             for (int c0 = base; c0 < snap_upto; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, snap_upto - c0);
                 if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
-                prefill_chunk(d_prompt + c0, c0, Tc);
+                float* d2t = (d2_on && c0 + Tc > NP - D2_SEED_WINDOW) ? d2_pf_taps : nullptr;
+                prefill_chunk(d_prompt + c0, c0, Tc, d2t);
+                if (d2t) d2_seed_chunk(c0, Tc, NP);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
-                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                // MTP KV warm only when the MTP head can be consulted: under
+                // DFlash2 the decode loop never runs mtp_forward (2026-09-08,
+                // ~1.5% of a chunk). CONTRACT: prefix-cache blobs written by a
+                // DFlash2 engine then carry unwarmed MTP rows -- a ladder
+                // config must never restore from a DFlash2 root (the launch
+                // script's ladder mode has no cache; keep it that way).
+                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
                 }
-                // P16b: system-block entry, at most one per cold prefill.
-                if (pfx_sys_cut_here(base, c0 + Tc) && pfx_should_persist(prompt, c0 + Tc))
+                // P16b: system-block entry, at most one per prefill (the cut
+                // window is one chunk wide; promotion/exploration reuse it).
+                if (pfx_sys_cut_here(base, c0 + Tc) && pfx_should_persist_sys(prompt, c0 + Tc, base))
                     pfx_persist(prompt, c0 + Tc);
                 round_gap();
             }
@@ -4621,12 +5177,49 @@ struct Engine {
             const bool pfx_stable_boundary = stable_len > base && stable_len < NP;
             if (pfx_stable_boundary && pfx_should_persist(prompt, snap_upto))
                 pfx_persist(prompt, snap_upto);
-            for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
-                int Tc = std::min((int)PF_T, (NP - 1) - c0);
+            // Lever B (2026-09-08, gpt-6-astra small-turn advisory item 3, the
+            // narrow case): when the post-snapshot span exists and its final
+            // chunk would hold >= 2 tokens, the LAST prompt token rides in that
+            // chunk instead of a separate single-token forward -- the eager
+            // step streamed the whole weight set once more (12 ms per warm
+            // turn after the graph capture, BUILDLOG (k)/(m)). The head then
+            // runs on that row's output_norm: same qx/mm/argmax/advance tail
+            // as token_launches, so every device-side handoff (logits,
+            // d_token, d_pos/d_step, d_gen) is the one decode expects. NOT
+            // bitwise: that token's hidden state now comes from the batched
+            // g64 kernels (WY scan, prefill attention) instead of the serial
+            // decode kernels -- the g64 tolerance class (policy 2026-07-04),
+            // gated by the first-token logits A/B + DFlash2 acceptance + the
+            // agentic run (BUILDLOG (o)). Legacy tail snapshots (stable_len <
+            // 0: CLI, canonicals) and one-token spans keep the old path: a
+            // one-token batched chunk streams the weights anyway, and the
+            // NP-1 snapshot must not include the last token's state.
+            // OPT-IN (Q27_PF_FOLDLAST=1): measured 2026-09-08 (BUILDLOG (o)),
+            // -12 ms per warm turn but the batched path's per-token NLL is
+            // +1.37% over serial on the agentic corpus (inside the +2% rule,
+            // not free) and the first-token distribution moves visibly on
+            // ~1/3 of sampled turns for ~1.3% of run wall. Off by default.
+            static const bool fold_env = [] { const char* e = getenv("Q27_PF_FOLDLAST"); return e && atoi(e); }();
+            const int span = NP - snap_upto;
+            const bool fold_last = fold_env && pfx_stable_boundary && span >= 2 && (span % PF_T) != 1;
+            const int span_end = fold_last ? NP : NP - 1;
+            for (int c0 = snap_upto; c0 < span_end; c0 += PF_T) {
+                int Tc = std::min((int)PF_T, span_end - c0);
                 if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
-                prefill_chunk(d_prompt + c0, c0, Tc);
+                float* d2t = (d2_on && c0 + Tc > NP - D2_SEED_WINDOW) ? d2_pf_taps : nullptr;
+                prefill_chunk(d_prompt + c0, c0, Tc, d2t);
+                if (d2t) d2_seed_chunk(c0, Tc, NP); // includes NP-1 when folded: no separate ingest
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
-                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                const bool has_last = fold_last && c0 + Tc == NP;
+                // the last row's output_norm becomes the decode-side x1 (the
+                // eager step left it there); copy BEFORE mtp_warm_T, which
+                // reuses x1T as scratch
+                if (has_last)
+                    CUDA_CHECK(cudaMemcpyAsync(x1, x1T + (size_t)(Tc - 1) * N_EMBD, (size_t)N_EMBD * 4,
+                                               cudaMemcpyDeviceToDevice, stm));
+                // MTP warm needs each row's successor token; NP-1 has none
+                if (!d2_on && Tc - (has_last ? 1 : 0) > 0)
+                    mtp_warm_T(d_prompt + c0 + 1, c0, Tc - (has_last ? 1 : 0)); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -4636,7 +5229,30 @@ struct Engine {
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));
-            step_with(prompt[NP - 1]);
+            if (fold_last) {
+                // token_launches' tail on the batched row: head, greedy next
+                // token, position/record advance (d_pos -> NP, d_gen[NP-1]).
+                qx(x1, N_EMBD);
+                mm(dm.get("output.weight"), x1, logits);
+                q27k::argmax(logits, VOCAB, d_token, d_amax, stm);
+                q27k::advance(d_pos, d_step, d_gen, d_token, stm);
+                gs_fold_last++;
+            } else if (d2_on) {
+                // DFlash2: the last prompt token's taps must reach the ring
+                // too. The batched loops stop at NP-1 and this single-token
+                // step produced no taps, so every turn's ring had a one-row
+                // hole at its most recent position (found 2026-09-07 by the
+                // ring contiguity check -- it also defeated warm-turn row
+                // retention). Eager token_launches is graph_exec's launch
+                // sequence plus the tap copies: same target numerics.
+                const int tok_last = prompt[NP - 1];
+                CUDA_CHECK(cudaMemcpy(d_token, &tok_last, 4, cudaMemcpyHostToDevice));
+                if (d2_token_exec) CUDA_CHECK(cudaGraphLaunch(d2_token_exec, stm));
+                else token_launches(d2_vtaps);
+                d2->ingest(d2_vtaps, &pos_last, 1, stm);
+            } else {
+                step_with(prompt[NP - 1]);
+            }
         } else {
             reset();
             // Serial path leaves no reusable cache: clear the snapshot AND the
@@ -4649,6 +5265,7 @@ struct Engine {
             snap_toks.clear();
             ckpt_clear();
             gs.pf = NP;
+            d2_prefill_align(prompt, 0); // serial path: cold ring
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
                 if (i + 1 < prompt.size()) {
@@ -4667,6 +5284,20 @@ struct Engine {
         gs.pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                              t_in)
                        .count();
+        // Gate instrument (lever B): Q27_DUMP_PF_LOGITS=<dir> writes the
+        // post-prefill logits of every request as <dir>/pf_%06d.bin (VOCAB
+        // fp32, per-engine counter) for a first-token distribution A/B.
+        {
+            static const char* dump_dir = getenv("Q27_DUMP_PF_LOGITS");
+            if (dump_dir) {
+                static int n = 0;
+                std::vector<float> lg(VOCAB);
+                CUDA_CHECK(cudaMemcpy(lg.data(), logits, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
+                char path[512];
+                snprintf(path, sizeof path, "%s/pf_%06d.bin", dump_dir, n++);
+                if (FILE* f = fopen(path, "wb")) { fwrite(lg.data(), 4, VOCAB, f); fclose(f); }
+            }
+        }
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
@@ -4678,6 +5309,7 @@ struct Engine {
         live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
         live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;
+        d2_prefill_done(NP); // DFlash2: snapshot pending + position for the decode loop
         return true;
     }
 

@@ -387,6 +387,35 @@ stripped (1.1 MB -> 5 KB each); the scores and per-pack breakdowns are intact.
 Captured request bodies are stripped from the tap logs: those are Claude Code's
 own system prompt and tool schemas.
 
+## 2026-09-09 addendum: the DFlash2-era standing (see agentic-2026-09-09/README.md)
+
+Both engines now run block drafters and ~97% prefix reuse. q27's
+production recipe decodes within 6% of ninfer's DFlash2 arm (207 vs 221
+t/s aggregate; 3.89 vs 4.19 tok/round) but takes 3x the wall per instance
+(108 vs 36 s) because its Claude Code sessions run 25 turns and 18K output
+tokens per instance against 15 and 6K -- the same pattern on 09-07 and
+09-08. Section 2's finding (reuse decides the agentic half) is now a tie;
+what decides it is trajectory length, and that is unattributed: quant
+tier (Q4_G64 vs NVFP4), the rendering of "medium" effort, or the parser.
+The 08-17 table below is the pre-fix ninfer; keep both.
+
+*Attributed the same day
+([agentic-2026-09-09-echo/](agentic-2026-09-09-echo/README.md)): on one
+identical turn-0 prompt with 24 seeds per arm, every q27 configuration
+(production, ladder, fp16 KV, q6 tier, and the corrected tools rendering)
+is indistinguishable from llama.cpp serving a Q8_0 of the same model
+(median thinking 276-340 chars vs 314, p 0.3-0.7), while ninfer's NVFP4
+arm thinks a median 209 (p=0.0003 against the Q8_0 reference). The
+trajectory gap is ninfer reasoning less than the model does at 8 bits, not
+q27 reasoning more; it compounds into turns and tokens over a session. Two
+q27 defects were found on the way and fixed -- Claude Code dropped prior
+thinking blocks because q27 returned its served model name instead of
+echoing the requested one, and the serving path had rendered the `<tools>`
+block compact and key-sorted since 08-22 -- and neither moved the
+trajectory length (12-instance A/B with a same-day control; probe re-run
+on the corrected prompt). Drafter, KV dtype, tier and sampler chain are
+excluded on q27.*
+
 ## 2026-08-22 addendum: Qwen3.8 quality legs, q27 vs llama.cpp
 
 A `llama38` leg (Qwen3.8-27B-MTP as Q5_K_M, 19.5 GB, within 0.3 GB of q27's q6

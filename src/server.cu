@@ -265,6 +265,35 @@ struct ReasoningBudgetObserver {
 
 };
 
+// Request-body recording (2026-09-08, item 2 of the (p) agenda): with
+// Q27_REQ_LOG=<file> every generation request is appended as one JSONL line
+// -- seq (arrival order), t_ms, api, path, body verbatim -- so
+// bench/replay/replay.py can feed two binaries the identical sequence.
+// Sampling is seed-0 when the client sends none, and the DFlash2 ring and
+// the cache tiers are history-dependent, so a turn is reproducible only
+// under the identical preceding sequence; this is what makes that
+// possible. Real session content: local, opt-in, never committed.
+static void req_log_body(const char* api, const char* path, const std::string& body) {
+    static FILE* f = [] {
+        const char* p = getenv("Q27_REQ_LOG");
+        FILE* h = p && *p ? fopen(p, "a") : nullptr;
+        if (p && *p && !h) fprintf(stderr, "Q27_REQ_LOG: cannot open %s\n", p);
+        return h;
+    }();
+    if (!f) return;
+    static std::mutex mu;
+    static long seq = 0;
+    const long long t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+    json rec = {{"seq", 0L}, {"t_ms", t_ms}, {"api", api}, {"path", path}, {"body", body}};
+    std::lock_guard<std::mutex> lk(mu);
+    rec["seq"] = seq++;
+    const std::string line = rec.dump(-1, ' ', false, json::error_handler_t::replace);
+    fwrite(line.data(), 1, line.size(), f);
+    fputc('\n', f);
+    fflush(f);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -531,6 +560,20 @@ int main(int argc, char** argv) {
         setenv("Q27_BATCH", "1", 0);
         setenv("Q27_BATCH_GRAPH", "1", 0);
         setenv("Q27_BATCH_GRAPH_CAP", "64", 0);
+    }
+    // DFlash2 serving is single-slot: the conductor's FUSED batch rounds
+    // commit through commit_outcome, which advances the target without the
+    // drafter's ring/position/sequence mirrors (dflash2_round owns those), so
+    // a later solo d2 round would label its taps with stale positions while
+    // every host invariant still looks intact (gpt-6-astra ring review).
+    // Refuse the contradiction at boot rather than degrade silently.
+    if (getenv("Q27_DFLASH2")) {
+        const char* b = getenv("Q27_BATCH");
+        if (!b || strcmp(b, "0") != 0) {
+            fprintf(stderr, "Q27_DFLASH2 requires Q27_BATCH=0 (single-slot solo rounds; fused "
+                            "batch rounds bypass the drafter ring)\n");
+            return 1;
+        }
     }
     // Q27_SAMPLED=0 (issue #1, small-VRAM greedy boots): the engine skips the
     // sampled graph set; this server refuses temperature>0 requests with a
@@ -1037,6 +1080,20 @@ int main(int argc, char** argv) {
                             fixed_for(n_slots) / 1e9);
                 }
             }
+        }
+        // DFlash2 (Q27_DFLASH2): the drafter pack + ring + scratch load in
+        // d2_setup, which runs AFTER this pool grabs its VRAM -- so carve the
+        // drafter's footprint out of the pool now or d2_setup OOMs. The serving
+        // pack is ~1.2 GB (Q4 matmuls + codebooks; head/embed reuse the
+        // engine's), + ring/scratch; reserve 2.0 GB. Override: Q27_DFLASH2_RESERVE_GB.
+        if (getenv("Q27_DFLASH2") && pool_b > 0) {
+            double d2_reserve = 2.0e9;
+            if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
+            const double was = pool_b;
+            pool_b = pool_b > d2_reserve ? pool_b - d2_reserve : 0;
+            fprintf(stderr, "[pool] reserved %.2f GB for the DFlash2 drafter; pool %.2f -> "
+                            "%.2f GB\n",
+                    d2_reserve / 1e9, was / 1e9, pool_b / 1e9);
         }
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
@@ -1955,6 +2012,7 @@ int main(int argc, char** argv) {
     };
 
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
+        req_log_body("oai", chat ? "/v1/chat/completions" : "/v1/completions", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
@@ -2653,7 +2711,14 @@ int main(int argc, char** argv) {
         q27::TemplateOpts topts=q27::template_opts_from_body(body);
         // client key order survives only in the raw text (the parsed json is
         // sorted); restrict to the selected subset so decl matches `tools`.
-        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
+        // `tool_names`, not `selected.names`: the latter was moved-from two
+        // lines up, so from 2026-08-22 to 2026-09-09 the keep-filter saw an
+        // empty list, dropped every tool, and the preamble fell back to the
+        // compact key-sorted dump -- 5% fewer tokens than the trained
+        // template on a 28-tool Claude Code request, keys in the wrong order.
+        // render_request never moved, so the offline corpus was the right
+        // prompt and the server was not.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&tool_names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
             q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
@@ -2693,12 +2758,29 @@ int main(int argc, char** argv) {
     });
 
     srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
+        req_log_body("anth", "/v1/messages", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Messages); // unified default (see /v1/chat/completions)
         bool stream = q27::jbool(body, "stream", false);
         auto tk0 = std::chrono::steady_clock::now();
+        // Echo the client's requested model name in the response, as the
+        // Anthropic API (and ninfer) do. Claude Code tags every assistant
+        // message with the response's model and drops prior thinking blocks
+        // from the history it sends back when that tag differs from the model
+        // it is requesting; with the served name here the model never saw its
+        // own earlier reasoning and re-derived it every turn (2026-09-09
+        // turn-count investigation: 1.7x turns / 3x output tokens vs ninfer).
+        // Q27_ECHO_MODEL=0 restores the served name for A/Bs.
+        std::string resp_model = served_name;
+        {
+            static const bool echo_model =
+                !(getenv("Q27_ECHO_MODEL") && strcmp(getenv("Q27_ECHO_MODEL"), "0") == 0);
+            if (echo_model && body.contains("model") && body["model"].is_string() &&
+                !body["model"].get_ref<const std::string&>().empty())
+                resp_model = body["model"].get<std::string>();
+        }
         q27::ToolChoice tchoice;
         json tools;
         std::vector<std::string> tool_names_v;
@@ -2925,7 +3007,7 @@ int main(int argc, char** argv) {
             const char* sr=q27::anthropic_tool_stop_reason(
                 any_call,final_tool_incomplete,generation_truncated);
             json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                        {"model", served_name}, {"content", content},
+                        {"model", resp_model}, {"content", content},
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", n},
@@ -2978,7 +3060,7 @@ int main(int argc, char** argv) {
                     return ok;
                 };
                 json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                            {"model", served_name}, {"content", json::array()},
+                            {"model", resp_model}, {"content", json::array()},
                             {"stop_reason", nullptr}, {"stop_sequence", nullptr},
                             {"usage", {{"input_tokens", (int)prompt.size()}, {"output_tokens", 0}}}};
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
@@ -3195,6 +3277,7 @@ int main(int argc, char** argv) {
     // 400 is fatal to Codex, 500 retries -- so tolerate quirks, 500 on bugs.
 
     srv.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
+        req_log_body("resp", "/v1/responses", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <tuple>
+#include "dflash2.h"
 #include "engine.cuh"
 
 int main(int argc, char** argv) {
@@ -61,6 +62,8 @@ int main(int argc, char** argv) {
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
     std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
+    std::string d2_pack;   // DFlash2 P1c E2E decode (--dflash2 <pack.d2w>)
+    int d2_k = q27d2::D2_K; // DFlash2 draft depth (--k, verify width K+1)
     bool p0b = false;      // DFlash P0b S=16 verify-cost bench
     // Sampling (roadmap #2). temp>0 routes the --spec loop to the sampled spec
     // path (Phase 2); Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B.
@@ -92,6 +95,8 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
         if (!strcmp(argv[i], "--dump-taps") && i + 1 < argc) taps_path = argv[++i];
+        if (!strcmp(argv[i], "--dflash2") && i + 1 < argc) d2_pack = argv[++i];
+        if (!strcmp(argv[i], "--k") && i + 1 < argc) d2_k = atoi(argv[++i]);
         if (!strcmp(argv[i], "--p0b")) p0b = true;
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
@@ -174,6 +179,134 @@ int main(int argc, char** argv) {
         fclose(tf);
         fprintf(stderr, "taps: %d steps (%d prompt-tail + %d gen) -> %s\n",
                 NP - base + n_gen, NP - base, n_gen, taps_path.c_str());
+        return 0;
+    }
+
+    if (!d2_pack.empty()) {
+        // DFlash2 P1c bring-up E2E (docs/plans/2026-09-06-dflash2-integration.md):
+        // eager serial-tap prefill, then the suffix-round pattern with the
+        // DFlash2 drafter -- host proposals staged into d_draft_L, EAGER
+        // width-8 verify (spec_verify_forward with tap capture + tail), fold,
+        // ingest the accepted lanes' taps. No graphs, no tuning. Emitted
+        // tokens are greedy-identical to the plain path by the verify-tail
+        // equality chain (gate: diff vs a plain run of the same prompt).
+        int NP = (int)toks.size();
+        if (NP + n_gen + W_MAX > ctx) {
+            fprintf(stderr, "--dflash2: prompt %d + n %d > --ctx %d -- refusing\n", NP, n_gen,
+                    ctx);
+            return 1;
+        }
+        const int d2_w = d2_k + 1; // verify width
+        if (d2_k < 1 || d2_w > W_MAX) {
+            fprintf(stderr, "--dflash2: --k %d out of range (1..%d)\n", d2_k, W_MAX - 1);
+            return 1;
+        }
+        q27d2::Dflash2 d2;
+        d2.load(d2_pack.c_str());
+        d2.alloc(NP + n_gen + 64);
+        // Phase 2: drafter logits through the engine's quantized head (the
+        // fp16 pack head measured 10.4 ms/round at 240 GB/s). Opt-out for
+        // the numerics A/B: Q27_D2_FP16HEAD=1.
+        if (!getenv("Q27_D2_FP16HEAD")) {
+            const char* vh = (e.fast_head && e.dm.model_has("output_q4.weight"))
+                                 ? "output_q4.weight"
+                                 : "output.weight";
+            const DevTensor& hw = e.dm.get(vh);
+            d2.set_engine_head(hw.data, (const __half*)hw.scales,
+                               hw.dtype == DType::Q4_G64);
+            fprintf(stderr, "dflash2: engine head (%s)\n", vh);
+        }
+        float* d_vtaps;
+        CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
+        // prompt: eager tapped steps, ingest each committed position
+        for (int i = 0; i < NP; i++) {
+            e.step_taps(toks[i]);
+            d2.ingest(e.d_taps, &i, 1, e.stm);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        // bootstrap, mirroring the --spec loop
+        CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                   e.stm));
+        int P = NP - 1;
+        CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
+        int pending;
+        CUDA_CHECK(cudaMemcpy(&pending, e.d_token, 4, cudaMemcpyDeviceToHost));
+        // gdn_mix and the record arena run at the MEMBER width (the view's vw
+        // only drives the attention/FFN sweep) -- without this, a round
+        // accepting n > 5 folds unrecorded rows and corrupts committed GDN
+        // state. No graphs exist in this mode, so setting it is safe.
+        e.set_round_width(d2_w);
+        // Phase 5: the width-d2_w verify (forward with tap capture + tail) is a
+        // fixed launch sequence over init-fixed buffers -- capture it ONCE and
+        // replay per round, dropping the eager 64-layer launch overhead. Every
+        // per-round input (staged drafts, positions, d_token, d_P) is a device
+        // buffer written by prep_round/the draft stage BEFORE the replay, so the
+        // graph reads current state. Q27_D2_NOGRAPH=1 keeps the eager path.
+        const bool d2_graph = !getenv("Q27_D2_NOGRAPH");
+        cudaGraphExec_t verify_exec = nullptr;
+        if (d2_graph) {
+            auto v = e.solo_view();
+            v.vw = d2_w;
+            cudaGraph_t g;
+            CUDA_CHECK(cudaStreamBeginCapture(e.stm, cudaStreamCaptureModeGlobal));
+            e.spec_verify_forward(v, d_vtaps);
+            e.spec_verify_tail(v);
+            CUDA_CHECK(cudaStreamEndCapture(e.stm, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&verify_exec, g, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(g));
+            fprintf(stderr, "dflash2: verify graph captured (width %d)\n", d2_w);
+        }
+        cudaEvent_t t0, t1;
+        CUDA_CHECK(cudaEventCreate(&t0));
+        CUDA_CHECK(cudaEventCreate(&t1));
+        std::vector<int> out;
+        int rounds = 0, hist[W_MAX] = {0};
+        CUDA_CHECK(cudaEventRecord(t0, e.stm));
+        while ((int)out.size() < n_gen && P + 2 * W_MAX < ctx) {
+            d2.draft(pending, P + 1, d2_k, e.stm); // proposals stay on device
+            q27k::prep_round(e.d_P, e.d_token, e.lane_pos(), e.mtp_pos(), W_MAX, D_MAX_MTP,
+                             e.d_outcome, e.stm);
+            for (int k = 0; k < d2_k; k++)
+                CUDA_CHECK(cudaMemcpyAsync(e.d_draft_L[k], d2.d_prop + k, 4,
+                                           cudaMemcpyDeviceToDevice, e.stm));
+            if (verify_exec) {
+                CUDA_CHECK(cudaGraphLaunch(verify_exec, e.stm));
+            } else {
+                auto v = e.solo_view();
+                v.vw = d2_w;
+                e.spec_verify_forward(v, d_vtaps);
+                e.spec_verify_tail(v);
+            }
+            int oc[OUTCOME_INTS];
+            CUDA_CHECK(cudaMemcpyAsync(oc, e.d_outcome, OUTCOME_INTS * 4,
+                                       cudaMemcpyDeviceToHost, e.stm));
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            int n = oc[0];
+            e.fold_pending = n - 1;
+            e.flush_fold(e.stm);
+            std::vector<int> ipos(n);
+            for (int k = 0; k < n; k++) ipos[k] = P + 1 + k;
+            d2.ingest(d_vtaps, ipos.data(), n, e.stm);
+            for (int k = 0; k < n; k++) out.push_back(oc[1 + k]);
+            pending = oc[OUTCOME_INTS - 1];
+            P += n;
+            rounds++;
+            hist[n - 1]++;
+        }
+        CUDA_CHECK(cudaEventRecord(t1, e.stm));
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        float msf = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&msf, t0, t1));
+        fprintf(stderr, "round outcomes:");
+        for (int k = 0; k < W_MAX; k++)
+            fprintf(stderr, "%s %d-tok %d", k ? "," : "", k + 1, hist[k]);
+        fprintf(stderr, "\n");
+        printf("generated:");
+        for (int i = 0; i < n_gen && i < (int)out.size(); i++) printf(" %d", out[i]);
+        printf("\ndflash2 decode (K=%d): %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round "
+               "over %d rounds)\n",
+               d2_k, (int)out.size(), msf, out.size() * 1000.0f / msf,
+               (double)out.size() / rounds, rounds);
         return 0;
     }
 
@@ -1206,11 +1339,15 @@ int main(int argc, char** argv) {
                     // via step_with and never hits it. Enables an fp8q-vs-default
                     // logit A/B (cosine/maxdiff/KL) to quantify the fp8 QK^T delta
                     // at depth -- the default-on gate the greedy checks don't give.
-                    if (batched && !dump.empty()) {
+                    // Q27_PF_DUMP_SERIAL=1 also dumps the SERIAL leg's logits to
+                    // <dump>.serial (2026-09-08: calibrates the serial-vs-batched
+                    // perturbation class for the lever-B first-token gate).
+                    if (!dump.empty() && (batched || getenv("Q27_PF_DUMP_SERIAL"))) {
                         std::vector<float> lg(VOCAB);
                         CUDA_CHECK(cudaMemcpy(lg.data(), e.logits, (size_t)VOCAB * 4,
                                               cudaMemcpyDeviceToHost));
-                        FILE* df = fopen(dump.c_str(), "wb");
+                        const std::string path = batched ? dump : dump + ".serial";
+                        FILE* df = fopen(path.c_str(), "wb");
                         if (df) {
                             fwrite(lg.data(), 4, VOCAB, df);
                             fclose(df);

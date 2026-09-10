@@ -213,6 +213,107 @@ static void test_eviction_respects_budget() {
     CHECK(pc.size() >= 1);
 }
 
+// LRU by access (2026-09-08 (p) item 3): a restored entry is re-stamped, so
+// an old entry that is hit all the time outlives newer ones nobody reads.
+static void test_touch_protects_hot_entry() {
+    const std::string root = tmproot("touch");
+    q27::PrefixCache pc;
+    q27::PrefixCacheCfg c = cfg_for(root);
+    const std::string blob(1500, 'z');
+    const size_t entry_bytes = sizeof(q27::PfxHdr) + 32 * 4 + 2 * blob.size();
+    c.max_bytes = 2 * entry_bytes + 64; // room for two whole entries, never three
+    CHECK(pc.init(c, COMPAT_A));
+    const std::vector<int> a = seq(64, 1000), b = seq(64, 2000), d = seq(64, 3000);
+    CHECK(pc.write(a, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    CHECK(pc.write(b, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    q27::PrefixCache::Entry ea;
+    CHECK(pc.find(a, &ea));
+    pc.touch(ea, (long)time(nullptr) + 100);            // a is hot: newer than b
+    CHECK(pc.write(d, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    CHECK(pc.size() == 2);
+    q27::PrefixCache::Entry e;
+    CHECK(pc.find(a, &e));                              // the hot old entry survived
+    CHECK(!pc.find(b, &e));                             // the cold one went
+    CHECK(pc.find(d, &e));
+    // the stamp is on the file too, so a fresh index after restart keeps it
+    q27::PrefixCache pc2;
+    CHECK(pc2.init(c, COMPAT_A));
+    CHECK(pc2.find(a, &e) && e.mtime >= (long)time(nullptr) + 99);
+}
+
+// P16b shared cut (2026-09-08): Claude Code sessions agree on the system block
+// up to a per-session gitStatus tail (five sessions shared exactly 22460 of a
+// 22544-22578-token block), so an entry cut at sys_len is hit by nobody. The
+// cut has to land at the longest prefix an indexed entry shares with THIS
+// prompt; this is the primitive that finds it.
+static void test_shared_prefix_across_sessions() {
+    const std::string root = tmproot("shared");
+    q27::PrefixCache pc;
+    CHECK(pc.init(cfg_for(root, /*min_tokens=*/16), COMPAT_A));
+    CHECK(pc.shared_prefix(seq(100), 60) == 0);        // empty cache: nothing to share
+    std::vector<int> s1 = seq(100); s1[50] = 777;      // session 1: tail differs from 50
+    CHECK(pc.write(s1, 64, "g", 1, "k", 1));           // its system entry, cut at 64
+    std::vector<int> s2 = seq(100); s2[50] = 888;      // session 2: same block, own tail
+    CHECK(pc.shared_prefix(s2, 60) == 50);             // agrees through token 49
+    CHECK(pc.shared_prefix(s2, 40) == 40);             // capped at upto
+    CHECK(pc.shared_prefix(s2, 200) == 50);            // upto past the prompt/entry is fine
+    CHECK(pc.shared_prefix(seq(100, 500000), 60) == 0); // foreign prompt shares nothing
+    std::vector<int> s3 = seq(100); s3[58] = 999;      // an entry that agrees further wins
+    CHECK(pc.write(s3, 64, "g", 1, "k", 1));
+    std::vector<int> s4 = seq(100); s4[58] = 1111;
+    CHECK(pc.shared_prefix(s4, 60) == 58);
+    CHECK(pc.write(seq(100, 300000), 8, "g", 1, "k", 1)); // below min_tokens: ignored
+    CHECK(pc.shared_prefix(seq(100, 300000), 60) == 0);
+    q27::PrefixCache off;                               // disabled cache answers 0
+    CHECK(off.shared_prefix(s4, 60) == 0);
+
+    // Entries longer than the 256-token head: the second read stage must
+    // continue the comparison past the head, and a head mismatch must stop
+    // at the right place without it.
+    const std::vector<int> big = seq(2000, 70000);
+    CHECK(pc.write(big, 1000, "g", 1, "k", 1));
+    std::vector<int> p1 = big; p1[700] = 5;             // diverges after the head
+    CHECK(pc.shared_prefix(p1, 900) == 700);
+    CHECK(pc.shared_prefix(p1, 1500) == 700);
+    std::vector<int> p2 = big; p2[100] = 5;             // diverges inside the head
+    CHECK(pc.shared_prefix(p2, 900) == 100);
+    std::vector<int> p3 = big; p3[256] = 5;             // exactly at the head boundary
+    CHECK(pc.shared_prefix(p3, 900) == 256);
+    CHECK(pc.shared_prefix(big, 900) == 900);           // full agreement through upto
+    // the caps themselves, with FULL agreement so nothing else can stop early
+    CHECK(pc.shared_prefix(big, 1500) == 1000);         // capped at the entry length L
+    std::vector<int> short_p(big.begin(), big.begin() + 300);
+    CHECK(pc.shared_prefix(short_p, 1500) == 300);      // capped at the prompt length
+    std::vector<int> s5 = seq(100); s5.resize(50);      // agrees with s1/s3 through 49, then ends
+    CHECK(pc.shared_prefix(s5, 200) == 50);             // capped at the prompt, below the entries' L
+}
+
+// A key can be exported by only one writer at a time: reserve() claims it,
+// has() reports it as present meanwhile, write() releases it (gpt-6-astra
+// review 2026-09-08 P1: two slots choosing the same cut could both write).
+static void test_reserve_serialises_writers() {
+    const std::string root = tmproot("reserve");
+    q27::PrefixCache pc;
+    CHECK(pc.init(cfg_for(root), COMPAT_A));
+    const std::vector<int> toks = seq(100);
+    CHECK(!pc.has(toks, 64));
+    CHECK(pc.reserve(toks, 64));
+    CHECK(!pc.reserve(toks, 64));                       // second claimant is refused
+    CHECK(pc.has(toks, 64));                            // in flight reads as present
+    CHECK(pc.reserve(toks, 32));                        // a different L is a different key
+    CHECK(pc.write(toks, 64, "g", 1, "k", 1));          // publishes and releases
+    CHECK(pc.has(toks, 64));
+    CHECK(!pc.reserve(toks, 64));                       // indexed now: still refused
+    pc.release(q27::pfx_fnv1a64(toks.data(), 32 * sizeof(int)), 32);
+    CHECK(!pc.has(toks, 32));                           // released without a write: gone
+    CHECK(pc.reserve(toks, 32));
+    pc.release(toks, 32);                               // the token-vector form (staging failure path)
+    CHECK(!pc.has(toks, 32));
+    CHECK(pc.reserve(toks, 32));                        // ...and the boundary can be retried
+    pc.release(toks, 96);                               // unclaimed key: a no-op, not a fault
+    CHECK(pc.has(toks, 32));
+}
+
 static void test_bad_root_disables() {
     q27::PrefixCache pc;
     q27::PrefixCacheCfg c = cfg_for("/proc/definitely/not/writable/q27");
@@ -233,6 +334,9 @@ int main() {
     test_truncated_file_is_not_indexed();
     test_rescan_survives_restart();
     test_eviction_respects_budget();
+    test_touch_protects_hot_entry();
+    test_shared_prefix_across_sessions();
+    test_reserve_serialises_writers();
     test_bad_root_disables();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }
     fprintf(stderr, "all prefix-cache tests passed\n");

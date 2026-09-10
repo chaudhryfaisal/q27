@@ -15553,3 +15553,1846 @@ requests are never preempted; dashboards should treat 0 as healthy. Design
 reference: `docs/metrics-endpoint.md`. Security posture of the new
 auth-exempt route dispositioned in the SECURITY-MODEL addendum of the same
 date.
+
+## 2026-09-01 (a): drift mode 23 -- the args-only object (issue #38 round 6)
+
+cosmicnag's sixth distinct shape: the model emits the ARGUMENTS object bare
+-- `{"command": "..."}`, no name, no wrapper, no opener -- then closes with
+XML dialect closers, and the value carries mode-11-class escaping damage
+(mixed `\"` and raw `"`, literal newlines mid-string). The inverse chimera
+of mode 17. Non-stream recovered nothing; streaming leaked the whole object
+as text and the agent halted.
+
+`recover_args_object_call`, last-resort tier next to mode 11. The XML
+closers are the intent evidence -- nothing but whitespace and closers may
+follow the object, so a bare JSON object in prose stays text. The value
+repair is mode 11's terminator scan (minimal-escape the span, first
+reconstruction that parses wins), tried per declared tool with that tool's
+string params as scan keys; the call fires only when exactly ONE tool
+yields a parse whose keys fit (all keys known, required present) --
+ambiguity refuses rather than guesses. Fidelity on the report's bytes: the
+1187-byte command survives with both the raw-quote region and the escaped
+tail intact.
+
+Streaming needed three touchpoints: `plausible_bare_tool_prefix` widened to
+any quoted-identifier first key (an ordinary object is held, classified,
+and re-emitted untouched -- the old bounds test asserting refusal is
+updated); args-only objects defer on strict failure so final tolerant
+recovery sees them; and the holdback's finish() absorbs trailing closers
+from `deferred_trailing` into the candidate, since the deferral machinery
+already captures late-arriving bytes. One implementation gotcha for the
+next recovery fn: the impl operates on the REWRITTEN buffer -- set
+rewritten_begin/rewritten_end, not source_*, or the span validator clears
+the whole result.
+
+Tracked tests both directions (the recovery at chunk sizes to 1 byte; a
+prose object without closers re-emitting byte-intact). test-tools green,
+corpus-check 159/159 unchanged, fuzz 250k clean, server.cu under nvcc.
+
+## 2026-09-06 (b): DFlash2 drafter integration, Phases 0-3 -- GO conditional on a Q4 repack
+
+Full arc in docs/plans/2026-09-06-dflash2-integration.md; this is the ledger
+summary. Triggered by the ninfer re-bench (bench/crossengine/NINFER-REBENCH.md):
+their DFlash2 integration beat their own MTP3 by +40-50% on our instrument,
+first working DFlash-family win on this box.
+
+**Phase 0 (measurement, zero engine risk).** z-lab's torch package run over
+q27-captured taps. Drafter beats the ladder on tok/round on think/code, and
+the composition thesis INVERTED vs the parked v1 design: both drafters feast
+on echo (correlated), so dflash2's real margin is prose/code, not the
+echo-stacking the old doc assumed.
+
+**Phase 1.** (a) Quant-tap kill gate PASSED: controlled same-token-stream
+comparison, q27 5.25-bpw taps vs BF16 taps = +2/+4/+9/0% (self-consistent
+live taps edge out off-policy BF16). (b) CUDA runtime src/dflash2.cu, parity
+vs torch (91.7% token match, AL within 2%). (c) In-engine `q27 --dflash2`:
+suffix-round pattern + eager width-8 verify with tap capture, BYTE-IDENTICAL
+to plain greedy on all four traffic types. Landmine: gdn_mix + the record
+arena run at the MEMBER vw (the LaneView vw only drives the attn/FFN sweep) --
+a width-8 round accepting n>=6 folded unrecorded GDN rows and corrupted state;
+fix set_round_width(W) (legal only off the graph paths).
+
+**Phase 2.** On-device top-16 + selector walk (no per-round D2H); engine
+quantized-head reuse for drafter logits = +37% throughput, tok/round
+byte-identical (Q8 head numerics don't shift acceptance); K runtime-selectable
+1..11; fp8 KV byte-identical to plain-fp8. K sweep: echo scales to the width-12
+ceiling, code-write peaks K=9.
+
+**Phase 3 -- the verdict. GO, conditional on a Phase-4 Q4 drafter repack.**
+Same binary/prompts/fp8, tok/round (fair) and t/s (wall):
+
+| traffic | ladder t/r/(t/s) | dflash2 K=7 | dflash2 K=9 |
+|---|---|---|---|
+| code-write | 2.76 / 154 | 3.25 / 89 | 3.25 / 81 |
+| prose | 2.21 / 124 | 2.68 / 74 | 2.97 / 74 |
+| code-edit | 3.43 / 189 | 4.51 / 122 | 4.73 / 116 |
+| echo | 4.64 / 252 | 7.65 / 199 | 9.05 / 213 |
+
+dflash2 wins tok/round on all four (+18% to +95%) -- the drafter is better,
+proven on our quant/engine/traffic. It loses on t/s TODAY, for exactly one
+reason: the verify is free (--p0b: width-2..12 forward 20.1->21.3 ms,
+bandwidth-bound), but the eager fp16 drafter is 26 ms/round because
+`k_gemv_f16_3` grids (rows, ntok) and re-reads the full weight row per verify
+column -- the drafter reads its 3.85 GB of fp16 weights ONCE PER COLUMN
+(~30 GB/round at W=8). The verify's `gemv_q4_n` reads each weight once and
+shares it across columns (~10 us/call, same shapes). The drafter is on the
+wrong kernel. Suffix never fires on single-turn prompts (needs agentic echo),
+so ladder==ladder+suffix here; the composition A/B defers to the live-CC trial
+and is lower-priority since dflash2's K knob already reaches echo's ceiling.
+
+Projection: verify+fold ~10 ms; drafter on gemv_q4_n at the ~0.6-2 ms design
+floor -> round ~12-13 ms -> code-write ~250 t/s (vs 154), echo K=9 ~450+ t/s
+(vs 252). **Phase 4 = the Q4-g64 drafter repack onto gemv_q4_n, with a numerics
+gate (Q4-drafter acceptance vs bf16, kill if >5-10% tok/round loss).** Nothing
+upstream of the repack is speculative -- every stage is byte-identity-gated.
+
+Commits: c725ca1 (P0), b1e4cf0 (P1a), 2307465 (P1b), bd300e4 (P1c),
+80e4447 (P2). Rig: bench/dflash2/, tools/dflash2_pack.py, tools/dflash2_smoke,
+src/dflash2.{h,cu}, `--dflash2 <pack.d2w> [--k N]`.
+
+## 2026-09-06 (c): DFlash2 Phase 4 -- the Q4 drafter repack, gate passed, first t/s wins
+
+Phase-3 root cause: gemv_f16_3 re-reads the weight per verify column, so the
+fp16 drafter read its 3.85 GB once per column (~30 GB/round). Fix: pack the 47
+drafter matmuls as Q4-g64 (tools/dflash2_pack.py quant_q4, the engine's own
+format) and route through gemv_q4_n via Dflash2::mmq (activation quantized once,
+weight read once and shared across columns). Norms/base_kernel stay fp32,
+codebooks/embed fp16. --q8 builds a Q8 fallback.
+
+Numerics gate PASSED: Q4 vs fp16 tok/round -1.5/-3.6/-2.3/0% (cw/prose/ce/echo),
+inside the 5-10% kill line; Q8 byte-identical to fp16. E2E stays BYTE-IDENTICAL
+to plain greedy at K=7 on all four (verify-decided). Drafter 26.1 -> 12.2 ms/round
+(2.1x). E2E K=7 fp8 t/s vs ladder: code-write 148/154, prose 117/124, code-edit
+205/189 (+9%), echo 328/252 (+30%) -- dflash2 wins where its tok/round lead is
+largest, ~parity where smallest.
+
+Open: (1) drafter still eager (12 ms, launch-bound, not the ~2 ms floor) -- a
+CUDA-graph capture is Phase 5, projects to a win on all four; (2) K=9 (width-10)
+diverges late on cw/prose (token 188/61) while ce/echo hold -- width>8 is a
+mode-only path (ladder graphs 2..8), needs a look before K>7 ships. K=7
+(width-8) is the byte-identical default.
+
+Detour worth recording: the first "divergences" were a stale fp16-KV plain
+baseline vs fp8-KV drafter runs. fp8 vs fp16 KV changes greedy tokens; always
+compare same-KV. Plain greedy is deterministic run-to-run; Q4/Q8/fp16 drafters
+all byte-identical to the matched fp8 plain at K=7.
+
+Commit chain: c725ca1 (P0) b1e4cf0 (P1a) 2307465 (P1b) bd300e4 (P1c) 80e4447 (P2)
+9ca6e90 (P3). Pack: qwen38-dflash2-q4.d2w (canonical), qwen38-dflash2-q8.d2w
+(fallback). `--dflash2 <pack> [--k N]`.
+
+## 2026-09-06 (d): DFlash2 Phase 5 -- verify graph, wins on all four; the width-8 wall
+
+Phase-4's "drafter 12 ms" was a smoke artifact: dflash2_smoke uses the fp16 PACK
+head (no engine), so 10.4 ms of it was one gemv_f16_3 head/round. Real E2E
+(engine Q8 head) profile: no hot kernel; the round is eager drafter (~2 ms) +
+eager 64-layer width-8 verify (~18-20 ms). Verify was the lever.
+
+Captured spec_verify_forward(with taps)+spec_verify_tail as a graph (fixed
+launch seq, init-fixed buffers, per-round inputs are device buffers written
+before the round) and replay per round; Q27_D2_NOGRAPH=1 keeps eager. Graph is
+byte-identical to eager and deterministic run-to-run.
+
+Result -- dflash2 wins t/s on ALL four at K=7, byte-identical to plain greedy
+(fp8, engine head): code-write 164/154 (+6%), prose 130/124 (+4%), code-edit
+226/189 (+20%), echo 361/252 (+43%). +10-15% over the Phase-4 eager verify;
+round ~20 ms (drafter ~2 + graphed verify ~18).
+
+Width-8 wall: identity-vs-K on prose shows K<=7 (w<=8) byte-identical, K>=8
+(w>=9) diverges at the same token regardless of K -- a hard width boundary at
+8, = the ladder's structural max (D_MAX_MTP=7 -> gate_maxd+1=8). Widths 9..12
+are reached only by suffix rounds via captured graphs; the eager verify/GDN/fold
+at width>8 has a latent, pre-existing engine bug. K=7 is the default (Phase-0
+balanced point; wins echo +43% without the wider block). K>7 gains are gated on
+that engine-core fix, tracked separately.
+[RETRACTED 2026-09-08 (q): there is no engine bug at width>8. The divergence
+is gemm_min=9 switching the verify from the GEMV family to the MMA family at
+width 9; with the family matched (Q27_GEMM_MIN=99) widths 9..12 are
+byte-identical to the ladder on all four prompts, graph and eager.]
+
+Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
+composition A/B; and the ~2 ms eager drafter tail (graphing needs a
+device-indexed embedding). Commit chain adds fbb19b6 (P4).
+
+## 2026-09-09 (x): the trajectory gap attributed -- ninfer reasons 1.5x shorter than the model at 8 bits; two q27 defects fixed on the way (model-name echo, the compact tools block) without moving it
+
+bench/crossengine/agentic-2026-09-09-echo/. The question (w) left: why
+q27's Claude Code sessions ran 1.7x the turns and 3x the output tokens of
+ninfer's at equal decode rate and reuse.
+
+Transcript anatomy first (turns_cmp.py over the retained out.jsonl): turn
+structure identical on both engines (0.9 tool calls per turn, 4-7%
+text-only turns, same Bash-error shapes, every q27 request end=eos,
+sampler chains and the medium effort pin identical); the excess is 1.7x
+API turns AND 2x thinking chars per turn (2222 vs 1106 mean, 27% vs 14%
+of turns over 2K chars). Then the prompt-growth test: next prompt minus
+previous completion is never negative on ninfer (156 pairs, min +19) and
+negative on 45% of q27's (266 pairs; requests-1921 turn 17: completion
+5995, growth 615) -- q27's model never saw its own prior thinking.
+Recorded bodies confirmed it client-side (zero thinking blocks in
+assistant history). Neither engine implements context_management; both
+use placeholder signatures; the one difference Claude Code sees is the
+response `model`: q27 returned its served name, ninfer echoes the
+requested `claude-opus-4-8`, and Claude Code 2.1.265 drops prior thinking
+blocks when an assistant message's model tag differs from the requested
+model (inferred from behaviour, flipped by the fix). server.cu: `/v1/
+messages` now echoes the client's model (`resp_model`, `Q27_ECHO_MODEL=0`
+opts out); a live session against the patched binary carried 1, 2, 3
+thinking blocks back where the old one carried none.
+
+12-instance A/B, `q27echo` vs same-binary `q27noecho` control (campaign.sh
+legs): 20.2 vs 21.1 turns, 15.3K vs 14.5K tokens, thinking/turn 2078 vs
+1903 chars, gold 12/12 vs 10/12; the 09-09 q27prod row was 23.8 / 18.2K.
+The control reproduced the 09-09 run bit-for-bit on 6/12 instances (seed
+0 when the client sends none => a session is a deterministic function of
+its prompts) and the other six diverged on external nondeterminism, so
+the harness's aggregate noise is +-3 turns / +-4K tokens per instance.
+The fix is real and inside that noise; not the answer.
+
+Fixed-prompt probe (probe_think.py / probe_think_oai.py: one identical
+turn-0 body, 28 tools, medium effort, 24 seeds, same sampler chain on
+every arm; medians with bootstrap CI, Mann-Whitney): q27 production 317
+[279, 354], ladder 262, fp16 KV 337, q6 tier 340, llama.cpp Q8_0 (made
+from the BF16 GGUF today) 314 [266, 352], llama.cpp Q5_K_M 246, ninfer
+DFlash2 NVFP4 209 [175, 244]. Every q27 arm vs Q8_0: p 0.4-0.7; ninfer vs
+Q8_0: p=0.0003; ninfer vs q27 production: p<0.0001. q27 IS the reference;
+ninfer reasons 1.5x shorter than the model does at 8 bits, and that
+compounds into its shorter sessions. Drafter, KV dtype and tier excluded
+on q27. Which of NVFP4 weights, int8 KV or ninfer's sampler does it is
+ninfer's question (its top-p runs over the top-k cap set's mass, flatter
+if anything). Right cross-engine number: per-token cost at equal
+reasoning (within 6%), not wall per instance.
+
+Found on the way, by render bisect (render_bisect.py, max_tokens=1 with
+sections removed; HF template 24586 tokens for the probe body, ninfer
+24701, q27 server 23347): the serving path's `<tools>` block was 1236
+tokens short of the template. `prepare_anthropic_prompt` handed
+`anthropic_tools_decl` the moved-from `selected.names` as its keep-filter
+(two lines after `tool_names=std::move(selected.names)`), so since
+2026-08-22 (054aee3) the declaration came back empty and `tools_preamble`
+fell back to the compact key-sorted dump on every served Anthropic request
+-- `{"function":{"description",...,"name"},"type"}`, no spaces, 5% fewer
+tokens, keys in the wrong order. render_request builds the declaration
+before any move, so the golden test, the offline corpora and the flip
+gates all saw the trained-format prompt while production did not; the
+integration harness's byte-exact copy of the lambda passed raw_body as
+nullptr and never exercised the path. Fixed (`&tool_names`), integration
+test 16b added (declaration present with a raw body, sorted fallback
+without), count_tokens now 24593 (template 24586). Re-probed on the
+corrected prompt: median 276 [231, 350], p=0.32 vs before, p=0.66 vs
+Q8_0 -- not the cause either. Also mirrored the 09-08 req_log_body line
+into the harness's handle() copy (extract_check had been failing since
+(v)). README (headline note, State, benchmark table, Open items),
+FINDINGS.md addendum, 09-09 readout pointer updated; test-tools green.
+v0.11.1 tagged on the README pointer bump that follows this commit: the
+two prompt-fidelity fixes change what every Anthropic tools request
+prefills (+5% prompt tokens, one cold miss per cached system block on
+upgrade), so they ship as a release rather than sit on master.
+
+## 2026-09-09 (w): release campaign for v0.11.0 -- decode within 6% of ninfer's DFlash2 arm, reuse equal, wall 3x apart on trajectory length
+
+bench/crossengine/agentic-2026-09-09/ (campaign.sh, new `q27prod` leg =
+the production recipe on a fresh tmpfs root at the medium effort pin, vs
+ninferd2 unchanged since 09-07). q27prod 207.2 agg / 219.4 med t/s, 3.887
+tok/round, 96.9% reuse, 108 s per instance, 25.0 turns and 18.2K output
+tokens per instance, 12/12 non-empty, 9/12 gold; ninferd2 220.6 / 240.1,
+4.188, 96.8%, 36 s, 15.0 turns, 6.2K tokens, 12/12, 11/12. Prefill wall
+126 s over 305 requests with 4 cold >= 20K prompts (the fresh root's
+bootstrap); no parser recovery fired; no first-turn death. The reads and
+caveats are in the campaign README; the one that matters: with both
+engines at ~97% reuse the wall ordering of 08-17 has flipped, and the
+3x is trajectory length (turns and output tokens), not decode rate --
+consistent across 09-07/08/09 and unattributed (quant tier, effort
+rendering, parser). The q27 leg ran without Q27_PRINT_WSUM (now in the
+campaign env). README State/Benchmarks/Open items, FINDINGS.md and
+BENCHMARKING.md updated; v0.11.0 tagged on this commit.
+
+## 2026-09-08 (v): request-body recording + sequential replay -- the turn-replay instrument item 2 was missing; two fresh boots agree on 15 of 15 outputs
+
+The last piece of (p) item 2. `Q27_REQ_LOG=<file>` (server.cu
+req_log_body, at the head of the /v1/messages, /v1/responses and
+/v1/chat/completions + /v1/completions handlers; `REQ_LOG=<file>` on
+tools/launch_q27_38.sh) appends one JSONL line per request: seq (arrival
+order), t_ms, api, path, the body verbatim. bench/replay/replay.py posts
+the bodies in order, one at a time, streaming when the body says so, and
+records per request the sha256 of the delivered output in delivery order
+(text, thinking, tool_use names + JSON), output tokens, TTFT, wall;
+bench/replay/replay_diff.py compares two replays per request and reports
+the count of identical outputs and the FIRST divergent seq. README in
+bench/replay/.
+
+Why this shape: (s) showed sampling without a client seed is
+deterministic per prompt AND per preceding sequence (the drafter ring and
+the cache tiers are history-dependent), so a re-run of a task through the
+harness draws a different turn; only the identical sequence reproduces a
+campaign turn. Sequential replay is exactly that condition, and it is also
+the condition under which a numerics change localises to one request.
+
+Gate (scratchpad replay_gate.sh): production with REQ_LOG on served 8
+seeded streams + one SWE-bench instance through the harness (15 requests,
+748 KB of bodies); then three FRESH boots on a fresh cache root: A (the
+binary), A2 (the same binary again), B (same binary, Q27_D2_TOKGRAPH=0, a
+bitwise config change). A vs A2: 15/15 identical outputs, wall 39.5 vs
+39.6 s -- the determinism gate. A vs B: 15/15 identical, B/A wall 1.001.
+The recorded session's own outputs differ from the replays' on the seeded
+rows (production had history before them), which is the (s) fact again,
+now observable per request.
+
+Use: record a real session on production (`REQ_LOG=build/reqlog-DATE.jsonl
+bash tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1`), stop, boot arm A on a
+fresh root, replay, stop, boot arm B, replay, diff. Bodies are real session
+content: local, never committed. Item 2 of (p) is now complete.
+
+## 2026-09-08 (u): item 4, the TMA spike -- bitwise, +10% over the cp.async fill, 1.33x/1.39x against the 1.6x bar; the W4A8 port stops here
+
+Exactly the intervention (h) proposed and (p) budgeted one spike for:
+k_w4a8_tma in tools/gemm_w4a8_spike.cu. The W and X tiles of a stage
+arrive by two cp.async.bulk.tensor.2d instructions from one elected
+thread, completing on the slot's mbarrier with expect_tx(W_BYTES +
+X_BYTES); the TMA swizzle modes reproduce the kernel's own smem layout
+(SWIZZLE_64B on the 64-B weight pitch is chunk ^= (row >> 1) & 3 =
+swz<4>, SWIZZLE_128B on the 128-B activation pitch is chunk ^= row & 7 =
+swz<8>), so the ldmatrix side is the base kernel's untouched; out-of-range
+rows and tokens are zero-filled by the TMA unit; the scale loads stay on
+cp.async and the fold is the same expression in the same order. Tensor
+maps come through cudaGetDriverEntryPointByVersion (no -lcuda).
+
+Bitwise: every TMA configuration identical to BOTH incumbent references
+over the 25 T values on ffn_gate and attn_out (175 variant-shape-T
+comparisons per shape, red zones clean) -- the swizzle mapping above is
+right, which is the fact worth keeping.
+
+T=1024 TOPS (incumbent live dispatch 322 / 313 today):
+  ffn_gate: cp.async 128x128x128 s2 4x2 389 (1.21x) | tma s2 4x2 429
+    (1.33x) | tma s3 4x2 382 | tma s2 4x4 407 | tma 128x64 s2/s3/s4 403/
+    404/394 (two blocks per SM) | ws 326
+  attn_out: cp.async 403 (1.29x) | tma s2 4x2 437 (1.39x) | tma s3 4x2 421
+    | tma s2 4x4 425 | tma 128x64 376/375/383 | ws 345
+  T=4096: tma s2 4x2 459 (1.39x) / 432 (1.38x).
+So removing the per-lane issue cost of the fill is worth +10%, not the
++40% the no-fill ceiling (609) implied, and nothing that should hide the
+remaining wait does: a deeper ring is slower (s3 < s2 at every tile), 16
+consumer warps are slower, and a 64-token tile that fits two blocks per
+SM is slower. What is left between 430 and 609 is the arrival of the stage
+bytes themselves, which no issue mechanism, depth or occupancy in this
+kernel shape reaches. (h)'s reading "fill and math do not overlap" was
+right about the symptom and wrong about the cure.
+
+Verdict, by the rule set in (p) ("if it fails, stop the port and further
+fold/occupancy/pipeline permutations"): bar NOT met, the W4A8 port stops.
+1.33x/1.39x bitwise stays on the shelf in the spike; phase 2 of the
+prefill plan is CLOSED. Wall arithmetic for the record: 1.6x on the ~60%
+GEMM share of the 14% prefill share was 3.15% of a run; 1.35x is ~2.2%.
+Traps: the un-versioned cudaGetDriverEntryPoint returns invalid-argument
+on CUDA 13.2 -- ask for the 12.0 ABI by version; the swizzled TMA
+destinations need 512-B (64B mode) / 1024-B (128B mode) alignment, so
+the stage size is rounded to 1 KB and the dynamic smem base is aligned
+by hand with 1 KB of slack.
+
+## 2026-09-08 (t): item 5 measured -- the empty-ring restore class is 1% of decode and drafts as well as a full ring; reseeding is a NO-GO
+
+Item 5 of (p): "restore drafter context -- measure the incidence before
+implementing; group by valid ring rows after alignment and suffix length,
+across the restore tiers". Every request already logs `[d2] ring align:
+keep N rows` (rows the ring retained for this prompt) next to its [gen]
+(restore tier) and [req] (dec/rounds), so the measurement is offline:
+bench/crossengine/agentic-2026-09-08/ring_attr.py. Rows available to the
+drafter at decode start = rows kept + the re-prefilled suffix (seeded from
+prefill taps), capped at the 2048-row window. prodpfx2 (production
+config, 228 decoding requests, 688 s of decode):
+  rows at start    n   decode s  share  tok/round
+  256-1023        18      71.0   10.3%    3.862
+  1024-2047       37     146.9   21.4%    3.990
+  2048 (full)    173     469.7   68.3%    3.972
+By tier: restored P16 with an EMPTY ring 4 requests / 5.3% / 3.852;
+restored P8 with an empty ring 5 / 3.2% / 3.967; the affected class as
+the reviewer defined it (restored, ring empty, suffix < 512 tokens) is 3
+requests, 7.1 s = 1.0% of decode, at 4.057 tok/round -- BETTER than the
+full-ring class. The only bin with a gap is 256-1023 rows at -3%
+tok/round over 10% of decode: a 0.3% run-wall ceiling if every one of
+them ran at full-ring acceptance. A reseed needs target taps for the
+window, i.e. a target forward over up to 2048 tokens (~0.5 s at the
+current chunk rate) or 80-200 MiB of saved drafter state per entry; the
+class it would help is worth ~50 ms per request. NO-GO, with the number.
+(prodpfx, the earlier run, shows a larger spread -- full 4.70 vs 256-1023
+3.75 -- but its full-ring class is dominated by long cold-prefill turns;
+completion-length mix, not ring rows, as the README already noted for the
+restore class.) The "+20% rounds" the advisory quoted was the 09-06/07
+cold-ring-per-turn finding that ring retention (g) fixed; on today's
+production traffic it is gone.
+
+## 2026-09-08 (s): item 2 -- queue wait is 2% and never two deep; the quality table found three of twelve tasks dying on their FIRST TURN in every DFlash2 arm, and the parser now survives four of the seven shapes
+
+Item 2 of (p): "reproducible turn replay, quality and queue attribution --
+makes small gains distinguishable from ring/history drift; identifies
+larger serving opportunities". Three findings, one fix.
+
+QUEUE ATTRIBUTION (bench/crossengine/agentic-2026-09-08/queue_attr.py on
+the prodpfx2 [req] log; a request occupies [t - pf_ms - dec_ms - cb_ms, t],
+its arrival is start - qw_ms): 228 requests over 840 s, the single slot in
+service 95% of the span, queue wait 18.7 s in total = 2.3% of service +
+queue. 111 requests "queued" but 99 of those for ~1 ms (dispatch); 12 had
+a request in service when they arrived, 9 waited >= 1 s, the longest
+4.8 s (a 25K-prompt turn behind a 4.4 s decode). Never more than ONE
+request ahead. The harness runs its 12 instances SEQUENTIALLY
+(bench/swebench/run.sh is a for loop over docker run), so the only
+concurrency in the campaign is Claude Code's own side requests. Verdict:
+batching / scheduling has <= 2.3% of wall to recover on this instrument,
+and the instrument cannot show sustained concurrency at all -- DFlash2
+batching stays deferred, with the number attached. Service composition:
+prefill 110 s, decode 688 s.
+
+QUALITY TABLE (bench/swebench/quality_table.py over results.*.jsonl):
+  arm          nonempty  gold  turns  out_tok  wall_s
+  prodlad        11/12   10/12  22.5   17260    130
+  prodd2          9/12    8/12  18.4   17012    181
+  prodpfx         9/12    7/12  12.5   11477    114
+  prodpfx2        9/12    8/12  18.2   11064     70
+  ninferd2       12/12   10/12  12.9    4996     28
+  ninfermtp      12/12   10/12  14.0    4581     38
+Every DFlash2 production arm has THREE instances at "1 turn, ~0 tokens"
+(requests-1142, xarray-4075, pylint-6903), the same three in prodpfx and
+prodpfx2 with BYTE-IDENTICAL first turns -- and prodd2 two of them.
+Sampling without a client seed is deterministic per prompt (server.cu
+parse_sample: seed 0 unless the client sends one, and Claude Code never
+does), so a prompt that draws a bad first turn draws it every time. The
+"speed parity" of (d) was sitting on a 25% task-death rate that neither
+t/s nor tok/round can see -- exactly the reviewer's warning ("216 vs 219
+does not establish equivalent task quality").
+
+WHAT THE DEAD FIRST TURNS WERE. The transcripts are retained
+(/mnt/ai/swebench-work/<arm>/<iid>/logs/out.jsonl); all seven texts are
+in bench/crossengine/agentic-2026-09-08/firstturn-deaths/ with the 28-tool
+Claude Code 4.8 schema those requests carried. Every one is a tool call the
+server did not turn into a tool_use block, so Claude Code saw a final turn
+with text only and exited "success" after one turn:
+  1. `<function_calls>\n<invoke>\n<parameter=file_path>...</parameter>\n</invoke>`
+     then EOS -- the Anthropic-XML wrapper family around an UNNAMED call
+     (requests-1142, identical in prodpfx and prodpfx2).
+  2. `<function=Grep>` x2, trained form, with `<parameter=-n>` -- and
+     Claude Code 4.8 declares NO Grep tool (the model was trained on
+     transcripts full of it). Refused as undeclared (xarray-4075, three
+     arms). The ninfer arm passed the same call through; Claude Code
+     answered `<tool_use_error>Error: No such tool available: Grep
+     </tool_use_error>` and the model switched to Bash grep -- 12/12
+     non-empty diffs on that arm.
+  3. `<parameter=function=Bash>\n<parameter=command>...` -- the mode-22
+     opener with the name behind a `function=` prefix (prodlad, xarray-4094).
+  4. `<tool_calls>\n<invoke>` x2, the second truncated at EOS (q27lad).
+  5. a hallucinated `<system-warning>System: The user has specified the
+     following settings...` block and no call at all (pylint-6903, three
+     arms) -- nothing to recover.
+  6. nested `<parameter=client>proxy<parameter=calls><parameter=call>...`
+     junk (prodd2 xarray-4075) -- nothing to recover.
+  7. `<tool_use>` + parameters with the last value unterminated at EOS
+     (q27d2q8 pytest-5262) -- refused by policy (a truncated value is never
+     executed).
+None of them left an UN-RESCUED line in the journal: the streaming
+holdback decides whether the parser runs at all, and none of these
+openers armed it, so the text streamed out and nothing was ever parsed.
+The batch replay (replay_missed_calls) sees them; the live path did not.
+That gap is now an instrument: tools/stream_probe (make build/stream_probe)
+feeds a turn through the SAME StreamSplitter + StreamToolRouter + bare
+chain the /v1/messages handler uses, chunked like tokens, with the
+request's schema, and prints the blocks a client would have received. It
+reproduced all seven deaths with the 28-tool schema before any change.
+
+THE FIXES (src/api_common.h, all gated by the existing Q27_TOOL_STRICT):
+- undeclared_passthrough (Q27_TOOL_UNDECLARED=refuse restores the old
+  rule): a well-formed `<function=NAME>` call whose NAME the client did
+  not declare is emitted under that name -- the model wrote it, nothing is
+  inferred -- and the client decides. Only an identifier (no placeholders
+  like `name`/`function`), only with >= 1 parameter, only under an
+  unrestricted auto tool_choice (tool_choice_allows_call); a named, forced
+  or restricted choice still refuses. Name INFERENCE (modes 20/21) is
+  unchanged: an absent name is never invented, and the mode-21 guard
+  against inferring past an explicit wrong name stands.
+- mode 22 accepts `<parameter=function=NAME>` / `name=` / `tool=` openers
+  (mode22_opener_name), in the detector, the probe, the batch scanner and
+  the standalone pass.
+- the wrapper family `<function_calls>` `<invoke>` `<tool_use>`
+  `<tool_calls>` is in the bare native opener table (holdback arms, probe
+  holds a split tag, parse_native_xml_call skips them as junk, the batch
+  scanner claims a span at them only when a declared name follows -- for a
+  bare wrapper never, so the call reaches mode 21 whole); mode 21 accepts
+  `</invoke>` `</function_calls>` `</tool_use>` `</tool_call>` as the
+  closer of an openerless list and absorbs the wrapper openers into the
+  call's span so they are not shown as text; IncrementalBareNativeEnd
+  closes a candidate on those closers too.
+stream_probe after the change, same schema: requests-1142 -> Read;
+xarray-4075 -> 2x Grep passed through; xarray-4094 -> Bash; requests-1921
+-> Read (the truncated second call stays text); 5, 6, 7 still refused.
+
+GATES: make test-tools (both legs) and corpus-check pass. Three drift tests
+and one bridge test encoded the old refusal and were rewritten to the new
+policy (strict leg keeps the refusal); test_drift_hook's "miss without a
+candidate" shape (`<tool_use>...`) is now a recovery and the test says so;
+the bridge test that pinned "`<tool_use>` streams as text" is pinned the
+other way, deliberately. New unit tests for the three shapes. Six new
+corpus rows captured through the real Q27_DRIFT_CORPUS path and
+human-labelled (three recoveries, three refusals); the `<parameter=
+function=Bash>` and `-n` shapes lose their key under redaction and are
+pinned by the unit tests instead; one row (the `<tool_calls><invoke>`
+shape) is marked replay-unreliable: the stream recovers it, the
+non-stream replay reads a wrapper tag at the very start of the text as a
+displayed HTML block and never parses it -- a pre-existing stream/
+non-stream difference (220c72b4 is the mirror case), noted, not changed.
+corpus_check's eligibility callback mirrors tool_choice_allows_call.
+Fuzz: 180 s on the new parser, clean. Corpus 164/164 human-labelled shapes
+agree (176 shapes, 12 replay-unreliable).
+
+LIVE RERUN, and what it did and did not show. Production relaunched on the
+new binary; the three dead instances rerun through the harness
+(results.prodfix.*.jsonl): requests-1142 14 turns / gold, xarray-4075 37
+turns / gold, pylint-6903 13 turns / gold -- all three that were "1 turn,
+0 tokens" now finish. But the journal has no pass-through and no mode-21/22
+line for the run: the first turns were DIFFERENT draws. Same prompt length
+(23870, restored from the 21504 system entry), different drafter ring
+history (a title side-request preceded it instead of another instance's
+last turn), different proposals, different realized sampled tokens. So
+"deterministic per prompt" is really deterministic per (prompt, preceding
+sequence): prodpfx and prodpfx2 matched byte for byte because their whole
+request sequences matched. The rerun is evidence that the tasks pass today,
+not that the fixes fired live; the fixes are verified by stream_probe on
+the real texts, which is the server's own streaming code. This is the
+reviewer's item-2 point from the other direction, and it fixes the shape
+of the missing instrument: a turn REPLAY needs the recorded request bodies
+of the whole preceding sequence, not a re-run of the task. Not built
+today; the proxy records timings only and the server records [req] lines
+only. Next for item 2: request-body recording (server-side or in
+tapproxy) + a sequential replayer, so two binaries can be fed the
+identical sequence.
+
+ISSUE #41 (same evening, VS Code + Claude Code extension, v0.10.0): the
+reporter's two shapes are the two classes above -- `<function=TaskCreate>`
+x2 refused because their 31-tool list declares no TaskCreate (v0.10.0
+recovers the text only when the tool is declared; master both ways), and
+the unnamed `<tool_calls>\n<invoke>` (dead on v0.10.0 and on master until
+today). Reproducing them found three more holes behind the first fix,
+all on the closer side:
+- a `</tool_calls>` split across chunks after a recovered call leaked as
+  text: IncrementalBareNativeEnd::advance waited for a possible
+  `</tool_call>` after the closer but not for the wrapper family; now it
+  takes the longest complete trailing wrapper closer and waits while the
+  tail could still become one.
+- the non-stream resolver (resolve_ordered_tool_segments) stripped
+  trailing dialect residue BEFORE parsing, which took a bare call's own
+  closers with it; the trained form survived on the EOF repair, an
+  unnamed `<invoke>...</invoke>` call did not. Residue is now dropped only
+  after the parser has said there is no call (both sites: ahead of a
+  wrapped segment, end of turn). The `<tool_calls><invoke>` corpus row is
+  back in the denominator: 165/165.
+- markdown_lex read a wrapper tag as an HTML container, so every
+  parameter of a `<tool_calls>...</tool_calls>` call sat in displayed
+  context for the batch chain while the stream (which checks context AT
+  the opener) recovered it. The dialect wrapper names no longer open a
+  container.
+Both reporter shapes verified on the stream path (chunk 4 and 64) and the
+batch path, with and without TaskCreate declared; the seven first-turn
+fixtures unchanged (4 recover, 3 refused); test-tools both legs, corpus
+165/165, fuzz clean. Unit tests pin both shapes (`issue #41` in
+test_tool_drift.cpp).
+
+Dispositions: queue attribution DONE (2.3%, never two deep, harness is
+serial -- batching stays deferred with the number); task-quality table is
+now part of the campaign readout (bench/swebench/quality_table.py, read it
+next to t/s); first-turn parser deaths: 4 of 7 shapes recovered on the
+stream path, 3 refused by design; turn replay: instrument gap named,
+recording is the next piece.
+
+## 2026-09-08 (r): shared-cut PROMOTION + access-LRU -- a client's system entry can now move forward; the one entry every session hits no longer ages out first
+
+Item 3 of (p). Two defects in the P16b machinery, both structural, both
+measured before they were touched.
+
+THE PROMOTION GAP. The (g) shared cut is cold-only: a request that restored
+an entry (base != 0) never writes a system entry, and its conversation
+entry sits behind the 8192-token step gate. So once a client's block grows
+past an indexed entry that is still an exact prefix of it (the block grew;
+or an early line changed, the first new session cut at the old shared
+length, and that short entry is now everyone's restore), every session
+restores the short entry and re-prefills the rest of the block for ever.
+Control (bench/ladder/pfx_promote_probe.py on the pre-change binary, one
+old-client session then four new-client sessions whose block shares a
+longer prefix among themselves, a foreign request between each so the VRAM
+tiers miss): every new session after the first restored the old cut and
+re-prefilled 3.4-4.8K tokens (1.03-1.36 s), the root held two entries per
+shape, and nothing would ever change that. Two prompt sets, two shapes
+each (sys_len chunk boundary inside the shared region / inside the
+per-session tail), 4 of 4 stuck.
+
+The fix (engine.cuh generate_prefill, the shared-cut block): a request
+restored from the disk/RAM tier whose block extends >= one chunk past the
+restore runs the shared-prefix scan too, and then one of two rules --
+  promote: an indexed entry agrees with this prompt >= one chunk beyond
+           base -> cut there (the shared length another session proved);
+  explore: nothing does, but the block runs >= one chunk past every known
+           divergence point -> write ONE sys_len-cut entry so the next
+           session can measure the shared length against it. Once per
+           restored prefix per engine (a std::set of prefix hashes; the
+           probe's two shapes collided when it was keyed by length). A
+           block whose known divergence sits within a chunk of sys_len (the
+           gitStatus tail) is never explored -- that entry would be a
+           prefix of nobody, the (g) finding again.
+System entries take pfx_should_persist_sys: no step gate (that gate spaces
+one conversation's blobs; a system entry is hit by every new session), but
+>= one chunk past base, within min/max, not indexed or in flight, writer
+idle. pfx_sys_cut_here requires the boundary to be one this prefill reaches
+(> base), so a restored request never claims a boundary inside its restore.
+Same-conversation restores (P8 snapshot, P9 checkpoint) are not eligible.
+
+Paired gate, same prompts on both binaries, [req] hit / pf / pf_ms:
+  shape A (boundary inside the shared region), old entry a pure prefix:
+    control  N1..N4  7168 / 3434 / 1028 ms, 2 entries
+    fix      N1 explores (writes 10240); N2..N4  10240 / 360 / 235 ms
+  shape B (boundary inside the tail), old entry a pure prefix:
+    control  N1..N4  7168 / 3853 / 1133 ms
+    fix      N1 explores (10240, a prefix of nobody); N2 promotes (9216);
+             N3..N4  9216 / 1802 / 620 ms; N4 "skip" (no further writes)
+  shape A, first new session cold with the 6144 shared cut:
+    control  N2..N4  6144 / 4263 / 1242 ms
+    fix      N2 explores (10240); N3..N4  10240 / 166 / 178 ms
+  shape B, same:
+    control  N2..N4  6144 / 4782 / 1360 ms
+    fix      N2 explores; N3 promotes (9216); N4  9216 / 1605 / 545 ms
+Cost of convergence: one extra entry when the sys_len boundary is inside
+the shared region (the exploratory entry IS the promoted one), two when it
+is inside the tail (one exploratory entry nobody restores, then the
+promoted one), then "skip" for every later session. The 1024-token
+granularity shows in shape B: promoted at 9216 against a shared length of
+10046-10234, so those sessions still re-prefill ~1.6-1.8K.
+
+On the production root today the new rules do nothing: every Claude Code
+session restores 21504, shares 22460 with the sys_len entry, and the block
+ends 84 tokens later -> "skip". They act the day the block changes.
+
+ACCESS-LRU. Eviction sorted by write mtime. Measured on the production
+root before touching it: 28 entries, 23 of 40 GB, and the 21504 system
+entry every new session restores was the SECOND-OLDEST file -- the next
+12-instance campaign (~20 GB of conversation entries) would have evicted
+it first. PrefixCache::touch(e) re-stamps the file (utimensat, so a rescan
+after restart keeps the order) and the index on every successful restore;
+tools/test_prefix_cache.cpp test_touch_protects_hot_entry (a touched old
+entry outlives a newer untouched one under the byte budget, and the stamp
+survives a re-index). The RAM-tier hit path does not touch the disk file
+(tier is off in production).
+
+Traps: the probe's filler carries the tag in every unit, so a different
+tag tokenizes differently -- the "fix2" prompts made the old entry a pure
+prefix of the new block (a third scenario, kept) while the "ctl" prompts
+made the first new session cold; pair control and treatment on the SAME
+tag. Scripts: bench/ladder/pfx_promote_probe.py (<base> <tag> <A|B>),
+bench/ladder/pfx_promote_run.sh (fresh root, production config, both
+shapes, journal + root listing; stops and relaunches q27-38).
+
+Next per (p): item 2 (turn replay / quality / queue attribution) or item 4
+(one TMA W/X-only spike at the 1.6x bar).
+
+## 2026-09-08 (q): the width-8 wall was the gemm_min=9 dispatch switch, not an engine bug -- widths 9-12 are bitwise on the matched family; wider K loses on the round wall at every depth; K=7 stays
+
+Item 1 of (p), run to the reviewer's recipe. Scripts and the trap list in
+bench/dflash2/width/ (README.md); raw runs in the session scratchpad.
+
+CLI matched-family gate (build/q27 --spec --dflash2 <full Q8 pack> --k K,
+fp8 KV, fast head, 512 generated tokens, four prompts, K in {6..11} =
+widths 7..12, verify graph AND eager, reference = the ladder stream):
+- gemv arm (Q27_GEMM_MIN=99, every width on gemv_q4_n<N>): 48 of 48 runs
+  byte-identical to the ladder. Widths 9, 10, 11, 12; graph and eager;
+  prose, code-write, code-edit, echo. There is nothing to fix in the
+  verify/GDN/fold at width>8.
+- default arm (gemm_min 9, widths >= 9 on k_vgemm): K=6,7 identical to the
+  ladder; K=8..11 diverge from it at ONE fixed token per prompt (prose 165,
+  code-write 81, code-edit 266, echo 266) -- the same token for every K
+  and for graph/eager. The (d) "hard width boundary at 8" was the mm5
+  family switch and nothing else. Retraction noted under (d).
+- the MMA family is width-invariant per lane too: the K=8..11 streams are
+  identical to EACH OTHER on every prompt, graph and eager (31 of 32 runs).
+  So on the serving path, which has been on k_vgemm at width 8 since (c),
+  a wider K changes no numerics -- K is a pure performance knob there.
+- the one outlier (code-write, K=10, graph: diverged at token 93 into a
+  genuinely different continuation, 413 differing positions, +31 rounds)
+  did NOT reproduce: 4 repeats plus 2 eager twins all match the other MMA
+  runs bit for bit. Every CLI run loads ~20 GB through the pageable path
+  and the sweep did not print the weight digest, so a corrupt load (the
+  ~1%-per-load fault in the 5090 memory: usually identical tokens, one
+  margin crossing when a flipped weight lands in a read tensor) is the
+  likely explanation and cannot be confirmed after the fact. The scripts
+  now print `wsum` per run; the serving boots below all loaded the modal
+  b743d26b1f0562a9.
+Traps met: (1) plain greedy is NOT the reference -- the plain decode graph
+uses k_gemv_q4, which is not k_gemv_q4_n<1> (engine.cuh:1709), so plain
+differs from every width-N stream (prose @32, code-write @52, code-edit
+@127; echo agrees by luck); the (d) gate compared against --spec, which is
+why it read "byte-identical to plain". (2) K=1 fails in the CLI: the
+drafter's own GEMV has no single-row kernel (`gemv_q4_n: bad nbatch 1`).
+(3) Q27_GEMM_MIN only bites with --spec (parsed in build_spec_graphs);
+the reviewer called this one in advance. (4) Round counts ARE reproducible
+for a fixed configuration and history: graph vs eager gave identical
+streams AND identical round counts on every gemv-arm run, and the serving
+boots below repeat every hash and every round count -- the (o) note about
+irreproducible round counts was ring-history drift between passes.
+
+The honest K budget, CLI gemv arm (identical streams, so tok/round is the
+same text under each K):
+  K              6     7     8     9    10    11    K10 vs K7
+  code-edit   3.30  3.37  3.44  3.53  3.63  3.56    +7.7%
+  prose       2.36  2.44  2.46  2.49  2.52  2.51    +3.3%
+  echo        2.31  2.30  2.25  2.27  2.32  2.38    +0.9%
+  code-write  2.72  2.86  2.89  2.89  2.88  2.88    +0.7%
+Inside the reviewer's +3-6% bracket on average, and the gain has to beat
+the round-wall cost of the wider block.
+
+Serving sweep (production config: Q8 serving pack, k_vgemm verify at width
+K+1, sampled walk, ring retention, fold overlap, Q27_DFLASH2_K=K, one boot
+per K, order 7 10 7 10 8 9 11; per boot 16 seeded 400-token streams at 2.3K
+and 6.6K prompts in two passes + 2 seeds each at 12.5K and 50K depth):
+  K      tok/round   dec t/s   round ms = draft + verify + host
+  7        4.012      223.3     17.82     2.46    15.13    0.23
+  8        3.906      210.5     18.51     2.72    15.56    0.23
+  9        4.139      221.7     18.57     2.67    15.66    0.23
+  10       4.004      211.2     18.82     2.68    15.92    0.23
+  11       4.134      214.5     19.17     2.79    16.15    0.23
+The repeated boots are exact: K=7 boots 1 and 3 and K=10 boots 2 and 4
+reproduce every stream hash, every round count and the round wall to
+0.04 ms. Widening costs 0.7-1.35 ms per round (17.82 -> 18.82 at K=10,
++5.6%): the drafter's attention goes from one 32-query group to two at
+W >= 9 (+0.2-0.3 ms, as the reviewer said it would) and the "flat" MMA
+verify is not flat (+0.4-1.0 ms). Acceptance moves 0..+3%. Net decode t/s:
+K=9 -0.7%, K=11 -3.9%, K=10 -5.4%, K=8 -5.7%. The n=2 depth probes in
+this sweep hinted K=10 +6-8% at 12.5K/50K; the follow-up (8 seeds each
+at 25K and 50K, K=7/10/9) says no:
+  K      tok/round   dec t/s   round ms
+  7        3.953      211.8     18.64
+  9        3.975      204.7     19.40
+  10       3.975      201.4     19.72
++0.6% acceptance, +1.1 ms round, -4.9% t/s at K=10. The bar was a
+repeatable >= 2% request-wall gain: NOT met by any K on any traffic class
+measured. K=7 stays, and the widening is parked with its price known: a
+wider block only pays if ~1 ms comes off the width-11 round (the drafter's
+second query group and the verify's width slope), i.e. it is the lanes
+6-7 / round-cost item, deferred in (p).
+
+Cross-K stream hashes differ by design: the sampled walk realises
+different tokens under different proposals even with identical target
+logits (position-keyed draws keep a stream identical only when the
+proposals are identical). Within-arm A/B repeatability is the instrument;
+the CLI greedy gate is where width-invariance was proven.
+
+Dispositions: no engine change; (d)'s "latent engine bug" retracted; K>7
+is a numerics-neutral serving knob that loses 1-6% t/s on this traffic;
+the reviewer's localisation stands in full (dispatch switch, two query
+groups, 3-6% budget, 0.5-1.1 ms tolerance -- the measured cost is
+1.0-1.35 ms). Session cost: one bounded session as budgeted. Next per (p):
+item 2 (turn replay / quality / queue attribution) and item 3 (shared-cut
+promotion + cache failure paths).
+
+## 2026-09-08 (p): gpt-6-astra on what comes next -- a bounded width>8 investigation first, cache robustness and one TMA spike after; one static P2 fixed on the spot
+
+Asked (docs/reviews/2026-09-08-gpt6astra-what-next.md, xhigh, read-only,
+static): rank the remaining agenda after (a)-(o) -- width>8 + K sweep, TMA
+W/X-only spike, lever A, prefill chunk graphs, shared-cut promotion, drafter
+context restore, lanes 6-7 numerics -- add what is missing, localise the
+width>8 divergence from the code, and name tomorrow's first experiment.
+
+Verdict, its words: "Spend tomorrow on a bounded width investigation, then
+prioritize cache robustness and one TMA spike ... Keep lever B off, defer A
+and chunk graphs, and stop tuning already-measured dead ends. The
+216-versus-219 t/s result establishes practical parity; it does not
+establish equivalent task quality or completion cost."
+
+Ranking (value on current traffic / sessions / decision):
+1. width wall + K=8..11 sweep -- +3-6% gross tok/round at K=10, net unknown;
+   1/2-1 diagnosis + 1-2 sweep; DO, bounded (one session to localise, else
+   keep K=7 and park).
+2. ADDED: reproducible turn replay + quality + queue attribution -- makes
+   small gains distinguishable from ring/history drift; 1-2; DO alongside.
+3. shared-cut promotion + persistence failure paths -- 1-2; DO next.
+4. TMA W/X-only spike -- 1-3% of wall if the 1.6x gate passes, more for
+   cold TTFT; 1 spike (+2-3 port); ONE spike, bar unchanged.
+5. restore drafter context (tiny-suffix warm turns) -- ~1/6 of the affected
+   requests' decode time before reseeding cost; MEASURE the incidence now,
+   implement selectively.
+6. lever A -- 192 eligible turns x 25 ms = 4.8 s = 0.6% of the 800 s run
+   for 3-5 sessions and boundary-state export risk; DEFER.
+7. prefill chunk graphs -- probably milliseconds per chunk, not the 55 ms
+   intercept (the trace was 88% GPU-busy); bound the gaps first; DEFER.
+8. lanes 6-7 drafter numerics -- sub-1% without new evidence; DEFER until
+   the wider-K experiment names a specific acceptance deficit.
+9. ADDED: DFlash2 batching -- unpriced, 4-8+ sessions, fused commits bypass
+   the ring mirrors; DEFER until queue attribution shows sustained
+   concurrency (prodpfx2 already has requests with 1-2 s queue waits).
+STOP: lever C (parked), B default-off, GEMV rewrites under the bitwise
+contract, exact-fold micro-tuning, fp4 revival, ladder/suffix retuning for
+this workload, reading 216 vs 219 as a remaining gap.
+
+The width>8 localisation (P1) is the part worth reading twice. The (l)-era
+attribution ("eager verify/GDN/fold has a latent bug at width>8") is not
+established by the experiment that produced it: gemm_min defaults to 9 and
+mm5 switches eligible projections from the GEMV family to the MMA family at
+exactly that width, and the two are documented as different numerical
+families. A divergence that appears at w=9 and sits at the same token for
+every K>=8 is what a dispatch switch looks like, not what a state bug looks
+like. The recipe it wants run before anyone touches the engine core:
+- CLI greedy identity-vs-plain (`--spec`) gate, prose reproducer first, then
+  code-write / code-edit / echo, >=512 generated tokens (the late failures),
+  W={2,7,8,9,10,11,12} i.e. K={1,6,7,8,9,10,11}, same model/head/prompt/fp8.
+- `Q27_KV=fp8 Q27_GEMM_MIN=99 Q27_SUFFIX=0 Q27_SAMPLED=0`, Q27_DFLASH2
+  unset, and `--spec` ALONGSIDE `--dflash2 <full CLI pack> --k K`:
+  Q27_GEMM_MIN is parsed inside build_spec_graphs, which the CLI only calls
+  with --spec, so a bare --dflash2 run keeps the default threshold and the
+  control is not a control. Full pack (with embedding), not the serving one.
+- each width with Q27_D2_NOGRAPH unset, then =1 (presence-based: =0 also
+  disables; it does not touch serving's verify graphs).
+- if matched-GEMV identity still fails: one temporary gate with fixed
+  proposal tokens and identical incoming state, committed n=1..W, compare
+  per-layer activations, lane-0 state, every recorded row, post-fold S/conv
+  history vs sequential; poison unused buffers; assert member vw == view.vw.
+  First mismatch before the fold = forward/plumbing, after = record/commit.
+  gdn_fuse_eq and ninv_test are the foundations but their width sets skip
+  the transition widths.
+- if GEMV passes: no core fix to manufacture; validate the production MMA
+  family at W=8..12 (Q27_DFLASH2_K=7..11, Q27_D2_VGEMM=1, Q27_BATCH=0, Q8
+  pack, reserve 3 GB, sampled walk, Q27_PF_FOLDLAST=0; Q27_D2_FOLD=sync
+  first, then overlap). A serving all-GEMV control needs BOTH
+  Q27_D2_VGEMM=0 and Q27_GEMM_MIN=99.
+- then interleaved K=7 vs K=10 on matched conversation histories at 12.5K
+  and 50K plus warm /v1/messages turns; judge on delivered tokens per round
+  wall; continuation bar >=2% request wall after the correctness gates.
+Do NOT widen W_PLUMB (16 already; engine and drafter capacities 12 cover
+K<=11; top-16 is candidates per position, not verified positions).
+
+K=10's honest budget (P1): dE[N] = S_8 + S_9 + S_10. From (f)'s S_7=0.076
+with conditionals 0.65-0.70: +0.10-0.12 tok/round (+3-3.5%); from the (d)
+production profile S_7=0.137 with conditionals ~0.75: S_8..10 ~ 0.103 /
+0.077 / 0.058 = +0.24 tok/round, 3.74 -> 3.98 (+6.4%). Not three extra
+tokens. And the drafter attention does 32 queries per group, so W>=9 is two
+groups where W=8 is one; the backbone/head stay GEMV; a 3-6% acceptance gain
+tolerates only 0.5-1.1 ms extra on a 17.35 ms round.
+
+Instrument discipline (P1): identical seeds and requests are not enough --
+(o) already logged identical streams with round counts that differ by up
+to 23 after earlier requests changed the ring. Reproduce the preceding
+conversation sequence and cache state in each arm; report first-round
+behaviour separately. Extend the sampled walk/rejection test (K=3 today,
+same for top-16) through K=11: late rejection, full acceptance, bonus/cap
+draws, empty residual, truncation, context-limit admission; different-K
+streams need not be byte-identical, require repeatability within an arm and
+the right target distribution. Keep first-token replay and task success in
+the quality battery; do not optimise toward ninfer's token count.
+
+Cache (P2): promotion must handle discovery, the cold-only save predicate
+and the shared 8192 step gate (calling shared_prefix on restored requests
+publishes nothing by itself); require a strictly longer verified shared
+prefix, save at a reached chunk boundary, bound promotion frequency; test
+an old short entry followed by several new-client sessions with a longer
+common prefix. Eviction is by write mtime, not access, so a hot old shared
+entry can age out -- measure before adding policy.
+
+TMA (P2): exactly the proposed intervention -- W/X bulk copies via an
+elected consumer thread, scale loading and arithmetic unchanged -- with
+the >=1.6x live-dispatch gate on both ffn_gate and attn_out at T=1024
+kept; price the quantizer/permutation into integration; the spike's inputs
+are synthetic, so real-weight/activation gates before any port. 1.6x on a
+60% GEMM share of a 14% prefill share is 3.15% of wall at most; the case
+for it is cold TTFT and boundedness. If it fails, stop the port and every
+further fold/occupancy/pipeline permutation.
+
+Reseeding (P2): group requests by valid ring rows after alignment and
+suffix length across P8/P9/RAM/disk, not by pfx>0 (every phase-0 restore
+re-prefilled >=2.3K tokens, so the tiny-suffix case is unmeasured). You
+cannot replay the preceding 2048 tokens from the restored state at L (the
+prefill mutates recurrent state forward); it needs an earlier compatible
+checkpoint, saved taps (200 MiB per 2048-row window) or saved drafter K/V
+(80 MiB + positions, compatibility includes drafter weights/numerics). With
++20% rounds in the affected class, a reseed costing C pays only when the
+affected decode time exceeds ~6C.
+
+Serving (P2): the 0.2 ms round host component is measured by a timer that
+stops before the callbacks and the rest of post_round -- profile the whole
+round before another host rewrite; the sampled nucleus kernel's 0.62 ms is
+the more concrete bounded target if a fresh profile still shows it. Audit
+the pool-clamped context and free VRAM after all graphs/drafter
+allocations, 128K admission, warm continuation, eviction and tool-call
+quality: cache persistence stops at 65536 and the 69.7K conversation in the
+campaign already showed the re-prefill cliff.
+
+Dispositions:
+- FIXED NOW (this commit): `pfx_persist` reserved the key and returned on a
+  staging-allocation failure without releasing it, so has() reported the
+  boundary as present for the rest of the process and it was never retried.
+  `PrefixCache::release(toks, L)` added, called on that path; unit test
+  covers reserve -> release-by-tokens -> reserve again and the no-op release
+  of an unclaimed key (all prefix-cache tests pass).
+- FIXED NOW: tools/launch_q27_38.sh keyed readiness on the DFlash2 "serving
+  ON" line, which prints during engine setup before the socket is bound
+  ((k) documented the trap for nsys; the helper had it too). Now keys on
+  "listening on".
+- FIXED NOW: the (o) B-estimate denominator -- 219 turns x 12 ms = 2.6 s =
+  0.3% of the 800 s run, not 1.3%. The verdict (opt-in, off) stands on the
+  numerics, not the fraction.
+- ACCEPTED, NOT CHANGED: `pfx_last_persist` advances before the write
+  succeeds. It is the step-spacing gate, reset to 0 on every new chain
+  (base == 0) and overwritten on restore; a failed write (the claim is
+  released by write()) is retried at the next step boundary and on the
+  next cold chain. Moving it behind the writer thread trades a bounded gap
+  for a cross-thread write racing the restore-path assignments.
+- ALREADY SO: output_config.effort is honoured (api_common.h:408); nothing
+  to implement, verify the rendering when the campaign harness next runs.
+- DEFERRED to their own sessions: promotion (item 3), the mtime-vs-access
+  measurement, the TMA spike (item 4), the reseeding attribution (item 5).
+
+Next session starts with item 1, the recipe above, ONE session bounded;
+items 2 and 3 follow whatever it finds. Commit chain: this entry + the
+review file + the two fixes.
+
+## 2026-09-08 (o): lever B built and gated -- -12 ms per warm turn, but the first token's numerics move 10-100x more than the g64 prefix class; OFF pending the corpus verdict
+
+Implementation (engine.cuh generate_prefill, Q27_PF_FOLDLAST=0 restores the
+old path): when the request has a P8 stable boundary and the post-snapshot
+span's final chunk would hold >= 2 tokens, the second chunk loop runs
+through NP, the last row's output_norm is copied into the decode-side x1
+BEFORE mtp_warm_T (which reuses x1T; the warm covers one row fewer since
+NP-1 has no successor), and the head runs on that row with token_launches'
+own tail (qx, mm(output.weight), argmax, advance) so logits / d_token /
+d_pos=d_step=NP / d_gen are what decode expects; DFlash2's NP-1 taps come
+from the chunk's seed (d2_seed_chunk's window ends at NP), the separate
+ingest is gone. Legacy tail snapshots (stable_len < 0: CLI, canonicals,
+pf=1 turns) and one-token spans keep the eager path (a one-token batched
+chunk streams the weights anyway). Instrument: Q27_DUMP_PF_LOGITS=<dir>
+dumps every request's post-prefill logits (pf_%06d.bin) for a first-token
+A/B; Q27_PF_DUMP_SERIAL=1 makes the CLI --pf leg dump the serial leg too.
+
+Timing (one binary, FOLDLAST=0 vs default, same 36 requests): warm +26
+tokens 64 -> 52 ms (3K), 69 -> 57 (25K), 75 -> 62 (45K); +41 71 -> 59;
++137 114 -> 102; +593 244 -> 231; chat/completions turns fold too (619 ->
+606); pf=1/5 unchanged by design. The -12 ms is the eager step's weight
+stream, as predicted.
+
+Numerics, first-token logits over the 36 requests: argmax 36/36, top-5
+4.53/5, but cosine min 0.881 / median 0.978 and KL(old||new) median 9.6e-3,
+max 0.175, with p(old argmax) moving by up to 0.3 (0.534 -> 0.642, 0.868
+-> 0.718). Calibration of the ACCEPTED class on the same instrument (CLI
+--pf serial vs batched prefix, eager last token in both): cosine 0.9985 @
+256 / 0.9952 @ 1024, KL 9.3e-5 / 3.3e-12. So B's direct perturbation of
+the emitted token is 10-100x the indirect prefix perturbation the g64
+policy was signed off on: the batched path's per-token output (WY scan,
+pv8 attention with e4m3 softmax weights, g64 activation groups) differs
+from the serial decode kernels far more than its downstream effect on
+later tokens does. Sampled first tokens at temperature 1 see a visibly
+different distribution on ~1/3 of turns.
+
+DFlash2 acceptance on 8 seeded 400-token streams: 802 -> 827 rounds (+3%),
+streams byte-identical (position-keyed draws). But the same server with
+the same seeds run twice gives 95/105/99/101/108/92/107/95 then
+95/105/99/101/131/106/112/102 rounds (streams identical): ring content
+after the first pass moves single requests by up to +23 rounds, so n=8
+cannot judge a 3% aggregate; the 12-instance run is the acceptance
+instrument if B goes forward.
+
+NLL gate (bench/flipgate/agentic38.i32, 20400 predictions, 256-token
+chunks, fp8 KV): serial mean NLL 0.842219 (PPL 2.3215) vs batched 0.853788
+(PPL 2.3485) = +1.37% NLL, +1.16% PPL. Inside the pre-registered +2%
+ceiling, so the rule PASSES B -- but it is a real cost paid on the first
+token of every turn, for 12 ms of a 60-130 ms warm turn (219 turns x 12
+ms = 2.6 s of an 800 s run, 0.3% -- the 1.3% first written here was
+wrong, caught by the (p) advisory; ~10-16% of a warm turn's TTFT). Verdict: SHIPPED
+OPT-IN (Q27_PF_FOLDLAST=1), default OFF; the launch script does not set
+it. Turn it on when the per-turn latency matters more than a +1.4%
+first-token NLL; the acceptance question (n=8 too noisy) would then need
+the 12-instance run. The instrument (Q27_DUMP_PF_LOGITS + bench/ladder/
+pf_logits_ab.py) is the gate for any future change to the last-token path.
+
+## 2026-09-08 (n): lever C measured before building it -- the attention split is already at its cap at production depths; NO-GO
+
+Advisory item 2's precondition: sweep the existing Q27_PF_SPLIT override
+before adding an underfill dispatch. Instrument: a scratch /v1/messages
+probe (one conversation per depth, then turns of ~26/137/251/593 new
+tokens), production DFlash2 config, one server per setting, pf_ms from
+[req]. The default rule is nsplit = (base_pos + SB)/4096 clamped to 1..8.
+
+  pf_ms            auto     2     4     8      (auto splits: 1 / 6 / 8)
+  3K   +26 tok       64    59    57    56
+  3K   +137         101    97    94    94
+  3K   +251         120   115   114   113
+  3K   +593         200   199   199   199
+  3K   cold 3334    837   872   878   887
+  25K  +26           69    99    77    66
+  25K  +137         114   137   115   110
+  25K  +251         140   155   145   140
+  25K  +593         243   260   250   240
+  45K  +26           75   135    95    76
+  45K  +137         123   172   133   124
+  45K  +593         273   315   295   276
+
+Read: at 3K depth (auto = 1 split) forcing 8 splits saves 7-8 ms on the
+small turns and nothing at +593; at 25K (auto = 6) the best case is 3-4 ms;
+at 45K (auto = 8) there is nothing left. Forcing 8 on every chunk costs
+the cold prefills 5% (combine on saturated grids). Claude Code turns live
+at 20-50K, where the depth rule already splits 5-8 ways, so lever C is
+worth <= 3 ms per turn there -- not a numerics-class change worth its
+gates (pv8's e4m3 softmax rounding moves under a new split geometry). An
+underfill rule would only pay for shallow (< 8K) conversations, ~7 ms per
+small turn; parked, with the sweep as the evidence. The advisory's order
+now points at lever B (append the last prompt token to a batched chunk),
+the 12 ms weight stream the token graph could not remove.
+
+## 2026-09-08 (m): DFlash2 last-token forward graphed -- bitwise, -2 ms per turn (advisory item 1)
+
+d2_setup now captures token_launches(d2_vtaps) into d2_token_exec (after
+capture_draft; token_launches' kernels were warmed by build_graph, the tap
+copies are D2D memcpy nodes, position/token come from d_pos/d_token so one
+graph serves every turn) and generate_prefill's DFlash2 branch launches it
+in place of the eager call; the one-row ring ingest stays outside (host
+bookkeeping). Q27_D2_TOKGRAPH=0 restores the eager path.
+
+Measured (old vs new server, same DFlash2 config, bench/ladder/
+drive_warm_turn.py + 8 seeded streams): SEEDED STREAMS IDENTICAL; pf_ms
+warm pf=1 15 -> 13, pf=5 39 -> 37, pf=41 73 -> 71, cold 3023-token 777-790
+-> 784-794 (noise band). So -2 ms per warm turn, not the advisory's 3-5:
+the eager step was 14.3 ms wall with 11.9 ms of GPU busy (nsys, entry (k)),
+i.e. only 2.4 ms of submission gaps to remove -- the rest is the 8.3 ms
+gemv weight stream plus launch-bound small kernels that a graph does not
+shorten. Bitwise and free, so it stays; it is the whole of what a graph
+can do for this step. The weight stream needs lever B (append the last
+token to a batched chunk), as the advisory ranked it.
+
+Side note from the same run: the (k) trims show up on the cold 3K prefill
+too, 887 -> 777-794 ms (-12%).
+
+## 2026-09-08 (l): gpt-6-astra on the small-turn levers -- C, then B, then A; first a bitwise one nobody listed
+
+docs/reviews/2026-09-08-gpt6astra-small-turn-levers.md (static, xhigh).
+The order it sets, adopted as the plan's phase 3 continuation:
+
+0. FIRST (bitwise, half to one session): graph-capture the DFlash2
+   last-token forward. Under the ladder the last prompt token goes through
+   step_with -> graph_exec (captured); under DFlash2 it runs
+   token_launches(d2_vtaps) EAGERLY so the taps reach the ring -- 963
+   launches, ~5 ms of submission overhead on top of the 8.3 ms gemv weight
+   stream. token_launches has no sync/alloc and already supports capturing
+   the five tap copies; capture a separate graph after d2_vtaps exists,
+   keep the one-row ingest outside (host bookkeeping), keep the synchronous
+   token upload and the fold-event dependency. Budget 3-5 ms per turn,
+   also helps pf=1 where A/B/C have nothing to batch. Gate: identical
+   logits, normalized hidden, recurrent state, KV/tap rows, position
+   counters and seeded warm-turn streams (the missing last ring row cost
+   acceptance before -- keeping it is what matters).
+1. C (attention split on underfill), 1-2 sessions incl. gates. Correction
+   to my sizing: the unsplit grid is 4 x ceil(T/16), so 4/8/12/16 blocks
+   through T=16/32/48/64, and eight splits give only 32 blocks for a
+   5-token tail: propose the split count from underfill but constrain it
+   by useful 32-position tiles and combine amortization; do not raise the
+   8-split cap just to reach 170 blocks. Run the existing Q27_PF_SPLIT
+   override at 1/2/4/8 for T 5/36/64/128 at warm-turn depths FIRST; only if
+   the win survives, add the guarded dispatch. Numerics: P4's class but
+   the pv8 path rounds softmax weights to e4m3, so changed local maxima
+   move those operands too -- P4's 1.9e-5 is not a bound. Gate the
+   production pv8 branch at shallow/deep, ragged queries, empty splits,
+   scattered pages, the scratch limit, plus turn replay and DFlash2
+   acceptance.
+2. B narrow (1-2 sessions for DFlash2): append the last token to an
+   EXISTING post-snapshot chunk that has room (never a new one-token chunk;
+   keep the old path when only one token remains, the chunk is full, or
+   it would cross the snapshot boundary); keep that row's output_norm in
+   engine-owned x1, run the existing qx + mm(output.weight) head, argmax
+   and advance; preserve logits/h_next/d_P=NP-1 and d_pos=d_step=NP.
+   Traps: MTP warm only rows with a known successor (save x1T first, the
+   warm overwrites it); DFlash2 seeds NP-1 through the batched taps exactly
+   once, no separate ingest, d2_prefill_done sees the pending token.
+   Numerics: g64 policy eligible, not pre-validated; first-token
+   distribution gate + continuations + restores; sampled bootstrap stays at
+   NP draw kind 0; CLI canonicals stay serial (pf_batch_min 32 vs the
+   server's 2).
+3. A (3-5 sessions): capture S[il] AND the three raw-QKV conv-history rows
+   per layer at the boundary (the ring is not rebuilt from normalized
+   convT; cuts under 3 tokens need incoming history); merge projections
+   but keep two conv/scan segments per GDN layer. Bitwise only for the
+   scan (two calls on the original subranges preserve the 64-token WY
+   grouping); the merged forward is NOT bitwise (split-K count depends on
+   T: 3 splits at T=36, 4 at T=5, 3 for both at 41; attention tile
+   endpoints move). Biggest trap: snap_save / ckpt_save / pfx_export copy
+   LIVE state -- after a merge the live state is past the boundary, so the
+   captured boundary state must be exported explicitly. Reprice after 0-2
+   land: a cheaper chunk B is worth less to remove.
+4. Not a shortcut: a tiny verify-style prefill (the verify GDN mixer
+   commits lane 0 only, the tail speculates, the head may be the fast one;
+   2-4 sessions if ever). Graph-capturing chunk B: baked base/T, shared
+   scratch -- no per-position graph cache.
+5. Gates that exercise the changed path: the batched NLL loop calls
+   prefill_chunk directly and bypasses generate_prefill / P8 / the
+   last-token handoff, so it cannot establish A or B; add a teacher-forced
+   turn-replay gate through generate_prefill (first-token NLL, warm suffix
+   lengths, restore tiers). Preregister the split-K trigger (+2% aggregate
+   or segment NLL) as the rejection ceiling; measure DFlash2 tok/round and
+   request wall, not just prefill wall; separate cache roots per
+   numerical experiment; DFlash2 keeps Q27_BATCH=0.
+
+## 2026-09-08 (k): the small-turn prefill floor measured -- three weight streams per warm turn; three bitwise trims shipped
+
+Phase 3 of docs/plans/2026-09-08-prefill-attack.md. After phase 0 the
+prefill wall on Claude Code traffic is 110 s of an 800 s run and half of it
+is the 192 same-conversation turns re-prefilling 64-1000 tokens at 130-760
+ms each, so the per-turn floor, not GEMM throughput, is what remains.
+
+Instrument: nsys on a short production-config server run (systemd-run,
+--cuda-graph-trace=node, -d 120 --kill=sigterm; readiness must key on
+"listening on" -- "serving ON" is the DFlash2 line and prints before the
+listener is up) driving bench/ladder/drive_warm_turn.py; windows cut by
+kernel family (batched GEMM / prefill attention / WY scan = prefill, the
+eager single-token kernels = the last-token step, vgemm / gemv_q8_n = the
+decode graph). Scratch analysis in the session; the numbers:
+
+  cold 3079 tokens: 887 ms = 3 x 1024-chunks (515 + 265) + a 7-token tail
+    chunk (25) + a 5-token post-boundary chunk (25) + the eager last-token
+    step (14) + host.
+  warm pf=41 (76 ms): chunk A 36 tokens 35 ms | chunk B (the ~5 tokens
+    after the stable boundary, second prefill_chunk loop) 25 ms | eager
+    last-token step 14 ms.
+  warm pf=5 (40 ms): chunk B 25 + eager 14.   warm pf=1 (15 ms): eager only.
+  CLI cold --pf: 128 tok 79 ms, 256 109, 512 165, 1024 285 -> ~55 ms fixed
+    + 0.22 ms/token.
+
+Anatomy of a warm turn: the full 13.5 GB weight set is streamed THREE
+times -- chunk A (k_gemm_mma_T at T<=64: 400 launches, 13-20 ms, i.e. the
+GEMM is weight-bandwidth-bound at 0.7-1 TB/s in this regime), chunk B
+(the same for ~5 tokens: 25 ms), the eager last-token step (k_gemv_q4 352
+launches 8.3 ms at 1.6 TB/s + ~5 ms of launch overhead). Plus the prefill
+attention kernel at small T: k_attn_prefill_mma_pv8 runs 4 blocks on 170
+SMs for 320 us per layer whatever T is (16 layers = 5.1 ms per chunk; the
+P4 position split only engages at deep base_pos), and ~1700 launches per
+chunk at 88% GPU busy. Per-launch table: k_gemm_f16_T (ssm alpha/beta,
+48x5120 fp16) grid 48x1024 = 212 us each, 96 per 1024-chunk = 20 ms
+(7.5%!); k_delta_wy 260 us x 48 = 12.5 ms/chunk (4.7%); k_quantize_x (the
+g32 quantizer nothing reads on the g64 route) 9.7 ms/chunk (3.7%);
+k_silu_mul at its bandwidth floor.
+
+Bitwise trims shipped (this entry):
+1. k_gemm_f16_T retiled: block per 4 tokens walking all 48 rows with the
+   activations register-resident (the old block-per-(row, token) grid re-read
+   both operands per output: 1.5 GB of L2 traffic per launch). Same
+   per-thread strided FMA chain and the same block_reduce<256> tree, so
+   every output is bitwise the serial k_gemv_f16 -- the --pf identity gate
+   (Q27_PF_XG=32, serial vs batched IDENTICAL) checks exactly that.
+2. qxT skips the g32 quantize unless the route reads it
+   (prefill_g32_needed(): dp4a or Q27_PF_XG=32).
+3. mtp_warm_T skipped when d2_on (the DFlash2 decode never calls
+   mtp_forward: engine.cuh decode_step's d2 branch; the forced-close path
+   samples plainly). CONTRACT: blobs written by a DFlash2 engine carry
+   unwarmed MTP rows, so /dev/shm/q27-pfx is a DFlash2-only root (launch
+   script comment; the ladder mode has no cache flags).
+
+Results (CLI --pf, default route, old -> new binary; nsys per launch):
+  k_gemm_f16_T 212 -> 61.5 us (20.4 -> 5.9 ms per 1024-chunk); two
+  intermediate retiles were NOT faster (rows walked inside a block: 9
+  barriers per row, still 212 us; a lane-strided layout: 160 two-byte
+  loads per row + a 256-float register array that spilled, 323 us) -- the
+  win needed consecutive columns per lane (16-B weight loads) AND the
+  register tree; k_quantize_x gone from the g64 route (-9.7 ms/chunk).
+  1024 tokens 285 -> 261 ms (3597 -> 3926 tok/s, -8.4%); 128 tokens 79 ->
+  76; 37 tokens 60 -> 58.
+Gates: post-prefill logits byte-identical old vs new on default, XG=32 and
+dp4a routes at pf 1024 and 37; test_kernels ALL PASS; DFlash2 serving A/B
+(old vs new server, 8 seeded streams at 2.3K/6.6K prompts) byte-identical
+-- covers the mtp_warm and g32 skips; the f16 kernel is covered by the
+logits identity. NOTE: the serial-vs-batched --pf gate at Q27_PF_XG=32
+reports MISMATCH on the pre-trims binary too (fp8 and f16 KV): it has been
+stale since the WY scan replaced the sequential scan on the batched path,
+and is not a signal about this change.
+
+Structural levers NOT taken here (each is a numerics-class change, needs
+the tolerance/quality gates, and is the user's call): (A) fold chunk B into
+chunk A by snapshotting the GDN state mid-chunk at the stable boundary
+(-25 ms per warm turn, 33% of a 76 ms turn; WY block alignment moves,
+same class as the existing chunk-alignment dependence); (B) fold the last
+prompt token into the batched chunk and take its logits from the head GEMV
+on that row (-12 ms; the first decode token's logits move from the serial
+to the g64 batched numerics; the canonical NP=5 prompts stay on the serial
+path); (C) engage the attention position split whenever the grid underfills
+(blocks < SMs), not only at deep base_pos (-4.5 ms per chunk; the P4 split's
+tolerance class). Together ~76 -> ~35 ms per warm turn; the production
+64-256-token turns (137 ms mean) ~-30%.
+
+## 2026-09-08 (j): gpt-6-astra review of the W4A8 spike -- design confirmed, cvt16 demoted to a probe, the port's gate list
+
+docs/reviews/2026-09-08-gpt6astra-w4a8-spike.md (static, xhigh, 15 items).
+Dispositions:
+
+- A1 P1 ACCEPTED: FOLD==2 (cvt16, the 3-op fold with 1/16 on wsc) is only
+  conditionally exact -- RN((wsc/16)*xs) loses bits while RN(wsc*xs) is still
+  normal below 16*FLT_MIN ~ 1.9e-37 (analytical counterexample in the
+  review: wsc=2^-24, xs=(1+2^-23)*2^-100, d=1), and overflow differs the
+  other way. It stays a probe; the shipped fold is the exact 4-op magic
+  path. An exact 3-op fold exists only if the unpack produces d directly.
+- A2 P1 ACCEPTED for the port: identical source expressions are a
+  compiler-dependent contract (contraction, FTZ, toolchain). The ported
+  fold will be explicit mul.rn/fma.rn asm (lag2 already showed it costs
+  nothing), the build flags recorded, the production SASS inspected, and
+  the gate extended with cancellation / halfway / tiny-product / overflow
+  / signed-zero inputs.
+- A3/A4 P2 CONFIRMED sound (|16d| <= 1,040,384 < 2^22; the permutation is
+  k -> floor(k/2) + 16*(k mod 2) within each 32-block on both operands;
+  packed-weight zero-fill unpacks to -128 but only into discarded rows).
+  Endpoint and one-hot-K tests are on the port's gate list.
+- B5 P2 ACCEPTED: "fill and math do not overlap" overstates the evidence
+  (609 -> 141 us + 74 us fill = 215 us, not 201; the fill-only probe omits
+  scales and swizzle; the no-fill ablation is not an initialized substitute).
+  Restated as "insufficient overlap plus copy-issue cost", fold still
+  material (609 vs 807).
+- B6/B7/B8 P2 ADOPTED as the next session's order: TMA for W and X only,
+  issued by an elected consumer thread with expect_tx mbarriers, scale
+  loads unchanged -- isolate TMA before any layout change; then the
+  structural matrix (rectangular tiles incl. 128x192 4x3, grouped
+  rasterization, BK, the operand-role swap, split-K for underfilled grids;
+  smem caps 128x128x256/s2 and 256x128x128/s3 at 102 KiB > 99 KiB). The
+  producer-warp regression was an unfavourable experiment (56 copies per
+  lane per stage on one warp, changed register allocation), not a verdict;
+  setmaxnreg exists on sm_120a but is warpgroup-wide.
+- B9 P3 FIXED: --notest printed "all bitwise"; now it reports untested,
+  zero selected tests is an error, and the summary counts comparisons.
+- C10 P1 FIXED in the spike: cols % BK gates added to the two launchers
+  that lacked them; the gate now covers 25 T values including every
+  incumbent dispatch boundary (15-17, 31-33, 63-65, 95-97, 127-129) and
+  tails. K tails and row tails 1/7/8/15/16/17 remain port gates.
+- C13 P1 FIXED in the spike: both incumbent references (ntx live dispatch
+  and Q27_PF_NTX=0 MR=64) on identical inputs, and the new kernel writes
+  into an exact-sized buffer with a 4096-float red zone that is checked.
+  800 comparisons pass. Real weights / captured activations remain a port
+  gate.
+- C11/C12/C14/C15 P1-P2 FOLDED into the plan's task 3: preserve the
+  split-K DECISION (scratch capacity, forced counts) not just the kernel;
+  nat64p as an additional quantizer output from the same rounded q0/q1
+  with Q8 exercised on the same XQuant right after Q4; buffers and
+  descriptors allocated on the existing init paths under the arena claim
+  discipline, no process-global mutable state, no lazy allocation during
+  another engine's capture; acceptance = legacy --pf identity + decode
+  canonicals + direct g64 old/new + mixed Q4/Q8 + short suffixes.
+
+## 2026-09-08 (i): gpt-6-astra review of the shared cut -- writer race closed, unlink under the lock, tests that test the caps
+
+docs/reviews/2026-09-08-gpt6astra-shared-cut.md (static, xhigh). Dispositions:
+
+- P1 FIXED: all slots share one PrefixCache while the export/writer state is
+  per engine, so two cold slots choosing the same cut could both pass has()
+  and both write the same `.tmp` with O_TRUNC -- one could publish the
+  other's half-written state (pre-existing; the shared cut makes different
+  sessions target the same key, so it became live). Now `reserve(toks, L)`
+  claims a (key, L) under the index lock before the D2H export (pfx_persist),
+  has() reports in-flight keys as present, `.tmp` names are per writer
+  (`.q27pc.tmp.<pid>.<n>`, the boot sweep matches the substring), and write()
+  releases the claim on every exit. Production is single-slot, so this was
+  not exposed today; the multi-slot ladder config was.
+- P2 FIXED: eviction unlinked its victims after releasing the lock, so a
+  writer's rename + index insert of a replacement at the same path could
+  land in between and the delayed unlink would delete the NEW file while
+  has() kept suppressing its repair. rename + index update now happen under
+  the lock in write(), and evict_to_budget() unlinks under the lock.
+- P2 DEFERRED (policy): a restored prefill (base > 0) never runs the
+  shared-cut discovery, so once a short entry (e.g. from an older client
+  version) matches, sessions restore it and never persist the longer shared
+  prefix. Real but an improvement over the pre-09-08 behaviour (no hit at
+  all); needs an explicit promotion policy (the 8192 step gate would also
+  suppress it after a restore). Noted in the plan.
+- P3 FIXED: the engine checked `shared >= min_tokens` but persistence is
+  measured at the chunk boundary <= shared; with an unaligned min_tokens the
+  shared cut could be chosen and then rejected. The boundary is checked now.
+- P3 FIXED: two unit assertions did not test the caps they claimed
+  (divergence came first); added full-agreement cases capped at the entry
+  length and at the prompt length, plus test_reserve_serialises_writers.
+- Reviewer-confirmed correct: index copy under the lock with I/O outside,
+  the two-stage read offsets, the down-rounded cut, `shared == sys_len`,
+  conversation entries as evidence, cold reset of pfx_last_persist, server
+  sys_len propagation; the `n <= best` prune (break would also be valid).
+  Cost bound: <= 100 KiB of head reads for a 40 GB root of unrelated
+  entries, ~9 MB if every head matches at sys_len 22.5K.
+
+Gates: test_prefix_cache PASS, make test-tools PASS, live probe on the
+rebuilt server (below).
+
+## 2026-09-08 (h): W4A8 prefill GEMM spike -- bitwise at 1.26-1.41x, the 1.6x bar NOT met; ceilings measured
+
+Phase 2 task 2 of docs/plans/2026-09-08-prefill-attack.md. Spike
+tools/gemm_w4a8_spike.cu (links the incumbent gemm_q4_T as the bitwise
+reference; `--time`, `--shape`, `--only`, `--notest`), probes in
+tools/probes/ (README there). Numbers: RTX 5090, production idle on the GPU.
+
+THE DESIGN IS PROVEN BITWISE: every variant (8+ tile/pipeline shapes) is
+byte-identical to gemm_q4_T on all four projection shapes at T in {1024,
+1000, 512, 257, 96, 37, 1, 4096}. The pieces: weights stay nibble-packed in
+smem (cp.async 16 B, swizzled), one ldmatrix.x4 per 16-row tile per 64-group
+hands each lane 8 consecutive packed K; unpack is SHL+LOP3 / LOP3 with the
+nibble in the HIGH half of the byte XOR 0x80 (= s8 16*(u-8)), so the IMMA
+yields exactly 16d; K inside each 32-block is consumed in even/odd order and
+the activations are stored that way per 32-block (k_permute_x; the port puts
+it in quantize_x_g64 as a second output), so the standard B ldmatrix matches;
+f = fma(int_as_float(16d + 0x4B400000), 1/16, -786432) == (float)d exactly;
+the fold is the incumbent's `acc += wsc*xs*f` in the incumbent's group order.
+
+MEASURED (T=1024 / T=4096, TOPS, incumbent live dispatch = 313-330):
+  ffn_gate 17408x5120: best 416 / 443 (1.30x / 1.34x)
+  attn_out  5120x8192: best 442 / 444 (1.41x / 1.42x); 256-row tile 461 once
+Best shapes: 128x128x128, 2-stage cp.async, 8 warps (255 regs) or 16 warps
+(4x4, 128 regs, no spills) -- all configurations land in a 400-460 band.
+
+CEILINGS (probes): IMMA pipe 1020 (dependent chains; a register-only loop
+with loop-invariant inputs reports 2-4x that because ptxas hoists the mma --
+PTX has no volatile). Register-only IMMA + the exact 4-op fold 817-827; a
+3-op cvt fold 889-896 (I2F is NOT slow on sm_120 -- the spike's opening
+comment about it was wrong and is corrected). Kernel with the stage fill and
+barrier removed: 609 (16 warps), 616 (256-row tile); with the fold also
+removed 807. Stage fill alone streams at 6.8 TB/s = 74 of the 201 us.
+
+WHAT DID NOT MOVE IT (each within +-3%): lagging the fold by one tile (the
+compiler re-hoists the IMMA bursts; an asm-ordered interleave that the SASS
+confirms changes nothing -- stall profile identical: wait 24%, tensor
+throttle 20%, barrier 11%, 0.57 eligible warps, CPI 4.7); 2 blocks/SM at
+128 regs; 12 or 16 warps; pipeline depth 3/4/6 (once the slot index is
+static -- kt%3 as a runtime slot cost 6%); the 3-op fold (+3%); group-major
+token scales with 8-B pair loads (-4%: the compiler's LDS.128 path was
+better); a producer-warp + mbarrier design (326-350: one cp.async warp
+cannot issue 60 copies per lane per stage fast enough and the consumers
+dropped to 168 regs).
+
+READ: the tensor pipe is 46% active because the fill and the math do not
+overlap (609 without the fill vs 428 with it), not because of the fold or
+occupancy. The vendor shape that fixes this on sm_120 is TMA bulk-tensor
+copies (one instruction per tile, expect_tx on the full mbarrier, no per-lane
+issue cost) feeding 8-16 consumer warps -- ninfer's kernel is exactly that.
+Prerequisites: transposed scale sidecars (W scales [ngrp][rows] fp16 on
+device at load; xs [ngrp][T] from the quantizer) so the scale tiles are TMA
+boxes with a >= 16-B inner dim, which also removes the 20% excessive global
+sectors ncu attributes to the per-row 4/8-byte scale copies. ncu also flags
+92% of the cp.async smem-write wavefronts as conflicts; the staging-only
+probe reaches L2 speed regardless, so that is not the wall.
+
+Verdict: spike bar (>= 1.6x at M=1024 on ffn_gate and attn_out) NOT met;
+1.30x / 1.41x bitwise stands ready to port if a 1.3x is wanted as-is. Not
+ported (no engine code changed). Next session: the TMA producer, then the
+scale sidecars, then re-measure against the same spike table.
+
+## 2026-09-08 (g): prefix-cache tiers ON in production + the P16b shared cut -- prefill wall 255 -> 110 s on Claude Code traffic
+
+Phase 0 of docs/plans/2026-09-08-prefill-attack.md, plus the first-turn fix
+it uncovered. Results: bench/crossengine/agentic-2026-09-08/README.md (two
+new sections), instruments pf_restore_agg.py (joins [gen] pfx with [req]),
+bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py (the live gates).
+
+Tiers on (tools/launch_q27_38.sh d2-pfx: P16 disk tier on tmpfs /dev/shm,
+40 GB, min 4096, max 65536, step 8192, RAM tier off, Q27_SYSBLK=1). The
+controlled eviction case passed every bar: a 48,852-token conversation entry
+restored in 254 ms after a foreign 369-token request (re-prefill 44 tokens,
+pf_ms 342 vs ~14 s cold); a new conversation with the same system block
+restored the system entry in 44 ms. The first probe overshot to 69.7K tokens
+and showed the max-tokens trap live: that boundary was silently never
+persisted and the returning turn re-prefilled 29K. 12 instances at xhigh
+(prodpfx): the after-side-request class went 6 full misses (80 s) -> 2
+restores (0.2 s each), no read failures, persist exports median 74 ms.
+
+But first turns still never hit (0 of 26; 60% of the remaining prefill
+wall). Diagnosed from the entries themselves -- the .q27pc files carry the
+token vectors, so no request dump was needed: five sessions shared EXACTLY
+22460 tokens and diverged inside Claude Code's gitStatus section ("Recent
+commits:" then per-repo hashes). The P16b cut sat at the last chunk boundary
+<= sys_len (22528), 68 tokens past the divergence, so no session could hit
+another's entry and each first turn wrote its own 0.94 GB entry.
+
+Fix: PrefixCache::shared_prefix(prompt, upto) = longest prefix an indexed
+entry shares with the prompt (reads token vectors only, longest entries
+first, skips entries that cannot beat the current best; two-stage read after
+the consensus review -- a 256-token head per entry, the full vector only
+when the head matches, so a root of unrelated entries costs 1 KB each; I/O
+outside the index lock, an entry evicted mid-scan just fails its open);
+generate() computes
+it once per cold prefill with a system block >= min_tokens and cuts the
+system entry at that length when shorter than sys_len (pfx_sys_cut;
+pfx_sys_cut_here reads it instead of pfx_sys_len). Session 1 cuts at
+sys_len, session 2 at the shared length, session 3 onward restores. Not a
+numerics change: the entry is still a chunk-boundary state and the chunked
+continuation is the same path a P16b hit already took.
+
+Gates: tools/test_prefix_cache.cpp test_shared_prefix_across_sessions
+(empty cache, shared length, upto cap, foreign prompt, longest sharing entry
+wins, below-min entries ignored, disabled cache) PASS; make test-tools PASS;
+live three-session probe (shared body ending just under a chunk boundary,
+sys_len just over it, a foreign request between sessions -- WITHOUT it the
+P9 checkpoint ring serves session 2 at 4096 and the cut logic never runs):
+S1 cut 7168, S2 "shares 7084 -> cut at 6144", S3 restored 6144 in 49 ms.
+
+12-instance rerun on a fresh root (prodpfx2): session 2 logged "system
+block 22574 tokens, shares 22460 -> cut at 21504"; 12 of the 13 later
+first turns with a system block restored L=21504 (79 + 45 ms) and
+re-prefilled 2.3-4.5K tokens -- 1.0-1.7 s instead of 7.0-8.4 s cold (the
+three cold ones after bootstrap had no system block at all). Both miss
+classes at 0 full misses; 16 restores median 124 ms; prefill wall 255 -> 110
+s with turn counts matched (221 vs 219); round wall 18.63 ms = baseline
+18.60 (the 19.05 in prodpfx was jitter); restored turns draft at 3.88
+tok/round vs 3.96 VRAM-hit; prefix reuse 96.2%; quality 9/12 nonempty, 8/12
+gold = baseline. The harness wall halving (2168 -> 840 s) is mostly fewer
+decoded tokens this pass; the attributable part is the 145 s of prefill.
+
+Production is d2-pfx with the shared cut (binary built 14:24 from this
+tree). campaign.sh's relaunch line now calls the launch script instead of
+an inline systemd-run that had reverted production to no cache. Remaining
+prefill cost on this traffic: two bootstrap cold prefills per fresh root,
+the ~2.3-4.5K re-prefill after each system restore (shared prefix ends 956
+tokens past the chunk boundary + gitStatus tail + first user message), and
+the step-gate remainder after conversation restores. Next: phase 2 (the
+int8 GEMM to the vendor shape) makes the remaining cold prefills cheaper.
+
+## 2026-09-08 (f): prefill recon -- two thirds of the prefill wall is cache policy; the int8 GEMM has 2x vendor headroom
+
+Recon only, no engine code. Full write-up: docs/perf-attribution-prefill-2026-09-08.md;
+executable plan: docs/plans/2026-09-08-prefill-attack.md; gpt-6-astra review of
+the plan: docs/reviews/2026-09-08-gpt6astra-prefill-plan.md.
+
+From the four 12-instance Claude Code runs of (d)/(e): prefill is 13-16% of
+the engine wall at xhigh, 28% at medium, ~2.9-3.1K tok/s aggregate, with the
+16-65K cold prefills (~3250 tok/s) at 62-73% of the prefill wall. The miss
+anatomy is exact: a returning turn hit iff the previous request was the same
+conversation. Every interleaved ~350-token Claude Code side request landed on
+slot 0 and invalidated the P8 snapshot + P9 ring (engine.cuh:4960-4966), so
+the next main turn re-prefilled 28-48K from zero (0/6 hits, 31-36% of the
+prefill wall in every config); first turns never reused the ~22K system block
+(33-42%). The P16/P16b/P16c tiers that handle both are shipped, measured on
+real CC on 07-24, and opt-in flags absent from the production command. ninfer
+on the same instances: 95.9% reuse (8 host state slots; shared_stable_prefix
+hits of 22,449 tokens).
+
+Kernel side: ninfer nvfp4 is 2.2x at 16-65K cold (25K: 3.5 vs 7.2 s), 1.6-1.8x
+at 256-4K; its published int tier equals q27 (3,275/1,610 vs our 3,201@16K /
+1,834@128K) and its prefill skeleton is the same as ours (eager, per-chunk
+sync, single lane, no split-K). The 08-17 plan's P0 finally ran:
+cuBLASLt int8 = 648-897 TOPS at M=1024 on our projection shapes
+(tools/cublaslt_peak.cu), gemm_q4_T = 310-322 -> 36-48% of the vendor
+ceiling; the plan's "~25% headroom" is retracted, it is ~2x with no format
+change. Plan order: cache tiers on (tmpfs-backed, tools/launch_q27_38.sh
+d2-pfx) -> GEMM to the vendor shape -> trims -> attention/delta at 128K.
+
+## 2026-09-08 (e): production on DFlash2 -- Claude Code traffic at xhigh, DFlash2 vs ladder on the same instances
+
+Production q27-38 moved to the DFlash2 config (Q8 serving pack, sampled
+walk, MMA-path verify, Q27_BATCH=0, reserve 3 GB) with its normal xhigh
+effort. The 12 SWE-bench instances were then run through the harness at
+Claude Code's default effort ('high' -> q27 renders xhigh) against
+production, first on DFlash2, then on the ladder, then DFlash2 restored.
+Aggregates from the [req] journal (file-based; run.sh's own decode line
+read 0 because the labels prodd2/prodlad do not start with q27 -- set
+SWEBENCH_TELEMETRY=q27 for non-q27* labels):
+
+                          DFlash2 (Q8)      ladder+suffix
+    requests / dec tok    299 / 329,672     271 / 212,254
+    decode t/s agg / med  201.0 / 218.3     164.2 / 177.2      (+22% / +23%)
+    tok/round             3.74              3.13
+    round wall            18.6 ms           19.1 ms            (vox running)
+    long thinking turns   3.78 tok/rnd, 203 t/s (80% of tokens)   3.12, 165 (70%)
+    short tool-call turns 4.36, 231                             3.78, 191
+    prefix reuse          93.3%             92.4%
+    quality (one pass)    9/12 nonempty, 8/12 gold   11/12, 10/12
+
+At production's xhigh the DFlash2 lead is +22%, vs +33% at the campaign's
+medium pin: xhigh pushes the traffic to 80% long thinking turns, where the
+drafter's edge is smallest. The rounds differ by 0.5 ms; the entire lead is
+acceptance. Quality columns are single sampled passes on different
+trajectories (the DFlash2 run had one instance hit the 700 s cap after 11
+minutes of thinking); not an engine signal at n=1. Per-lane on this traffic
+(DFlash2): 0.800 0.601 0.446 0.330 0.244 0.183 0.137, conditional flat at
+~0.75 from lane 2 (the ladder's lanes 5-7 fire only in promoted rounds, so
+its per-lane profile is not comparable).
+
+Production stays on DFlash2 (launch recipe: scratch launch_d2.sh prod-d2;
+env Q27_KV=fp8 Q27_PRINT_WSUM=1 Q27_BATCH=0 Q27_DFLASH2=<q8-serve pack>
+Q27_DFLASH2_RESERVE_GB=3 Q27_D2_TIMING=1, same CLI args as before).
+
+## 2026-09-08 (d): agentic campaign rerun on d4947fd -- q27 DFlash2 at parity with ninfer's arm on Claude Code traffic
+
+bench/crossengine/agentic-2026-09-08/ (same harness/legs/controls as the
+09-07 campaign; ninfer legs rerun unchanged in the same session):
+
+    q27 ladder+suffix   162.8 t/s (was 162.1)   3.08 tok/round
+    q27 DFlash2 Q4      215.1     (was 173.3)   3.91   +24%
+    q27 DFlash2 Q8      216.2     (was 176.3)   4.03   +23%
+    ninfer DFlash2      218.5     (was 228.5)   4.10   unchanged binary, -4% drift
+    ninfer MTP3         150.2     (was 148.3)   2.90
+
+q27's DFlash2 arm went from -23% to -1% against ninfer's on real agentic
+traffic (216 vs 219, drift bounded at ~+-4% by the two control legs), and
+is +33% over the production ladder. The night's levers (ring retention,
+drafter attention, side-stream fold, verify launch batch, fused norm, and
+the MMA-path verify) transferred to Claude Code traffic at about the size
+the seeded instrument predicted for the d2 legs. One pass, effort medium,
+quality signals inside n=1 noise (gold hits 7-11/12 across q27 legs).
+
+## 2026-09-08 (c): the d2 verify on the MMA path -- verify 16.8 -> 15.1 ms, +11% t/s, round now under ninfer's
+
+mm5 switches from gemv_q4_n<W> to k_vgemm (vgemm.cuh: the flat-in-width int8
+MMA path, deterministic by construction -- fixed-order intra-CTA and
+cross-CTA K-splits, no atomics) at gemm_min = 9, and build_spec_graphs
+refuses to run if the ladder's widest verify reaches it: that is what makes
+the CLI canonical md5 gate structural. The DFlash2 serving verify is width 8
+-- one below the line -- and ran on the gemv, which vgemm.cuh had already
+measured as REGISTER-bound at width (1230 GB/s at W=5, collapsing above).
+
+d2_setup now sets the d2 view's gemm_min to d2_w (Q27_D2_VGEMM=0 restores
+the gemv). View-local: the ladder, the CLI (--dflash2 included: engine.cu
+captures its own verify at gemm_min 9) and the canonical gates are
+untouched, and greedy CLI --dflash2 == --spec still holds. This IS a
+numerics-family change for the d2 SERVING path (fp32 accumulation order of
+the int8 products differs from the gemv's), deterministic run-to-run, and
+outside the canonical contract by construction; serving greedy was already
+not width-invariant across depth configs.
+
+Paired A/B (worktree incumbent at 8e6a465, vox stopped, 12.5K seeded
+think): verify 16.70/16.84 -> 15.12 ms, round 18.92/19.07 -> 17.35 ms, t/s
+198.3/196.8 -> 219.5 (+11%); tok/round 3.648 -> 3.751 (different streams by
+design; lane profile 0.747 0.620 0.503 0.381 0.242 0.156 0.122 vs 0.739
+0.597 0.469 0.356 0.235 0.151 0.115 -- equivalent). ninv_test covers the
+vgemm families' N-invariance (PASS). The d2 round (draft 2.0 + verify 15.1
++ host 0.2 = 17.35) is now below ninfer's 18.0 on this instrument, with
+tok/round 3.75 vs their 3.69: q27 d2 219 t/s vs ninfer d2 203.
+
+The 08-19 gemv verdict ("near floor, register-trapped, NO-GO") was about
+rewriting the gemv kernel under the bitwise contract; the deterministic
+alternative already existed since 07-13 and was only fenced off below width
+9 to protect the canonical gate the d2 path never carried.
+
+## 2026-09-08 (b): fused rmsnorm3 + quantize in the verify forward -- bitwise, -129 nodes, gain inside drift
+
+k_rmsnorm3q runs k_rmsnorm3's body, a block barrier, then k_quantize_x3's
+per-32-group body over the y it just wrote; test_rmsnorm3q compares every
+output buffer (y, nat, eo, scale, isum) against the two-launch sequence:
+bitwise. spec_verify_forward uses it at all 129 norm sites (attention norm,
+post-attention norm, output norm); attn_pre / gdn_pre / ffn_pair take an
+x1q flag (default false) so the conductor's fused driver is untouched.
+
+Paired A/B: streams identical (842 / 3.648 on all three legs), but the wall
+effect is inside the run's drift -- the two incumbent legs read 18.92 and
+19.59 ms and the new binary 19.30 between them (the GPU warms across a
+three-leg run; interleave more legs when the expected effect is < 0.3 ms).
+Kept for the node count (1723 -> ~1300 with batch 1), reported as
+unmeasured. Lesson: for sub-1% levers the three-leg A/B is not enough.
+
+## 2026-09-08 (a): width-8 verify, batch 1 -- three bitwise launch/tiling wins, verify 17.6 -> 16.8 ms
+
+The width-8 verify graph decomposed (serving nsys, 59 rounds): span 17.81 ms
+= kernels 17.06 + inter-node gaps 0.75 over 1723 nodes. k_gemv_q4_n<8>
+11.49 ms (67%, 353 launches, ~1.23 TB/s effective), k_gdn_delta_all 1.17
+(48 x 24 us), fdmma attention 0.71 + combine 0.20, gemv_q8_n<8> 0.70,
+k_nucleus_multi 0.62 (ONE launch: 8 blocks doing the top-p/top-k search
+over 248K logits per lane -- sampled path only), rmsnorm3 0.47 (129),
+gemv_f16_3 0.39 (96), rmsnorm_heads 0.33 (256 per-lane launches),
+quantize_x3 0.30 (257), add3 0.13, the rest < 0.1 each. Tiny kernels plus
+gaps are ~2.9 ms of the graph.
+
+Shipped, all bitwise by construction:
+- k_rmsnorm_heads3: lane-packed twin of k_rmsnorm_heads (block = (head,
+  lane), body verbatim); attn_pre's two per-lane loops become two launches
+  -> 224 fewer nodes per round.
+- k_gemv_f16_3x2: the GDN alpha and beta gate projections (same activation)
+  in one launch via blockIdx.z; 48 fewer nodes.
+- k_gdn_delta_all column-tile split (the k_delta_scan_T pattern): a block
+  owns one head's 32-column slice over all 128 rows, grid 48 -> 192 CTAs,
+  128 threads; per-element expressions and the part[0..3] sum order
+  unchanged. Gates: gdn_fuse_eq BITWISE IDENTICAL at vw 2/3/5/8/12/16 (on a
+  FRESH build -- the first run silently reused a stale binary because nvcc
+  was not on the background shell's PATH: exit 127 + a PASS from this
+  morning's binary; always check the binary's timestamp), ninv_test all
+  families PASS.
+
+Paired A/B (worktree incumbent at 937f5c1, vox stopped, 12.5K seeded think):
+streams IDENTICAL (842 rounds / 3.648 both), verify 17.41/17.80 -> 16.79 ms,
+round 19.63/20.03 -> 19.01 ms, t/s 191.1/187.3 -> 197.3 (+4%). Greedy CLI
+--dflash2 == --spec on code-edit and prose, and faster (190 -> 202 t/s).
+
+Left in the verify (16.8): gemv 11.5 + 0.7, GDN ~0.9, attention 0.9,
+nucleus 0.62 (sampled), rmsnorm3+quantize 0.77 (fusable), gaps ~0.6.
+
+## 2026-09-07 (k): DFlash2 commit-fold on a side stream -- bitwise, -0.3 ms/round
+
+The GDN commit-fold (post_round, ~0.38 ms of k_delta_scan_T + conv-ring
+kernels) ran on stm between the verify's outcome and the next draft graph,
+which never touches the GDN state or the record arena. With Q27_DFLASH2 the
+fold now runs on a non-blocking side stream (d2_fold_stm) and records
+d2_fold_ev; the d2 verify launch, the ladder/sample round entry points and
+generate_prefill wait on the event before reading committed S. The host had
+already synced stm at the outcome read, so every arena write of the verify
+has landed before the fold starts; the next verify is the only reader.
+Q27_D2_FOLD=sync keeps the old ordering.
+
+Paired A/B (worktree incumbent at the attention commit, vox stopped, 12.5K
+seeded think): streams IDENTICAL (842 rounds / 3.648 both), round
+20.30/20.44 -> 20.04 ms, t/s 184.6/183.4 -> 187.1 (+1.7%); Q27_D2_TIMING
+host 0.58 -> 0.18 (the fold left the window), draft 1.92 -> 2.02 (the fold
+now shares SMs with the draft graph). Greedy CLI identity holds.
+
+Drafter attack standing (this session): d2 round 22.4 -> 20.0 ms, seeded
+think 164 -> 187 t/s (+14%). What remains in the drafter is weight traffic
+at the floor: Q8 gemvs 1.3 ms (Q4 pack: -0.4 ms at -5.8% tok/round, still a
+net loss), Q4 head 0.43 (a 131072-row draft head would save ~0.2 at an
+unmeasured acceptance cost), top-16 0.09, tiny kernels ~0.15. The round is
+now verify 17.8 + draft 2.0 + host 0.2 vs ninfer 18.0 total: the verify
+(width 8, their ~16.5) is the remaining engine gap.
+
+## 2026-09-07 (j): DFlash2 drafter attention -> flash-decoding: draft 3.57 -> 1.95 ms, +12% t/s
+
+Serving-side nsys node trace of the d2 unit (Q8 pack, 12.5K think, one warm
+request, per-round over 59 rounds): round 22.44 ms = verify graph 17.81 +
+[ingest + fold + host] 0.67 + draft graph 3.95 (gaps 0.07). Inside the
+draft graph: k_d2_attn 1874 us (5 x 375 us at a ~2.3K-row ring -- the
+bring-up kernel's per-thread key-row walk + single-thread softmax scales
+badly with rows), Q8 backbone gemvs 1304 us (45 x 29 us, near the 2.08 GB
+floor), Q4 head 434 us (near floor), top-16 94, tiny kernels ~170, walk 17.
+The attention was HALF the drafter and ~20x what its arithmetic warrants
+(1.35 GFLOP/round, 80 MB of L2-resident K/V).
+
+Rewrite (k_d2_attn_split + k_d2_attn_combine): grid = 32 key splits x 8 kv
+heads; a block serves all query vectors of its kv head (nrows x 4 GQA
+heads) against its key range in 32-key tiles staged with float4 loads (rows
+padded to 132 floats -> 8 consecutive rows on disjoint bank quads); thread
+(query, key-lane) computes 4 dots per tile from smem, online softmax per
+query (8-lane shuffles), PV with 16 accumulators per thread in registers;
+partials (m, l, acc[128]) merged by the combine kernel. fp32 throughout;
+test_d2_attn vs CPU err 3e-8 (the serial kernel was 2e-7). Window
+restriction kept (last D2_WINDOW rows + noise rows, position mask
+authoritative). Partials buffer 6.4 MB per drafter.
+
+Paired A/B (git worktree of HEAD as incumbent, vox stopped, 12.5K seeded
+think, incumbent reproduces 855 rounds / 3.593 both legs):
+    draft 3.57 -> 1.95 ms   round 22.0 -> 20.4 ms   t/s 164 -> 183.6 (+12%)
+    tok/round 3.593 -> 3.648 (drafter numerics differ slightly; lane profile
+    0.739 0.597 0.469 0.356 0.235 0.151 0.115 vs 0.749 0.593 0.470 0.336
+    0.219 0.139 0.103 -- equivalent). Greedy CLI --dflash2 == --spec on
+    code-edit and prose.
+
+Drafter now 1.95 ms: Q8 gemvs 1.3 (floor for the Q8 pack; Q4 pack would be
+~0.9 at -5.8% tok/round, still a net loss), head 0.43, top-16 0.09, tiny
+kernels ~0.15. d2 round 20.4 vs ninfer 18.0: the rest is verify (17.85 vs
+their ~16.5) and [fold 0.38 + host 0.58 + ingest 0.13] vs their 0.6.
+
+## 2026-09-07 (i): agentic cross-engine campaign -- DFlash2 is now a serving win on q27; ninfer's arm leads on the round wall
+
+bench/crossengine/agentic-2026-09-07/ (README has the table, method,
+confounds). Claude Code 2.1.170 on the 12 pinned SWE-bench instances, five
+legs back to back, vox transcribers stopped, one pass each:
+
+    q27 ladder+suffix (production)  162.1 t/s   3.13 tok/round
+    q27 DFlash2 Q4 serving pack     173.3 (+7%) 3.94
+    q27 DFlash2 Q8 serving pack     176.3 (+9%) 4.03
+    ninfer DFlash2 k=7              228.5       4.28
+    ninfer MTP3 (control)           148.3       2.90
+
+DFlash2 on q27 flipped from -7% (09-06 live-CC trial) to +9% on the same
+harness -- the day's three changes (sampled walk, ring retention, last-token
+row) were exactly the agentic ones. Engine vs engine at equal drafter class
+q27 leads ninfer +9% (ladder vs MTP3); their DFlash2 arm leads ours +30% on
++6% tok/round, so the residual is the round wall (per-lane: lane 1 at parity
+0.83/0.82, lanes 2-7 trail 2-3 points each). Confound in their favour: the
+model thinks 2.5x less per message on ninfer with the same rendered prompt
+(nvfp4/int8 vs q4s/fp8 is the only difference the model sees), so their
+traffic is easier to draft; decode t/s and tok/round are per-engine
+metrics on each engine's own trajectories, wall/turns are not comparable.
+
+Harness fixes on the way (commit 342c379): ninfer telemetry branch in
+run.sh (its --request-log-jsonl), CLAUDE_CODE_EFFORT_LEVEL pinned to medium
+on both engines (Claude Code sends effort 'high', which the Qwen3.8 template
+cannot render, and ninfer 400s on it; q27 ignores the field and renders
+xhigh -- medium is the only effort reachable on both; follow-up: honour
+output_config.effort in q27's /v1/messages), and a one-line LOCAL ninfer
+parser patch: their master rejects a whole tool-call batch as text when any
+name is undeclared, and Claude Code 2.1.170 defers Grep/Glob while its
+prompt still names them, so every ninfer turn ended after one request
+(smoke: 1 request / 6 s / no diff -> 18 requests / gold file edited after
+the patch). Also observed: the q27 suffix drafter fired 0 times in 220
+agentic requests.
+
+## 2026-09-07 (h): DFlash2 round premium -- measured, one small lever shipped, one negative
+
+Item 1 of docs/plans/2026-09-08-dflash2-close-the-arm-gap.md, measurement
+first. nsys on the CLI --dflash2 run (eager drafter, so per-kernel times are
+visible; per-round window = verify-tail end -> walk end, 61 rounds, code-edit
+prompt, ring ~1.2K rows): 3.3 ms of which idle launch gaps 0.53 (absent in
+serving: the drafter is graphed), the GDN commit-fold 0.42 (post_round's in
+serving), ingest ~0.08, and the drafter proper: 47 Q4 gemvs at width 8
+0.89 ms (1.2 GB read at ~75% of peak -- near floor), head gemv 0.78 (Q8 head
+in the CLI; serving's Q4 head ~0.4), k_d2_attn 0.24 (5 x 48 us),
+top-16 0.17 (65 + 106 us), ~110 tiny kernels ~0.2, walk 0.014. Serving
+Q27_D2_TIMING agrees: draft ~2.5 ms at 12.5K (3.7 with both vox
+transcribers running -- host jitter; stop them for any drafter timing).
+
+The addressable part is ~1 ms (attention, top-16, tiny-kernel chatter, small
+low-occupancy gemvs); the gemv floor (1.2 GB backbone + 0.64 GB head) is
+~1 ms and needs an fp4/fp8 repack or ninfer's 131072-row draft head to move.
+
+SHIPPED (bitwise-neutral -- the drafter's arithmetic is unchanged, so the
+serving A/B reproduces the incumbent's streams exactly: 855 rounds / 3.593
+tok/round both binaries; greedy CLI identity on code-edit + prose):
+- top-16: two in-smem bitonic sorts (256 blocks x 1024-tile per row, then
+  one 4096-candidate block) with (value, id) keys -> exact (value desc, id
+  asc); 171 -> 91 us/round. test_d2_top16 vs a CPU partial_sort with ties
+  across slice boundaries.
+- attention: the score loop skips ring rows older than D2_WINDOW (up to half
+  the ring between slides); exact zeros dropped from serial fp32 sums.
+  test_d2_attn vs a CPU reference over a 3000-row ring.
+- Incumbent-vs-new A/B, vox stopped, 12.5K seeded think: draft 3.74/3.75 ->
+  3.55 ms, round 22.09/22.17 -> 21.89 ms, t/s 163.8/163.2 -> 165.3 (+1%).
+
+NEGATIVE: an smem-tiled attention (32-row tiles staged with float4 loads,
+warp-per-key dot products, block-parallel softmax) measured SLOWER in
+serving -- draft 4.64 vs 3.76 ms/round -- and a parallel-softmax-only
+version was flat (43 vs 46 us/launch): this kernel's cost is the per-thread
+key-row walk (L1-friendly, no barriers), and 32-row tiles do too little work
+per barrier at 256 blocks x 128 threads. A real win needs a flash-decoding
+split (key ranges per block + combine) or K/V shared across the 4 GQA heads
+per block; ~0.2-0.4 ms/round on the table, not taken tonight. Lesson (again):
+the profile said 43 of 48 us was NOT the softmax; believe the profile.
+
+Instrument: bench the incumbent in the SAME session (git worktree of the
+previous commit, same unit recipe) -- the drafter's timing varies 2.5-3.8 ms
+across sessions with host load, so only a paired A/B on a quiet box means
+anything; the incumbent reproduced 3.74/3.75 and NEW 3.55 in interleaved legs.
+
+## 2026-09-07 (g): DFlash2 ring retention across turns + the missing last-token row
+
+The (f) probe exposed warm-turn ring starvation: generate_prefill reset the
+drafter ring on EVERY turn and prefill re-seeded only the uncached tail
+[base, NP), so a prefix-cache warm turn (pf = a few tokens) ran the drafter
+with 1-5 context rows -- tok/round 3.28 cold -> 3.16 -> 3.05 on identical
+requests. Agentic traffic is almost all warm turns.
+
+Shipped: d2_prefill_align(prompt, base), called once the hit is known (both
+prefill branches). It keeps ring rows for positions below
+min(LCP(d2_seq, prompt), base): d2_seq is the host token sequence the ring's
+rows were built from (appended per accepted lane in dflash2_round, truncated
+with the post_round rollback), so validity is decided by tokens, not lineage
+-- a RAM/disk restore over a ring built from another conversation gets
+LCP ~ 0 and resets; the cap at base keeps re-seeded positions from appearing
+twice. Dflash2 tracks ctx_end + ctx_contig; rollback_to(pos) resets on any
+non-contiguous coverage. Q27_D2_RING=reset restores the old behaviour.
+
+The contiguity check immediately found a PRE-EXISTING hole (Q27_D2_DEBUG=1:
+"ring ingest NOT contiguous: pos 3079..3081 after ctx_end 3078"): the last
+prompt token NP-1 goes through step_with (graph_exec) which captures no taps,
+so it was never in the ring -- since the prefill tap capture landed
+(e9a8f43) every turn's drafter lacked its most recent context row, and it
+silently defeated retention (every turn looked non-contiguous). Fixed: with
+d2_on the tail step runs token_launches(d2_vtaps) eagerly (graph_exec IS a
+capture of token_launches, so same target numerics plus the tap copies) and
+ingests that one row.
+
+Measured (bench/ladder/drive_warm_turn.py, keep vs Q27_D2_RING=reset, same
+binary, think-on sampled):
+  (A) identical request x3: keep 3.82 / 3.82 / 3.82 tok/round -- 67 rounds
+      each, IDENTICAL streams (warm == cold now); reset 3.56 / 3.12 / 3.12.
+  (B) two-turn conversation, turn 2 (hit=3074, pf=41): keep 5.69 and 4.92
+      tok/round (260 / 225 t/s) vs reset 4.57 and 3.88 (226 / 192 t/s).
+  Standard 12.5K seeded think leg (all cold; only the last-token row differs
+  from (f)): tok/round 3.383 -> 3.593 (+6.2%), t/s 153.3 -> 162.9, round
+  22.2 ms unchanged; lanes 0.749 0.593 0.470 0.336 0.219 0.139 0.103 (ninfer
+  0.754 0.609 0.444 0.347 0.243 0.160 0.129) -- the drafter's most recent
+  context row was worth 6% even on cold single-turn. Q4 pack now sits at
+  -2.6% tok/round vs ninfer's arm (3.593 vs 3.69).
+
+gpt-6-astra review (docs/reviews/2026-09-07-gpt6astra-d2-ring-retention.md):
+bookkeeping sound for solo serving; three P2s fixed before commit, two of
+them pre-existing -- (1) the slide's compaction copy could OVERLAP (keep =
+D2_WINDOW with ctx_n 4095: rows [2047,4095) onto [0,2048), undefined for
+cudaMemcpyAsync): keep is now D2_WINDOW - T rows (everything older cannot
+fall inside the window once the chunk lands; with ctx_cap = 2*D2_WINDOW the
+copied tail always starts past its destination, asserted); (2) fused batch
+rounds commit without the drafter's mirrors, so Q27_DFLASH2 now refuses to
+boot unless Q27_BATCH=0 (the only mode it was wired for); (3) a disconnected
+seed window (base < NP - 2048) latched ctx_contig off for good -> ingest now
+drops the retained rows on a disconnected chunk (all > D2_WINDOW behind any
+future query: lossless) and the ring stays contiguous by construction.
+
+Instrument note: readiness waits must key on the unit's InvocationID; a
+`--since` window matches the PREVIOUS unit's "serving ON" line and the probe
+then runs against a server that is not up yet (connection refused).
+
+## 2026-09-07 (f): DFlash2 sampled selector walk + sparse-q rejection -- the sampled acceptance gap was the proposal law
+
+Where 09-07 left it (docs/plans/2026-09-08-dflash2-close-the-arm-gap.md):
+q27's engine beats ninfer at equal acceptance, and their whole lead is the
+DFlash2 arm -- 3.65 tok/round vs our dflash2-sampled 3.08 on the seeded think
+instrument, same drafter class. Item 2 (acceptance delta) closed cheap-first:
+
+- Provenance: ninfer's pack is a straight conversion of the same z-lab
+  checkpoint (pinned revision, W8G32 matrices, BF16 elsewhere). Not a retrain.
+- Per-lane localization: dflash2_round now feeds the [req] gnh/glf/gla
+  counters (it never did -- gnh was all zero in every d2 journal), so the d2
+  profile reads off the journal like the ladder's. Against ninfer's
+  accepted_per_position (rebench-2026-09-07 logs): lanes 3..7 conditional
+  IDENTICAL, lane 1 0.645 vs 0.754. Greedy no-think acceptance was already
+  identical (4.86 vs 4.87), so the deficit was the SAMPLED proposal law:
+  k_d2_walk was greedy in sampled rounds (one-hot q, accept prob p(argmax E))
+  while ninfer draws the path from softmax(E/T) over the 16 candidates and
+  rejects against that sparse q (expected accept sum_v min(p,q) = 1 - TV).
+
+Shipped (design + implementation reviewed by gpt-6-astra, docs/reviews/
+2026-09-07-gpt6astra-d2-sampled-walk-*.md): k_d2_walk sampled branch (softmax
+over the 16 scores at the request temperature, one Philox uniform keyed on
+(seed, mask-row position, KIND_D2_PROPOSAL=4), inverse-CDF, q row retained in
+d_qrow; fp32-cdf fallback to the last q>0 slot); a second captured draft graph
+for the sampled walk; k_d2_spec_accept (accept iff p>0 && (p>=q || u*q<p),
+cap branch preserved) + k_d2_sample_stop (Gumbel-max over max(p-q,0), q
+subtracted ONLY on an actual rejection; non-candidate keys bit-identical to
+k_sample_stop so bonus/cap draws are unchanged) + k_d2_stop_fallback (gated on
+an empty residual: sample_stop's exclude-d draw); spec_verify_tail_sampled_d2
+captured as the d2 sampled twin; Q27_D2_WALK=greedy restores the old walk AND
+the old one-hot tail (A/B). philox_uniform moved to blocks.cuh. Two
+pre-existing bugs fixed on the way: d_ctx_n was never initialised before
+capture_draft's warm run (k_d2_attn read garbage), and the ladder's sampled
+warm never exercised d2-only kernels.
+
+Gates: test_kernels --sampling-only test_d2_walk_reject (integrated DEVICE
+walk + DEVICE tail on synthetic candidates with zeroed codebooks: committed
+token ~ served p by chi-square regardless of q; lane-0 accept == sum min(p,q);
+one-hot q reproduces spec_accept/sample_stop bit-for-bit; cap = plain draw;
+empty residual -> fallback == sample_stop) ALL PASS; make test-tools pass;
+greedy CLI --dflash2 byte-identical to --spec (greedy walk untouched).
+
+Measured (seeded think driver, 6 seeds x {12.5K, 50K}, quiet box):
+
+    q27 d2 sampled-walk 12.5K  P>=j 0.751 0.575 0.424 0.278 0.184 0.109 0.076
+    (was greedy walk)          was  0.645 0.486 0.354 0.249 0.170 0.105 0.077
+    ninfer                          0.754 0.609 0.444 0.347 0.243 0.160 0.129
+    tok/round 12.5K 3.075 -> 3.383 (ninfer 3.69); 50K 3.036 -> 3.234 (3.59)
+    t/s       12.5K 138.9 -> 153.3 (+10%);        50K 132.0 -> 141.7 (+7%)
+    round wall unchanged: 22.2 / 23.3 ms (the walk is free)
+
+Lane 1 at parity. Q8 serving pack A/B (tools/dflash2_pack.py --q8, no head/
+embed, 2.08 GB, Q27_DFLASH2_RESERVE_GB=3): tok/round +5.7/+5.9% (3.576 /
+3.425; lanes 3-5 reach ninfer's) but the drafter reads 2x bytes -> round
++0.6 ms -> net t/s +2.4% (156.9 / 144.5). Q8 is the better serving pack; the
++4.8 ms d2 round premium (item 1) is now the dominant lever. Instrument traps:
+the [req] counters are cumulative per engine -- diff within ONE unit
+invocation (journalctl _SYSTEMD_INVOCATION_ID=...), never across a restart;
+and nvcc builds on the box add ~2 ms/round of host jitter to a serving bench.
+
+NEW LEVER (queued): warm-turn ring starvation -- the ring cold-resets every
+turn and prefill re-seeds only the uncached tail, so prefix-cache warm turns
+start the drafter with 1-5 rows: tok/round 3.28 (cold) -> 3.16 (pf=5) -> 3.05
+(pf=1) on identical seeded requests. Agentic traffic is all warm turns.
+
+## 2026-09-06 (e): DFlash2 Phase 6 -- server wiring + the live-CC verdict (NOT a serving win yet)
+
+Wired dflash2 into serving (Q27_DFLASH2=<pack>, single-slot/Q27_BATCH=0):
+per-engine Dflash2 with a sliding ring, dflash2_round in decode_step, verify
+graph captured in d2_setup, drafter reuses the engine's Q8 head AND Q8 embed
+(serving pack drops fp16 head+embed -> 1.2 GB; KV pool reserves ~2 GB up front
+via Q27_DFLASH2_RESERVE_GB or d2_setup OOMs -- the pool otherwise eats all free
+VRAM). Ring cold-resets per turn (warm turns restore target state, NOT the
+drafter's prefix taps).
+
+Works + correct: real Claude Code (SWE-bench flask+requests) ran to completion,
+edited the right files, hit prefix-cache warm turns. But LOSES on live agentic
+traffic (same 2 instances, single-slot, only the drafter differs): dflash2 164.6
+t/s agg / 3.17 tok/round vs ladder+suffix 177.5 / 3.43 -- -7.2%. Single-turn CLI
+wins DON'T transfer: agentic CC is many short turns, the ring cold-starts each
+turn and the drafter has no prefix context, while the MTP head always drafts
+from the target's hidden state (context via KV). The CLI benches had one
+prefill + one long decode -> ring warmed once. (Suffix accepted 0 tok here; the
+incumbent is pure MTP.)
+
+Gated on: (1) prefill tap capture (last ~2048 prompt taps into the ring during
+prefill_chunk -- the whole -7% is cold-start), (2) composition with the ladder
+for cold rounds. Until (1), dflash2 is a CLI/warm-context win, NOT a serving
+default. Honest state -- exactly what the live-CC trial is for.

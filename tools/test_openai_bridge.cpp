@@ -486,7 +486,12 @@ static void test_anthropic_tool_choice_shapes() {
     CHECK(!q27::tool_choice_allows_call(none,declared,"get_weather",0));
     CHECK(q27::tool_choice_allows_call(automatic,declared,"get_weather",0));
     CHECK(!q27::tool_choice_allows_call(automatic,declared,"get_time",1));
-    CHECK(!q27::tool_choice_allows_call(automatic,declared,"undeclared",0));
+    // an undeclared name is eligible only under an unrestricted auto choice
+    // and only with the pass-through on (2026-09-08); never under a named one
+    CHECK(q27::tool_choice_allows_call(automatic,declared,"undeclared",0) ==
+          q27::undeclared_passthrough());
+    CHECK(!q27::tool_choice_allows_call(named,declared,"undeclared",0));
+    CHECK(!q27::tool_choice_allows_call(automatic,declared,"not a name",0));
     bool missing_threw=false;
     try {
         auto missing=q27::parse_anthropic_tool_choice(
@@ -1636,7 +1641,10 @@ static void test_bare_tool_stream_holdback_bounds() {
     CHECK(q27::plausible_bare_tool_prefix("{  \n\"na"));
     CHECK(q27::plausible_bare_tool_prefix("{\"arguments\":{"));
     CHECK(q27::plausible_bare_tool_prefix("{\"tool_name\":\"read\"}"));
-    CHECK(!q27::plausible_bare_tool_prefix("{\"title\":\"ordinary\"}"));
+    // Round 6 (mode 23) inverted this: an ordinary-keyed object IS plausible
+    // now -- it is held, classified, and re-emitted untouched when it is not
+    // a call (see test_stream_router_bare_object_without_closers_stays_text).
+    CHECK(q27::plausible_bare_tool_prefix("{\"title\":\"ordinary\"}"));
     CHECK(!q27::plausible_bare_tool_prefix("{code block"));
     const std::string complete="{\"name\":\"read\",\"arguments\":{\"text\":\"} kept\"}} tail";
     CHECK(q27::balanced_json_object_prefix_end(complete)==complete.size()-5);
@@ -3101,6 +3109,49 @@ static json mode21_stream_tools() {
       {"type":"function","function":{"name":"read","parameters":{"type":"object",
         "properties":{"path":{"type":"string"}},"required":["path"]}}}])");
 }
+// issue #38 round 6 (2026-09-01, cosmicnag): the ARGUMENTS object emitted
+// bare -- {"command": "..."} with no name, no wrapper, no opener -- closed by
+// XML dialect closers, with mode-11-class escaping damage inside the value
+// (mixed \\" and raw ", literal newlines). The XML closers are the intent
+// evidence; the repair is the mode-11 terminator scan tried per declared
+// tool, firing only on a unique fit (mode 23).
+static void test_stream_router_args_only_object_with_closers() {
+    const json tools = mode21_stream_tools();
+    // representative reduction of the report's bytes: escaped \\n, then a RAW
+    // unescaped quote + literal newline mid-value, then escaped \\" later,
+    // terminated "} + closers.
+    const std::string gen =
+        "This is the deciding evidence.\n Let me look.\n\n "
+        "{\"command\":\"D=/tmp/x\\necho \"===\n inner raw quote region\\ngrep -i \\\"pat\\\" f | head -c 600\"}\n\n"
+        " </parameter>\n </function>";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.size() == 1);
+        if (!r.calls.empty()) {
+            CHECK(r.calls[0].name == "Bash");
+            const std::string cmd = r.calls[0].arguments.value("command", std::string());
+            CHECK(cmd.find("echo \"===") != std::string::npos);      // raw quote survived
+            CHECK(cmd.find("head -c 600") != std::string::npos);      // tail survived
+        }
+        CHECK(r.text.find("{\"command\"") == std::string::npos);      // no leak
+        CHECK(r.text.find("deciding evidence.") != std::string::npos); // prose kept
+    }
+}
+
+// The evidence gate both ways: a bare JSON object in prose WITHOUT closers is
+// an ordinary object and must come back out as text; with closers but an
+// AMBIGUOUS registry fit, refuse rather than guess.
+static void test_stream_router_bare_object_without_closers_stays_text() {
+    const json tools = mode21_stream_tools();
+    const std::string gen = "the config is {\"command\":\"ls -la\"} as requested, done.";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.empty());
+        CHECK(r.text.find("{\"command\":\"ls -la\"}") != std::string::npos);
+        CHECK(r.text.find("done.") != std::string::npos);
+    }
+}
+
 static void test_stream_router_openerless_html_attr_params() {
     const json tools = mode21_stream_tools();
     const std::string gen =
@@ -3162,17 +3213,19 @@ static void test_stream_router_arms_on_every_opener_spelling() {
             CHECK(q27::strip_ws2(r.text).empty());
         }
     }
-    // The pylint-6903 shape opens with `<tool_use>`, which is a markdown HTML
-    // block, so the display-context rule (a fenced or HTML example must not
-    // fire) correctly refuses to arm mid-block: it streams as text. That is
-    // not a silent drop -- the router records it to the corpus at finish
-    // (test_drift_hook), and the OFFLINE chain, which has no display gate on
-    // the native scan, recovers it (test_tool_drift). Pinned here so a future
-    // change to displayed_html is a deliberate one.
+    // The pylint-6903 shape opens with `<tool_use>`. Until 2026-09-08 the
+    // holdback did not arm on the wrapper tag (only the OFFLINE chain
+    // recovered it, and this test pinned the stream leaving it as text).
+    // The wrapper family (`<tool_use>`, `<tool_calls>`, `<function_calls>`,
+    // `<invoke>`) is now in the native opener table, because two production
+    // first turns died on `<function_calls>\n<invoke>\n<parameter=...` with a
+    // silent journal: the stream recovers this shape too. Pinned the other
+    // way round, deliberately.
     const std::string html_block =
         "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>read\n</parameter>\n<parameter=path>\n/w/x.py\n";
     auto h = stream_turn(html_block, false, 7);
-    CHECK(h.calls.empty());
+    CHECK(h.calls.size() == 1);
+    if (!h.calls.empty()) CHECK(h.calls[0].name == "read");
     // the safety cases: a fenced example and <name> as prose stay text
     const std::string fenced =
         "example:\n```\n<name>read\n</parameter>\n<parameter=path>\n/w\n</parameter>\n</function>\n```\ndone";
@@ -3259,6 +3312,8 @@ int main() {
     test_stream_router_bare_mode22_in_reasoning();
     test_stream_router_bare_mode22_standalone_zero_arg();
     test_stream_router_parameter_tag_that_is_not_a_call();
+    test_stream_router_args_only_object_with_closers();
+    test_stream_router_bare_object_without_closers_stays_text();
     test_stream_router_openerless_html_attr_params();
     test_stream_router_quoted_parameter_pair_stays_text();
     test_dialect_residue_is_not_text();

@@ -10,7 +10,8 @@
 
 namespace q27k {
 
-struct IP3 { const int* p[16]; }; // width-12: 12 live lanes max, 16 slots (see P3/CP3)
+// IP3 (the const-int lane pack) moved to kernels.cuh next to P3/CP3 -- the
+// sampled tail in blocks.cuh takes it too.
 // Writable-int lane bundle (positions, verdict slots): prep/finish hit the
 // 17/25-param wall at width 8, so wide-verify pointer args ride these
 // by-value structs instead of growing the signatures (width-12 P0).
@@ -22,6 +23,9 @@ void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0, in
 // f16 GEMV, one weight, ntok activation columns.
 void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaStream_t st = 0,
                 int ntok = 3);
+// Two weights sharing x, one launch (blockIdx.z picks): bitwise per output vs two calls.
+void gemv_f16_3x2(const __half* Wa, const __half* Wb, CP3 x, P3 ya, P3 yb, int64_t rows,
+                  int64_t cols, cudaStream_t st = 0, int ntok = 1);
 
 // gdn gate math for ntok tokens.
 void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int n,

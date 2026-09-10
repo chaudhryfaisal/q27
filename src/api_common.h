@@ -2189,6 +2189,9 @@ inline std::vector<Msg> openai_msgs(const json& body) {
 // tool_choice (OpenAI shape): "auto"/absent -> AUTO; "none" -> NONE;
 // "required", a named function, or allowed_tools mode:"required" -> FORCED.
 // allowed_tools mode:"auto" keeps AUTO while narrowing the eligible registry.
+inline bool undeclared_passthrough();                      // defined with tool_strict()
+inline bool plausible_tool_identifier(const std::string& nm);
+
 struct ToolChoice {
     enum Mode { AUTO, NONE, FORCED } mode = AUTO;
     std::string forced_name; // non-empty only for a named function choice
@@ -2234,7 +2237,14 @@ inline void apply_openai_parallel_tool_calls(const json& body,ToolChoice& choice
 template<class NameSet>
 inline bool tool_choice_allows_call(const ToolChoice& choice,const NameSet& allowed,
                                     const std::string& name,size_t accepted_calls) {
-    return choice.mode != ToolChoice::NONE && allowed.count(name) &&
+    // An undeclared name reaches here only from the pass-through (the parser
+    // refuses everything else); it is eligible under an unrestricted "auto"
+    // choice, never under a named/forced/restricted one.
+    const bool known = allowed.count(name) > 0;
+    const bool pass = !known && choice.mode == ToolChoice::AUTO &&
+                      choice.forced_name.empty() && choice.allowed_names.empty() &&
+                      undeclared_passthrough() && plausible_tool_identifier(name);
+    return choice.mode != ToolChoice::NONE && (known || pass) &&
         (choice.forced_name.empty() || name == choice.forced_name) &&
         (!choice.disable_parallel_tool_use || accepted_calls == 0);
 }
@@ -2767,6 +2777,58 @@ inline bool tool_strict() {
     return v == 1;
 }
 
+// UNDECLARED TOOL NAMES (2026-09-08, item 2 of the (p) agenda). Claude Code
+// 4.8 declares no Grep/Glob tool, but the model was trained on transcripts
+// full of them and still emits `<function=Grep>` -- as its FIRST call on 3 of
+// 12 SWE-bench instances in every DFlash2 production arm. Refusing the name
+// put the whole call in the text channel; the client saw a final turn with no
+// tool_use and ended the session with the work unstarted. The ninfer arm on
+// the same instances passed the call through, Claude Code answered
+// `<tool_use_error>Error: No such tool available: Grep</tool_use_error>` and
+// the model switched to Bash grep on the next turn: 12/12 non-empty diffs
+// against q27's 9/12. So a well-formed call whose name the client did not
+// declare is EMITTED with that name and the client decides -- the model wrote
+// the name; nothing is inferred. Q27_TOOL_UNDECLARED=refuse restores the old
+// behaviour; strict mode implies refuse. Name inference (modes 20/21) is
+// unchanged: a name that is absent is still never invented.
+inline bool undeclared_passthrough() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("Q27_TOOL_UNDECLARED");
+        v = (e && strcmp(e, "refuse") == 0) ? 0 : 1;
+    }
+    return v == 1 && !tool_strict();
+}
+// A name the pass-through will carry: an identifier, not prose that landed in
+// an opener. Dots and dashes are allowed (MCP-style `server.tool` names).
+inline bool plausible_tool_identifier(const std::string& nm) {
+    if (nm.empty() || nm.size() > 64) return false;
+    if (!(isalpha((unsigned char)nm[0]) || nm[0] == '_')) return false;
+    for (unsigned char c : nm)
+        if (!(isalnum(c) || c == '_' || c == '.' || c == '-')) return false;
+    // the placeholders a drifted opener carries where the name belongs
+    // (`<function=name>` with the real name on the next line): never a tool
+    for (const char* ph : {"name", "tool_name", "function", "tool", "q27_unnamed"})
+        if (nm == ph) return false;
+    return true;
+}
+// The mode-22 opener with the tool name behind a `function=`/`name=`/`tool=`
+// prefix: `<parameter=function=Bash>` (2026-09-08, prodlad xarray-4094, a
+// first turn that ended the session). Strip the prefix and any quotes so the
+// declared check sees the name the model wrote; any other key is returned
+// unchanged, so an ordinary parameter is never mistaken for an opener.
+inline std::string mode22_opener_name(std::string key) {
+    for (const char* pre : {"function name=", "function=", "name=", "tool="}) {
+        const size_t n = strlen(pre);
+        if (key.size() > n && key.compare(0, n, pre) == 0) { key.erase(0, n); break; }
+    }
+    while (!key.empty() && isspace((unsigned char)key.front())) key.erase(0, 1);
+    while (!key.empty() && isspace((unsigned char)key.back())) key.pop_back();
+    if (key.size() >= 2 && (key.front() == '"' || key.front() == '\'') && key.back() == key.front())
+        key = key.substr(1, key.size() - 2);
+    return key;
+}
+
 // NATIVE XML TOOL DIALECT (2026-08-14). Qwen3.8's chat template trains
 //   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>...\n</function>\n</tool_call>
 // while tools_preamble historically instructed JSON-in-<tool_call>. The 3.8
@@ -2845,7 +2907,14 @@ inline bool parse_parameter_opener(const std::string& seg, size_t b, std::string
 // table's users at bare_native_opener_position (the streaming holdback) and
 // the batch scanner in parse_bare_tool_calls_impl. One table, three readers.
 inline size_t bare_native_opener_len_at(const std::string& text,size_t i) {
-    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    // The last four are the Anthropic-XML wrapper family the model emits
+    // around an UNNAMED call (`<function_calls>\n<invoke>\n<parameter=...`,
+    // 2026-09-08: two first turns in the production arms). They arm the
+    // holdback and are skipped by parse_native_xml_call; the batch scanner
+    // claims a span at them only when a declared name follows, which for a
+    // bare wrapper it never does, so the call reaches mode 21 whole.
+    static const char* const k[]={"<function=","<name>","<parameter_name>",
+                                  "<function_calls>","<invoke>","<tool_use>","<tool_calls>"};
     for(const char* o:k) {
         const size_t n=std::char_traits<char>::length(o);
         if(text.compare(i,n,o)==0) return n;
@@ -2862,7 +2931,7 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
     // first one empty. Skip them; the opener that carries a name decides.
     for (;;) {
         bool skipped = false;
-        for (const char* junk : {"<tool_use>", "<tool>", "<tool_calls>"}) {
+        for (const char* junk : {"<tool_use>", "<tool>", "<tool_calls>", "<function_calls>", "<invoke>"}) {
             const size_t n = strlen(junk);
             if (seg.compare(b, n, junk) == 0) {
                 b = seg.find_first_not_of(" \t\r\n", b + n);
@@ -3273,6 +3342,23 @@ inline bool plausible_bare_tool_prefix_range(
         const size_t compared=std::min(available,key_size);
         if(text.compare(p,compared,key,compared)==0) return true;
     }
+    // Args-only object (issue #38 round 6): the model emits the ARGUMENTS
+    // object bare -- {"command": ...} -- with no name key at all. Any quoted
+    // identifier first key is plausible; classification decides whether a
+    // call comes out (an ordinary JSON object is re-emitted untouched), so
+    // the cost of holding is latency, not bytes.
+    if(text[p]=='"') {
+        size_t q=p+1;
+        if(q==end) return true;
+        if(!(isalpha((unsigned char)text[q]) || text[q]=='_')) return false;
+        while(q<end && (isalnum((unsigned char)text[q]) || text[q]=='_' ||
+                        text[q]=='-')) q++;
+        if(q==end) return true;
+        if(text[q]!='"') return false;
+        q++;
+        while(q<end && (text[q]==' '||text[q]=='\t')) q++;
+        return q==end || text[q]==':';
+    }
     return false;
 }
 
@@ -3384,7 +3470,8 @@ inline size_t bare_native_opener_position(const std::string& text,
 inline size_t bare_native_opener_probe_start(
     const std::string& text,JsonStringLexState string_state={},
     MarkdownFenceLexState fence_state={}) {
-    static const char* const k[]={"<function=","<name>","<parameter_name>"};
+    static const char* const k[]={"<function=","<name>","<parameter_name>",
+                                  "<function_calls>","<invoke>","<tool_use>","<tool_calls>"};
     size_t best=std::string::npos;
     for(const char* o:k) {
         const size_t n=std::char_traits<char>::length(o);
@@ -3421,7 +3508,7 @@ inline size_t bare_mode22_opener_position(const std::string& text,const NameSet&
            text.compare(i,11,"<parameter_")!=0) {
             std::string key; size_t after=0;
             if(parse_parameter_opener(text,i,key,after)) {
-                if(names.find(key)!=names.end()) {
+                if(names.find(mode22_opener_name(key))!=names.end()) {
                     // parameter-as-opener (mode 22): NAME is a declared tool.
                     const size_t nb=text.find_first_not_of(" \t\r\n",after);
                     const bool param_next=nb!=std::string::npos && text.compare(nb,10,"<parameter")==0;
@@ -3477,7 +3564,7 @@ inline size_t bare_mode22_opener_probe_start(
         std::string key; size_t after=0;
         if(!parse_parameter_opener(text,p,key,after)) {
             hold=(hold==std::string::npos?p:std::min(hold,p));   // tag not closed
-        } else if(names.find(key)!=names.end()) {
+        } else if(names.find(mode22_opener_name(key))!=names.end()) {
             const size_t nb=text.find_first_not_of(" \t\r\n",after);
             bool decided=false;
             if(nb!=std::string::npos && text[nb]!='<') decided=true;  // a value -> ordinary param
@@ -3523,23 +3610,46 @@ struct IncrementalBareNativeEnd {
                text.find("<parameter=")==std::string::npos;
     }
     size_t advance(const std::string& text,bool final) {
-        static const std::string FC="</function>",TC="</tool_call>";
-        for(size_t p=text.find(FC,cursor);p!=std::string::npos;
-            p=text.find(FC,p+1)) {
-            if(!closes_call(text,p)) continue;
-            size_t e=p+FC.size();
+        static const std::string TC="</tool_call>";
+        // `</function>` is the trained closer; the wrapper family's closers
+        // end an unnamed call the same way (2026-09-08), so a candidate that
+        // opened at `<function_calls>`/`<invoke>` does not hold to end of turn.
+        static const char* const kClosers[]={"</function>","</invoke>","</function_calls>","</tool_use>"};
+        size_t p=std::string::npos,plen=0;
+        for(const char* c:kClosers) {
+            const size_t n=std::char_traits<char>::length(c);
+            for(size_t q=text.find(c,cursor);q!=std::string::npos;q=text.find(c,q+1)) {
+                if(!closes_call(text,q)) continue;
+                if(q<p) { p=q; plen=n; }
+                break;
+            }
+        }
+        if(p!=std::string::npos) {
+            size_t e=p+plen;
             size_t q=e;
             while(q<text.size() && (text[q]==' ' || text[q]=='\t' ||
                                     text[q]=='\r' || text[q]=='\n')) q++;
             const size_t avail=text.size()-q;
-            if(avail>=TC.size()) {
-                if(text.compare(q,TC.size(),TC)==0) e=q+TC.size();
-            } else if(!final && text.compare(q,avail,TC,0,avail)==0) {
-                return std::string::npos;
+            // One trailing wrapper closer belongs to the call (`</tool_call>`
+            // always did; the wrapper family's closers since issue #41, where
+            // a `</tool_calls>` split across chunks leaked as text). Take the
+            // longest complete one; while the tail could still become one,
+            // wait for more bytes.
+            static const char* const kTrail[]={"</tool_call>","</tool_calls>","</function_calls>","</tool_use>"};
+            size_t taken=0;
+            bool could_grow=false;
+            for(const char* t:kTrail) {
+                const size_t n=std::char_traits<char>::length(t);
+                if(avail>=n) { if(text.compare(q,n,t)==0 && n>taken) taken=n; }
+                else if(avail>0 && text.compare(q,avail,t,0,avail)==0) could_grow=true;
             }
+            if(taken) e=q+taken;
+            else if(!final && (avail==0 || could_grow)) return std::string::npos;
+            (void)TC;
             return e;
         }
-        cursor=text.size()>=FC.size()?text.size()-FC.size()+1:0;
+        // back off by the longest closer so a split one is re-scanned whole
+        cursor=text.size()>=17?text.size()-16:0;
         return std::string::npos;
     }
 };
@@ -3647,6 +3757,15 @@ inline bool bare_candidate_repair_eligible(
     // balanced-object path is deferred only for the exact mode-11 shape;
     // ordinary {"name":...} JSON must continue streaming immediately.
     if(mode10) return true;
+    // Args-only object (round 6): a balanced-but-malformed {"ident": ...}
+    // defers to final tolerant recovery, where the trailing XML closers the
+    // deferral captured decide whether mode 23 fires.
+    if(!text.empty() && text[0]=='{' && text.compare(0,7,"{\"name\"")!=0) {
+        size_t p=1;
+        while(p<text.size() && isspace((unsigned char)text[p])) p++;
+        if(p<text.size() && text[p]=='"' && p+1<text.size() &&
+           (isalpha((unsigned char)text[p+1]) || text[p+1]=='_')) return true;
+    }
     if(text.compare(0,7,"{\"name\"")!=0) return false;
     const size_t colon=text.find(':',7);
     if(colon==std::string::npos) return false;
@@ -3724,7 +3843,8 @@ inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t en
         if (q != std::string::npos && q < s.size() && s[q] == '{') return 13;
     }
     for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
-                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>"}) {
+                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>",
+                           "<function_calls>", "</function_calls>", "<invoke>", "</invoke>"}) {
         const size_t n = strlen(tk);
         if (i + n <= end && s.compare(i, n, tk) == 0) return n;
         size_t l = 0;
@@ -3746,10 +3866,14 @@ inline DialectResidueSuffix dialect_residue_suffix(const std::string& s,
         if (isspace((unsigned char)s[i])) { i++; continue; }
         const size_t n = dialect_residue_token_at(s, i, s.size(), params_are_residue);
         if (!n) { i++; r.start = i; r.complete = false; r.partial = false; continue; }
-        // a truncated token only counts at the very end
-        const bool whole = i + n < s.size() || s.compare(i, n, "</function>") == 0 ||
-                           s.compare(i, n, "</parameter>") == 0 || s.compare(i, n, "</tool_call>") == 0 ||
-                           s.compare(i, n, "<tool_call>") == 0;
+        // a truncated token only counts at the very end. A complete closer of
+        // the wrapper family at the end is whole too (issue #41: `</tool_calls>`
+        // after a recovered unnamed <invoke> call was read as "possibly
+        // truncated" and shown as text).
+        bool whole = i + n < s.size();
+        for (const char* full : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
+                                 "</tool_calls>", "</tool_use>", "</function_calls>", "</invoke>", "</tool>"})
+            if (!whole && s.compare(i, n, full) == 0 && n == strlen(full)) whole = true;
         if (whole) r.complete = true; else r.partial = true;
         i += n;
     }
@@ -3993,6 +4117,23 @@ struct BareToolTextHoldback {
         if(!deferred.empty()) {
             pending=std::move(deferred);
             trailing=std::move(deferred_trailing);
+            // Round 6: XML closers that followed a deferred args-only object
+            // are its intent evidence -- move them into the candidate so the
+            // repair-time classify sees them (a bare object with no closers
+            // stays an ordinary object and is re-emitted).
+            size_t adv=0;
+            for(;;) {
+                size_t w=adv;
+                while(w<trailing.size() && isspace((unsigned char)trailing[w])) w++;
+                static const char* const closers[]={"</parameter>","</function>","</tool_call>"};
+                bool moved=false;
+                for(const char* c:closers) {
+                    const size_t n=std::char_traits<char>::length(c);
+                    if(trailing.compare(w,n,c)==0) { adv=w+n; moved=true; break; }
+                }
+                if(!moved) break;
+            }
+            if(adv>0) { pending+=trailing.substr(0,adv); trailing.erase(0,adv); }
             holding=true;
             mode10=deferred_mode10;
             deferred_mode10=false;
@@ -4632,6 +4773,123 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
         }
     }
     return false;
+}
+
+// DRIFT MODE 23 (2026-09-01, issue #38 round 6, cosmicnag): the model emits
+// the ARGUMENTS object bare -- {"command": "..."} with no name, no wrapper,
+// no opener -- then closes with XML dialect closers (</parameter>
+// </function>). The inverse chimera of mode 17, with mode-11-class escaping
+// damage inside the value (mixed \" and raw ", literal newlines). The XML
+// closers are the intent evidence: a bare JSON object in prose does NOT
+// fire (nothing but whitespace/closers may follow the object). The value
+// repair is the mode-11 terminator scan, tried per declared tool (its
+// string params are the scan keys); the call fires only when exactly ONE
+// tool yields a parse whose keys fit it.
+inline bool recover_args_object_call(const std::string& text, const json& tools,
+                                     std::vector<ToolCall>& out) {
+    // The object start: the LAST bare '{' opening a quoted-identifier key.
+    size_t mo=std::string::npos;
+    for(size_t i=text.rfind('{');i!=std::string::npos;
+        i=i?text.rfind('{',i-1):std::string::npos) {
+        size_t p=i+1;
+        while(p<text.size() && isspace((unsigned char)text[p])) p++;
+        if(p<text.size() && text[p]=='"' && p+1<text.size() &&
+           (isalpha((unsigned char)text[p+1])||text[p+1]=='_') &&
+           text.compare(i,7,"{\"name\"")!=0 &&
+           bare_text_position_is_executable(text,i)) { mo=i; break; }
+        if(!i) break;
+    }
+    if(mo==std::string::npos) return false;
+    // Closer evidence: the text after the object's last "} must be only
+    // whitespace and XML closers, with at least one </function> or
+    // </parameter> present.
+    const size_t vend=text.rfind("\"}");
+    if(vend==std::string::npos || vend<mo) return false;
+    size_t q=vend+2; bool saw_closer=false;
+    while(q<text.size()) {
+        if(isspace((unsigned char)text[q])) { q++; continue; }
+        bool moved=false;
+        static const char* const closers[]={"</parameter>","</function>","</tool_call>"};
+        for(const char* c:closers) {
+            const size_t n=std::char_traits<char>::length(c);
+            if(text.compare(q,n,c)==0) { q+=n; moved=true; saw_closer=true; break; }
+        }
+        if(!moved) return false;  // real content after the object: not a call
+    }
+    if(!saw_closer) return false;
+    const std::string obj=text.substr(mo,vend+2-mo);
+    // Per-tool trial of the mode-11 terminator-scan repair.
+    std::string hit_name; json hit_args; int hits=0;
+    for(const auto& t:tools) {
+        if(!t.contains("function")) continue;
+        const json& fn=t["function"];
+        const std::string nm=fn.value("name",std::string());
+        if(nm.empty()) continue;
+        std::vector<std::string> strkeys; json props;
+        if(fn.contains("parameters") && fn["parameters"].is_object() &&
+           fn["parameters"].contains("properties") &&
+           fn["parameters"]["properties"].is_object()) {
+            props=fn["parameters"]["properties"];
+            for(auto it=props.begin();it!=props.end();++it)
+                if(it.value().is_object() &&
+                   it.value().value("type",std::string())=="string")
+                    strkeys.push_back(it.key());
+        }
+        json parsed;
+        bool ok=false;
+        try { parsed=json::parse(obj); ok=parsed.is_object(); } catch(...) {}
+        if(!ok) {
+            for(const auto& k:strkeys) {
+                size_t kp=obj.find("\""+k+"\"");
+                if(kp==std::string::npos) continue;
+                size_t kc=obj.find(':',kp+k.size()+2);
+                if(kc==std::string::npos) continue;
+                size_t opener=obj.find('"',kc+1);
+                if(opener==std::string::npos) continue;
+                for(size_t cand=obj.find('"',opener+1);cand!=std::string::npos;
+                    cand=obj.find('"',cand+1)) {
+                    const std::string body=minimal_escape_body(
+                        obj.substr(opener+1,cand-opener-1));
+                    const std::string recon=first_balanced_object(
+                        obj.substr(0,opener)+"\""+body+"\""+obj.substr(cand+1));
+                    if(recon.empty()) continue;
+                    try {
+                        json o2=json::parse(recon);
+                        if(o2.is_object()) { parsed=std::move(o2); ok=true; }
+                    } catch(...) { continue; }
+                    if(ok) break;
+                }
+                if(ok) break;
+            }
+        }
+        if(!ok || !parsed.is_object() || parsed.empty()) continue;
+        // Fit: every key known to this tool, every required key present.
+        bool fits=true;
+        for(auto it=parsed.begin();it!=parsed.end();++it)
+            if(!props.is_object() || !props.contains(it.key())) { fits=false; break; }
+        if(fits && fn.contains("parameters") &&
+           fn["parameters"].contains("required") &&
+           fn["parameters"]["required"].is_array())
+            for(const auto& r:fn["parameters"]["required"])
+                if(r.is_string() && !parsed.contains(r.get<std::string>())) { fits=false; break; }
+        if(!fits) continue;
+        hits++;
+        if(hits>1) return false;  // ambiguous: refuse rather than guess
+        hit_name=nm; hit_args=std::move(parsed);
+    }
+    if(hits!=1) return false;
+    ToolCall tc;
+    tc.ok=true;
+    tc.name=hit_name;
+    tc.arguments=std::move(hit_args);
+    // Offsets are in the rewritten buffer; the span validator maps them back
+    // to source and fills source_begin/source_end/raw (same as mode 11).
+    tc.rewritten_begin=mo;
+    tc.rewritten_end=q;
+    fprintf(stderr,"[drift] mode 23: args-only object + XML closers -> %s\n",
+            hit_name.c_str());
+    out.push_back(std::move(tc));
+    return true;
 }
 
 inline bool only_dialect_control_bytes(const std::string& s) {
@@ -5332,6 +5590,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         size_t pgt = 0;
                         if (find_parameter_opener(text_in, c, &pn, &pgt) == c) {
                             const size_t nxt = find_parameter_opener(text_in, pgt);
+                            pn = mode22_opener_name(pn);
                             std::string canon = declared(pn) ? pn : canonical_declared_name(tools, pn);
                             const size_t nb = text_in.find_first_not_of(" \t\r\n", pgt);
                             if (!canon.empty() && nxt != std::string::npos && nb == nxt) {
@@ -5485,8 +5744,18 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         const std::string canon = canonical_declared_name(tools, alt);
                         if (!canon.empty()) alt = canon;
                     }
-                    if (alt == tc.name || !declared(alt)) { named_undeclared = true; break; }
-                    tc.name = alt;
+                    if (alt == tc.name || !declared(alt)) {
+                        // The name is present, well-formed and simply not in
+                        // the client's list: pass it through as written and
+                        // let the client answer it (see undeclared_passthrough).
+                        // A name that is not even an identifier, or a call
+                        // with no parameters, still refuses as before.
+                        if (undeclared_passthrough() && plausible_tool_identifier(tc.name) &&
+                            !tc.arguments.empty()) {
+                            fprintf(stderr, "[q27] undeclared tool `%s` passed through -- the client "
+                                            "answers it, the model corrects itself\n", tc.name.c_str());
+                        } else { named_undeclared = true; break; }
+                    } else tc.name = alt;
                 }
                 tc.source_begin = fb;
                 tc.source_end = span_end;
@@ -5658,6 +5927,33 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                                                 : native_function_closer(text_in, ps);
             if (ps != std::string::npos && fe == std::string::npos)
                 fe = text_in.find("</function>", ps);
+            // The wrapper family's closer ends an UNNAMED call the same way
+            // (2026-09-08: `<function_calls>\n<invoke>\n<parameter=file_path>
+            // ...</parameter>\n</invoke>` -- two production first turns died
+            // on it). `clen` is the closer's length; the synthesized span
+            // always ends in the trained `</function>` so the one parser reads it.
+            size_t clen = 11;
+            if (ps != std::string::npos && fe == std::string::npos)
+                for (const char* c : {"</invoke>", "</function_calls>", "</tool_use>", "</tool_call>"}) {
+                    const size_t q = text_in.find(c, ps);
+                    if (q != std::string::npos && (fe == std::string::npos || q < fe)) {
+                        fe = q; clen = strlen(c);
+                    }
+                }
+            // Absorb the wrapper openers ahead of the first parameter into the
+            // call's span, so `<function_calls>\n<invoke>\n` is not shown as text.
+            size_t ps0 = ps;
+            if (ps != std::string::npos)
+                for (;;) {
+                    size_t w = ps0;
+                    while (w > 0 && isspace((unsigned char)text_in[w - 1])) w--;
+                    bool moved = false;
+                    for (const char* o : {"<function_calls>", "<invoke>", "<tool_use>", "<tool_calls>", "<tool>"}) {
+                        const size_t n = strlen(o);
+                        if (w >= n && text_in.compare(w - n, n, o) == 0) { ps0 = w - n; moved = true; break; }
+                    }
+                    if (!moved) break;
+                }
             if (fe != std::string::npos) {
                 // Scoped hallucinated-result guard (2026-08-21). The span is
                 // [ps, fe+11) -- the parameter list itself. A <result>/<output>
@@ -5667,14 +5963,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                 // at this scoped it only at the END, so a closed block earlier
                 // in the tail still killed the call -- the very leak it meant
                 // to fix.)
-                const size_t span_end = fe + 11;
+                const size_t span_end = fe + clen;
                 if (hallucinated_result_around(text_in, ps, span_end)) {
                     fprintf(stderr,
                             "[q27] drift mode 21: hallucinated <result>/<output> "
                             "block in the parameter span, refusing\n");
                 } else {
                 std::string span =
-                    "<function=q27_unnamed>\n" + text_in.substr(ps, fe + 11 - ps);
+                    "<function=q27_unnamed>\n" + text_in.substr(ps, fe - ps) + "</function>";
                 ToolCall tc;
                 if (!named_undeclared && parse_native_xml_call(span, tc) &&
                     !tc.arguments.empty()) {
@@ -5700,9 +5996,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     if (!nm.empty() && declared(nm)) {
                         tc.name = nm;
                         tc.ok = true;
-                        tc.source_begin = ps;
-                        tc.source_end = fe + 11;
-                        if (prefix) *prefix = text_in.substr(0, ps);
+                        tc.source_begin = ps0;
+                        tc.source_end = fe + clen;
+                        if (prefix) *prefix = text_in.substr(0, ps0);
                         if (remaining_text) *remaining_text = "";
                         fprintf(stderr,
                                 "[q27] drift mode 21: openerless parameter list -> %s\n",
@@ -5749,6 +6045,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                 if (ps == std::string::npos) break;
                 const size_t gt = gt1 - 1;   // the '>' itself
                 const size_t nxt = find_parameter_opener(text_in, gt + 1);
+                nm = mode22_opener_name(nm);
                 // `<parameter=task>` against a declared `Task`: same tool, the
                 // model's own casing.
                 if (!declared(nm)) {
@@ -6331,6 +6628,15 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
         if (prefix) *prefix = before;
         if (remaining_text) *remaining_text = before;
     }
+    // mode 23: args-only object + XML closers (round 6). Same last-resort
+    // tier as mode 11; the closer-evidence gate keeps prose JSON as text.
+    if (out.empty() && allow_eof_repair && tools && tools->is_array() &&
+        recover_args_object_call(text, *tools, out)) {
+        drift_mode_hint = "23";
+        const std::string before = strip_ws2(text.substr(0, out.front().source_begin));
+        if (prefix) *prefix = before;
+        if (remaining_text) *remaining_text = before;
+    }
     bool exact_source_spans=true;
     size_t source_cursor=0;
     for(auto& call:out) {
@@ -6678,13 +6984,27 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
     const std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
     const json* tools,bool allow_eof_repair,Eligible eligible) {
     OrderedToolOutput out;
-    auto append_text=[&](const std::string& raw,bool repair_eof) {
+    // `drop_residue`: trailing dialect residue (a stray closer at the end of
+    // the turn, or ahead of a wrapped segment) is garbage rather than text --
+    // but only once the parser has said there is no call in the text. It used
+    // to be stripped BEFORE parsing, which took a bare call's own closers with
+    // it; the trained form survived on the EOF repair, an unnamed
+    // `<invoke>...</invoke>` call did not (issue #41, 2026-09-08).
+    auto append_text=[&](const std::string& raw,bool repair_eof,bool drop_residue=false) {
         if(!tools) { out.append_visible_text(raw); return; }
         if(raw.empty()) return;
         std::string pre,residual;
         auto calls=parse_bare_tool_calls(raw,&pre,tools,true,
                                          repair_eof,&residual);
-        if(calls.empty()) { out.append_visible_text(raw); return; }
+        if(calls.empty()) {
+            std::string shown=raw;
+            if(drop_residue) {
+                const DialectResidueSuffix r=dialect_residue_suffix(shown);
+                if(r.complete) shown.erase(r.start);
+            }
+            out.append_visible_text(shown);
+            return;
+        }
         size_t cursor=0;
         for(auto& call:calls) {
             // defense-in-depth (review 2026-08-20): see recover_unclosed_tool_tail.
@@ -6708,25 +7028,18 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         out.append_visible_text(raw.substr(cursor));
     };
     std::string pending_text;
-    auto flush_pending_text=[&](bool final_segment) {
+    auto flush_pending_text=[&](bool final_segment,bool drop_residue=false) {
         if(pending_text.empty()) return;
-        append_text(pending_text,final_segment && allow_eof_repair);
+        append_text(pending_text,final_segment && allow_eof_repair,drop_residue);
         pending_text.clear();
-    };
-    // trailing dialect residue ahead of a wrapped segment, or at the end of
-    // the turn, is garbage rather than text (see absorb_dialect_residue)
-    auto drop_trailing_residue=[&]() {
-        if(!tools) return;
-        const DialectResidueSuffix r=dialect_residue_suffix(pending_text);
-        if(r.complete) pending_text.erase(r.start);
     };
     for(const auto& segment:segments) {
         if(segment.first==StreamSplitter::TEXT) {
             pending_text+=segment.second;
             continue;
         }
-        if(segment.first==StreamSplitter::TOOL) drop_trailing_residue();
-        flush_pending_text(false);
+        // residue ahead of a wrapped segment is garbage (see append_text)
+        flush_pending_text(false,segment.first==StreamSplitter::TOOL);
         if(segment.first==StreamSplitter::THINK) {
             // Issue #38: a complete tool call can arrive INSIDE reasoning, and
             // reasoning used to pass straight through to out.reasoning, so the
@@ -6788,8 +7101,8 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         }
         append_text(body,false);
     }
-    drop_trailing_residue();
-    flush_pending_text(true);
+    // end of the turn: residue after the last call is garbage (see append_text)
+    flush_pending_text(true,true);
     return out;
 }
 

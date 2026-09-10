@@ -66,11 +66,16 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 // kernel params by value -- slots beyond ntok are never read.
 struct P3 { float* p[16]; };
 struct CP3 { const float* p[16]; };
+struct IP3 { const int* p[16]; }; // int twin (draft-token lanes); lived in spec3.cuh until the sampled tail (blocks.cuh) needed it too
 struct XQ3 { XQuant q[16]; };
 
 void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0, int ntok = 3);
 void add3(P3 x, CP3 y, int n, cudaStream_t st = 0, int ntok = 3);
 void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st = 0, int ntok = 3);
 void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st = 0, int ntok = 3);
+// Fused rmsnorm3 + quantize3 of the result (bitwise those two launches; the
+// verify forward quantizes every normed activation it produces).
+void rmsnorm3q(CP3 x, const float* w, P3 y, const XQ3& xq, int n, float eps, cudaStream_t st = 0,
+               int ntok = 3);
 
 } // namespace q27k
