@@ -35,6 +35,7 @@
 #include "tokenizer.h"
 #include "api_common.h"
 #include "conductor.h"
+#include "kv_bank.h"
 #include "metrics.h"
 #include "toolgram.h"
 #include "toolconstrain.h"
@@ -302,7 +303,8 @@ int main(int argc, char** argv) {
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
-                "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
+                "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; with --slots N every\n"
+                "  slot may use the whole shared KV pool -- elastic windows). Escapes:\n"
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
                 "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
@@ -742,6 +744,30 @@ int main(int argc, char** argv) {
     // 2048 B, fp8 1024 B) or N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3 /
     // *82 B = 656 B turbo5 K.
     // MIRROR WARNING: matches Engine::kv_bytes -- update together.
+    //
+    // M2b: the process-wide paged KV pool. DEFAULT ON since 2026-08-16 (M1b
+    // flip criterion met: pooled C=4/C=6 at parity with per-slot --
+    // 270.0/309.8 vs 271.2/307.7 -- while buying a 7th slot and per-request
+    // ctx). Q27_KV_POOL=0 restores per-slot KV. Read here, before auto-ctx,
+    // because it decides whether multi-slot windows are divided or elastic.
+    const bool want_pool = [] {
+        const char* e = getenv("Q27_KV_POOL");
+        return !e || atoi(e) != 0;
+    }();
+    // ELASTIC multi-slot windows (issue #42, 2026-09-10). With the pool on,
+    // KV pages are already shared and handed out per request at claim_slot;
+    // the only thing that still partitioned the card was each slot's
+    // max_ctx, which auto-ctx computed by dividing VRAM by the slot count
+    // (4 slots on a 5090: 45056 each, 180K summed against a 249K-token pool,
+    // and no request past 45K with three slots idle). The M2b plan said to
+    // drop that divisor and cap every slot at the native window; this does.
+    // Every slot's window becomes the cap (262144/131072), the pool block
+    // below clamps it to what the pool can entitle, and admission arbitrates
+    // the rest: idle lineages are scavenged LRU-first, busy ones are waited
+    // for. The divided window is kept only as the fallback when the pool
+    // does not come up. Explicit --ctx / --slot1-ctx are untouched.
+    bool elastic_ctx = false;
+    int ctx_divided = 0, n_slots_divided = 0;
     {
         // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
         // 8 = the conductor's hard MAX_K/2 fusion limit (W_PLUMB=16 lane
@@ -822,16 +848,30 @@ int main(int argc, char** argv) {
                 if (pf_arena_on) free_b = free_b > kEngArena ? free_b - (size_t)kEngArena : 0;
                 int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
                 if (fit < 1) fit = 1;
-                if (fit < n_slots) {
-                    fprintf(stderr,
-                            "--ctx auto: only %d of %d requested slots fit in %.1f GB "
-                            "(~%.1f GB/slot fixed) -- sizing for %d\n",
-                            fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
-                    n_slots = fit;
+                // Elastic (pool on): this divided sizing is only the fallback
+                // for a pool that fails to come up, so it must not clamp the
+                // slot count -- it charges kEngBase to every slot, which the
+                // pool block's own arithmetic (base once) does not, and would
+                // throw away slots the pool can hold (issue #42: 7 slots sized
+                // to 2K each here). The pool block clamps slots itself.
+                int ns = n_slots;
+                if (fit < ns) {
+                    if (!want_pool)
+                        fprintf(stderr,
+                                "--ctx auto: only %d of %d requested slots fit in %.1f GB "
+                                "(~%.1f GB/slot fixed) -- sizing for %d\n",
+                                fit, ns, free_b / 1e9, per_slot / 1e9, fit);
+                    ns = fit;
                 }
-                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * n_slots; // arch margin (issue #6), per slot
-                budget = (long)((double)free_b - n_slots * per_slot - slack);
-                c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
+                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * ns; // arch margin (issue #6), per slot
+                budget = (long)((double)free_b - ns * per_slot - slack);
+                c = budget > 0 ? (long)(budget / (per_tok * ns)) : 0;
+                if (want_pool) {
+                    elastic_ctx = true;
+                    n_slots_divided = ns;
+                } else {
+                    n_slots = ns;
+                }
             }
             // cap: native window (262144) for the compact KV formats
             // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
@@ -841,7 +881,16 @@ int main(int argc, char** argv) {
             const long cap = (fp8 || t3 || t3v || t5k) ? 262144 : 131072;
             if (c > cap) c = cap;
             ctx = (int)(c / 4096 * 4096);
-            if (ctx < 4096) {
+            if (elastic_ctx) {
+                // keep the divided window as the no-pool fallback only
+                ctx_divided = std::max(ctx, 2048);
+                ctx = (int)cap;
+                fprintf(stderr,
+                        "--ctx auto: elastic -- %d slots share one KV pool, each may hold "
+                        "up to %d tokens (clamped to the pool below; %d per slot if the "
+                        "pool fails)\n",
+                        n_slots, ctx, ctx_divided);
+            } else if (ctx < 4096) {
                 fprintf(stderr,
                         "--ctx auto: only %d fits (free %.1fGB post-weights, %s KV, W_MAX=%d) -- "
                         "likely to OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
@@ -856,7 +905,9 @@ int main(int argc, char** argv) {
                 if (ctx < 16384)
                     fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
             }
-            if (n_slots > 1) slot1_ctx = ctx; // auto: every slot gets the same window
+            // auto: every slot gets the same window (elastic: an explicit
+            // --slot1-ctx still sizes slots 1+)
+            if (n_slots > 1 && !(elastic_ctx && slot1_ctx_set)) slot1_ctx = ctx;
         }
     }
     // Explicit --ctx propagates to slots 1+ unless --slot1-ctx was given.
@@ -879,6 +930,10 @@ int main(int argc, char** argv) {
         int id = 0;
         bool busy = false;                   // R1b: claimed by a generation
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
+        // incremental KV (issue #42 step 2): rows the active request may grow
+        // to (prompt + max_tokens + close + round reserve, clamped to the
+        // window); 0 while idle. Guarded by route_m.
+        int ent_max = 0;
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
     // P16 persistent prefix cache. Declared BEFORE `slots` so it outlives the
@@ -924,13 +979,7 @@ int main(int argc, char** argv) {
     // M3a: one process-wide prefill scratch arena instead of ~0.73 GB per
     // engine (prefill_arena.h). Q27_PF_ARENA=0 restores per-engine buffers.
     q27::PrefillArena pf_arena;
-    // DEFAULT ON since 2026-08-16 (M1b flip criterion met: pooled C=4/C=6
-    // at parity with per-slot -- 270.0/309.8 vs 271.2/307.7 -- while buying
-    // a 7th slot and per-request ctx). Q27_KV_POOL=0 restores per-slot KV.
-    const bool want_pool = [] {
-        const char* e = getenv("Q27_KV_POOL");
-        return !e || atoi(e) != 0;
-    }();
+    // (want_pool is read above the auto-ctx block -- it decides elastic.)
     // M3a: the shared prefill arena is allocated before any Engine exists
     // (allocation during serving is illegal under graph capture, the pool's
     // discipline) and before the POOL BLOCK measures free VRAM, so its numbers
@@ -1000,16 +1049,19 @@ int main(int argc, char** argv) {
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
                    pool_slack + (double)ns * (double)(256ull << 20);
         };
-        const int half_rows = std::max(4096, slot1_ctx / 2);
+        // Elastic windows (issue #42) are pool-sized, so half of one would
+        // trade every extra slot away; they get a FIXED 16K concurrent share
+        // per slot instead, and admission arbitrates anything larger.
+        const int floor_rows = elastic_ctx ? 16384 : std::max(4096, slot1_ctx / 2);
         const double ent_bytes =
-            (double)(17 * (size_t)((half_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
+            (double)(17 * (size_t)((floor_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
         double pool_b = (double)freeb - fixed_for(n_slots);
         while (n_slots > 1 && pool_b < (double)n_slots * ent_bytes) {
             n_slots--;
             pool_b = (double)freeb - fixed_for(n_slots);
         }
-        fprintf(stderr, "[pool] %d slots, floor %.2f GB (half-ctx x slots), pool %.2f GB\n",
-                n_slots, n_slots * ent_bytes / 1e9, pool_b / 1e9);
+        fprintf(stderr, "[pool] %d slots, floor %.2f GB (%d rows x slots), pool %.2f GB\n",
+                n_slots, n_slots * ent_bytes / 1e9, floor_rows, pool_b / 1e9);
 
         // AN EXPLICIT --ctx BIDS AGAINST THE ARCH SLACK (2026-08-20, the #25
         // follow-up). pool_b above is "whatever free VRAM is left after a
@@ -1126,6 +1178,14 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[pool] cannot entitle even 4096 rows -- per-slot KV\n");
                 for (int s_ = 0; s_ < 2; s_++)
                     if (kv_pool.base[s_]) { cudaFree(kv_pool.base[s_]); kv_pool.base[s_] = nullptr; }
+            } else if (elastic_ctx) {
+                // the expected outcome, not a clamp worth warning about
+                if (ctx > r_max) ctx = r_max;
+                if (slot1_ctx > r_max) slot1_ctx = r_max;
+                fprintf(stderr,
+                        "[pool] elastic windows: each of %d slots may hold up to %d tokens "
+                        "of the shared pool (slots 1+: %d)\n",
+                        n_slots, ctx, slot1_ctx);
             } else {
                 if (ctx > r_max) {
                     fprintf(stderr, "[pool] ctx %d -> %d (pool-entitlable window)\n", ctx,
@@ -1143,6 +1203,18 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "[pool] sizing failed -- per-slot KV (paged pool is the default; "
                     "Q27_KV_POOL=0 selects per-slot explicitly)\n");
+    }
+    // Elastic windows exist only on the pool: per-slot KV at a pool-sized
+    // window would self-provision N full windows and OOM. Fall back to the
+    // divided sizing auto-ctx computed (and its slot clamp).
+    if (elastic_ctx && !kv_pool.enabled()) {
+        fprintf(stderr, "[pool] elastic windows need the pool -- falling back to %d per slot "
+                        "x %d slots\n",
+                ctx_divided, std::min(n_slots, n_slots_divided));
+        ctx = ctx_divided;
+        if (!slot1_ctx_set) slot1_ctx = ctx_divided;
+        n_slots = std::min(n_slots, n_slots_divided);
+        elastic_ctx = false;
     }
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
@@ -1507,6 +1579,66 @@ int main(int argc, char** argv) {
     // bounded by <=4 slots and self-limiting clients -- the GPU gate is the
     // fair one.
     long slot_use_counter = 0;
+    // ---- Incremental KV entitlements (issue #42 step 2; plan
+    // docs/plans/2026-09-10-incremental-kv.md). With the conductor on, a
+    // request is entitled to its prompt + kKvHeadroom rows at claim and its
+    // lineage grows kKvGrowChunk rows at a time from pre_round, instead of
+    // reserving prompt + max_tokens up front (Claude Code asks for 64K, so
+    // up front a burst queued behind one long session). Every grant --
+    // claim or growth -- must leave the pool SAFE (q27::kv_bank_safe): some
+    // completion order exists in which every active request reaches its
+    // declared maximum, counting idle lineages' pages as reclaimable. The
+    // request with the smallest remaining need can then always grow, so
+    // some request always progresses; others park at round boundaries until
+    // one finishes. Off (full up-front reservation, the pre-step-2 path)
+    // without the conductor -- solo generate() cannot sit a round out -- or
+    // with Q27_KV_INCREMENTAL=0. Set after the conductor is built below.
+    bool kv_incremental = false;
+    q27::Conductor* kv_conductor = nullptr; // for poke(); same lifetime rules
+    constexpr int kKvHeadroom = 4096, kKvGrowChunk = 4096;
+    // Safety of granting `c` a lineage of `c_rows` rows while it may grow to
+    // `c_max` rows. Under route_m. Busy slots other than c are claims (a
+    // finished-decoding one needs nothing more: kv_growth_done); idle slots'
+    // pages are reclaimable; c's own pages count toward its claim.
+    auto kv_bank_ok = [&](Slot& c, int c_rows, int c_max) -> bool {
+        if (!kv_pool.enabled()) return true;
+        long avail = std::min((long)kv_pool.free_pages(0), (long)kv_pool.free_pages(1));
+        std::vector<q27::KvClaim> claims;
+        claims.reserve(slots.size());
+        for (auto& s : slots) {
+            if (&s == &c) continue;
+            const long h = s.eng->kv_pages_held();
+            if (!s.busy) {
+                avail += h;
+                continue;
+            }
+            const long m = s.eng->kv_growth_done.load() || s.ent_max <= 0
+                               ? h
+                               : h + s.eng->kv_pages_needed(s.ent_max);
+            claims.push_back({h, m});
+        }
+        const long hc = c.eng->kv_pages_held();
+        const long grow = c.eng->kv_pages_needed(c_rows);
+        claims.push_back({hc + grow, hc + c.eng->kv_pages_needed(std::max(c_rows, c_max))});
+        return q27::kv_bank_safe(std::move(claims), avail - grow);
+    };
+    // Entitle `c` to `rows`, reclaiming idle lineages LRU-first when the free
+    // list is short (they are cache, not entitlement -- the M2b scavenge).
+    // Under route_m; callers have already checked kv_bank_ok.
+    auto kv_grant = [&](Slot& c, int rows) -> bool {
+        bool ok = c.eng->kv_entitle(rows);
+        while (!ok) {
+            Slot* victim = nullptr;
+            for (auto& sv : slots)
+                if (!sv.busy && &sv != &c && sv.eng->kv_rows > 0 &&
+                    (!victim || sv.last_used < victim->last_used))
+                    victim = &sv;
+            if (!victim) break;
+            victim->eng->kv_release_for_takeover();
+            ok = c.eng->kv_entitle(rows);
+        }
+        return ok;
+    };
     auto claim_slot = [&](const std::vector<int>& prompt, int requested,
                           bool thinking, const q27::ThinkCfg& cfg,
                           bool budget_aware) -> Slot& {
@@ -1557,6 +1689,11 @@ int main(int argc, char** argv) {
                 // same route_cv wait as slot scarcity and retry the whole
                 // selection (a takeover elsewhere may free pages).
                 if (fits_any) {
+                    // Declared maximum: prompt + max_tokens as the admission
+                    // limits resolved it + the forced reasoning-close tokens
+                    // (they may run past max_tokens; before step 2 they were
+                    // left out and could write a few rows past the mapped
+                    // pages) + one round's reserve, clamped to the window.
                     const int rows =
                         (int)prompt.size() +
                         q27::resolve_think_decode_limits(
@@ -1564,32 +1701,31 @@ int main(int argc, char** argv) {
                             best->eng->ctx_round_reserve(), limit_close, thinking,
                             limit_cfg, limit_flag)
                             .n_max +
-                        best->eng->ctx_round_reserve() - 1;
+                        limit_close + best->eng->ctx_round_reserve() - 1;
+                    const int max_rows = std::min(rows, best->eng->max_ctx);
+                    // Incremental: entitle the prompt plus headroom now; the
+                    // lineage grows as tokens are written (pre_round ->
+                    // on_need_rows). Otherwise the whole maximum up front.
+                    const int init_rows =
+                        kv_incremental
+                            ? std::min(max_rows, (int)prompt.size() + kKvHeadroom +
+                                                     best->eng->ctx_round_reserve() - 1)
+                            : max_rows;
                     if (best_tier < 2) best->eng->kv_release_for_takeover();
-                    bool entitled =
-                        best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
-                    // Pool scavenge on exhaustion: idle lineages are CACHE,
-                    // not entitlement -- reclaim them LRU-first until the
-                    // reservation fits. Without this the selector can retry
-                    // an empty-lineage slot forever while another idle slot
-                    // holds the pages (starvation). Busy slots and the chosen
-                    // slot are never touched; releasing clears the victim's
-                    // reuse tiers (the R1 rule), exactly like a takeover.
-                    while (!entitled) {
-                        Slot* victim = nullptr;
-                        for (auto& sv : slots)
-                            if (!sv.busy && &sv != best && sv.eng->kv_rows > 0 &&
-                                (!victim || sv.last_used < victim->last_used))
-                                victim = &sv;
-                        if (!victim) break;
-                        victim->eng->kv_release_for_takeover();
-                        entitled =
-                            best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
-                    }
+                    // Grant only into a SAFE state (kv_bank_ok); the pages
+                    // come from the free list, then from idle lineages
+                    // LRU-first (kv_grant -- the M2b scavenge: idle lineages
+                    // are cache, not entitlement; busy slots are never
+                    // touched). Unsafe or short: wait for a request to
+                    // finish and retry the whole selection.
+                    const bool entitled =
+                        kv_bank_ok(*best, init_rows, max_rows) && kv_grant(*best, init_rows);
                     if (!entitled) {
                         route_cv.wait(lk);
                         continue;
                     }
+                    best->ent_max = max_rows;
+                    best->eng->kv_growth_done.store(false);
                 }
                 best->busy = true;
                 // LRU is stamped at FREE, not here: eviction preference must
@@ -1615,9 +1751,12 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lk(route_m);
             s.busy = false;
+            s.ent_max = 0; // its pages are an idle lineage now: reclaimable
             if (s.stamp_on_free) s.last_used = ++slot_use_counter;
         }
         route_cv.notify_all();
+        // parked conductor members re-check their growth now (incremental KV)
+        if (kv_conductor) kv_conductor->poke();
     };
     // scope guard so the claim is released on every exit path
     auto slot_guard = [&free_slot](Slot& s) {
@@ -1749,6 +1888,56 @@ int main(int argc, char** argv) {
             // future path unsets it: report which.
             fprintf(stderr, "continuous batching: OFF (%s)\n",
                     ref_profile ? "Q27_PROFILE=ref" : "Q27_BATCH unset");
+        }
+    }
+    // Incremental KV entitlements (issue #42 step 2): needs the pool, more
+    // than one slot (one slot has nobody to share with) and the conductor
+    // (only a conductor member can sit a round out; every decode runs there
+    // when it exists). Each engine's growth hook runs on the conductor thread
+    // from pre_round, holding the GPU gate, then route_m -- no route_m holder
+    // ever takes the gate, so the order is safe.
+    {
+        const char* e = getenv("Q27_KV_INCREMENTAL");
+        const bool want = !e || atoi(e) != 0;
+        if (conductor && kv_pool.enabled() && slots.size() > 1 && want) {
+            kv_incremental = true;
+            kv_conductor = conductor.get();
+            for (auto& s : slots) {
+                Slot* sp = &s; // slots is fully built; it never reallocates now
+                s.eng->on_need_rows = [&, sp](int need_rows) -> bool {
+                    std::lock_guard<std::mutex> lk(route_m);
+                    Slot& c = *sp;
+                    // the declared max is exceeded only by a forced close
+                    // tail, and never past the window (the ctx guard ran first)
+                    const int cap =
+                        std::min(std::max(c.ent_max, need_rows), c.eng->max_ctx);
+                    if (need_rows > cap) return false;
+                    // Grow in WHOLE pages: rows = 64k-1 fills k pages on every
+                    // pair (attention ceil(r/64) = k, MTP ceil((r+1)/64) = k), so
+                    // a grant never leaves a partial page to re-request next
+                    // round (the first gate ran 200-500 row-sized growths per
+                    // request under pressure).
+                    auto cover = [](int r) { return ((r + 1 + 63) / 64) * 64 - 1; };
+                    int target = std::min(
+                        cap, cover(std::max(need_rows, c.eng->kv_rows + kKvGrowChunk)));
+                    const int minimal = std::min(cap, cover(need_rows));
+                    for (;;) {
+                        if (kv_bank_ok(c, target, cap) && kv_grant(c, target)) return true;
+                        if (target <= minimal) return false; // park this round
+                        target = minimal; // retry with the smallest whole-page growth
+                    }
+                };
+            }
+            fprintf(stderr,
+                    "[pool] incremental reservation ON: prompt + %d rows at admission, "
+                    "+%d per growth, every grant under a banker's safety check "
+                    "(Q27_KV_INCREMENTAL=0 reserves prompt + max_tokens up front)\n",
+                    kKvHeadroom, kKvGrowChunk);
+        } else if (kv_pool.enabled() && slots.size() > 1) {
+            fprintf(stderr,
+                    "[pool] incremental reservation OFF (%s): requests reserve prompt + "
+                    "max_tokens up front\n",
+                    !want ? "Q27_KV_INCREMENTAL=0" : "needs continuous batching");
         }
     }
     // Batch-mode generation driver shared by every generate() call site.
@@ -4296,6 +4485,7 @@ int main(int argc, char** argv) {
                 "FATAL: cannot bind %s:%d (port already in use? see `ss -tlnp | grep %d`)\n",
                 host.c_str(), port, port);
         if (conductor) conductor->request_stop();
+        kv_conductor = nullptr; // free_slot must not poke a destroyed conductor
         conductor.reset();
         return 1;
     }
@@ -4306,6 +4496,7 @@ int main(int argc, char** argv) {
     // any remaining members) and join it BEFORE the engines it drives tear
     // down with `slots` at scope exit.
     if (conductor) conductor->request_stop();
+    kv_conductor = nullptr; // free_slot must not poke a destroyed conductor
     conductor.reset();
     return 0;
 }

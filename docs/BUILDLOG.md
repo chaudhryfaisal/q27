@@ -15714,6 +15714,240 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ab): PR #43 merged (sampler filter order + small-top-k nucleus), v0.11.3 cut and deployed to production
+
+PR #43 (the Codex session's sampler work, rebased onto published master)
+merged as 818990a on top of bd81f73. The CUDA nucleus applied min_p
+before top_p, which shrank top_p's denominator and could drop a boundary
+token -- the SampleParams comment already said top_k -> top_p -> min_p
+(llama.cpp's and HF's order) and the kernel did not do it. Now top_p is
+normalized over top_k's support and min_p cuts after. For top_k <= 32
+(serving uses 20) top_p is computed from the survivors sorted in shared
+memory instead of a 16-pass bisection over the vocabulary, and the top_k
+bisection stops once exactly k survive; larger or tie-overflowing
+supports keep the general path. Codex's numbers: 8-lane nucleus 0.7036 ->
+0.2335 ms, decode -2.5% on a 15-request replay with identical hashes
+against a reference that already had the order fix.
+
+Checked on the merged tree before merging: clean merge (no file overlap
+with step 2), server + test builds, test_sampling PASS, test_kernels
+--sampling-only 102/102 on the 5090 (new: top_p-before-min_p support and
+probabilities with and without k, 248321-token ragged vocab at k=20/32/64,
+single- vs multi-lane bit identity on every case), test-tools 453. The
+Metal backend and the DFlash2 drafter carry no min_p/top_p chain, so
+nothing else drifts. Sampled outputs change vs v0.11.2 wherever top_p < 1
+and min_p > 0 -- the agentic recipe included; greedy and the canonical
+gates are unchanged.
+
+v0.11.3 tagged on the README pointer bump after this entry (step 2 + this
+PR). Deployed: q27-server built from 818990a in a master worktree
+(/mnt/ai/projects/q27-master, md5 0e48d741...), moved over
+/mnt/ai/projects/q27/build/q27-server (previous binary kept as
+q27-server.pre-v0.11.3, md5 5870dff0...), production relaunched d2-pfx:
+wsum b743d26b1f0562a9 (modal), DFlash2 ON, batching OFF as configured;
+smoke -- a sampled chat request (the card sampler) and an Anthropic tool
+call (model echoed, get_weather{city: Paris}) both correct. OPS NOTE: the
+main checkout is on codex/perf-sampler-20260909 and production's binary
+lives in its build/; a rebuild there from that branch would silently
+replace production with the older branch's code. Build masters in
+/mnt/ai/projects/q27-master.
+
+## 2026-09-10 (aa): incremental KV entitlements (issue #42 step 2) -- reserve as tokens are written under a banker's safety check; four 50K sessions keep their caches (69 s vs 189 s for 12 turns)
+
+Plan and the no-deadlock argument: docs/plans/2026-09-10-incremental-kv.md.
+With continuous batching on, more than one slot and the pool,
+`claim_slot` entitles prompt + 4096 rows + round reserve instead of
+prompt + max_tokens, and `Engine::pre_round` grows the lineage at round
+boundaries through the server's `on_need_rows` hook (4096 rows, or the
+smallest whole-page growth that is safe). Every grant must leave the pool
+safe per `q27::kv_bank_safe` (src/kv_bank.h): an order exists in which
+every active request reaches its declared maximum, idle lineages counted
+reclaimable. A member that cannot grow is PARKED -- it skips the round,
+keeps its slot and state, and is re-checked next boundary; a round where
+every member is parked releases the gate and waits for a join or a freed
+slot (Conductor::poke). Serial mode (Q27_BATCH=0, DFlash2 production) and
+single-slot boots keep the up-front reservation; there the new pre_round
+guard is a belt that stops instead of writing past the entitlement.
+`Q27_KV_INCREMENTAL=0` restores up-front reservation.
+
+Two things found on the way: (1) the declared maximum left out the forced
+reasoning-close tokens, which can run past max_tokens -- a close landing
+within a few rows of a page boundary at the very end of a response could
+write through an unmapped table entry into the lineage's own page 0. The
+maximum now includes them and the guard catches anything else. (2)
+`build/fused_smoke` had not linked since DFlash2 moved into the engine
+(src/dflash2.cu missing from its Makefile target); fixed.
+
+Gates:
+
+- CPU: tools/test_kv_bank.cpp 18/18 (page arithmetic, safe/unsafe states,
+  order independence, over-held lineages, the head-of-line growth
+  property); tools/test_conductor.cpp + 7 parking cases (skipped and kept,
+  rejoin, all-parked idle round, solo among parked, cancel beats park);
+  test-tools 453 PASS.
+- fused_smoke: FUSED / CONDUCTOR / A2 ERROR-PATH / GRAPH SMOKE PASS
+  (union-vs-solo byte identity through the changed round loop).
+- Boot matrix: incremental ON at 4 slots with batching, OFF (with the
+  reason) for Q27_BATCH=0; single slot and Q27_KV_POOL=0 unchanged. Step 1's
+  elastic_admission.py 5/5 with incremental on.
+- bench/pool/incremental_admission.py + multisession.py, each with
+  Q27_KV_INCREMENTAL=0 as the same-day control (4-slot 5090, pool 268879
+  tokens, window 262144):
+
+| scenario | incremental | up front |
+|---|---|---|
+| burst: 4 x 43.7K prompts, max_tokens 64000, short answers | all admitted at once (qw <= 0.7 s), wall 54 s, all finish 53-54 s | 2 wait 28-30 s to start, wall 56 s, finish 28/30/55/56 s |
+| decode burst: 3 x 60K prompts, ~3K-token counts, max_tokens 64000 | wall 82 s (76-82), every count 1..700 intact | wall 88 s (55-88), third admitted after 55 s |
+| growth: 4 x 61K prompts + 9000-token counts (sum outgrows the pool) | wall 201 s (174-201); head grew twice, never parked; others parked ~650 rounds; all four outputs 1..1121 unbroken | wall 203 s (131-203) |
+| multi-session: 4 x 50K conversations x 3 turns, sequential, max_tokens 64000 | 69 s; turns 2-3 hit the whole conversation, 0.3-0.4 s each | 189 s; every turn cold (hit=0), 15.2-15.3 s each |
+
+Reads. The multi-session row is the point: under up-front reservation an
+idle conversation's lineage keeps prompt + 64K pages, so four ~50K sessions
+(4 x 114K) overflow the pool and scavenge each other on every turn; under
+incremental each keeps ~54K and all four stay resident -- 2.7x on the
+12-turn wall, warm turns 38x. That is the resident multi-session Claude
+Code case #42 describes. The cold bursts change little in total wall
+(prefill is GPU-bound and not batched across requests); incremental
+admits everyone at once, which with time-sliced prefill makes equal-sized
+jobs finish together rather than first-come-first-served (burst: mean
+completion 54 vs 42 s). The growth row is the adversarial case --
+outputs that together outgrow the pool: same total wall, but the parked
+requests finish later than up front, where three ran concurrently from
+the start. Content survived every remap (the unbroken counts).
+
+Efficiency fix inside the gate: the first run showed 227-487 growths per
+parked request -- the minimal-growth fallback granted a round's worth of
+rows at a time and kv_entitle re-uploaded the whole block table even when
+no page was added. Growth is now whole pages (rows = 64k - 1 fills every
+pair) and kv_entitle skips the upload when nothing new is mapped: 17-21
+growths per parked request, same content and wall.
+
+Left: no preemption (optimistic admission redistributes latency under
+true pressure, above); no fairness beyond the safety check (barging, as
+for slot waits); the block table still uploads from pageable host memory
+on each page-adding growth (the 5090's pageable-DMA corruption is ~1e-6
+per MB -- pinning h_kv_tab is the follow-up). README Serving paragraph and
+Open items updated.
+
+## 2026-09-10 (z): elastic multi-slot windows (issue #42 step 1) -- the pool was shared since 08-16, the windows were not; 4 slots on a 5090 go from 49K to 262K per slot, 8 slots from 2K to 152K, at the same free VRAM
+
+Issue #42 (the #41 reporter): with `--slots N` and auto ctx, the card
+is divided into N fixed windows at boot -- 4 slots 45K each on their
+5090, 7 slots 2K, 8 slots no boot -- so a mostly-single-user resident
+service loses most of its context to slots that are idle. The M2b plan
+(docs/plans/2026-08-16-m2-paged-kv.md) had already said the fix: the KV
+is one paged pool with per-request entitlements and LRU scavenging of
+idle lineages (M2b gate battery, (e)), and the auto-ctx multi-slot
+arithmetic should "drop the per_tok * n_slots divisor". It never did.
+Two defects in that one block: the division itself (the pool is sized
+afterwards from what is actually free, so on the reporter's box 249K
+tokens of pool sat behind 180K of caps), and a per-slot charge of the
+whole single-engine stack including kEngBase (~0.9 GB, once per process;
+the pool block's fixed_for already charges it once), which is why 7
+slots got 2K.
+
+Change (server.cu, boot sizing only): want_pool is read before auto-ctx;
+with auto ctx, N > 1 and the pool on, every slot's window is the cap
+(262144 compact KV / 131072 fp16), the pool block's existing r_max clamp
+brings it to what the pool can entitle, and the auto-ctx slot clamp no
+longer applies (the pool block's fit_slots and floor loop decide the
+slot count). The pool floor for elastic slots is a fixed 16384 rows per
+slot instead of half the window (half of a pool-sized window would trade
+every extra slot away). The divided window and slot count are kept as
+the fallback when the pool does not come up (per-slot KV at a pool-sized
+window would OOM). An explicit --slot1-ctx is honored in elastic mode.
+Single slot, Q27_KV_POOL=0 and explicit --ctx are untouched. Admission
+is unchanged: prompt + max_tokens reserved at claim, LRU scavenge of idle
+lineages, route_cv wait behind busy ones.
+
+Gate (bench/pool/elastic_boot.sh + elastic_admission.py; journal reads
+keyed on InvocationID, GPU-occupancy guard; production down 08:49-08:55,
+relaunched wsum b743d26b1f0562a9):
+
+| card, tier, KV | config | window before (divided) | window after | pool | free at ready |
+|---|---|--:|--:|--:|--:|
+| 5090, q4 17.0 GB, fp8 | single slot | 262144 | 262144 | 12.35 GB | 1.50 GB |
+| | --slots 4 | 49152 | 262144 | 9.36 GB | 2.56 GB (divided: 2.57) |
+| | --slots 7 | 4096 | 180224 | 6.37 GB | 3.62 GB |
+| | --slots 8 | 2048 | 151552 | 5.38 GB | 3.97 GB |
+| | --slots 4, Q27_KV_POOL=0 | 49152 | 49152 (unchanged path) | -- | 5.09 GB |
+| | --slots 4 --ctx 196608 --slot1-ctx 32768 | 196608 / 32768 | unchanged | 9.36 GB | 2.57 GB |
+| 3090, q4s 15.7 GB, fp16 | --slots 2 | 2048 | 32768 | 2.34 GB | 3.85 GB |
+| 3090, q4s, turbo5k (Ampere default) | --slots 2 | 2048 | 126976 | 2.34 GB | 3.84 GB |
+| | --slots 3 | 2048 | 57344 | 1.04 GB | 4.36 GB |
+
+Bigger windows cost nothing measurable: free at ready is the same at 4
+slots elastic vs divided (2.56 vs 2.57 GB), and on sm_86 -- where the
+auto-ctx comments warn of a ctx-scaled graph zoo -- a 4x larger window
+(126976 vs 32768) leaves the same 3.84/3.85 GB. Block tables are 8 B a
+page; d_gen is 4 B a row.
+
+Admission suite on elastic --slots 4 (window 262144), ALL PASS:
+beyond-old-cap -- a 60661-token prompt admits (the divided window here
+was 49152, the reporter's 45056); four concurrent 31.5K prompts run
+together (queue waits 0-0.7 s); pressure -- four concurrent 91.6K
+prompts (1.4x the pool) run two at a time, the other two wait 64-65 s,
+scavenge the finished slots and complete, nothing hangs; oversized -- a
+282786-token prompt 400s in 0.1 s ("> 262129 maximum"); continuation --
+the next turn lands on its slot with hit=60656. Also visible, and the
+trade this change makes: the pressure test scavenged test 1's idle
+conversation, so its repeat re-prefilled 60K (hit=0) before the
+continuation reused it.
+
+Left as they were, and why: (1) reservation is still prompt + max_tokens
+up front, so Claude Code's 64K asks make a burst queue behind a long
+session -- step 2 (reserve as tokens are written, park at a round
+boundary, eviction order, no-deadlock argument), in README Open items;
+(2) the pool block's per-extra-slot charge (~1.0 GB modeled vs ~0.64 GB
+measured on the reporter's log) still leaves free-at-ready growing with
+slot count (2.56 -> 3.97 GB at 4 -> 8 slots) -- recalibrating it would
+buy ~2.8 GB of pool at 8 slots but moves every arch's safety margin, so
+it is its own change with its own boots. CPU suite green. Shipped as
+v0.11.2 (tag on the README pointer bump after this commit) with the
+concurrency trade in the release notes -- concurrent sessions that each
+fit a divided window before may now take turns, since each reserves its
+full max_tokens; an explicit --ctx keeps fixed windows -- and the
+issue #42 follow-up posted against the release.
+
+## 2026-09-09 (y): v0.11.1 on thunderdome -- T14/T12 spot check, then the ninfer pair at medium: engines within 3% on every engine-side number, Claude Code emits the same output volume on both
+
+Thunderdome (claude-code-q27-haight, production :8081, effort unpinned =
+Claude Code's default): T14 Financial Ledger 1.00 / 1.00 (108 / 100 s),
+T12 Constraint Scheduler 0.947 / 0.934 (593 / 786 s; hidden tests 0.97 /
+0.95, agent tests 1.0, coverage 0.95-0.96). August baseline on the same
+orchestrator: T14 median 1.0 over 19 trials, T12 mean 0.71 / median 0.62
+over 49. Engine side over the window: 101 requests, 195 t/s aggregate,
+3.80 tok/round, 96.1% reuse. Runs 2026-09-09T17-41-34 / T17-45-14 in
+the thunderdome tree (uncommitted, as that tree is).
+
+Then the cross-engine pair at the medium pin (ninfer's template rejects
+Claude Code's default effort name; two new yaml entries
+claude-code-{q27,ninfer}-haight-medium share the :8081 adapter with
+CLAUDE_CODE_EFFORT_LEVEL=medium; scratchpad td/run_pair.sh swaps the
+engine behind the port). Two trials each:
+
+| leg | T14 | T12 | CC output tokens, 4 trials | turns | engine: t/s agg, tok/round, reuse, engine s |
+|---|--:|--:|--:|--:|---|
+| q27 v0.11.1 medium | 1.00, 1.00 (115, 105 s) | 0.605, 0.897 (309, 1034 s) | 223.5K | 174 | 186.5, 3.70, 97.6%, 1357 |
+| ninfer DFlash2 medium | 1.00, 1.00 (65, 35 s) | 0.953, 0.903 (1077, 676 s) | 227.8K | 190 | 191.8, 3.79, 96.2%, 1346 |
+
+Reads: (1) engine-side parity -- decode rate, tokens per round, reuse
+and total engine time within 3%, on the same harness and pin. (2) The
+SWE-bench trajectory gap does not reproduce here: Claude Code produced
+the same output volume on both engines (224K vs 228K tokens over the
+four trials) and ninfer took MORE turns (190 vs 174); at n=2 per task
+the 09-09 campaign's 1.7x is not a law of the engines. (3) T12 mean
+0.75 vs 0.93 is one q27 trial (0.605, 309 s) that stopped without
+writing tests -- hidden tests 0.974, the same as ninfer's best, agent
+tests absent, coverage 0.25; the other q27 trial 0.897. At xhigh (the
+production default) the morning run scored 0.947 / 0.934. (4) T14 wall:
+q27 110 s vs ninfer 50 s at equal turns because q27's trajectories
+emitted 2x the output tokens (40K vs 19K over two trials) -- the
+per-turn length difference of (x), visible on the short task where two
+trials cannot average it out. Nothing here changes (x)'s attribution;
+it bounds what the SWE-bench table means: same engine cost per token,
+trajectories that differ by task and seed more than by engine.
+
 ## 2026-09-09 (x): the trajectory gap attributed -- ninfer reasons 1.5x shorter than the model at 8 bits; two q27 defects fixed on the way (model-name echo, the compact tools block) without moving it
 
 bench/crossengine/agentic-2026-09-09-echo/. The question (w) left: why
