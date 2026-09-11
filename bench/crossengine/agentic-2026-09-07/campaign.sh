@@ -21,6 +21,9 @@ Q27ARGS="--host 0.0.0.0 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 -
 # field and renders its boot default (xhigh). The only effort reachable on
 # BOTH engines is medium: run.sh pins CLAUDE_CODE_EFFORT_LEVEL=medium and the
 # q27 legs render medium too. This is NOT production's xhigh -- say so.
+# (2026-09-10: q27 now reads output_config.effort -- template_opts_from_body
+# -- so a request's effort wins over the boot default on both engines; legs
+# named *low run Claude Code at effort low, everything else at medium.)
 # Q27_PRINT_WSUM so every leg's weight digest is in its journal: the 5090's
 # pageable-DMA load corruption (~1%/load) is otherwise invisible in a
 # campaign result. Added 2026-09-09; the 09-07/08/09 legs ran without it.
@@ -37,6 +40,20 @@ LEGS=${LEGS:-q27lad q27d2q4 q27d2q8 ninferd2 ninfermtp}
 INSTANCE=${INSTANCE:-}
 mkdir -p $DIR
 log() { echo "[campaign $(date '+%H:%M:%S')] $*"; }
+# Prefix-cache budget per q27 leg (GB). Each leg's cache root lives on the
+# /dev/shm tmpfs, which production's own cache (/dev/shm/q27-pfx, up to
+# 40 GB) shares: on 2026-09-10 a leg's root ran out of room mid-run and the
+# disk tier's writes failed silently, confounding reuse and wall. A q27 leg
+# now refuses to boot unless its budget fits; lower PFX_GB deliberately if
+# you must, and the readout should say so.
+PFX_GB=${PFX_GB:-40}
+pfx_fits() { # $1 root -- true when /dev/shm can hold a PFX_GB cache
+  local avail; avail=$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)
+  if [ "${avail:-0}" -lt "$PFX_GB" ]; then
+    log "refusing: /dev/shm has ${avail}G free, the leg's ${PFX_GB} GB cache budget does not fit ($(du -sh /dev/shm/q27-pfx* 2>/dev/null | tr '\n' ' '))"
+    return 1
+  fi
+}
 
 start_engine() { # $1 label
   local unit=$1-eval
@@ -50,20 +67,41 @@ start_engine() { # $1 label
     # bootstrap turns itself) at the campaign's effort pin (medium, the only
     # level both engines render -- production serves xhigh; see the 09-08
     # README for the xhigh numbers). Added 2026-09-08 for the v0.11.0 table.
-    q27prod)  rm -rf /dev/shm/q27-pfx-campaign; mkdir -p /dev/shm/q27-pfx-campaign
+    q27prod)  rm -rf /dev/shm/q27-pfx-campaign; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-campaign
               systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 $Q27 $MODEL $TOK $Q27ARGS \
-                --prefix-cache /dev/shm/q27-pfx-campaign --prefix-cache-max-gb 40 --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+                --prefix-cache /dev/shm/q27-pfx-campaign --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     # 2026-09-09 model-echo A/B (turn-count investigation): the q27prod config
     # with /v1/messages echoing the client's model name (server.cu resp_model)
     # so Claude Code keeps prior thinking blocks in the history it sends back.
     # q27noecho = the same binary with Q27_ECHO_MODEL=0 (the 09-09 q27prod
     # leg's wire behaviour) as the same-day control. Own pfx root each.
     q27echo|q27noecho)
-              rm -rf /dev/shm/q27-pfx-$1; mkdir -p /dev/shm/q27-pfx-$1
+              rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
               systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
                 -E Q27_ECHO_MODEL=$([ "$1" = q27echo ] && echo 1 || echo 0) $Q27 $MODEL $TOK $Q27ARGS \
-                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb 40 --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
-    ninferd2) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
+                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+    # 2026-09-10 v0.11.3 re-bench: the q27prod config on the v0.11.3 binary
+    # (PR #43 sampler order + small-top-k nucleus) and on the kept
+    # pre-v0.11.3 binary (bd81f73: identical engine minus PR #43) as the
+    # same-day control. Own pfx root each; new leg names so the 09-09
+    # q27prod/ninferd2 workspaces under /mnt/ai/swebench-work survive.
+    # 2026-09-10 reasoning-length lever: q27low = the q27v0113 config with
+    # Claude Code at effort low (SWEBENCH_EFFORT below), so every request
+    # renders the template's trained low-effort instruction line; q27v0113c =
+    # the same-day medium control. REQBODY_LOG=<prefix> records every request
+    # body (Q27_REQ_LOG) to <prefix>.<leg>.jsonl -- real session content, keep
+    # it OUT of the repo.
+    # q27tok = the same config on a CANDIDATE binary (Q27_CANDIDATE, default
+    # the master worktree's build): 2026-09-10 tokenizer fix (the tool tags as
+    # added tokens) + 3.8 history rendering, against q27v0113c as the control.
+    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow)
+              B=$Q27; [ "$1" = q27pre0113 ] && B=$Q/build/q27-server.pre-v0.11.3
+              case "$1" in q27tok*) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
+              rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
+              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+                ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $MODEL $TOK $Q27ARGS \
+                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+    ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     *) log "unknown leg $1"; return 1 ;;
   esac
@@ -74,17 +112,33 @@ start_engine() { # $1 label
   done
   log "$unit never became healthy"; return 1
 }
-stop_engine() { systemctl --user stop $1-eval 2>/dev/null; sleep 3; }
+stop_engine() { systemctl --user stop $1-eval 2>/dev/null; sleep 3
+  # a leg's cache root is scratch: drop it so it cannot crowd the next leg
+  case "$1" in q27prod) rm -rf /dev/shm/q27-pfx-campaign ;; q27*) rm -rf /dev/shm/q27-pfx-$1 ;; esac
+  # the next leg binds :8081 too; ninfer exits on EADDRINUSE (09-09 probes)
+  for i in $(seq 1 30); do ss -ltn | grep -q ':8081 ' || break; sleep 1; done
+  # and for the old server's TIME_WAIT sockets: a q27 bind right after a
+  # ninfer leg failed EADDRINUSE on them (2026-09-10 gap probe)
+  for i in $(seq 1 90); do [ -z "$(ss -tanH '( sport = :8081 )')" ] && break; sleep 1; done; }
 
 systemctl --user stop q27-38 q27-d2test 2>/dev/null
 sudo -n systemctl stop vox-transcriber vox-transcriber-gmrs 2>/dev/null
 sleep 3
+# CLEAR_PROD_PFX=1: drop production's own prefix cache (/dev/shm/q27-pfx) so
+# the legs get their full PFX_GB budget on the shared tmpfs. Only after
+# q27-38 has stopped (its index would be pulled from under it); the relaunch
+# at the end starts production on an empty cache, which refills as it serves.
+if [ "${CLEAR_PROD_PFX:-0}" = 1 ]; then
+  log "clearing production's prefix cache: $(du -sh /dev/shm/q27-pfx 2>/dev/null | cut -f1)"
+  rm -rf /dev/shm/q27-pfx
+fi
 log "vox: $(systemctl is-active vox-transcriber) $(systemctl is-active vox-transcriber-gmrs); legs: $LEGS; instance filter: '${INSTANCE:-all}'"
 for leg in $LEGS; do
   log "=== leg $leg ==="
   if ! start_engine $leg; then log "leg $leg SKIPPED (engine failed)"; stop_engine $leg; continue; fi
   export SWEBENCH_UNIT=$leg-eval SWEBENCH_HOST=127.0.0.1
   case "$leg" in ninfer*) export SWEBENCH_REQLOG=$DIR/$leg.reqlog.jsonl ;; *) unset SWEBENCH_REQLOG ;; esac
+  case "$leg" in *low) export SWEBENCH_EFFORT=low ;; *) export SWEBENCH_EFFORT=medium ;; esac
   bash $Q/bench/swebench/run.sh $leg $INSTANCE 2>&1 | tee $DIR/$leg.log
   cp $Q/bench/swebench/results.$leg.jsonl $DIR/ 2>/dev/null
   cp $Q/bench/swebench/swebench_$leg.journal $DIR/ 2>/dev/null

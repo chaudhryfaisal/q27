@@ -511,6 +511,47 @@ inline bool is_tool_response_failure(const std::string& content) {
     return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
 }
 
+// The chat template's `|trim`. transformers renders templates with jinja2, whose
+// trim is Python's str.strip(): it removes every code point str.isspace()
+// accepts -- \t\n\v\f\r and space, U+001C-U+001F, U+0085, U+00A0, U+1680,
+// U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 (29 in all; checked
+// exhaustively against Python). llama.cpp's minja strips " \t\n\r" only; the
+// checkpoint was trained on the Python rendering.
+inline bool py_isspace_cp(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
+           cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+// The code point starting at s[i] (0xFFFFFFFF if the bytes there are not valid
+// UTF-8); *len = its byte length (1 for invalid).
+inline uint32_t utf8_cp_at(const std::string& s, size_t i, size_t* len) {
+    const unsigned char c = (unsigned char)s[i];
+    size_t n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+    *len = 1;
+    if (n == 1) return c;
+    if (n == 0 || i + n > s.size()) return 0xFFFFFFFFu;
+    uint32_t cp = c & (0x7F >> n);
+    for (size_t k = 1; k < n; k++) {
+        const unsigned char b = (unsigned char)s[i + k];
+        if ((b & 0xC0) != 0x80) return 0xFFFFFFFFu;
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *len = n;
+    return cp;
+}
+inline std::string trim_ws(const std::string& s) {
+    size_t a = 0, e = s.size(), len = 0;
+    while (a < e && py_isspace_cp(utf8_cp_at(s, a, &len))) a += len;
+    while (e > a) {
+        size_t p = e - 1;  // step back to the start of the last code point
+        while (p > a && e - p < 4 && ((unsigned char)s[p] & 0xC0) == 0x80) p--;
+        const uint32_t cp = utf8_cp_at(s, p, &len);
+        if (p + len != e || !py_isspace_cp(cp)) break;
+        e = p;
+    }
+    return s.substr(a, e - a);
+}
+
 // v22.3: strip a leading think block from content when explicit reasoning is
 // present (avoids double-rendering a block the client also sent in text).
 inline void strip_leading_think(std::string& content) {
@@ -713,6 +754,15 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // zero reasoning cost (real Claude Code always sends a system prompt, so
     // this never fires there). Q27_BARE=1 restores the no-default behavior.
     if (sys.empty() && !getenv("Q27_BARE")) sys = "You are a helpful assistant.";
+    // Qwen3.8 history rules (2026-09-10): the 3.8 template runs EVERY message's
+    // content and every reasoning_content through |trim. q27 kept the client's
+    // edges, and its own responses carry them (thinking ends "\n", text starts
+    // "\n\n"), so each assistant turn came back as "...\n\n</think>\n\n\n\ntext"
+    // -- a shape the checkpoint never saw -- on every turn of every session.
+    // Keyed on the XML dialect = the 3.8 template's format (3.6-family renders
+    // are byte-identical to before). Golden: tools/golden/qwen38_history_*.
+    const bool rules38 = tool_dialect_xml();
+    if (rules38) sys = trim_ws(sys);
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
                                !unavailable_tools->empty();
@@ -797,8 +847,10 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
         // not double-rendered.
         if (m.role == "assistant") {
             strip_leading_think(content);
-            p += "<think>\n" + strip_ctrl(m.reasoning) + "\n</think>\n\n";
+            p += "<think>\n" + strip_ctrl(rules38 ? trim_ws(m.reasoning) : m.reasoning) +
+                 "\n</think>\n\n";
         }
+        if (rules38) content = trim_ws(content);
         p += strip_ctrl(content) + "<|im_end|>\n";
     }
     if (stable_off) *stable_off = p.size();
@@ -885,6 +937,57 @@ inline std::string tool_call_text_dialect(const std::string& name, const json& a
     return s;
 }
 
+// Qwen3.8 history rules for an assistant tool call (2026-09-10): parameters in
+// the CLIENT's order -- `tool_call.arguments|items` walks the dict the client
+// sent, while nlohmann::json sorts keys, which put Edit's new_string BEFORE
+// old_string, the reverse of what the model generated -- and non-string values
+// through the template's tojson spacing (ordered_dump_spaced), not dump()'s
+// compact form. Truncation as in tool_call_text_dialect.
+inline std::string tool_call_xml_ordered(const std::string& name,
+                                         const nlohmann::ordered_json& args,
+                                         long max_arg_chars = -1) {
+    if (max_arg_chars < 0) {
+        const char* e = getenv("Q27_MAX_TOOL_ARG_CHARS");
+        max_arg_chars = e ? atol(e) : 0;
+    }
+    auto trunc = [&](std::string v) -> std::string {
+        if (max_arg_chars > 0 && (long)v.size() > max_arg_chars)
+            return v.substr(0, (size_t)max_arg_chars) + "\n[TRUNCATED - original length " +
+                   std::to_string(v.size()) + " chars]";
+        return v;
+    };
+    std::string s = "<tool_call>\n<function=" + name + ">\n";
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            s += "<parameter=" + it.key() + ">\n" +
+                 trunc(it.value().is_string() ? it.value().get<std::string>()
+                                              : ordered_dump_spaced(it.value())) +
+                 "\n</parameter>\n";
+    } else if (args.is_string()) {
+        s += trunc(args.get<std::string>()) + "\n";
+    } else {
+        s += trunc(ordered_dump_spaced(args)) + "\n";
+    }
+    s += "</function>\n</tool_call>";
+    return s;
+}
+
+// An assistant turn's content per the Qwen3.8 template: `content|trim`, then
+// the calls -- the first after "\n\n" when there is text (directly otherwise),
+// each later one after "\n". The legacy flattening joined with ONE "\n" and
+// kept the text's own edges, so a q27 response (thinking ends "\n", text starts
+// "\n\n") came back as "...\n\n</think>\n\n\n\ntext" in every later turn.
+inline std::string assistant_content_38(const std::string& text,
+                                        const std::vector<std::string>& calls) {
+    std::string s = trim_ws(text);
+    for (size_t i = 0; i < calls.size(); i++) {
+        if (i) s += "\n";
+        else if (!s.empty()) s += "\n\n";
+        s += calls[i];
+    }
+    return s;
+}
+
 inline std::string tool_response_text(const std::string& out,
                                       long max_response_chars = -1) {
     std::string o = out;
@@ -898,10 +1001,8 @@ inline std::string tool_response_text(const std::string& out,
             std::to_string(o.size()) + " chars]";
     // The template runs every message's content through |trim. A tool result
     // ending in "\n" otherwise renders a blank line inside <tool_response>
-    // that llama.cpp does not (golden test).
-    const size_t a = o.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) o.clear();
-    else o = o.substr(a, o.find_last_not_of(" \t\r\n") - a + 1);
+    // that llama.cpp does not (golden test). Python's strip set (trim_ws).
+    o = trim_ws(o);
     return "<tool_response>\n" + o + "\n</tool_response>";
 }
 
@@ -2019,11 +2120,30 @@ inline json anthropic_tools_json(const json& body) {
 
 // Anthropic messages -> Msg list (thinking + tool_use reconstructed to
 // model markers, tool_result wrapped in <tool_response>)
-inline std::vector<Msg> anthropic_msgs(const json& body) {
+// raw_body (optional): the request bytes, re-parsed in insertion order so a
+// tool_use's `input` renders in the client's key order under the 3.8 rules
+// (the parsed `body` has sorted it). Arrays keep their order in both parses,
+// so message i / block j index the same element.
+inline std::vector<Msg> anthropic_msgs(const json& body, const std::string* raw_body = nullptr) {
     std::vector<Msg> msgs;
     // P3: request-driven truncation limits (top-level or chat_template_kwargs)
     const long max_arg = request_max_chars(body, "max_tool_arg_chars");
     const long max_resp = request_max_chars(body, "max_tool_response_chars");
+    const bool rules38 = tool_dialect_xml();
+    nlohmann::ordered_json obody;
+    if (rules38 && raw_body) {
+        try { obody = nlohmann::ordered_json::parse(*raw_body); } catch (...) { obody = nullptr; }
+    }
+    // the client-ordered `input` of messages[i].content[j], or nullptr
+    auto ordered_input = [&](size_t i, size_t j) -> const nlohmann::ordered_json* {
+        if (!obody.is_object() || !obody.contains("messages")) return nullptr;
+        const auto& om = obody["messages"];
+        if (!om.is_array() || i >= om.size() || !om[i].is_object() || !om[i].contains("content")) return nullptr;
+        const auto& oc = om[i]["content"];
+        if (!oc.is_array() || j >= oc.size() || !oc[j].is_object() || !oc[j].contains("input")) return nullptr;
+        return &oc[j]["input"];
+    };
+    size_t mi = 0;
     if (body.contains("system")) {
         std::string sys;
         if (body["system"].is_string()) sys = body["system"];
@@ -2041,6 +2161,7 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
     }
     if (!body.contains("messages")) return msgs;
     for (auto& m : body["messages"]) {
+        const size_t this_i = mi++;
         // is_object() BEFORE the first value() call: value() on a non-object
         // (messages:["hi"]) throws 306 -- which the old ordering did one line
         // ahead of the guard meant to prevent exactly that. A non-object
@@ -2050,14 +2171,30 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
         if (!m.contains("content")) { msgs.push_back({role, content, {}}); continue; }
+        // 3.8 rules: an assistant turn's text and calls are assembled at the
+        // end (assistant_content_38), not interleaved as they arrive
+        const bool asm38 = rules38 && role == "assistant";
+        std::string text38;
+        std::vector<std::string> calls38;
+        size_t bj = 0;
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
+                const size_t this_j = bj++;
                 if (!part.is_object()) continue; // bare string in a content array
                 std::string ty = part.value("type", "");
-                if (ty == "text") content += part.value("text", "");
+                if (ty == "text") (asm38 ? text38 : content) += part.value("text", "");
                 else if (ty == "thinking") think += part.value("thinking", "");
                 else if (ty == "tool_use") {
+                    if (asm38) {
+                        const nlohmann::ordered_json* oi = ordered_input(this_i, this_j);
+                        const nlohmann::ordered_json args =
+                            oi ? *oi
+                               : nlohmann::ordered_json::parse(
+                                     (part.contains("input") ? part["input"] : json::object()).dump());
+                        calls38.push_back(tool_call_xml_ordered(part.value("name", ""), args, max_arg));
+                        continue;
+                    }
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_call_text_dialect(part.value("name", ""),
                                                       part.contains("input") ? part["input"]
@@ -2076,6 +2213,8 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                     content += tool_response_text(rc, max_resp);
                 }
             }
+        // string-shaped assistant content lands in `content`, block text in text38
+        if (asm38) content = assistant_content_38(content + text38, calls38);
         // reasoning block is emitted by the renderer (chatml_prompt), not
         // flattened here -- keeps the jinja's format and per-message logic
         // (preserve_reasoning / <|think_*|> toggles) in one place.
@@ -2152,7 +2291,27 @@ inline std::vector<Msg> openai_msgs(const json& body) {
             msgs.push_back({"user", tool_response_text(content, max_resp), {}});
             continue;
         }
-        if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
+        if (role == "assistant" && tool_dialect_xml()) {
+            // 3.8 rules (see assistant_content_38): trimmed text, the template's
+            // separators, arguments in the order the client's JSON string has
+            std::vector<std::string> calls;
+            if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                for (auto& tc : m["tool_calls"]) {
+                    if (!tc.is_object() || !tc.contains("function") || !tc["function"].is_object())
+                        continue;
+                    const json& fn = tc["function"];
+                    nlohmann::ordered_json args = nlohmann::ordered_json::object();
+                    if (fn.contains("arguments")) {
+                        if (fn["arguments"].is_string()) {
+                            const std::string& a = fn["arguments"].get_ref<const std::string&>();
+                            try { args = nlohmann::ordered_json::parse(a); }
+                            catch (...) { args = a; } // never lose a turn (see below)
+                        } else args = nlohmann::ordered_json::parse(fn["arguments"].dump());
+                    }
+                    calls.push_back(tool_call_xml_ordered(fn.value("name", std::string()), args, max_arg));
+                }
+            content = assistant_content_38(content, calls);
+        } else if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
             for (auto& tc : m["tool_calls"]) {
                 if (!tc.is_object() || !tc.contains("function") || !tc["function"].is_object())
                     continue;
@@ -6318,6 +6477,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
             // model prepends a bare {"name": before a batch of VALID calls ("read all files
             // in parallel"). Don't discard the rest: advance past the opener and keep scanning
             // so the real calls after it recover normally.
+            // The opener's '{' must not reach the context lexer either: it never
+            // closes, so the lexer would hold it open as a JSON container and
+            // classify every call after it as inert nested data -- the mode-8
+            // batch then recovered 1 call of 3 (the name-dropped fallback's
+            // first unit) from 9d2f866 (2026-08-07) to 2026-09-10. Only this
+            // dangling-{"name" branch skips it; other unbalanced candidates keep
+            // their contents inert.
+            candidate_context_cursor = i + 1;
             i = text.find('{', i + 1);
             continue;
         }

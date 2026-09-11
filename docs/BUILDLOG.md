@@ -15714,6 +15714,193 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ag): v0.11.5 cut (the (af) follow-ups), NOT deployed
+
+Tag v0.11.5 on master after bf0a40d: PR #44 + the w16 fix, the mode-8 parser
+fix, HF-exact Unicode tokenization and trim. Gates are (af)'s on this tree
+(test_tokenizer exit 0, make test-tools 464, corpus 165/165, fuzz 120 s,
+tok_parity all identical, q27-server builds). Canonical md5s cannot move
+(token-id input). Production stays on v0.11.4 until a deploy; ASCII traffic
+renders and tokenizes identically between the two (the one ASCII change: a
+message edge of U+001C-001F is now trimmed, as Python does), so only cache
+entries holding non-ASCII text stop matching.
+
+## 2026-09-10 (af): follow-ups -- PR #44 (narrow builds link again), a month-old parser regression, and HF-exact Unicode tokenization
+
+PR #44 (external, chaudhryfaisal): build/q27-server-w8 has not linked since
+the DFlash2 server wiring (794eba8, 09-06) added src/dflash2.cu to
+build/q27-server only; every release since v0.11.0 shipped a w8 target that
+the README sends 24GB cards to and that fails at link time. Merged as
+7e3efe8; 2029a38 fixes the same gap in w16 and adds src/dflash2.h to both
+variants' prerequisites (every target including engine.cuh checked; w8/w16
+built, linked, ran).
+
+Codex reviewed 6084562 and flagged two follow-ups; both, plus what they hid:
+
+- test_tokenizer had failed since 08-07 and returned at its first failure.
+  "bare tool-call fallback" sub-check 10 was a real regression: drift mode 8
+  (a batch of {"function": "Read", ...} calls behind a dangling {"name":
+  line) recovered 1 call of 3. Bisected to 9d2f866 (08-07, "serving: restore
+  shared API hardening"): its context lexer held the never-closing {"name":
+  as an open JSON container, so every later object was classified inert; the
+  main scan found nothing and the name-dropped fallback returned its first
+  unit. Fixed in the dangling-{"name" branch only (the opener's '{' stays out
+  of the lexer), bc67b08. Behind it, "billing-header cch normalize" was a
+  stale test from before 5a81225's cc_version pinning. test_tokenizer exit 0,
+  test-tools, corpus 165/165 with identical verdicts, make fuzz 120 s clean.
+- Unicode (5fc654f): the pretokenizer ran the Split regex on bytes (every
+  byte >= 0x80 a letter) and skipped the checkpoint's NFC normalizer; trim
+  was ASCII where jinja2's |trim is Python's str.strip(). Classes now come
+  from probing the reference pre-tokenizer on every scalar value
+  (tools/gen_unicode_tables.py -> src/unicode_tables.h), NFC data from the
+  tokenizers normalizers; trim uses Python's 29 isspace code points. Parity
+  with tokenizers (tools/tok_parity.py): every scalar in two contexts
+  1,112,064/1,112,064 each (was 1,110,942 and 1,110,233), NFD/mark/Hangul
+  sequences 99,699/99,699 (was 21,547), 200K random mixed strings all (was
+  161,531), the 34 Claude Code prompts 34/34 (already). Encode time +3%.
+
+Not deployed: production runs v0.11.4 (6084562); these are on master.
+
+## 2026-09-10 (ae): v0.11.4 cut (tokenizer fix + 3.8 history rendering) and deployed
+
+Tag v0.11.4 on master after 85412b7 (the (ad) readout). Source-wise the
+release is 5c28eaf (history rendering) + 6084562 (tokenizer) over v0.11.3.
+Gates on this tree: make test-tools (462 PASS, the three template goldens
+byte-exact), test_tokenizer HF-parity 9/9 (its pre-existing "bare tool-call
+fallback" FAIL is identical on v0.11.3), server build clean. The canonical
+md5s cannot move -- the gates feed token ids, the encoder never runs -- and
+no kernel changed. Live validation is (ad): two Claude Code legs on a
+binary built from this source.
+
+DEPLOYED 21:17 PDT: master build (md5 e6a35d34) moved atomically into
+/mnt/ai/projects/q27/build/q27-server, v0.11.3 kept as q27-server.v0.11.3
+(0e48d741) for rollback; q27-38 stopped, /dev/shm/q27-pfx cleared,
+relaunched with tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1. Running exe
+e6a35d34, wsum b743d26b1f0562a9, XML dialect. Smoke: count_tokens on the
+recorded 28-tool Claude Code turn-0 body = 24582 = AutoTokenizer on the
+same render (v0.11.3: 24593); /v1/messages -> thinking + Bash tool_use,
+model tag echoed; the 23552-token system entry persisted.
+
+## 2026-09-10 (ad): the reasoning-length gap was mostly a tokenizer bug -- the tool tags never encoded as their added tokens; fixed: -43% thinking per turn on Claude Code, +8% decode, 11/12 gold
+
+bench/crossengine/agentic-2026-09-10-effort/README.md has every table.
+Question: q27 thinks ~2x per turn and runs ~2x the turns of ninfer on the
+12 Claude Code SWE-bench instances (09-09/09-10), 4x the wall at equal
+decode rate.
+
+What did NOT explain it:
+- ninfer's KV dtype, weight format or drafter: turn-0 probe, 24 seeds,
+  NVFP4 int8/bf16 KV and the groupwise-int weights without speculation all
+  234-248 median chars vs q27 291. ninfer renders medium effort as q27 does
+  and samples in q27's post-PR #43 order.
+- effort low (the template's trained line): Claude Code leg `q27low` vs
+  same-day control `q27v0113c` -- 69 vs 106 s/inst, 18.1 vs 21.8 turns,
+  11.2K vs 16.6K out tok, gold 10/12 both; but thinking PER TURN barely
+  moves (1864 vs 2281 chars; ninfer 954) and at turn 0 low thinks LONGER
+  (382 vs 291, p=0.03).
+- history rendering: q27 showed its own turns as
+  "...\n\n</think>\n\n\n\ntext" (the 3.8 template trims content and
+  reasoning), Edit args in sorted order (new_string before old_string) and
+  compact lists. Fixed for the XML dialect (commit 5c28eaf, new
+  llama.cpp-captured golden tools/golden/qwen38_history_request.*), but on
+  34 recorded mid-session states x 4 seeds, trimmed vs untrimmed: 1.02x,
+  p=0.39.
+
+What did: the tokenizer (commit 6084562). `src/tokenizer.cpp` matched
+CONTROL tokens plus hardcoded <think>/</think>; the Qwen3.6/3.8 vocab's
+other USER_DEFINED added tokens -- <tool_call>, </tool_call>,
+<tool_response>, </tool_response> -- encoded as "<","tool","_call",">" in
+the tool-format paragraph, every past call and every tool result, since the
+tokenizer landed (07-01). llama.cpp tokenized a q27-rendered prompt to
+26544, q27 to 26578; AutoTokenizer agrees with llama.cpp. Also fixed: the
+pretokenizer's \s*[\r\n]+ stopped at the first newline ("\n \n" is one HF
+token). Parity on the 34 prompts, q27 ids vs AutoTokenizer: 0/34 -> 34/34;
+test_tokenizer HF-parity block 9/9 (3/9 on the old encoder). The text
+goldens could not see any of this -- they compare bytes, not ids.
+
+Claude Code leg `q27tok` (the master build, 6084562 + 5c28eaf, medium, fresh
+cache root, 0 failed writes, wsum b743d26b1f0562a9) vs `q27v0113c`: decode
+231.5 vs 213.9 t/s agg (242.9 vs 231.9 med), 4.265 vs 3.977 tok/round,
+reuse 95.7 vs 95.2%, wall 75 vs 106 s/inst, out tok 11.2K vs 16.6K,
+thinking 27.5K vs 47.5K chars/inst = 1295 vs 2281 per turn (ninfer 954),
+turns >2K chars 17% vs 26%, gold 11/12 vs 10/12. Turns 21-23, unchanged:
+the remaining wall gap to ninfer (24 s, 10.8 turns) is trajectory -- q27
+still tries to reproduce and verify before it edits (14 vs 5.6 tool calls
+before the first edit; the harness containers have no repo dependencies,
+so most of that fails, and the gold-file proxy scores neither way).
+Replicate `q27tokb`: 228.0 / 247.2 t/s, 4.211 tok/round, 96.5% reuse, 70
+s/inst, 21.4 turns, 29.7K thinking chars = 1387/turn, 11.7K out tok, 10/12
+(seven sessions repeat exactly -- seed-0 determinism -- five diverged).
+`q27toklow` (fixed binary, effort low): 218.4 / 248.4, 4.070, 85 s, 22.2
+turns, 1637 chars/turn, 11/12 -- no gain over medium; one runaway
+xarray-4094 session (80 turns, 52K tokens) dominates, and the v0.11.3
+low-effort turn cut (18 vs 22) is inside the +-3 turn noise. Effort low is
+not a lever on this evidence.
+
+Reference check, byte-identical raw prompts (raw_think.py: pre-rendered
+text to /v1/completions and llama.cpp /completion, so no template is in the
+comparison), 34 states x 4 seeds: llama.cpp Q8_0 vs q27 fixed tokenizer
+1.11x thinking (p=0.80); ninfer vs q27 fixed 0.95x (was 0.77x against the
+old tokenizer); every engine picks the same next action mix (Bash 55-58%,
+Read 25-29%). Turn-0 probes cannot see the tokenizer effect (303 vs 291):
+the turn-0 prompt holds only the tool-format paragraph's tags.
+
+Instrument notes: q27's /v1/completions takes raw text; llama.cpp's stock
+jinja REFUSES Claude Code 2.1.x bodies (mid-conversation system messages:
+"System message must be at the beginning" -- use the harness sysinline
+template or raw prompts); ninfer's TIME_WAIT sockets block a q27 bind right
+after it (campaign.sh now waits for every :8081 socket).
+
+Deploy note: every tool-bearing prompt tokenizes differently, so a deploy
+needs a fresh prefix-cache root. Every q27 agentic number before this entry
+ran with the bug.
+
+## 2026-09-10 (ac): v0.11.3 re-bench on Claude Code traffic -- decode parity with ninfer (218-222 vs 218.2 t/s, 4.05-4.10 vs 4.11 tok/round); PR #43 is +4-6% against a same-day control; reuse 95.7% once a tmpfs confound was removed
+
+bench/crossengine/agentic-2026-09-10/ (campaign.sh legs q27v0113,
+ninferd2b, q27pre0113 -- new names so the 09-09 workspaces survive; the
+campaign now waits for :8081 to free between legs). Same 12 instances,
+medium effort, card sampler; q27 legs on the production recipe with a
+fresh cache root, both wsum b743d26b1f0562a9.
+
+q27 v0.11.3 221.8 agg / 233.2 med t/s, 4.101 tok/round, 23.8 turns, 15.2K
+out tok/inst, 10/12 gold. Control (bd81f73, PR #43 absent) 209.7 / 223.1,
+3.978, 23.2, 16.8K, 12/12. ninfer DFlash2 218.2 / 240.5, 4.113, 96.1%
+reuse, 24 s/inst, 10.8 turns, 4.0K, 11/12. Reads: decode parity (different
+request mixes, so parity rather than a lead); PR #43 +5.8% agg / +4.5%
+median / +3.1% tok/round on this traffic, matching the replay; wall still
+trajectory length (the 09-09 attribution).
+
+CONFOUND, and a retraction: /dev/shm is a 62 GB tmpfs, and production's
+own prefix cache already held 38 GB of it (+ 5.3 GB of stale 09-08
+scratch roots), so each leg's fresh root had ~19 GB. It filled at
+14:52:57 and the disk tier's writes failed from then on -- 26 of the
+v0.11.3 leg's 41 persists, all 60 of the control's. The q27 legs' reuse
+(92.8%, 90.0%) and wall (108 s, 123 s) are therefore not measurements of
+the engine. A first read of the logs took the resulting pattern --
+restores falling back to the shared 23552 system entry after side
+requests -- for a Claude Code history change caused by v0.11.1's model
+echo; every deeper entry it cited (45490/50546/51596/54859/59571) is on
+the failed-write list, so that hypothesis is retracted. What stands: on
+every consecutive same-conversation pair, today and on 09-09, the warm
+turn reuses prev_prompt - 5 and re-prefills the previous turn's own
+output (by design -- the snapshot sits at the stable prefix). Fix:
+campaign.sh checks /dev/shm free space against each q27 leg's cache
+budget before booting it (refuses and says why) and deletes the leg's
+root after the leg. The stale roots and today's leg roots were deleted
+(tmpfs 62 -> 38 GB used).
+
+RERUN (leg q27v0113b, CLEAR_PROD_PFX=1 so production's 38 GB cache was
+dropped after q27-38 stopped and the leg had its full 40 GB): zero failed
+writes, 32 persists, 31 restores. 218.0 agg / 232.2 med t/s, 4.052
+tok/round, 95.7% reuse, 98 s/inst, 25.2 turns, 15.3K out tok/inst,
+10/12 gold. So: decode parity holds across two runs (218.0 / 221.8 vs
+ninfer 218.2); PR #43 is +4.0% / +5.8% agg across them vs the control;
+reuse 95.7% vs ninfer 96.1% and 09-09's 96.9% -- no regression; wall 98
+vs 24 s/inst on trajectory length. Production relaunched on an empty
+cache (wsum modal, health 200). README State/table carry the rerun row
+with the confounded cells marked.
+
 ## 2026-09-10 (ab): PR #43 merged (sampler filter order + small-top-k nucleus), v0.11.3 cut and deployed to production
 
 PR #43 (the Codex session's sampler work, rebased onto published master)
