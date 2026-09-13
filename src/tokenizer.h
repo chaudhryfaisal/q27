@@ -59,6 +59,7 @@ class Tokenizer {
     std::unique_ptr<Impl> impl_;
 
     std::vector<int> bpe_word(const std::string& word) const;
+    std::vector<int> bpe_word_uncached(const std::string& word) const;
 
     std::vector<std::string> pretokenize(const std::string& text) const;
 
