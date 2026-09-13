@@ -171,7 +171,7 @@ One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.11.5](https://github.com/signalnine/q27/releases).
+release: [v0.11.6](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -623,10 +623,13 @@ real coding while MTP nearly doubled stock llama.cpp.
   bypass the ring mirrors, so batching it is real integration work, and the
   serial SWE-bench harness cannot show whether sustained concurrency exists
   to pay for it (queue wait was 2.3% of a 12-instance run).
-- **Cache persistence stops at 65536 tokens.** A 69.7K-token conversation
-  re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
-  costs pinned staging memory per slot. Not yet measured against 128K
-  admission.
+- **Cache persistence stops at 65536 tokens by default.** Returning to an
+  evicted 69K-token conversation re-prefills 45K tokens (16.4 s); with
+  `--prefix-cache-max-tokens 131072` the same return restores in 0.5 s, for
+  about 4.6 GB more pinned host memory per slot
+  ([docs/perf-next-2026-09-12.md](docs/perf-next-2026-09-12.md)). Raise it
+  where the host RAM allows; the incidence on recent Claude Code campaigns
+  was 0-3 such misses per 12 instances.
 - **Incremental KV admits optimistically.** When long outputs outgrow the
   pool together, the request first in the safe order runs and the others
   park until it finishes: same total wall as up-front reservation in the

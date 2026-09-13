@@ -15714,6 +15714,15 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-13 (aj): v0.11.6 cut (wait diagnostics, BPE cache + one-pass encode, the Codex perf report), NOT deployed
+
+Tag v0.11.6 on master after e1d35f6. Source over v0.11.5: 8cd7083 (ah)
+and e1d35f6 (ai); 231d7f5 is the report. Gates are (ai)'s on this tree
+(test_tokenizer with the cache and split checks, tok_parity all sets,
+test-tools 464, extract_check, q27-server builds; the live tok_ms A/B).
+Token ids are unchanged from v0.11.5, so a v0.11.5 prefix-cache root
+carries over. Production stays on v0.11.4 until a deploy.
+
 ## 2026-09-12 (ai): front end halved -- per-thread BPE cache + one encode pass instead of three; identical ids
 
 From the Codex perf pass (docs/perf-next-2026-09-12.md, its first
