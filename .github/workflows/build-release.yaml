@@ -16,9 +16,9 @@ on:
         required: false
         default: ""
       targets:
-        description: "Space-separated make targets (server variants) to build."
+        description: "Space-separated make targets (server variants: ex: 'q27-server q27-server-w8') to build."
         required: false
-        default: "q27-server q27-server-w8"
+        default: "q27-server-w8"
       nvccflags:
         description: "Override NVCCFLAGS. Empty = all-arch default below."
         required: false
