@@ -2439,19 +2439,32 @@ int main(int argc, char** argv) {
             topts.tools_decl=q27::openai_tools_decl(req.body,&tool_names_v);
             std::string rendered =
                 q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
-            // P16b: token length of the system+tools block. Measured with a
-            // THIRD encode used only for its length -- the prompt itself is
-            // still built from the same two pieces, so no request's bytes
-            // change when the cache is on.
-            if (pfx_cache.enabled() && sys_off > 0)
-                sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
             // is pre-seeded straight into the TOOL channel since the marker
             // itself never appears in the GENERATED text this way.
             if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
-            prompt = tok.encode(rendered.substr(0, stable_off));
+            // P8/P16b: ONE pass over the prompt, in three pieces -- the system
+            // block [0, sys_off), the rest of the stable history [sys_off,
+            // stable_off), the volatile tail. Both cuts abut an <|im_start|>
+            // special, where tokenization is split-invariant (the P8
+            // argument), so the ids equal a whole-string encode and sys_len
+            // is the first piece's length. Until 2026-09-12 sys_len came from
+            // a THIRD encode of the system block: ~13 of the 38 ms a 24K
+            // Claude Code prompt spent in the front end.
+            const size_t sys_cut =
+                (pfx_cache.enabled() && sys_off > 0 && sys_off <= stable_off) ? sys_off : 0;
+            if (sys_cut > 0) {
+                prompt = tok.encode(rendered.substr(0, sys_cut));
+                sys_len = (int)prompt.size();
+            } else {
+                prompt.clear();
+            }
+            {
+                std::vector<int> midv = tok.encode(rendered.substr(sys_cut, stable_off - sys_cut));
+                prompt.insert(prompt.end(), midv.begin(), midv.end());
+            }
             stable_len = (int)prompt.size();
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
@@ -3163,14 +3176,24 @@ int main(int argc, char** argv) {
         // shared history with the same split (the boundary always abuts the
         // <|im_start|> special, so tokenization is split-invariant there),
         // which is what makes the snapshot prefix-match next turn.
-        std::vector<int> prompt = tok.encode(rendered.substr(0, stable_off));
+        // P16b: the system block is the first of three pieces (see the
+        // /v1/chat/completions twin) -- one pass, not a third encode.
+        const size_t sys_cut =
+            (pfx_cache.enabled() && sys_off > 0 && sys_off <= stable_off) ? sys_off : 0;
+        std::vector<int> prompt;
+        if (sys_cut > 0) {
+            prompt = tok.encode(rendered.substr(0, sys_cut));
+            sys_len = (int)prompt.size();
+        }
+        {
+            std::vector<int> midv = tok.encode(rendered.substr(sys_cut, stable_off - sys_cut));
+            prompt.insert(prompt.end(), midv.begin(), midv.end());
+        }
         const int stable_len = (int)prompt.size();
         {
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
         }
-        if (pfx_cache.enabled() && sys_off > 0)
-            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size(); // P16b, see twin
         // Q27_SYSBLK=1: system-block geometry per request. The diagnostic for
         // "why did cross-session prefix reuse miss" -- a client whose system
         // block changes size between sessions cannot share a prefix at all.
@@ -3832,12 +3855,21 @@ int main(int argc, char** argv) {
         const q27::TemplateOpts topts=q27::template_opts_from_body(body);
         std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off, {}, {}, &topts);
         if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
-        std::vector<int> prompt = tok.encode(rendered);
         // P16b applies here even though P16a does not: this shape computes no
         // stable_off (so it never persists a stable entry), but a system+tools
         // block is a system+tools block, and codex re-sends one every session.
-        if (pfx_cache.enabled() && sys_off > 0)
-            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
+        // Two pieces at the system cut (split-invariant: it abuts <|im_start|>),
+        // one pass -- sys_len is the first piece's length.
+        const size_t sys_cut = (pfx_cache.enabled() && sys_off > 0) ? sys_off : 0;
+        std::vector<int> prompt;
+        if (sys_cut > 0) {
+            prompt = tok.encode(rendered.substr(0, sys_cut));
+            sys_len = (int)prompt.size();
+        }
+        {
+            std::vector<int> restv = tok.encode(rendered.substr(sys_cut));
+            prompt.insert(prompt.end(), restv.begin(), restv.end());
+        }
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
         // review follow-up 2026-07-09 #3: the bound includes the spec-round

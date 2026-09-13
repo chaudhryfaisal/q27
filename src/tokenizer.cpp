@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <memory>
 #include <array>
+#include <atomic>
 
 #include "unicode_tables.h"
 
@@ -58,6 +59,7 @@ struct Tokenizer::Impl {
     std::string b2u[256];
     std::unordered_map<std::string, uint8_t> u2b;
     std::vector<std::pair<std::string, int>> specials; // control tokens, longest first
+    uint64_t id = 0;                                   // BpeCache owner key
 };
 
 #ifdef Q27_TOKENIZER_TESTING
@@ -84,7 +86,10 @@ static std::string read_lp(FILE* f) {
     return s;
 }
 
+static std::atomic<uint64_t> g_tok_ids{1}; // BpeCache owner keys, unique per instance
+
 Tokenizer::Tokenizer(const std::string& path) : impl_(std::make_unique<Impl>()) {
+    impl_->id = g_tok_ids.fetch_add(1);
     std::unique_ptr<FILE, FileCloser> f(fopen(path.c_str(), "rb"));
     if (!f) throw std::runtime_error("tok: cannot open " + path);
     uint32_t magic = 0, ver = 0, n = 0, bos = 0, eos = 0;
@@ -142,7 +147,46 @@ static std::vector<std::string> utf8_chars(const std::string& s) {
     return out;
 }
 
+// BPE result cache (2026-09-12, from the Codex perf pass: front-end CPU per
+// request 38 -> 12 ms, warm TTFT -20 ms on Claude Code traffic). bpe_word is a
+// pure function of the word bytes, so memoizing it cannot change an id. The
+// cache is per THREAD, not shared: httplib serves each request on a persistent
+// worker, so each worker warms its own map from the first prompt it sees, and
+// no lock sits between concurrent encodes (the mutex prototype serialized them
+// per word). Keyed by tokenizer id as well, so a second Tokenizer in the same
+// thread (tests) never reads the first one's ids. Bounded at kBpeCacheMax
+// entries per thread (a few MB); when full it is cleared and re-warms in one
+// prompt. Words over kBpeCacheWord bytes are not cached (rare; the 1024-byte
+// chunking below handles the pathological ones).
+namespace {
+constexpr size_t kBpeCacheMax = 32768, kBpeCacheWord = 128;
+struct BpeCache {
+    uint64_t owner = 0;
+    std::unordered_map<std::string, std::vector<int>> map;
+};
+BpeCache& bpe_cache() {
+    thread_local BpeCache c;
+    return c;
+}
+}  // namespace
+
 std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
+    const bool cacheable = word.size() <= kBpeCacheWord;
+    BpeCache& c = bpe_cache();
+    if (cacheable) {
+        if (c.owner != impl_->id) { c.map.clear(); c.owner = impl_->id; }
+        auto it = c.map.find(word);
+        if (it != c.map.end()) return it->second;
+    }
+    std::vector<int> out = bpe_word_uncached(word);
+    if (cacheable) {
+        if (c.map.size() >= kBpeCacheMax) c.map.clear();
+        c.map.emplace(word, out);
+    }
+    return out;
+}
+
+std::vector<int> Tokenizer::bpe_word_uncached(const std::string& word) const {
     // Bounded-word guard: the merge loop below is O(word^2) (full pair rescan +
     // erase-in-loop per merge). A pathological no-whitespace blob (minified JS,
     // base64) collapses to one huge "word" and stalls tokenization single-threaded
@@ -154,7 +198,7 @@ std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
     if (word.size() > WORD_CAP) {
         std::vector<int> out;
         for (size_t off = 0; off < word.size(); off += WORD_CAP) {
-            auto chunk = bpe_word(word.substr(off, WORD_CAP));
+            auto chunk = bpe_word_uncached(word.substr(off, WORD_CAP));
             out.insert(out.end(), chunk.begin(), chunk.end());
         }
         return out;

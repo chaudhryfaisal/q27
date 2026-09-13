@@ -673,19 +673,32 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             topts.tools_decl=q27::openai_tools_decl(req.body,&tool_names_v);
             std::string rendered =
                 q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off, {}, {}, &topts);
-            // P16b: token length of the system+tools block. Measured with a
-            // THIRD encode used only for its length -- the prompt itself is
-            // still built from the same two pieces, so no request's bytes
-            // change when the cache is on.
-            if (pfx_cache.enabled() && sys_off > 0)
-                sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
             // is pre-seeded straight into the TOOL channel since the marker
             // itself never appears in the GENERATED text this way.
             if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
-            prompt = tok.encode(rendered.substr(0, stable_off));
+            // P8/P16b: ONE pass over the prompt, in three pieces -- the system
+            // block [0, sys_off), the rest of the stable history [sys_off,
+            // stable_off), the volatile tail. Both cuts abut an <|im_start|>
+            // special, where tokenization is split-invariant (the P8
+            // argument), so the ids equal a whole-string encode and sys_len
+            // is the first piece's length. Until 2026-09-12 sys_len came from
+            // a THIRD encode of the system block: ~13 of the 38 ms a 24K
+            // Claude Code prompt spent in the front end.
+            const size_t sys_cut =
+                (pfx_cache.enabled() && sys_off > 0 && sys_off <= stable_off) ? sys_off : 0;
+            if (sys_cut > 0) {
+                prompt = tok.encode(rendered.substr(0, sys_cut));
+                sys_len = (int)prompt.size();
+            } else {
+                prompt.clear();
+            }
+            {
+                std::vector<int> midv = tok.encode(rendered.substr(sys_cut, stable_off - sys_cut));
+                prompt.insert(prompt.end(), midv.begin(), midv.end());
+            }
             stable_len = (int)prompt.size();
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());

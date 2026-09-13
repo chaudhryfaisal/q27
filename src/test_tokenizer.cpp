@@ -458,6 +458,51 @@ int main(int argc, char** argv) {
         if (hp != (int)hf.size()) return 1;
     }
 
+    // BPE cache (2026-09-12): the per-thread memo must be invisible -- eight
+    // threads encoding the same texts concurrently, with a second Tokenizer
+    // instance alive, must all produce the single-thread ids.
+    {
+        std::vector<std::string> texts;
+        for (int r = 0; r < 40; r++)
+            texts.push_back("<|im_start|>user\nround " + std::to_string(r) +
+                            ": the quick brown fox 123 don't <tool_call>\n{\"a\": [1, 2]}\n</tool_call> "
+                            "caf\xc3\xa9 \xe4\xb8\xad\xe6\x96\x87 \xf0\x9f\x98\x80\n<|im_end|>\n");
+        std::vector<std::vector<int>> want;
+        for (auto& t : texts) want.push_back(tok.encode(t));
+        q27::Tokenizer tok2(argv[1]); // a second instance in the same thread
+        std::atomic<int> bad{0};
+        std::vector<std::thread> ts;
+        for (int th = 0; th < 8; th++)
+            ts.emplace_back([&] {
+                for (int pass = 0; pass < 3; pass++)
+                    for (size_t i = 0; i < texts.size(); i++) {
+                        if (tok.encode(texts[i]) != want[i]) bad++;
+                        if (tok2.encode(texts[i]) != want[i]) bad++;
+                    }
+            });
+        for (auto& t : ts) t.join();
+        const bool ok = bad.load() == 0 && tok.encode(texts[0]) == want[0];
+        printf("bpe cache: 8 threads x 2 instances identical ids: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+    // Split-invariant encode at the system cut and the stable boundary (the
+    // server encodes three pieces in one pass, 2026-09-12): whole == pieces.
+    {
+        std::vector<q27::Msg> msgs = {{"system", "S\nline two", {}}, {"user", "hi there", {}},
+                                      {"assistant", "yo", {}}, {"user", "go on 123", {}}};
+        size_t stable = 0, sys = 0;
+        std::string r = q27::chatml_prompt(msgs, nlohmann::json::array(), true, &stable, &sys);
+        auto whole = tok.encode(r);
+        auto a = tok.encode(r.substr(0, sys)), b = tok.encode(r.substr(sys, stable - sys)),
+             c = tok.encode(r.substr(stable));
+        std::vector<int> pieces = a;
+        pieces.insert(pieces.end(), b.begin(), b.end());
+        pieces.insert(pieces.end(), c.begin(), c.end());
+        const bool ok = sys > 0 && sys < stable && pieces == whole && !a.empty() && !c.empty();
+        printf("three-piece encode == whole (sys %zu, stable %zu): %s\n", sys, stable, ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
     // bare tool-call fallback: models sometimes drop the <tool_call> wrapper
     // and emit the JSON as plain text (observed: Qwopus v1.4 no-think greedy
     // on long write calls, with trailing junk like "</file>"). The server must

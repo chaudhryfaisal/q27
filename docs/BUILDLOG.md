@@ -15714,6 +15714,51 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-12 (ai): front end halved -- per-thread BPE cache + one encode pass instead of three; identical ids
+
+From the Codex perf pass (docs/perf-next-2026-09-12.md, its first
+recommendation). Two changes, both invisible to the token stream:
+
+- src/tokenizer.cpp: bpe_word memoizes its result per THREAD (thread_local
+  map keyed by word, owner-checked by a per-Tokenizer id; 32K entries max,
+  cleared when full; words over 128 bytes not cached). Codex's prototype
+  used one mutex around a shared map, which serializes concurrent encodes
+  per word across the HTTP workers; a per-worker map has no lock and warms
+  from the first prompt each worker sees. bpe_word is a pure function of the
+  word bytes, so no id can change.
+- src/server.cu, all three prompt paths: sys_len came from a THIRD encode of
+  the system block (the P16b length), on top of the stable-prefix and tail
+  encodes. Claude Code's system block is ~90% of the prompt, so that was
+  nearly a full second pass. The prompt is now encoded once in three pieces
+  -- [0, sys_off), [sys_off, stable_off), tail -- and sys_len is the first
+  piece's length. Both cuts abut an <|im_start|> control token, where the
+  encoder's span boundaries are identical whether or not the string is
+  split (the P8 argument the stable cut already relies on). Checked on the
+  34 recorded Claude Code bodies + both goldens: three-piece ids == whole-
+  string ids, 36/36. The integration harness mirror is updated
+  (extract_check in sync); with its cache stub disabled the harness's id
+  bookkeeping is unchanged.
+
+Gates: test_tokenizer (new: 8 threads x 2 tokenizer instances produce the
+single-thread ids; three-piece == whole on a synthetic prompt; HF parity
+19/19), tools/tok_parity.py all sets identical (1.1M scalars x2, NFD 99.7K,
+mix 200K, 34 prompts), make test-tools 464, q27-server builds.
+
+Live A/B, old (v0.11.4) / new / old / new, 17 recorded Claude Code bodies
+per boot (26K-86K prompt tokens, mean 38K), max_tokens 1, [req] tok_ms
+(render + encode):
+
+| arm | tok_ms total | mean | median | first request (cold cache, 26.5K tokens) |
+|---|--:|--:|--:|--:|
+| v0.11.4 | 699 / 651 | 41.1 / 40.7 | 37 / 36 | 31 ms |
+| cache + one pass | 323 / 321 | 19.0 / 18.9 | 17 / 17 | 15 ms |
+
+-54% front end per request; the cold first request shows the single-pass
+share (31 -> 15 ms), the warm ones the cache on top (38K-token prompts at 17
+ms). What is left in tok_ms is rendering: two ordered_json parses of the
+raw body (tools declaration, then the client-ordered tool inputs) and the
+string assembly -- a possible follow-up, a few ms. Not deployed.
+
 ## 2026-09-11 (ah): wait diagnostics -- a stuck request now says why, and a short slot count says so at boot
 
 Issue #42 comment (WSL user): `--slots 4/6/8` with 4/6/7 concurrent ~10K-char
