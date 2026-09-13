@@ -15714,14 +15714,29 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
-## 2026-09-13 (aj): v0.11.6 cut (wait diagnostics, BPE cache + one-pass encode, the Codex perf report), NOT deployed
+## 2026-09-13 (aj): v0.11.6 cut (wait diagnostics, BPE cache + one-pass encode, the Codex perf report) and deployed, with 128K cache entries
 
 Tag v0.11.6 on master after e1d35f6. Source over v0.11.5: 8cd7083 (ah)
 and e1d35f6 (ai); 231d7f5 is the report. Gates are (ai)'s on this tree
 (test_tokenizer with the cache and split checks, tok_parity all sets,
 test-tools 464, extract_check, q27-server builds; the live tok_ms A/B).
 Token ids are unchanged from v0.11.5, so a v0.11.5 prefix-cache root
-carries over. Production stays on v0.11.4 until a deploy.
+carries over.
+
+DEPLOYED 08:30 PDT: master build b15a569e (source e1d35f6 = the tag's) moved
+atomically into /mnt/ai/projects/q27/build/q27-server; v0.11.4 kept as
+q27-server.v0.11.4 (e6a35d34) for rollback, v0.11.3 still there too.
+tools/launch_q27_38.sh now defaults --prefix-cache-max-tokens to 131072
+(was 65536; the Codex measurement, README open item) -- synced into the
+main checkout the launch command points at. Cache root KEPT: entries are
+verified token-by-token, so a v0.11.4 entry holding non-ASCII text just
+misses; the 23552-token system entry hit on the smoke request. Running:
+exe b15a569e, wsum b743d26b1f0562a9, XML dialect, 1 entry indexed, max
+131072, pinned staging 2 x 4.72 GB (was 2 x 2.44), http: 23 workers,
+[wait] at 5000 ms, health 200. Smoke on the recorded 28-tool turn-0 body:
+count_tokens 24582 = AutoTokenizer; /v1/messages -> thinking + Bash
+tool_use; [req] tok_ms=14 on 24582 prompt tokens (v0.11.4 measured 20-31
+on the same body), hit=23552.
 
 ## 2026-09-12 (ai): front end halved -- per-thread BPE cache + one encode pass instead of three; identical ids
 

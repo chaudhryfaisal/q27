@@ -39,7 +39,11 @@ D2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E
 # content -- keep it local, delete when done.
 REQLOG_ENV=""; [ -n "${REQ_LOG:-}" ] && REQLOG_ENV="-E Q27_REQ_LOG=$REQ_LOG"
 PFX_DIR=${PFX_DIR:-/dev/shm/q27-pfx}
-PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
+# 131072-token entries since 2026-09-13 (was 65536): returning to an evicted
+# 69K-token conversation restores in 0.5 s instead of re-prefilling 45K
+# tokens (16 s) -- docs/perf-next-2026-09-12.md. Costs ~4.6 GB more pinned
+# host memory (2 x 4.72 GB staging on the one production slot).
+PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-131072}"
 mode=${1:-}; shift || true
 systemctl --user stop q27-38 2>/dev/null || true
 systemctl --user reset-failed q27-38 2>/dev/null || true
