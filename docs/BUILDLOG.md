@@ -15714,6 +15714,16 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-15 (al): v0.11.7 cut (the (ak) fixes), NOT deployed
+
+Tag v0.11.7 on master after 0bf475d. Source over v0.11.6: 0bf475d only --
+the streaming /v1/messages dangling capture (#45), the non-fatal checkpoint
+pin (#46), the per-slot DFlash2 reserve (#47). Gates are (ak)'s (test-tools
+464, server + w8 build, the 3090 repro on the fixed w8, the 2-slot DFlash2
+boot on the 5090). Token ids and prompts unchanged. Production is the
+v0.11.6 build until a deploy; the #45 read exists there too, on every
+streaming /v1/messages response, so the deploy should not wait long.
+
 ## 2026-09-15 (ak): three field bugs -- a dangling capture that crashed streaming /v1/messages (#45), a fatal pinned-memory failure in the checkpoint ring (#46), the DFlash2 reserve counted once for N slots (#47)
 
 Four issues in two days; #48 (TaskCreate) is a Claude Code-side tool-list
