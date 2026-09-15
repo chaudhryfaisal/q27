@@ -81,7 +81,7 @@ jobs:
           [ -n "$GIT_REPO" ]   || GIT_REPO="https://github.com/${{ github.repository }}.git"
           [ -n "$GIT_COMMIT" ] || GIT_COMMIT="${{ github.sha }}"
           [ -n "$GH_REPO" ]    || GH_REPO="${{ github.repository }}"
-          [ -n "$TARGETS" ]    || TARGETS="q27-server q27-server-w8"
+          [ -n "$TARGETS" ]    || TARGETS="q27-server-w8"
           [ -n "$NVCCFLAGS" ]  || NVCCFLAGS="$DEFAULT_NVCCFLAGS"
 
           CLONE_DIR="q27-$GIT_COMMIT"
