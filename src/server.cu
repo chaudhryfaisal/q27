@@ -1014,11 +1014,23 @@ int main(int argc, char** argv) {
         // (calibration 2026-08-16: sizing for 8 requested slots on a card
         // that fits 3 stacks went negative and disabled the pool); the
         // build-loop skip check then agrees by construction.
+        // DFlash2 (Q27_DFLASH2): d2_setup runs in EVERY engine after this
+        // pool has taken its VRAM -- the ~2 GB Q8 serving pack, the ring and
+        // scratch, per slot. So the reserve is part of each slot's fixed
+        // stack. Until 2026-09-15 it was carved out of the pool ONCE for the
+        // process (issue #47): --slots 2 with the Q8 pack booted at 0 MB free,
+        // and on WDDM/WSL the driver pages VRAM to system RAM instead of
+        // failing, which read as 280 -> 100 t/s. Override: Q27_DFLASH2_RESERVE_GB.
+        double d2_reserve = 0;
+        if (getenv("Q27_DFLASH2")) {
+            d2_reserve = 2.0e9;
+            if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
+        }
         const double per_extra = (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
-                                 (double)(256ull << 20);
+                                 (double)(256ull << 20) + d2_reserve;
         int fit_slots = 1;
-        if ((double)freeb > (double)ENG_FIXED_BYTES + 0.25e9)
-            fit_slots = 1 + (int)(((double)freeb - (double)ENG_FIXED_BYTES - 0.25e9) /
+        if ((double)freeb > (double)ENG_FIXED_BYTES + 0.25e9 + d2_reserve)
+            fit_slots = 1 + (int)(((double)freeb - (double)ENG_FIXED_BYTES - 0.25e9 - d2_reserve) /
                                   per_extra);
         if (fit_slots < n_slots) {
             fprintf(stderr, "[pool] clamping projected slots %d -> %d (fixed stacks)\n",
@@ -1055,7 +1067,7 @@ int main(int argc, char** argv) {
         auto fixed_for = [&](int ns) {
             return (double)ENG_FIXED_BYTES +
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
-                   pool_slack + (double)ns * (double)(256ull << 20);
+                   pool_slack + (double)ns * ((double)(256ull << 20) + d2_reserve);
         };
         // Elastic windows (issue #42) are pool-sized, so half of one would
         // trade every extra slot away; they get a FIXED 16K concurrent share
@@ -1148,19 +1160,17 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // DFlash2 (Q27_DFLASH2): the drafter pack + ring + scratch load in
-        // d2_setup, which runs AFTER this pool grabs its VRAM -- so carve the
-        // drafter's footprint out of the pool now or d2_setup OOMs. The serving
-        // pack is ~1.2 GB (Q4 matmuls + codebooks; head/embed reuse the
-        // engine's), + ring/scratch; reserve 2.0 GB. Override: Q27_DFLASH2_RESERVE_GB.
-        if (getenv("Q27_DFLASH2") && pool_b > 0) {
-            double d2_reserve = 2.0e9;
-            if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
-            const double was = pool_b;
-            pool_b = pool_b > d2_reserve ? pool_b - d2_reserve : 0;
-            fprintf(stderr, "[pool] reserved %.2f GB for the DFlash2 drafter; pool %.2f -> "
-                            "%.2f GB\n",
-                    d2_reserve / 1e9, was / 1e9, pool_b / 1e9);
+        // DFlash2 reserve: already inside fixed_for (per slot), so the pool
+        // above excludes it; say what was set aside.
+        if (d2_reserve > 0) {
+            fprintf(stderr, "[pool] reserved %.2f GB per slot for the DFlash2 drafter (%.2f GB over "
+                            "%d slot%s, inside the fixed stacks above)\n",
+                    d2_reserve / 1e9, d2_reserve * n_slots / 1e9, n_slots, n_slots == 1 ? "" : "s");
+            if (n_slots > 1)
+                fprintf(stderr, "[pool] NOTE: DFlash2 serving is single-slot (it needs Q27_BATCH=0); "
+                                "%d slots each load their own drafter and take turns on the GPU -- "
+                                "extra slots buy separate caches and windows, not throughput\n",
+                        n_slots);
         }
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
@@ -3406,9 +3416,14 @@ int main(int argc, char** argv) {
         res.set_chunked_content_provider(
             "text/event-stream",
             // by-value or dangling: see the /v1/chat/completions twin
+            // resp_model by VALUE (issue #45, 2026-09-15): it is a handler
+            // local, and this provider runs after the handler has returned.
+            // Captured by reference since v0.11.1 (0217e36) it read a dead
+            // string -- garbage model names in message_start here, a
+            // std::bad_alloc that took the server down on the reporter's box.
             [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v,
              allowed_tool_names, tchoice, tools, stable_len, rt, thinking, tcfg,
-             sys_len](size_t, httplib::DataSink& sink) {
+             sys_len, resp_model](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;

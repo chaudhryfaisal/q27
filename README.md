@@ -394,6 +394,13 @@ first, then waits for a running one to finish. `Q27_KV_INCREMENTAL=0`
 restores up-front reservation; an explicit `--ctx` / `--slot1-ctx` still
 fixes the windows.
 
+DFlash2 serving is single-slot: it needs `Q27_BATCH=0`, and with `--slots N`
+every slot loads its own drafter (~2 GB for the Q8 pack plus ring and
+scratch) and the slots take turns on the GPU, so extra slots buy separate
+caches and windows, not throughput. The pool sizing reserves the drafter's
+VRAM per slot (v0.11.7; before that once per process, and a 2-slot boot
+could end at 0 MB free).
+
 **When a request seems stuck**, read the startup lines and the `[wait]`
 lines. Each slot needs a fixed stack plus a 16K-token KV floor, so on a
 card with less free VRAM `--slots N` can bring up fewer slots; the server
@@ -407,6 +414,15 @@ prefill, or a prefill time-sliced with other requests' prefills. It
 repeats every 30 s while the wait lasts and once more when it ends. The
 `http:` startup line gives the HTTP worker count; connections past it
 queue inside the HTTP layer before q27 sees them, with no log line.
+
+Two things to know on WSL2 or any box that caps pinned host memory. Each
+slot lazily pins a GDN checkpoint ring for mid-history divergence (up to 16
+x ~157 MB); if that pin fails the ring turns off for the slot with a
+`[ckpt]` line instead of taking the server down (before v0.11.7 it was
+fatal on a long prompt), and `Q27_CKPT_INTERVAL=0` skips it up front. And
+the Windows driver pages VRAM to system RAM instead of failing when the
+card is oversubscribed, which shows up as decode at a third of its speed;
+`vram: free ... at ready` near 0 is the tell.
 
 **Persistent prefix cache**: `--prefix-cache DIR` (opt-in). Restart TTFT
 8.15 s -> 1.20 s; entries verified token-by-token; LRU capped by

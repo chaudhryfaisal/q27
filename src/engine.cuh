@@ -4042,7 +4042,25 @@ struct Engine {
             size_t total = 0;
             for (int il = 0; il < N_LAYER; il++)
                 if (!attn_layer[il]) total += lf;
-            CUDA_CHECK(cudaMallocHost((void**)&c.buf, total * 4));
+            // Not fatal (issue #46, 2026-09-15): the ring pins up to ckpt_slots
+            // x ~157 MB per slot, lazily, and WSL2 caps pinned host memory well
+            // below a Linux box's -- a 172K-token prompt on 2 slots died here
+            // mid-request with "out of memory". The ring is an optimization
+            // (a mid-history divergence falls back to a cold prefill without
+            // it), so a failed pin turns it off for this slot and says so.
+            const cudaError_t e = cudaMallocHost((void**)&c.buf, total * 4);
+            if (e != cudaSuccess) {
+                (void)cudaGetLastError();
+                c.buf = nullptr;
+                fprintf(stderr,
+                        "[ckpt] pinned host alloc of %.0f MB failed (%s): GDN checkpoint ring OFF "
+                        "for this slot; a mid-history divergence re-prefills instead. Each slot's "
+                        "ring pins up to %d x %.0f MB -- Q27_CKPT_INTERVAL=0 skips it, or raise the "
+                        "pinned-memory limit (WSL2: .wslconfig memory)\n",
+                        total * 4 / 1e6, cudaGetErrorString(e), ckpt_slots, total * 4 / 1e6);
+                ckpt_interval = 0;
+                return;
+            }
         }
         float* h = c.buf;
         for (int il = 0; il < N_LAYER; il++)
