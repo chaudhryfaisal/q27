@@ -15714,6 +15714,62 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-15 (al): v0.11.7 cut (the (ak) fixes), NOT deployed
+
+Tag v0.11.7 on master after 0bf475d. Source over v0.11.6: 0bf475d only --
+the streaming /v1/messages dangling capture (#45), the non-fatal checkpoint
+pin (#46), the per-slot DFlash2 reserve (#47). Gates are (ak)'s (test-tools
+464, server + w8 build, the 3090 repro on the fixed w8, the 2-slot DFlash2
+boot on the 5090). Token ids and prompts unchanged. Production is the
+v0.11.6 build until a deploy; the #45 read exists there too, on every
+streaming /v1/messages response, so the deploy should not wait long.
+
+## 2026-09-15 (ak): three field bugs -- a dangling capture that crashed streaming /v1/messages (#45), a fatal pinned-memory failure in the checkpoint ring (#46), the DFlash2 reserve counted once for N slots (#47)
+
+Four issues in two days; #48 (TaskCreate) is a Claude Code-side tool-list
+question, answered without a code change.
+
+#45 (chaudhryfaisal, w8 build on sm_86 behind llama-swap on Modal):
+std::bad_alloc after "[http] POST /v1/messages -> 200". Reproduced on the
+3090 with his exact config (w8, q4s tier, turbo3 KV, Q27_SAMPLED=0, --ctx
+94208, prefix cache, --min-p 0) and his opencode title request: the
+streaming message_start event carried garbage bytes in "model". Cause: the
+v0.11.1 model echo (0217e36) made resp_model a handler local, and the
+/v1/messages streaming provider's explicit capture list took it by
+reference -- the provider runs after the handler returned. UB since
+v0.11.1 on EVERY streaming /v1/messages response; SSO strings survived by
+luck on the Claude Code campaigns (the recorded transcripts showed the
+right tag), garbage here, bad_alloc on his box. Fix: resp_model in the
+by-value list. A scan of the three streaming providers for handler locals
+used inside found only this one. Fixed w8 on the 3090: "model":
+"qwen38-27b-mtp" on both passes, server up.
+
+#46 (1010323691, WSL2, --slots 2 + DFlash2 Q8): "CUDA error: out of memory
+at engine.cuh:4045 cudaMallocHost" on a 172K-token prompt unless
+Q27_CKPT_INTERVAL=0. The P9 GDN checkpoint ring pins up to 16 x 157 MB per
+slot lazily; WSL2 caps pinned host memory. CUDA_CHECK made the pin fatal.
+Now a failed pin turns the ring off for that slot with a [ckpt] line (a
+mid-history divergence re-prefills instead) and the request continues.
+Also answered: Q27_KV_INCREMENTAL=0 is KV reservation policy (batching
+only), unrelated.
+
+#47 (same reporter): --slots N with DFlash2 boots at "vram: free 0.00 GB
+at ready" and long-context decode drops 280 -> 100 t/s; disabling DFlash2
+restores it. d2_setup runs per engine (Q8 pack ~2 GB + ring + scratch each)
+but the reserve (Q27_DFLASH2_RESERVE_GB) was carved out of the pool ONCE per
+process. On WDDM the driver pages VRAM to system RAM instead of failing --
+the 100 t/s. Fix: the reserve is per slot inside fixed_for and per_extra
+(the slot-count clamp and the KV-floor trade see it), the boot line says
+"reserved 3.00 GB per slot ... (6.00 GB over 2 slots)", and a NOTE says
+DFlash2 serving is single-slot (Q27_BATCH=0; slots take turns). Verified on
+the 5090 with his config: 2 slots at 147456 tokens each, 2.97 GB free at
+ready (was 0), a 120K-token prompt served (pf 46.6 s).
+
+README: DFlash2-with-slots note under multi-slot; WSL2 pinned-memory and
+VRAM-paging notes under "When a request seems stuck". make test-tools 464
+PASS; server and w8 build. Not deployed (production is the v0.11.6 build;
+none of the three affects a single-slot Linux box with a short stack).
+
 ## 2026-09-13 (aj): v0.11.6 cut (wait diagnostics, BPE cache + one-pass encode, the Codex perf report) and deployed, with 128K cache entries
 
 Tag v0.11.6 on master after e1d35f6. Source over v0.11.5: 8cd7083 (ah)
