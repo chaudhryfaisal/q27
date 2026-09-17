@@ -1,0 +1,12 @@
+{"seq": 1, "seed": 1, "think": 201, "closed": true, "tools": [], "out": 86, "prompt": 24923, "stop": "eos", "text_after": 165, "narr": 165, "secs": 8.98}
+{"seq": 2, "seed": 1, "think": 295, "closed": true, "tools": [], "out": 140, "prompt": 24985, "stop": "eos", "text_after": 310, "narr": 310, "secs": 9.85}
+{"seq": 3, "seed": 1, "think": 341, "closed": true, "tools": [], "out": 134, "prompt": 27074, "stop": "eos", "text_after": 187, "narr": 187, "secs": 10.55}
+{"seq": 4, "seed": 1, "think": 202, "closed": true, "tools": [], "out": 124, "prompt": 25118, "stop": "eos", "text_after": 269, "narr": 269, "secs": 9.78}
+{"seq": 5, "seed": 1, "think": 209, "closed": true, "tools": [], "out": 112, "prompt": 25080, "stop": "eos", "text_after": 270, "narr": 270, "secs": 9.59}
+{"seq": 6, "seed": 1, "think": 335, "closed": true, "tools": [], "out": 124, "prompt": 25664, "stop": "eos", "text_after": 178, "narr": 178, "secs": 10.04}
+{"seq": 7, "seed": 1, "think": 229, "closed": true, "tools": [], "out": 126, "prompt": 25501, "stop": "eos", "text_after": 244, "narr": 244, "secs": 10.04}
+{"seq": 8, "seed": 1, "think": 230, "closed": true, "tools": [], "out": 127, "prompt": 25067, "stop": "eos", "text_after": 280, "narr": 280, "secs": 9.91}
+{"seq": 9, "seed": 1, "think": 164, "closed": true, "tools": [], "out": 71, "prompt": 25867, "stop": "eos", "text_after": 102, "narr": 102, "secs": 9.39}
+{"seq": 10, "seed": 1, "think": 382, "closed": true, "tools": [], "out": 154, "prompt": 25673, "stop": "eos", "text_after": 309, "narr": 309, "secs": 10.61}
+{"seq": 11, "seed": 1, "think": 210, "closed": true, "tools": [], "out": 98, "prompt": 26153, "stop": "eos", "text_after": 134, "narr": 134, "secs": 9.95}
+{"seq": 12, "seed": 1, "think": 118, "closed": true, "tools": [], "out": 74, "prompt": 25197, "stop": "eos", "text_after": 176, "narr": 176, "secs": 9.25}

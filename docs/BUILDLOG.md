@@ -15714,6 +15714,69 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-17 (am): issue #49 -- why ninfer runs half the Claude Code turns: the planning turn, not a cutoff; every q27-side mechanism excluded; render_request had the wrong tool dialect for 3.8
+
+Full readout with tables: bench/crossengine/agentic-2026-09-17-turns/README.md.
+Method: recorded /v1/messages bodies (scratchpad only) replayed on both
+engines N seeds per state (state_replay.py), first action / thinking /
+visible text before the call compared per state (paired.py); raw prompts
+via raw_think.py; trajectory legs on the 12-instance SWE-bench harness.
+
+What the day established, in order:
+- Deep states (turns 8/12/16 of q27's sessions, 27 x 6): IDENTICAL. 314 vs
+  310 chars, narration 52 vs 55%, same action mix, post-edit run 68 vs 72%,
+  end-turn 12 vs 8%. Same on 19 states rebuilt from ninfer's own
+  trajectories (recon_ninfer.py, validated 0 diffs against q27's recorded
+  bodies): 738 vs 518 (p=0.39), narration 44% both.
+- Turn 0 (12 bodies x 24): ninfer 130 vs q27 338 chars, targeted inspection
+  62 vs 34%, orientation 16 vs 35%. GREEDY (both deterministic 12/12): 136
+  vs 292 (p=0.0001), visible text before the call 17% vs 100%; first
+  tool+arg identical on 7/12.
+- Where the turns go: 4/12 instances ninfer finished in 3-5 turns as read,
+  read, edit, end (no test run on two); q27 15-25 on the same four. All
+  four patches hit the gold file. Legs: q27 20-22 turns/inst on four legs
+  (seed 0 x2, ladder 19.9, Q27_SEED=random 22.0), ninfer 14.0.
+- Excluded on q27's side: rendering (header dropped 316 / keys sorted 292
+  p=0.013 / both 330 vs 338; narration 97-100% on all), effort line (both
+  engines implement the template line; Claude Code sends effort=medium on
+  every request -> neither renders it; q27 honours it on all 3 paths),
+  drafter (ladder vs DFlash2 8 states x 32: 222 vs 228; leg 19.9 vs 21.4),
+  seed (random-seed leg 22.0), error marker, output drops, sampler
+  (greedy). On ninfer's side: no --spec (159 vs 130, narration 33 vs 36%),
+  kToolInstructions byte-identical to q27's XML block, no thinking budget.
+- Quantization ladder on the SERVED turn-0 prompt (12 x 12 + greedy): q27
+  304 / llama Q8_0 264 / Q5_K_M 242 / Q4_K_M 266 (Q5,Q4 vs Q8 p=0.48/0.73;
+  q27 vs Q8 p=0.010, LONGER); narration 85-94% sampled, 100% greedy on
+  every tier. Bit width does not shorten the planning turn; what ninfer's
+  NVFP4/int8 pass does there is specific to it and not visible from here.
+  Narration on raw mid-session prompts (34 states): q27 67 / q6 66 / Q8
+  64%, per state all-or-nothing -> state-determined.
+Reading: the engines diverge at turns 0-1 (ninfer plans shorter, skips the
+visible text, goes to the suspected file without orienting or reproducing)
+and each then follows the state it is in. Not a cutoff (no sample on
+either engine stopped on a budget), so the reporter's "expose a reasoning
+cutoff" would not reproduce it; effort=low is the model's own short mode
+(18 vs 21 turns on 09-10). Reply drafted, not posted.
+
+Tooling defect found on the way: tools/render_request rendered the Qwen3.6
+JSON tool preamble for 3.8 bodies unless Q27_TOOL_DIALECT was set (no
+artifact -> no general.name -> tool_dialect_xml_default() false), 83
+tokens short of the served prompt with a different instruction block
+(count_tokens bisect: 0 delta without tools, +83 with 1 or 28). Every
+turn-0 raw arm rendered today before 16:30 ran on it (narration 0-50%
+there vs 85-100% on the served preamble -- a prompt effect, not an engine
+one; the within-ladder thinking comparison was unchanged: 256/244/264).
+Mid-session raw prompts (09-10 pipeline, q27's served system block) were
+XML already. render_request now takes --dialect xml|json, infers xml from
+a qwen38 path, and prints which it used; default render of turn0_1 is
+byte-identical to the server (25006 tokens). The 08-22 flip-gate corpus
+was rendered under the old default; noted in bench/flipgate/provenance.txt.
+
+Shipped in this commit: Q27_SEED=random (per-request seed when the client
+sends none; default stays 0) + seed= in [req]; campaign.sh legs q27seed /
+q27ladr; raw_think.py narr field + RT_TEMP/RT_TOPK; turns_cmp.py 09-17 dir;
+render_request --dialect; readout + scripts; results.q27ladr/q27seed.
+
 ## 2026-09-15 (al): v0.11.7 cut (the (ak) fixes), NOT deployed
 
 Tag v0.11.7 on master after 0bf475d. Source over v0.11.6: 0bf475d only --

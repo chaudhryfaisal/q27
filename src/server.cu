@@ -20,6 +20,7 @@
 // on bench-time-tracker that was worth 0.779 vs 0.967 (see docs/BUILDLOG.md
 // 2026-08-22 (c)). For Qwen3.8 agentic serving: --temp 1.0 --top-p 0.95.
 #include <atomic>
+#include <random>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -104,12 +105,28 @@ static q27k::SampleParams parse_sample(const json& body) {
         s.top_k = (tk > 0.0 && tk < 1e9) ? (int)tk : 0;
         const double mp = q27::jnum(body, "min_p", g_default_min_p);
         s.min_p = (float)((mp > 0.0 && mp <= 1.0) ? mp : 0.0);
+        // Q27_SEED (2026-09-17): a request that sends no seed samples with seed
+        // 0, so every Claude Code session on a box draws the SAME random stream
+        // -- the 12-instance campaigns were one seed, not twelve. Q27_SEED=random
+        // draws a fresh seed per such request (logged in [req] as seed=, so a
+        // turn stays reproducible by replaying it); Q27_SEED=N fixes the base.
+        static const long long seed_mode = [] {
+            const char* e = getenv("Q27_SEED");
+            if (!e || !*e) return 0LL;               // seed 0, the historical default
+            if (!strcmp(e, "random")) return -1LL;
+            return atoll(e);
+        }();
+        static std::atomic<unsigned long long> auto_seed_ctr{0};
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
         else if (force_temp > 0.0) {
             s.seed = ++force_seed_ctr;   // distinct independent draw per forced request
             fprintf(stderr, "[force-sample] temp=%.3f top_p=%.3f seed=%llu\n",
                     temp, (double)s.top_p, s.seed);
+        } else if (seed_mode == -1) {
+            s.seed = std::random_device{}() ^ (++auto_seed_ctr << 32);
+        } else if (seed_mode > 0) {
+            s.seed = (unsigned long long)seed_mode;
         }
     }
     return s;
@@ -1556,11 +1573,11 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s%s\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f seed=%llu%s%s%s%s%s%s\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
-                ms_since(srv_t0),
+                ms_since(srv_t0), e.samp.seed,
                 // P13: adaptive-maxd activity, cumulative on this engine
                 // (per-request when Q27_MAXD_RESET=1 -- review 2026-07-09)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,

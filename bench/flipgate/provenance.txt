@@ -26,3 +26,12 @@ NOT the older scratchpad/t3_quality/corpus/agentic_req0031.i32: that one is
 154k tokens of which a single runaway assistant message is 128k (the same
 shape as the 30k-token generations in the 08-22 arm logs), so 83% of its
 "assistant output" is one pathological turn.
+
+NOTE (2026-09-17): this corpus was rendered before render_request learned
+the tool dialect. With no artifact to read general.name from, the tool
+defaulted to the Qwen3.6 JSON tool preamble; the server renders the XML
+preamble for 3.8 (83 tokens longer on a 28-tool body, different
+instruction block). The flip rates below are therefore measured on a
+prompt the server would not send. render_request now takes --dialect and
+infers xml from a qwen38 path; re-render with it before re-baselining.
+See bench/crossengine/agentic-2026-09-17-turns/README.md, section 8.

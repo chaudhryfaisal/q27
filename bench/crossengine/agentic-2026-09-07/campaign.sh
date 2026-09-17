@@ -94,11 +94,20 @@ start_engine() { # $1 label
     # q27tok = the same config on a CANDIDATE binary (Q27_CANDIDATE, default
     # the master worktree's build): 2026-09-10 tokenizer fix (the tool tags as
     # added tokens) + 3.8 history rendering, against q27v0113c as the control.
-    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow)
+    # q27seed = the candidate binary with Q27_SEED=random: a fresh seed per
+    # request instead of seed 0 for every one (2026-09-17, issue #49 -- are the
+    # 12 q27 instances one draw of the first-move style, or twelve?)
+    # q27ladr = the candidate binary WITHOUT DFlash2 (MTP ladder + suffix
+    # drafter, batching default), otherwise the q27tok config: does the
+    # drafter change trajectory length? (2026-09-17; 09-07 had lad 12.7 turns
+    # vs d2 17.2-17.5, ninfer 13.8.)
+    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow|q27seed|q27ladr)
               B=$Q27; [ "$1" = q27pre0113 ] && B=$Q/build/q27-server.pre-v0.11.3
-              case "$1" in q27tok*) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
+              case "$1" in q27tok*|q27seed|q27ladr) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
+              D2ENV="-E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3"; [ "$1" = q27ladr ] && D2ENV=""
+              SEEDENV=""; [ "$1" = q27seed ] && SEEDENV="-E Q27_SEED=random"
               rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
-              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+              systemd-run --user --unit $unit $Q27ENV $D2ENV -E Q27_SYSBLK=1 $SEEDENV \
                 ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $MODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
