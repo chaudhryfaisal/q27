@@ -15787,6 +15787,17 @@ boot on the 5090). Token ids and prompts unchanged. Production is the
 v0.11.6 build until a deploy; the #45 read exists there too, on every
 streaming /v1/messages response, so the deploy should not wait long.
 
+DEPLOYED 2026-09-17 17:10 PDT: built from the v0.11.7 tag (1c1f972) in a
+throwaway worktree, md5 63ce03d9, moved atomically into
+/mnt/ai/projects/q27/build/q27-server; the v0.11.6 build saved as
+q27-server.v0.11.6 (b15a569e) for rollback, v0.11.4 and v0.11.3 still
+there. Boot: wsum b743d26b1f0562a9, XML dialect, DFlash2 serving ON K=7,
+listening; health 200 in 2 s. Smoke on the #45 path: streaming
+message_start carries the requested model name ("claude-opus-4-8"), text
+delivered; non-stream fine. Master is 0f1f1d4 (issue #49 readout,
+Q27_SEED, render_request --dialect) -- NOT in this build; the deployed
+source is exactly the tag's.
+
 ## 2026-09-15 (ak): three field bugs -- a dangling capture that crashed streaming /v1/messages (#45), a fatal pinned-memory failure in the checkpoint ring (#46), the DFlash2 reserve counted once for N slots (#47)
 
 Four issues in two days; #48 (TaskCreate) is a Claude Code-side tool-list
