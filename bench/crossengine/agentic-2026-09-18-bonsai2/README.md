@@ -13,6 +13,7 @@ and `../agentic-2026-09-17-turns/depth_think.py`.
 
 | leg | gold | turns/inst | think K/inst | out tok/inst | wall s/inst | agg t/s | tok/round |
 |---|--:|--:|--:|--:|--:|--:|--:|
+| bonsai2d2b (pure T2, Bonsai-trained drafter) | 10/12 | 37.2 | 66.1 | 22414 | 138 | 227.7 | 3.80 |
 | bonsai2 | 11/12 | 37.3 | 74.8 | 26214 | 182 | 205.1 | 3.47 |
 | q27seed (3.8 default, DFlash2) | 11/12 | 22.0 | 34.5 | 12564 | 78 | 222.0 | 4.02 |
 | q27ladr (3.8 default, MTP ladder) | 11/12 | 19.9 | 32.5 | 12244 | 92 | 176.0 | 3.31 |
@@ -30,7 +31,14 @@ mechanics are the same on both sides. Thinking by turn depth (`depth_think.py`)
 is longer at every depth from turn 3 on (medians 250-680 chars vs 150-670
 for q27seed, with a heavier tail: 24% of turns over 2K chars vs 18%).
 
-Files: `results.bonsai2.jsonl` (harness rows), `bonsai2.log` (run.sh
-output). The server journal and the request-body log
+Second leg, same afternoon: `bonsai2d2b` is the pure-T2 pack (Phase 3, no
+Q4 shadows) with the third-party Bonsai-trained DFlash2 drafter
+(ProCreations/Ternary-Bonsai-2-27B-DFlash2, repacked Q8 by
+`tools/dflash2_pack.py`, identity-gated on the 3090). Same trajectory shape
+(37 turns), +9.7% tokens per round and +11% aggregate decode over the
+Qwen3.8 drafter; the gold flip on requests-1921 is one sampled trial, the
+verify is exact in distribution. BUILDLOG (as).
+
+Files: `results.<leg>.jsonl` (harness rows), `<leg>.log` (run.sh output). The server journal and the request-body log
 (`REQBODY_LOG=/mnt/ai/data/reqbody/2026-09-18-bonsai2`) are session content
 and stay out of the repo.

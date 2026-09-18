@@ -15714,6 +15714,70 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (as): a Bonsai-trained DFlash2 drafter (third-party) -- +7% tokens per round on code, identity clean on sm_86; and the 5090 identity gate is not an identity gate
+
+PrismML ships no MTP block for Bonsai 2 (64 blocks, no nextn tensors, no MTP
+repo under prism-ml). ProCreations (independent, Apache-2.0, updated today)
+ships two drafters: a Qwen3.8 MTP head distilled onto Bonsai hidden states
+(HF-named safetensors; 58.6% draft acceptance at draft 2 in their runtime,
+~2.2 tok/round, below what DFlash2 already gives us -- not pursued, a day
+of engine work for a footprint win only) and a DFlash2 drafter retrained on
+Bonsai features. The DFlash2 one is the z-lab architecture exactly: 81
+tensors, names and shapes equal to the Qwen3.8 drafter, same mask token and
+target taps, so tools/dflash2_pack.py --q8 packs it unchanged (2.08 GB,
+md5 e6dd75e7574f4fe414a9e3893570b9b5, checkpoint sha256 verified against
+the repo's own manifest). Treated as untrusted weights and gated like ours.
+
+**Prompt A/B on the 5090** (pure-T2 target, same binary, same four greedy
+prompts, the Qwen3.8 Q8 pack as the same-day control; exact-mode rounds
+then vgemm timing):
+
+    prompt   tok/round  qwen -> bonsai    t/s (vgemm)  qwen -> bonsai
+    short        7.3 -> 4.8 (29 tokens)          492 -> 326
+    cities       5.1 -> 5.8                      344 -> 389
+    long         3.45 -> 3.48                    231 -> 232
+    code         4.01 -> 4.31  (+7.5%)           266 -> 286
+    round wall 14.9 ms both (same bytes, same kernels)
+
+3090 (sm_86) on the same target, exact mode: long 3.50 -> 3.74 (+7%).
+Target-trained drafting helps on code and short answers, is a wash on the
+prose prompt, and loses on a 29-token reply (one more round). Campaign leg
+`bonsai2d2b` (pure T2 + this pack) added to campaign.sh; see below.
+
+**Identity gate finding.** Plain vs DFlash2 with Q27_D2_VGEMM=0 (the GEMV
+verify family) on the 5090 DIFFERS for BOTH drafters at the same character
+(long 906, code 366; short and cities identical), deterministically (run 2
+== run 1 on every text), with clean weight digests on every load, and
+gemv_t2_n vs gemv_t2 bitwise (err 0). Same experiment on the 3090: IDENTICAL
+on every prompt with either pack. Same experiment on the Qwen3.8 DEFAULT
+tier on the 5090: DIFFERS (long 435, code 863). So this is the 09-07 (f)
+instrument finding again -- serving greedy on the 5090 is not
+width-invariant, reduction shapes differ between the width-1 and width-8
+paths and near-ties flip -- pre-existing, arch-specific, nothing to do with
+Bonsai or the drafters. The (ao) entry's identity gate was run on the 3090
+for that reason; the rule is now written down: plain-vs-DFlash2 identity is
+an sm_86 instrument; on the 5090 compare drafters against each other.
+
+**Campaign leg `bonsai2d2b`** (pure-T2 pack + the Bonsai-trained Q8 drafter,
+otherwise the morning's bonsai2 config; 12 instances, fresh pfx root):
+
+    leg          drafter     tok/round  agg t/s  median req t/s  turns/i  think K/i  wall s/i  gold
+    bonsai2d2b   bonsai      3.802      227.7    240.6           37.2     66.1       138       10/12
+    bonsai2      qwen3.8     3.466      205.1    220.0           37.3     74.8       182       11/12
+    q27seed      (3.8 target) 4.02      222.0    245.1           22.0     34.5        78       11/12
+
++9.7% tokens per round and +11% aggregate decode on live Claude Code traffic
+(480 vs 490 requests, reuse 0.966 vs 0.969), which lifts the ternary target
+above the Qwen3.8 default tier's aggregate. Trajectory shape unchanged (37
+turns either way; the thinking drop is one-trial sampled variance, as is
+the gold flip on requests-1921 -- the verify is exact in distribution, a
+drafter cannot move outcomes). So the third-party drafter is the better pack
+for this target; the Qwen3.8 one stays the fallback. Not redistributed: it
+is ProCreations' checkpoint, repacked locally (pack path in the campaign
+comment). Also fixed: stop_engine dropped only q27* cache roots, so the
+morning's 37 GB bonsai2 root starved the next leg's 40 GB budget (refused,
+SKIPPED) -- bonsai* roots are dropped now.
+
 ## 2026-09-18 (ar): Bonsai 2 Phase 3 + the gates -- T2 prefill GEMM drops the 13 GB of Q4 shadows (9.44 GB pack, 262K auto ctx); PPL 9.25 vs 7.31, HE+ 25/30, needle 6/6, campaign gold 11/12 at 2x the reasoning
 
 **Phase 3.** prefill.cu's two MMA GEMM kernels (k_gemm_mma_T, k_gemm_mma_ntx)
