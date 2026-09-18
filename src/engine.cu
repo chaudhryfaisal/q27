@@ -213,9 +213,16 @@ int main(int argc, char** argv) {
                                  : "output.weight";
             const DevTensor& hw = e.dm.get(vh);
             d2.set_engine_head(hw.data, (const __half*)hw.scales,
-                               hw.dtype == DType::Q4_G64);
+                               hw.dtype == DType::Q4_G64 ? 1 : hw.dtype == DType::T2_G128 ? 2 : 0);
             fprintf(stderr, "dflash2: engine head (%s)\n", vh);
         }
+        {
+            // serving packs drop target.embed/target.head: use the engine's Q8
+            // embedding like the server does (Bonsai: inverse-rotated inside)
+            const DevTensor& ew = e.dm.get("token_embd.weight");
+            d2.set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+        }
+        if (e.bonsai2) d2.set_bonsai2_signs(e.bz_s5120); // rotated embed table + folded head
         float* d_vtaps;
         CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
         // prompt: eager tapped steps, ingest each committed position

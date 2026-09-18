@@ -997,7 +997,9 @@ public:
         // whose ctor throws never runs. Tear down + rethrow.
         try {
             core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
-            core.needs_solo_round = [](Member& mm) { return mm.t->round_forced; };
+            // Bonsai 2 packs stay on solo rounds: fused_verify_round mirrors
+            // spec_verify_forward's skeleton without the activation rotation.
+            core.needs_solo_round = [](Member& mm) { return mm.t->round_forced || mm.e->bonsai2; };
             core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                       int k, bool* done) {
                 this->fused_round(ms, granted, sfx, k, done);

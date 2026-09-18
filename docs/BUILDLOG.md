@@ -15714,6 +15714,46 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (ao): DFlash2 on the ternary target -- Bonsai 2 serves at 184-391 t/s on the 5090, greedy-exact vs plain
+
+The drafter attaches to the unrotated residual stream, so the pack trained on
+BF16 Qwen3.8-27B drafts for Bonsai 2 unchanged; what needed rotation was the
+engine's multi-lane verify forward and the two places the drafter touches
+folded tensors. engine.cuh: bz_norm3_rot_q5 (rmsnorm3 -> rotate lanes ->
+quantize3; GDN layers on a lane COPY because gdn_pre's alpha/beta F16 GEMVs
+read the raw x1), gdn_post perm+rotate via bz_ogp_L, attn_post/ffn_pair
+rotate lanes in place, embed3 inverse, head-norm rotation; conductor.h forces
+solo rounds for bonsai2 engines (fused_verify_round is not mirrored);
+dflash2.{h,cu}: set_bonsai2_signs -> inverse on the mask/anchor embed rows,
+head input rotated on a copy (the selector projection keeps plain nhf), and
+the engine-head kind is now an enum (Q8/Q4/T2) so a T2 head runs gemv_t2_n
+(the t2 artifact's output_q4.weight IS T2; reading it as Q8 was the 5090
+illegal access at dflash2.cu:737). build_spec_graphs' no-MTP branch now
+seeds the lanes (d_pos_L[i]=i, tokens 0, d_samp warm), runs
+spec_verify_forward + tail (+ sampled tail) eagerly at width K+1, reset(),
+then d2_setup() -- d2_setup captures its verify graphs with no warm of its
+own, and the ladder's warm rounds that used to provide it are gone here.
+
+Gates (server, scratchpad/bonsai/server_d2_gate.sh: plain vs DFlash2
+servers, identical greedy requests): 3090 q4x with Q27_D2_VGEMM=0 -> all
+three outputs IDENTICAL to plain (the verify chain is exact on the ternary
+target); default vgemm family -> identical on the short prompts, the
+700-token one diverges at char 197 (the known accumulation-order family, same
+as on the BF16 model). Acceptance: 7.3 / 5.1 / 3.5-3.8 tokens per round on
+the short / cities / 700-token prompts -- the BF16 model's class.
+
+5090, bonsai2-27b-t2.q27 (T2 decode + .q4x prefill shadows, 22.4 GB), ctx
+8192: plain 110 t/s; DFlash2 K=7: short 391 t/s, cities 276 t/s, 700-token
+184 t/s (203 rounds, 18.7 ms/round). The round wall is NOT below the Q4
+production tier's (~17.4 ms) despite half the weight bytes: T2 has no vgemm
+(MMA) verify path yet, so width-8 rounds run the register-bound gemv_t2_n<8>,
+plus 6 rotation launches per layer per lane set. Next lever: a T2 verify
+GEMM (dequant to int8 tiles + MMA, the k_vgemm family) and the fused
+rotate+quantize kernel.
+
+Trap: the CLI's --dflash2 bring-up path is stale (map::at on the serving
+pack for the production model too); gate DFlash2 through the server.
+
 ## 2026-09-18 (an): Bonsai 2 27B (PrismML ternary Qwen3.8-27B) runs on q27 -- fork-parity logits, plain decode 110 t/s on the 5090 with the first ternary kernel
 
 Plan: docs/plans/2026-09-18-bonsai2-ternary.md. Model: Qwen3.8-27B with

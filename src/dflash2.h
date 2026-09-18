@@ -102,12 +102,13 @@ struct Dflash2 {
     // are verify-decided and unaffected. Cleared = fp16 pack head.
     const void* ehead_data = nullptr;
     const __half* ehead_scales = nullptr;
-    bool ehead_q4 = false;
+    // 0 = Q8_G128, 1 = Q4_G64, 2 = T2_G128 (Bonsai 2 ternary head)
+    int ehead_kind = 0;
     q27k::XQuant hxq[D2_WMAX - 1] = {};
-    void set_engine_head(const void* data, const __half* scales, bool q4) {
+    void set_engine_head(const void* data, const __half* scales, int kind) {
         ehead_data = data;
         ehead_scales = scales;
-        ehead_q4 = q4;
+        ehead_kind = kind;
     }
     // Engine Q8 embedding reuse (serving): the drafter's anchor/mask embed
     // rows come from the engine's own token_embd (Q8_G128) instead of a
@@ -120,6 +121,13 @@ struct Dflash2 {
         eembed_data = data;
         eembed_scales = scales;
     }
+    // Bonsai 2 (docs/plans/2026-09-18-bonsai2-ternary.md): the engine's
+    // token_embd rows are Hadamard-rotated (inverse after lookup) and its
+    // head is folded on the input dim (rotate before the GEMV). The drafter's
+    // own layers ride the unrotated residual taps and need nothing.
+    const float* bz_signs = nullptr; // sign vector for width D2_H, device
+    float* nrot = nullptr;           // [WMAX][D2_H] rotated copy of nhf for the head
+    void set_bonsai2_signs(const float* s) { bz_signs = s; }
     void alloc(int cap);
 
     // append T committed-token context rows. taps: device [T][TAPD] fp32,
