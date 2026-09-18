@@ -3731,6 +3731,102 @@ static void test_hadamard1024() {
         CUDA_CHECK(cudaFree(d_x));
         CUDA_CHECK(cudaFree(d_s));
     }
+    // fused rotate+quantize == hadamard1024 on a copy, then quantize_x (bitwise
+    // nat/eo/scale/isum); with the GDN permutation; and the norm twin ==
+    // rmsnorm3 + hadamard lanes + quantize3.
+    {
+        std::mt19937 rng2(4242);
+        std::uniform_real_distribution<float> U2(-3.f, 3.f);
+        auto cmp_xq = [&](const q27k::XQuant& a, const q27k::XQuant& b, int width, const char* nm) {
+            const int nb = width / 32;
+            std::vector<int8_t> na(width), nb_(width);
+            std::vector<uint2> ea(width / 8), eb(width / 8);
+            std::vector<float> sa(nb), sb(nb);
+            std::vector<int> ia(nb), ib(nb);
+            CUDA_CHECK(cudaMemcpy(na.data(), a.nat, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(nb_.data(), b.nat, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ea.data(), a.eo, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(eb.data(), b.eo, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sa.data(), a.scale, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sb.data(), b.scale, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ia.data(), a.isum, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ib.data(), b.isum, nb * 4, cudaMemcpyDeviceToHost));
+            long bad = (memcmp(na.data(), nb_.data(), width) != 0) + (memcmp(ea.data(), eb.data(), width) != 0) +
+                       (memcmp(sa.data(), sb.data(), nb * 4) != 0) + (memcmp(ia.data(), ib.data(), nb * 4) != 0);
+            check(nm, (double)bad, 1);
+        };
+        for (int width : {5120, 6144, 17408}) {
+            const bool perm = width == 6144;
+            std::vector<float> x(width), sg(width);
+            for (auto& v : x) v = U2(rng2);
+            for (auto& v : sg) v = (rng2() & 1) ? 1.f : -1.f;
+            float *d_x, *d_s, *d_tmp;
+            CUDA_CHECK(cudaMalloc((void**)&d_x, width * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_s, width * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_tmp, width * 4));
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), width * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_s, sg.data(), width * 4, cudaMemcpyHostToDevice));
+            q27k::XQuant qa = q27k::xquant_alloc(width), qb = q27k::xquant_alloc(width);
+            // reference: (perm) -> rotate copy -> quantize
+            if (perm) q27k::gdn_v_tiled_to_grouped(d_x, d_tmp, 128, 16, 3);
+            else CUDA_CHECK(cudaMemcpy(d_tmp, d_x, width * 4, cudaMemcpyDeviceToDevice));
+            q27k::hadamard1024(d_tmp, d_s, width, false);
+            q27k::quantize_x(d_tmp, width, qa);
+            q27k::rotq(d_x, d_s, width, qb, 0, perm, 128, 16, 3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            char nm[96];
+            snprintf(nm, sizeof nm, "rotq w=%d%s == rotate+quantize (bitwise)", width, perm ? " perm" : "");
+            cmp_xq(qa, qb, width, nm);
+            // lanes form
+            q27k::CP3 in{{d_x, d_x}};
+            q27k::XQuant qc = q27k::xquant_alloc(width);
+            q27k::XQ3 q3{};
+            q3.q[0] = qc; q3.q[1] = qb;
+            q27k::rotq3(in, d_s, width, q3, 2, 0, perm, 128, 16, 3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            snprintf(nm, sizeof nm, "rotq3 w=%d%s lane 0 == rotq (bitwise)", width, perm ? " perm" : "");
+            cmp_xq(qa, qc, width, nm);
+            CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_s)); CUDA_CHECK(cudaFree(d_tmp));
+        }
+        // norm twin at 5120, 2 lanes
+        {
+            const int n = 5120;
+            std::vector<float> x(2 * n), w(n), sg(n);
+            for (auto& v : x) v = U2(rng2);
+            for (auto& v : w) v = 0.5f + 0.01f * U2(rng2);
+            for (auto& v : sg) v = (rng2() & 1) ? 1.f : -1.f;
+            float *d_x, *d_w, *d_s, *d_y, *d_y2;
+            CUDA_CHECK(cudaMalloc((void**)&d_x, 2 * n * 4)); CUDA_CHECK(cudaMalloc((void**)&d_w, n * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_s, n * 4)); CUDA_CHECK(cudaMalloc((void**)&d_y, 2 * n * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_y2, 2 * n * 4));
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), 2 * n * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_w, w.data(), n * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_s, sg.data(), n * 4, cudaMemcpyHostToDevice));
+            q27k::CP3 in{{d_x, d_x + n}};
+            q27k::P3 y{{d_y, d_y + n}}, y2{{d_y2, d_y2 + n}};
+            q27k::XQuant qa0 = q27k::xquant_alloc(n), qa1 = q27k::xquant_alloc(n);
+            q27k::XQuant qb0 = q27k::xquant_alloc(n), qb1 = q27k::xquant_alloc(n);
+            // reference: rmsnorm3 -> copy lanes -> hadamard lanes -> quantize3
+            q27k::rmsnorm3(in, d_w, y, n, 1e-6f, 0, 2);
+            CUDA_CHECK(cudaMemcpy(d_y2, d_y, 2 * n * 4, cudaMemcpyDeviceToDevice));
+            q27k::hadamard1024_lanes(y2, d_s, n, 2, false, 0);
+            q27k::CP3 y2c{{d_y2, d_y2 + n}};
+            q27k::XQ3 qa{}; qa.q[0] = qa0; qa.q[1] = qa1;
+            q27k::quantize3(y2c, n, qa, 0, 2);
+            // fused
+            float* d_y3; CUDA_CHECK(cudaMalloc((void**)&d_y3, 2 * n * 4));
+            q27k::P3 y3{{d_y3, d_y3 + n}};
+            q27k::XQ3 qb{}; qb.q[0] = qb0; qb.q[1] = qb1;
+            q27k::rmsnorm3_rotq(in, d_w, y3, d_s, qb, n, 1e-6f, 0, 2);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> ya(2 * n), yb(2 * n);
+            CUDA_CHECK(cudaMemcpy(ya.data(), d_y, 2 * n * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_y3, 2 * n * 4, cudaMemcpyDeviceToHost));
+            check("rmsnorm3_rotq y == rmsnorm3 y (bitwise)", (double)(memcmp(ya.data(), yb.data(), 2 * n * 4) != 0), 1);
+            cmp_xq(qa0, qb0, n, "rmsnorm3_rotq lane 0 == norm+rotate+quantize (bitwise)");
+            cmp_xq(qa1, qb1, n, "rmsnorm3_rotq lane 1 == norm+rotate+quantize (bitwise)");
+        }
+    }
     // GDN value-head permutation: out[k*rep*hd + r*hd + h] = in[r*nk*hd + k*hd + h]
     {
         const int hd = 128, nk = 16, rep = 3, n = hd * nk * rep, T = 2;

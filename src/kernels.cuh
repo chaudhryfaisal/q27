@@ -117,5 +117,21 @@ void gdn_v_tiled_to_grouped_rows(const float* in, float* out, int hd, int nk, in
                                  long stride, cudaStream_t st = 0);
 void gdn_v_tiled_to_grouped_lanes(CP3 in, P3 out, int hd, int nk, int rep, int nlanes,
                                   cudaStream_t st = 0);
+// Fused rotate + quantize (decode): the int8 activation set (nat/eo/scale/
+// isum, group 32) of the ROTATED vector, computed from the raw x without
+// writing the rotated floats anywhere. Bitwise those of hadamard1024 on a
+// copy followed by quantize_x (same butterfly, same quantize body). With
+// perm, the input is gathered through the GDN tiled->grouped order first
+// (hd/nk/rep as in gdn_v_tiled_to_grouped). One block per 1024-chunk.
+void rotq(const float* x, const float* signs, int width, const XQuant& xq, cudaStream_t st = 0,
+          bool perm = false, int hd = 0, int nk = 0, int rep = 0);
+void rotq3(CP3 x, const float* signs, int width, const XQ3& xq, int ntok, cudaStream_t st = 0,
+           bool perm = false, int hd = 0, int nk = 0, int rep = 0);
+// rmsnorm3 (y = x * rsqrt(mean(x^2)+eps) * w, written UNROTATED to y) fused
+// with the rotate+quantize of y: one block per lane. y stays available for
+// the unfolded F16 projections (GDN alpha/beta). Norm part is k_rmsnorm3q's
+// verbatim (bitwise rmsnorm3); quantize part is rotq's.
+void rmsnorm3_rotq(CP3 x, const float* w, P3 y, const float* signs, const XQ3& xq, int n,
+                   float eps, cudaStream_t st = 0, int ntok = 3);
 
 } // namespace q27k

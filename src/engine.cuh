@@ -1617,16 +1617,11 @@ struct Engine {
     }
 
     void gdn_block(int il, const float* xin, float* yout) {
-        if (bonsai2) {
-            // qkv/gate are folded, alpha/beta are not (F16, read the raw xin):
-            // rotate a copy; mm() for Q4/Q8 reads the member xq, so the qx of
-            // the rotated copy feeds exactly the folded pair.
-            CUDA_CHECK(cudaMemcpyAsync(bz_xrot, xin, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-            bz_rot(bz_xrot, N_EMBD, stm);
-            qx(bz_xrot, N_EMBD);
-        } else {
-            qx(xin, N_EMBD);
-        }
+        // qkv/gate are folded, alpha/beta are not (F16, read the raw xin):
+        // the fused rotate+quantize feeds the member xq from the rotated
+        // values without touching xin.
+        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
+        else qx(xin, N_EMBD);
         mm(T(il, "attn_qkv.weight"), xin, qkv);
         mm(T(il, "attn_gate.weight"), xin, z);
         mm(T(il, "ssm_alpha.weight"), xin, alpha);
@@ -1640,18 +1635,8 @@ struct Engine {
         q27k::delta_step(S[il], S[il], convout, g, beta, o, stm);
         q27k::gated_norm_gdn(o, (const float*)T(il, "ssm_norm.weight").data, z, og, GDN_HEADS,
                              GDN_DIM, EPS, stm);
-        if (bonsai2) {
-            float* v = og;
-            if (bz_gdn_grouped) {
-                q27k::gdn_v_tiled_to_grouped(og, bz_ogp, GDN_DIM, GDN_HEADS / 3, 3, stm);
-                v = bz_ogp;
-            }
-            bz_rot(v, GDN_V, stm);
-            qx(v, GDN_V);
-            mm(T(il, "ssm_out.weight"), v, yout);
-            return;
-        }
-        qx(og, GDN_V);
+        if (bonsai2) q27k::rotq(og, bz_s6144, GDN_V, xq, stm, bz_gdn_grouped, GDN_DIM, GDN_HEADS / 3, 3);
+        else qx(og, GDN_V);
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
@@ -1673,10 +1658,8 @@ struct Engine {
             vt = kv_vtab(ci);
         }
         if (!pos_src) pos_src = d_pos;
-        // Bonsai 2: q/k/v are all folded on this input, and nothing else reads
-        // it afterwards -- rotate in place (xin is the block's own x1).
-        if (bonsai2) bz_rot(const_cast<float*>(xin), N_EMBD, st);
-        qx(xin, N_EMBD, st);
+        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, st); // q/k/v all folded
+        else qx(xin, N_EMBD, st);
         mm(T(il, "attn_q.weight"), xin, qg, st);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
                             HEAD_DIM, 2 * HEAD_DIM, EPS, st);
@@ -1712,19 +1695,19 @@ struct Engine {
             q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, st, 1);
         }
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, st);
-        if (bonsai2) bz_rot(attnout, N_HEAD * HEAD_DIM, st);
-        qx(attnout, N_HEAD * HEAD_DIM, st);
+        if (bonsai2) q27k::rotq(attnout, bz_s6144, N_HEAD * HEAD_DIM, xq, st);
+        else qx(attnout, N_HEAD * HEAD_DIM, st);
         mm(T(il, "attn_output.weight"), attnout, yout, st);
     }
 
     void ffn(int il, const float* xin, float* yout) {
-        if (bonsai2) bz_rot(const_cast<float*>(xin), N_EMBD, stm);
-        qx(xin, N_EMBD);
+        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
+        else qx(xin, N_EMBD);
         mm(T(il, "ffn_gate.weight"), xin, ffn_g);
         mm(T(il, "ffn_up.weight"), xin, ffn_u);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
-        if (bonsai2) bz_rot(ffn_g, N_FFN, stm);
-        qx(ffn_g, N_FFN);
+        if (bonsai2) q27k::rotq(ffn_g, bz_s17408, N_FFN, xq, stm);
+        else qx(ffn_g, N_FFN);
         mm(T(il, "ffn_down.weight"), ffn_g, yout);
     }
 
@@ -1761,8 +1744,8 @@ struct Engine {
             }
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
-        if (bonsai2) bz_rot(x1, N_EMBD, stm);
-        qx(x1, N_EMBD);
+        if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+        else qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_token, d_amax, stm); // d_token becomes NEXT token
         q27k::advance(d_pos, d_step, d_gen, d_token, stm); // record + pos++
@@ -1790,8 +1773,8 @@ struct Engine {
             q27k::add_inplace(h, y, N_EMBD, stm);
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
-        if (bonsai2) bz_rot(x1, N_EMBD, stm);
-        qx(x1, N_EMBD);
+        if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+        else qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 1, d_token, d_amax, stm);
         q27k::advance(d_pos, d_step, d_gen, d_token, stm);
@@ -2161,20 +2144,21 @@ struct Engine {
     // Bonsai 2 twin of rmsnorm3q5 for the layer-input norms: norm -> rotate ->
     // quantize. GDN layers rotate a COPY (bz_xrot_L) because gdn_pre's alpha/
     // beta F16 GEMVs read the raw x1 lanes; attention/FFN/head rotate in place.
+    // fused rotate+quantize of the lanes into the view's activation set
+    void bz_rotq5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int width,
+                  bool perm = false) {
+        q27k::CP3 in{};
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) { in.p[i] = x[i]; q.q[i] = v.xq[i]; }
+        q27k::rotq3(in, bz_signs(width), width, q, v.vw, v.stm, perm, GDN_DIM, GDN_HEADS / 3, 3);
+    }
     void bz_norm3_rot_q5(const LaneView& v, const q27k::CP3& x, const float* w,
-                         const q27k::P3& y, bool gdn) {
-        q27k::rmsnorm3(x, w, y, N_EMBD, EPS, v.stm, v.vw);
-        if (gdn) {
-            for (int i = 0; i < v.vw; i++)
-                CUDA_CHECK(cudaMemcpyAsync(bz_xrot_L[i], v.x1[i], N_EMBD * 4,
-                                           cudaMemcpyDeviceToDevice, v.stm));
-            const auto a = bz_arr(bz_xrot_L);
-            bz_rot_lanes(a, N_EMBD, v.vw, v.stm);
-            qx5(v, a, N_EMBD);
-        } else {
-            bz_rot_lanes(v.x1, N_EMBD, v.vw, v.stm);
-            qx5(v, v.x1, N_EMBD);
-        }
+                         const q27k::P3& y, bool /*gdn*/) {
+        // one launch: norm (y unrotated, so gdn_pre's alpha/beta F16 GEMVs
+        // read the plain normed lanes) + rotate + quantize into the view's xq
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) q.q[i] = v.xq[i];
+        q27k::rmsnorm3_rotq(x, w, y, bz_s5120, q, N_EMBD, EPS, v.stm, v.vw);
     }
     void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
@@ -2340,21 +2324,8 @@ struct Engine {
         q27k::gated_norm3(LANESV(v, o), nw,
                           LANESV(v, z),
                           LANESV(v, og), GDN_HEADS, GDN_DIM, EPS, v.stm, v.vw);
-        if (bonsai2) {
-            std::array<float*, W_PLUMB> src = v.og;
-            if (bz_gdn_grouped) {
-                q27k::CP3 in{};
-                for (int i = 0; i < 16; i++) in.p[i] = v.og[i];
-                q27k::gdn_v_tiled_to_grouped_lanes(in, bz_p3(bz_ogp_L), GDN_DIM, GDN_HEADS / 3, 3,
-                                                   v.vw, v.stm);
-                src = bz_arr(bz_ogp_L);
-            }
-            bz_rot_lanes(src, GDN_V, v.vw, v.stm);
-            qx5(v, src, GDN_V);
-            mm5(v, T(il, "ssm_out.weight"), v.y);
-            return;
-        }
-        qx5(v, v.og, GDN_V);
+        if (bonsai2) bz_rotq5(v, v.og, GDN_V, bz_gdn_grouped);
+        else qx5(v, v.og, GDN_V);
         mm5(v, T(il, "ssm_out.weight"), v.y);
     }
     void gdn_pair(int il, const LaneView& v, bool x1q = false) {
@@ -2421,8 +2392,8 @@ struct Engine {
     void attn_post(int il, const LaneView& v) {
         q27k::sigmoid_gate3(LANESV(v, attnout),
                             LANESV(v, qg), N_HEAD, HEAD_DIM, v.stm, v.vw);
-        if (bonsai2) bz_rot_lanes(v.attnout, N_HEAD * HEAD_DIM, v.vw, v.stm);
-        qx5(v, v.attnout, N_HEAD * HEAD_DIM);
+        if (bonsai2) bz_rotq5(v, v.attnout, N_HEAD * HEAD_DIM);
+        else qx5(v, v.attnout, N_HEAD * HEAD_DIM);
         mm5(v, T(il, "attn_output.weight"), v.y);
     }
     void attn_pair(int il, const LaneView& v, bool x1q = false) {
@@ -2440,8 +2411,8 @@ struct Engine {
         mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
         q27k::silu_mul3(LANESV(v, ffn_g),
                         LANESV(v, ffn_u), N_FFN, v.stm, v.vw);
-        if (bonsai2) bz_rot_lanes(v.ffn_g, N_FFN, v.vw, v.stm);
-        qx5(v, v.ffn_g, N_FFN);
+        if (bonsai2) bz_rotq5(v, v.ffn_g, N_FFN);
+        else qx5(v, v.ffn_g, N_FFN);
         mm5(v, T(il, "ffn_down.weight"), v.y);
     }
 
@@ -5638,8 +5609,8 @@ struct Engine {
             if (fold_last) {
                 // token_launches' tail on the batched row: head, greedy next
                 // token, position/record advance (d_pos -> NP, d_gen[NP-1]).
-                if (bonsai2) bz_rot(x1, N_EMBD, stm);
-                qx(x1, N_EMBD);
+                if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+                else qx(x1, N_EMBD);
                 mm(dm.get("output.weight"), x1, logits);
                 q27k::argmax(logits, VOCAB, d_token, d_amax, stm);
                 q27k::advance(d_pos, d_step, d_gen, d_token, stm);

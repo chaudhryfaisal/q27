@@ -15714,6 +15714,30 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (aq): fused rotate+quantize -- the rotation costs no graph node; Bonsai 2 round 14.75 ms, 233 t/s
+
+kernels.cu rotq / rotq3 (one 256-thread block per 1024-chunk: sign+load the
+raw activation -- optionally through the GDN tiled->grouped gather --
+butterfly in smem, then each warp quantizes four 32-groups with
+k_quantize_x's body on s*1/32) and rmsnorm3_rotq (k_rmsnorm3q's 1024-thread
+norm writing the UNROTATED y for the F16 alpha/beta projections, then
+per-chunk rotate+quantize). Every decode and verify call site that did
+copy/rotate/perm + quantize now issues one launch, and the rotated floats are
+never written. test_kernels: rotq / rotq3 (5120, 6144 with perm, 17408) and
+rmsnorm3_rotq (y and both lanes) BITWISE vs the separate sequences; whole
+suite ALL PASS on the production model. 3090 identity gate (q4x,
+Q27_D2_VGEMM=0): plain vs DFlash2 identical on all three prompts; plain
+46.8 -> 47.5 t/s.
+
+5090 t2 + DFlash2 K=7: round 14.75 = draft 2.21 + verify 12.42 + host 0.13
+(was 15.26 / 12.91); 700-token 233 t/s (was 225), cities 346 t/s (was 335).
+The gain is the launch count, ~0.5 ms/round; what remains in verify is the
+width-8 attention/GDN/norm work the Q4 tier also carries (~8 ms) plus the
+T2 staging. Bonsai 2 now serves faster than the Q4_G64 production tier on
+this traffic class (233 vs ~216-222), at 22.4 GB resident (T2 + the Q4
+prefill shadows); Phase 3 (T2 prefill GEMM) is what brings residency to
+~9 GB.
+
 ## 2026-09-18 (ap): T2 verify GEMM -- Bonsai 2 DFlash2 round 18.4 -> 15.3 ms, 225 t/s on the 700-token prompt
 
 k_vgemm (vgemm.cu) takes a third dtype mode (template int DT: 0 Q8, 1 Q4,

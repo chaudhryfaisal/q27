@@ -897,6 +897,162 @@ void hadamard1024_lanes(P3 x, const float* signs, int width, int nlanes, bool in
     else     k_hadamard1024_lanes<false><<<g, 256, 0, st>>>(x, signs);
     CUDA_CHECK(cudaGetLastError());
 }
+// ---- fused rotate + quantize (kernels.cuh for the contract) ----
+__device__ __forceinline__ int gdn_perm_src(int i, int hd, int nk, int rep) {
+    const int h = i % hd, r = (i / hd) % rep, k = i / (hd * rep); // i = k*rep*hd + r*hd + h
+    return r * nk * hd + k * hd + h;
+}
+// k_quantize_x's per-group body on a value v held by this lane, group b.
+__device__ __forceinline__ void quant_group32(float v, int b, int lane, int8_t* __restrict__ nat,
+                                              uint2* __restrict__ eo, float* __restrict__ scale,
+                                              int* __restrict__ isum) {
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    float s = amax / 127.f;
+    float inv = s > 0.f ? 1.f / s : 0.f;
+    int q = __float2int_rn(v * inv);
+    q = max(-127, min(127, q));
+    nat[b * 32 + lane] = (int8_t)q;
+    int bsum = q;
+    for (int off = 16; off > 0; off >>= 1) bsum += __shfl_xor_sync(0xffffffff, bsum, off);
+    if (lane == 0) { scale[b] = s; isum[b] = bsum; }
+    int base = (lane & 3) * 8;
+    uint32_t e = 0, o = 0;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int qe = __shfl_sync(0xffffffff, q, base + 2 * k);
+        int qo = __shfl_sync(0xffffffff, q, base + 2 * k + 1);
+        e |= (uint32_t)(uint8_t)(int8_t)qe << (8 * k);
+        o |= (uint32_t)(uint8_t)(int8_t)qo << (8 * k);
+    }
+    if (lane < 4) eo[b * 4 + lane] = make_uint2(e, o);
+}
+// 256 threads: sign+load one 1024-chunk into s, butterfly, then warp w
+// quantizes groups w*4..w*4+3 of the chunk (v = s * 1/32 exactly as the
+// standalone rotation stores it).
+template <bool PERM>
+__device__ __forceinline__ void rotq_chunk(const float* __restrict__ x,
+                                           const float* __restrict__ signs, int chunk, float* s,
+                                           int8_t* __restrict__ nat, uint2* __restrict__ eo,
+                                           float* __restrict__ scale, int* __restrict__ isum,
+                                           int hd, int nk, int rep) {
+    const int j0 = threadIdx.x, base = chunk * 1024;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int j = j0 + 256 * i, idx = base + j;
+        const int src = PERM ? gdn_perm_src(idx, hd, nk, rep) : idx;
+        s[j] = x[src] * signs[idx];
+    }
+    __syncthreads();
+    for (int h = 1; h < 1024; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int idx = j0 + 256 * k;
+            const int j = ((idx / h) * 2 * h) + (idx % h);
+            const float a = s[j], b = s[j + h];
+            s[j] = a + b;
+            s[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    const int lane = j0 & 31, warp = j0 >> 5;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int g = warp * 4 + k;
+        quant_group32(s[g * 32 + lane] * 0.03125f, chunk * 32 + g, lane, nat, eo, scale, isum);
+    }
+}
+template <bool PERM>
+__global__ void __launch_bounds__(256) k_rotq(const float* __restrict__ x,
+                                              const float* __restrict__ signs,
+                                              int8_t* __restrict__ nat, uint2* __restrict__ eo,
+                                              float* __restrict__ scale, int* __restrict__ isum,
+                                              int hd, int nk, int rep) {
+    __shared__ float s[1024];
+    rotq_chunk<PERM>(x, signs, blockIdx.x, s, nat, eo, scale, isum, hd, nk, rep);
+}
+template <bool PERM>
+__global__ void __launch_bounds__(256) k_rotq3(__grid_constant__ const CP3 xp,
+                                               const float* __restrict__ signs,
+                                               __grid_constant__ const XQ3 xq, int hd, int nk,
+                                               int rep) {
+    __shared__ float s[1024];
+    const int t = blockIdx.y;
+    rotq_chunk<PERM>(xp.p[t], signs, blockIdx.x, s, xq.q[t].nat, xq.q[t].eo, xq.q[t].scale,
+                     xq.q[t].isum, hd, nk, rep);
+}
+void rotq(const float* x, const float* signs, int width, const XQuant& xq, cudaStream_t st,
+          bool perm, int hd, int nk, int rep) {
+    if (width % 1024) { fprintf(stderr, "rotq: width %d not a multiple of 1024\n", width); exit(1); }
+    if (perm) k_rotq<true><<<width / 1024, 256, 0, st>>>(x, signs, xq.nat, xq.eo, xq.scale, xq.isum, hd, nk, rep);
+    else      k_rotq<false><<<width / 1024, 256, 0, st>>>(x, signs, xq.nat, xq.eo, xq.scale, xq.isum, 0, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+void rotq3(CP3 x, const float* signs, int width, const XQ3& xq, int ntok, cudaStream_t st,
+           bool perm, int hd, int nk, int rep) {
+    if (width % 1024) { fprintf(stderr, "rotq3: width %d not a multiple of 1024\n", width); exit(1); }
+    dim3 g(width / 1024, ntok);
+    if (perm) k_rotq3<true><<<g, 256, 0, st>>>(x, signs, xq, hd, nk, rep);
+    else      k_rotq3<false><<<g, 256, 0, st>>>(x, signs, xq, 0, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+// k_rmsnorm3q's norm (1024 threads, bitwise rmsnorm3) + per-chunk rotate +
+// quantize. The 1024-thread butterfly runs the same 512 pair ops per stage
+// as the 256-thread chunk function (threads >= 512 idle), so the rotated
+// values are bitwise those of hadamard1024.
+__global__ void k_rmsnorm3_rotq(__grid_constant__ const CP3 xp, const float* __restrict__ w,
+                                __grid_constant__ const P3 yp, const float* __restrict__ signs,
+                                __grid_constant__ const XQ3 xq, int n, float eps) {
+    const int t = blockIdx.x;
+    const float* x = xp.p[t];
+    float* y = yp.p[t];
+    __shared__ float sh[32];
+    __shared__ float s[1024];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
+    acc = warp_reduce(acc);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+        v = warp_reduce(v);
+        if (threadIdx.x == 0) sh[0] = v;
+    }
+    __syncthreads();
+    float inv = rsqrtf(sh[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+    __syncthreads(); // y complete block-wide before the chunks read it back
+    int8_t* nat = xq.q[t].nat;
+    uint2* eo = xq.q[t].eo;
+    float* scale = xq.q[t].scale;
+    int* isum = xq.q[t].isum;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int c = 0; c < n / 1024; c++) {
+        const int base = c * 1024;
+        s[threadIdx.x] = y[base + threadIdx.x] * signs[base + threadIdx.x];
+        __syncthreads();
+        for (int h = 1; h < 1024; h <<= 1) {
+            if (threadIdx.x < 512) {
+                const int idx = threadIdx.x;
+                const int j = ((idx / h) * 2 * h) + (idx % h);
+                const float a = s[j], b = s[j + h];
+                s[j] = a + b;
+                s[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+        quant_group32(s[warp * 32 + lane] * 0.03125f, c * 32 + warp, lane, nat, eo, scale, isum);
+        __syncthreads(); // s is reloaded by the next chunk
+    }
+}
+void rmsnorm3_rotq(CP3 x, const float* w, P3 y, const float* signs, const XQ3& xq, int n,
+                   float eps, cudaStream_t st, int ntok) {
+    if (n % 1024) { fprintf(stderr, "rmsnorm3_rotq: n %d not a multiple of 1024\n", n); exit(1); }
+    k_rmsnorm3_rotq<<<ntok, 1024, 0, st>>>(x, w, y, signs, xq, n, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // out[k*rep*hd + r*hd + h] = in[r*nk*hd + k*hd + h]; one block per row/lane.
 __global__ void k_gdn_v_perm_rows(const float* __restrict__ in, float* __restrict__ out, int hd,
                                   int nk, int rep, long stride) {
