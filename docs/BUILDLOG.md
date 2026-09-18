@@ -15714,6 +15714,29 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (ap): T2 verify GEMM -- Bonsai 2 DFlash2 round 18.4 -> 15.3 ms, 225 t/s on the 700-token prompt
+
+k_vgemm (vgemm.cu) takes a third dtype mode (template int DT: 0 Q8, 1 Q4,
+2 T2): T2 stages 8-byte chunks (32 codes) so the pass geometry stays Q4's,
+undoes the device-side interleave at the smem unpack (four masked
+extractions + __byte_perm re-interleave, __vsub4 0x01 = the "-1" bias),
+g128 scales like Q8, 0x55 (code 1) for padded rows. vgemm_verify dispatches
+T2; vgemm_ws_bytes_model counts T2 tensors; vgemm_attrs_dt exposes the
+attrs. Gates (tools/vgemm_test.cu, now 6 instantiations): 5090 all six at
+64 regs / 0 stack / 4 CTA per SM; numerics vs gemv_t2_n on every T2 shape
+of the mini artifact worst rel 1.2e-7..1.8e-7 on all 16 lanes and widths,
+bitwise-stable across repeats. (On the 3090 the Q8 instantiations show 8 B
+of stack -- an sm_86 allocation artifact; the gate's home is the 5090.)
+
+5090, t2 artifact + DFlash2 K=7, Q27_D2_TIMING: 200 rounds, wall 15.26 =
+draft 2.22 + verify 12.91 + host 0.13 ms/round (was 18.41 / 16.07);
+700-token 225.3 t/s (was 184), cities 334.9 t/s (was 276). Verify still
+carries ~9.6 ms of non-weight work vs the Q4 tier's ~8: the rotation is 6-8
+extra launches per layer per lane set (norm3 + hadamard + quantize3 instead
+of the fused rmsnorm3q, plus the GDN lane copy and perm). Next: fuse
+rotate+quantize (and norm+rotate+quantize) so the count returns to the Q4
+tier's; the plain token graph gains the same.
+
 ## 2026-09-18 (ao): DFlash2 on the ternary target -- Bonsai 2 serves at 184-391 t/s on the 5090, greedy-exact vs plain
 
 The drafter attaches to the unrotated residual stream, so the pack trained on
