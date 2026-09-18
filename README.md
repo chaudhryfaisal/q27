@@ -1,6 +1,6 @@
 # Quasar
 
-A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and their fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
+A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads), their fine-tunes, and PrismML's **Ternary Bonsai 2 27B** (2-bit, Hadamard-folded) on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
 ## Why this is interesting
 
@@ -162,6 +162,17 @@ legs) at 205 vs 222 t/s aggregate, but reasons about twice as long per
 instance (37 vs 22 API turns, 75K vs 35K thinking chars), so wall is 2.3x
 (`bench/crossengine/agentic-2026-09-18-bonsai2/`).
 
+The Qwen3.8 drafter works against this target as-is. A drafter trained on
+the ternary target does better: ProCreations'
+[Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
+(independent, Apache-2.0, the z-lab architecture retrained on Bonsai
+features) packs unchanged through `tools/dflash2_pack.py --q8` and on the
+same campaign gives 3.80 tok/round and 227.7 t/s aggregate against 3.47 and
+205 -- above the Qwen3.8 default tier's own aggregate on this traffic, at
+the same trajectory shape. Identity-gated against plain decode on the 3090
+(the 5090's greedy is not width-invariant for any drafter, a known
+instrument property; BUILDLOG 2026-09-18 (as)).
+
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
 # serve with the Qwen3.8 tokenizer and DFlash2 pack (tools/launch_q27_38.sh
@@ -209,17 +220,27 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-09-10)
+## State of the engine (2026-09-18)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.11.7](https://github.com/signalnine/q27/releases).
+release: [v0.12.0](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
 
+- **Ternary Bonsai 2 27B (v0.12.0)**: PrismML's 2-bit Qwen3.8 served
+  natively from a 9.44 GB pack -- exact ternary containers, activation
+  rotation fused into the quantizers, 2-bit GEMVs for decode and a 2-bit
+  staging unpack for the tensor-core prefill and verify GEMMs, DFlash2 on
+  the ternary target. On the same 12-instance Claude Code run: **227.7 t/s
+  aggregate at 3.80 tok/round** with a target-trained drafter (205 / 3.47
+  with the Qwen3.8 one), 23 GB of KV left on a 32 GB card. The checkpoint
+  itself measures +27% wikitext PPL and 25/30 HumanEval+ against the
+  Qwen3.8 default tier and reasons about twice as long per instance --
+  same patches landed, 2.3x the wall (09-18; the tier table below).
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
