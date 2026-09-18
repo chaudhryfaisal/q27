@@ -14,7 +14,7 @@ int main() {
             return 1;
         }
     }
-    for (DType dtype : {DType::T2_G128, DType::T3_G128, DType::B1_G128}) {
+    for (DType dtype : {DType::T3_G128, DType::B1_G128}) {
         if (q27::cuda_weight_dtype_supported(dtype)) {
             std::fprintf(stderr, "CUDA-unsupported packed dtype accepted: %s\n",
                          q27::dtype_name(dtype));
@@ -37,7 +37,7 @@ int main() {
 
     q27::Tensor packed;
     packed.name = "blk.0.ffn_gate.weight";
-    packed.dtype = DType::T2_G128;
+    packed.dtype = DType::B1_G128;
     model.index.emplace(packed.name, model.tensors.size());
     model.tensors.push_back(packed);
     bool packed_rejected = false;
@@ -45,7 +45,7 @@ int main() {
         q27::validate_cuda_model(model);
     } catch (const std::runtime_error& error) {
         packed_rejected = std::string(error.what()).find(
-            "unsupported weight dtype T2_G128") != std::string::npos;
+            "unsupported weight dtype B1_G128") != std::string::npos;
     }
     if (!packed_rejected) {
         std::fputs("CUDA-unsupported packed model was accepted\n", stderr);
@@ -56,7 +56,7 @@ int main() {
         q27::validate_cuda_tensor(packed);
     } catch (const std::runtime_error& error) {
         selective_packed_rejected = std::string(error.what()).find(
-            "unsupported weight dtype T2_G128") != std::string::npos;
+            "unsupported weight dtype B1_G128") != std::string::npos;
     }
     if (!selective_packed_rejected) {
         std::fputs("CUDA-unsupported packed tensor was accepted\n", stderr);

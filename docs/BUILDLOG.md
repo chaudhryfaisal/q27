@@ -15714,6 +15714,63 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (an): Bonsai 2 27B (PrismML ternary Qwen3.8-27B) runs on q27 -- fork-parity logits, plain decode 110 t/s on the 5090 with the first ternary kernel
+
+Plan: docs/plans/2026-09-18-bonsai2-ternary.md. Model: Qwen3.8-27B with
+every projection ternary (fp16 scale per 128) in a Hadamard-rotated basis
+(block 1024, explicit signs), no MTP block; PrismML's PTQ1_0 GGUF
+(5.95 GB) + their llama.cpp fork as the reference (built sm_120 in
+/mnt/ai/projects/prism-llama; build files diffed vs upstream first).
+
+Converter (tools/repack.py): PTQ1_0/PQ2_0 detected (forged types 143/142),
+trit decode per the fork's element map (numpy, 0 mismatches vs ggml
+to_float on 524288 real values), EXACT containers: Q4_G64 nibble = trit+8
+with the 128-group scale duplicated per 64, Q8_G128 int8 = trit for
+token_embd/output, T2_G128 with --bonsai2-container t2 plus a `.q4x` exact-Q4
+shadow per blk.* matrix for prefill; hadamard meta verbatim + F32 tensors
+hadamard_signs.<width>; general.name carries qwen38 (the GGUF says "Hf");
+block_count 64. Artifacts: bonsai2-27b-q4x.q27 (16.24 GB, wsum
+2ec46317f507727b), bonsai2-27b-t2.q27 (22.36 GB, wsum 650f9dc2acd266d1).
+
+Engine: kernels.cu hadamard1024 (rows/lanes/single, fwd + inv, natural-order
+butterfly, bitwise CPU-equal) + gdn_v_tiled_to_grouped (ssm_out was folded in
+the training V-head order); engine.cuh bonsai2/has_mtp flags, validate_arch
+accepts block_count 64, rotation before every folded matmul (gdn_block on a
+rotated COPY since ssm_alpha/beta read the raw input; attn/ffn in place;
+ssm_out perm+rot; head input) and the inverse after the embedding lookup, in
+decode, sampled decode, batched prefill, fold_last and the CLI's teacher-forced
+heads; mtp_warm_T gated; plain_round (token-graph replay) + sample_round when
+there is no MTP block, build_spec_graphs skips. Phase 2: gemv_t2 / gemv_t2_n
+(dp4a over 2-bit codes, sum = dp4a(c,x) - isum, device words interleaved at
+upload so the Q4 kernels' even/odd activation words apply unchanged), loader
+accepts T2 on CUDA (B1/T3 still refused; contract test updated), mm/mm5/mtp
+dispatch (mm5's bare else now fails loud), prefill reads the .q4x shadow via
+TP(il, leaf).
+
+Gates: test_kernels hadamard1024 bitwise vs CPU, inv(fwd)=x; T2 gemv vs CPU
+(err 1.6e-2, tol 2e-2), gemv_n bitwise vs gemv; loader contracts PASS;
+384-position teacher-forced parity vs the fork (tools/bonsai/
+llama_logits_dump.cpp, scratchpad parity.py): top-1 agreement 0.9974
+(1/383), fork argmax in q27 top-5 100%, NLL 2.0792 vs 2.0796, mean|dNLL|
+0.011, top-16 logit mean|d| 0.026; serial-vs-batched prefill (--pfdbg 1/8)
+ordinary g32/g64 quant noise. Server smoke (3090, plain): thinking on,
+greedy + sampled correct, prefix cache hits, 46 t/s.
+
+5090 plain decode (384-token prompt, 128 tokens): q4x 78.6 t/s, t2 109.9 t/s
+with BITWISE-identical greedy tokens (same per-chunk integer dots). The
+marginal bandwidth of the weight bytes removed (7.2 GB for 3.6 ms) is ~2
+TB/s, so the ternary GEMV is near the roofline already; the remaining
+step (~9 ms) is the Q8 head (1.3 GB), the rotation launches (~6 per layer)
+and the fixed decode cost. The fork's own llama-bench aborted on this box.
+
+Trap: the CLI head-row rotation was inserted after that build had started
+-- the first position-wise runs (NLL 12.7) were a stale binary. Check the
+binary carries an edit before debugging it.
+
+Next: DFlash2 on the ternary target (multi-lane rotation path incl. the
+drafter's embedding inverse), fused rotate+quantize, T2 head, T2 prefill
+GEMM (drop the shadow), tier README numbers, the agentic campaign.
+
 ## 2026-09-17 (am): issue #49 -- why ninfer runs half the Claude Code turns: the planning turn, not a cutoff; every q27-side mechanism excluded; render_request had the wrong tool dialect for 3.8
 
 Full readout with tables: bench/crossengine/agentic-2026-09-17-turns/README.md.

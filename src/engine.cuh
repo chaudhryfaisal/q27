@@ -132,9 +132,24 @@ static inline void arch_require_s(const std::string& mj, const char* key, const 
 static inline void validate_arch(const q27::Model& model) {
     const std::string& mj = model.meta_json;
     arch_require_s(mj, "general.architecture", "qwen35");
-    // block_count counts the MTP layer, hence N_LAYER + 1.
-    arch_require_u(mj, "qwen35.block_count", N_LAYER + 1);
-    arch_require_u(mj, "qwen35.nextn_predict_layers", 1);
+    // block_count counts the MTP layer, hence N_LAYER + 1 -- or exactly
+    // N_LAYER for a pack without one (Bonsai 2: no nextn block; the manifest
+    // treats blk.64 as optional and the engine's MTP paths are gated on it).
+    {
+        size_t p = arch_value_at(mj, "qwen35.block_count");
+        if (p == std::string::npos) arch_fail("qwen35.block_count", "missing from metadata");
+        const uint64_t bc = strtoull(mj.c_str() + p, nullptr, 10);
+        if (bc == N_LAYER + 1) {
+            arch_require_u(mj, "qwen35.nextn_predict_layers", 1);
+        } else if (bc == N_LAYER) {
+            if (arch_value_at(mj, "qwen35.nextn_predict_layers") != std::string::npos)
+                arch_require_u(mj, "qwen35.nextn_predict_layers", 0);
+        } else {
+            arch_fail("qwen35.block_count", "is " + std::to_string(bc) + ", this build needs " +
+                                                 std::to_string(N_LAYER) + " or " +
+                                                 std::to_string(N_LAYER + 1));
+        }
+    }
     arch_require_u(mj, "qwen35.embedding_length", N_EMBD);
     arch_require_u(mj, "qwen35.feed_forward_length", N_FFN);
     arch_require_u(mj, "qwen35.attention.head_count", N_HEAD);
@@ -361,6 +376,38 @@ struct Engine {
     q27::DeviceModel& dm;
     int max_ctx;
     bool attn_layer[N_LAYER + 1] = {false};
+    // MTP block present (blk.64.nextn.*). A 64-block pack (Bonsai 2) has none:
+    // the ladder drafter and the prefill MTP warm are skipped; DFlash2 and
+    // plain decode do not need it.
+    bool has_mtp = true;
+    // Bonsai 2 (docs/plans/2026-09-18-bonsai2-ternary.md): every projection
+    // is stored Hadamard-rotated on its input dim; the engine rotates the
+    // activation right before each such matmul (kernels.cuh hadamard1024) and
+    // inverse-rotates embedding rows after lookup. Sign vectors travel in the
+    // pack as F32 tensors hadamard_signs.<width>.
+    bool bonsai2 = false;
+    bool bz_gdn_grouped = false;           // ssm_out folded in grouped V-head order
+    const float* bz_s5120 = nullptr;       // sign vectors, device
+    const float* bz_s6144 = nullptr;
+    const float* bz_s17408 = nullptr;
+    float* bz_xrot = nullptr;              // rotated copy of the GDN input (alpha/beta read the raw one)
+    float* bz_ogp = nullptr;               // permuted GDN value output
+    float* bz_xrotT = nullptr;             // prefill twins (PF_T rows)
+    float* bz_ogpT = nullptr;
+    const float* bz_signs(int width) const {
+        return width == N_EMBD ? bz_s5120 : width == GDN_V ? bz_s6144 : bz_s17408;
+    }
+    // fwd rotation in place (single vector / T rows); inverse for embeddings.
+    void bz_rot(float* x, int width, cudaStream_t st) {
+        q27k::hadamard1024(x, bz_signs(width), width, false, st);
+    }
+    void bz_rot_T(float* x, int width, int T) {
+        q27k::hadamard1024_rows(x, bz_signs(width), width, T, width, false, stm);
+    }
+    void bz_unrot_embed(float* x, cudaStream_t st) { q27k::hadamard1024(x, bz_s5120, N_EMBD, true, st); }
+    void bz_unrot_embed_T(float* x, int T) {
+        q27k::hadamard1024_rows(x, bz_s5120, N_EMBD, T, N_EMBD, true, stm);
+    }
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
     cudaGraphExec_t sample_graph = nullptr; // plain forward + sample (temp>0)
@@ -390,6 +437,10 @@ struct Engine {
     float* d_nuc = nullptr;  // [W_PLUMB][4]: {thresh,M,logZ,mass} per verify lane
     int* d_spec = nullptr;   // [3]: {n, stop_lane, exclude_token} (Phase-2 verdict)
     bool samp_first = false; // first sampled token comes from the retained prefill logits
+    // Greedy no-draft rounds (a pack without an MTP block and no DFlash2):
+    // the first token is the prefill tail's argmax already in d_token; every
+    // later round replays the token graph. Mirrors sample_round's shape.
+    bool plain_first = false;
     // MTP draft head state (stage 1: host-driven acceptance measurement)
     float *h_next, *e_hn, *x_mtp, *mtp_logits;
     void *mtp_k, *mtp_v;
@@ -1019,8 +1070,41 @@ struct Engine {
         // Needs attn_layer[], so it cannot live inside validate_arch(); still
         // ahead of every cudaMalloc and of upload_all().
         validate_tensor_manifest(model, attn_layer);
+        has_mtp = model.find("blk.64.nextn.eh_proj.weight") != nullptr;
+        {
+            // Bonsai 2 pack: "bonsai2": true plus the hadamard block. The
+            // hand-rolled scanner finds the first occurrence of a key, so the
+            // keys read here are unique in the meta by construction (repack).
+            size_t bp = arch_value_at(mj, "bonsai2");
+            bonsai2 = bp != std::string::npos && mj.compare(bp, 4, "true") == 0;
+            if (bonsai2) {
+                arch_require_u(mj, "block_size", 1024);
+                arch_require_s(mj, "transform", "normalized-sylvester-walsh-hadamard");
+                arch_require_s(mj, "axis", "input-last-dimension");
+                arch_require_s(mj, "sign_mode", "explicit");
+                size_t gp = arch_value_at(mj, "gdn_v_grouped");
+                bz_gdn_grouped = gp != std::string::npos && mj.compare(gp, 4, "true") == 0;
+                for (int w : {N_EMBD, GDN_V, N_FFN}) {
+                    const q27::Tensor* st = model.find("hadamard_signs." + std::to_string(w));
+                    if (!st || st->dtype != q27::DType::F32 || st->shape != std::vector<uint64_t>{(uint64_t)w})
+                        arch_fail(("hadamard_signs." + std::to_string(w)).c_str(),
+                                  "missing or not an F32 vector of that width");
+                }
+                if (has_mtp) arch_fail("bonsai2", "a Bonsai 2 pack cannot carry an MTP block");
+                fprintf(stderr, "bonsai2: Hadamard-folded pack (block 1024, gdn_v_grouped=%d); "
+                                "activation rotation ON, MTP ladder OFF\n", (int)bz_gdn_grouped);
+            }
+        }
+        if (!has_mtp && !bonsai2)
+            fprintf(stderr, "note: pack has no MTP block; ladder drafting unavailable\n");
 
         auto A = [](void** pp, size_t n) { CUDA_CHECK(cudaMalloc(pp, n)); };
+        if (bonsai2) {
+            A((void**)&bz_xrot, N_EMBD * 4);
+            A((void**)&bz_ogp, GDN_V * 4);
+            A((void**)&bz_xrotT, (size_t)PF_T * N_EMBD * 4);
+            A((void**)&bz_ogpT, (size_t)PF_T * GDN_V * 4);
+        }
         A((void**)&h, N_EMBD * 4); A((void**)&x1, N_EMBD * 4); A((void**)&y, N_EMBD * 4);
         A((void**)&qg, 2 * N_HEAD * HEAD_DIM * 4);
         A((void**)&kbuf, N_KV * HEAD_DIM * 4); A((void**)&vbuf, N_KV * HEAD_DIM * 4);
@@ -1463,6 +1547,12 @@ struct Engine {
                 fprintf(stderr, "prefill: Q27_PREFILL=fp4 requested but this pack has no .pf4 "
                                 "sidecars (repack with --pf4) -- int path stays\n");
         }
+        if (bonsai2) {
+            // resident either way (own upload above, or the server's shared one)
+            bz_s5120 = (const float*)dm.get("hadamard_signs.5120").data;
+            bz_s6144 = (const float*)dm.get("hadamard_signs.6144").data;
+            bz_s17408 = (const float*)dm.get("hadamard_signs.17408").data;
+        }
     }
 
   public:
@@ -1491,6 +1581,10 @@ struct Engine {
                 q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
                               w.cols, st);
                 break;
+            case DType::T2_G128:
+                q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
+                              w.cols, st);
+                break;
             case DType::F16:
                 q27k::gemv_f16((const __half*)w.data, x, out, w.rows, w.cols, st);
                 break;
@@ -1501,7 +1595,16 @@ struct Engine {
     }
 
     void gdn_block(int il, const float* xin, float* yout) {
-        qx(xin, N_EMBD);
+        if (bonsai2) {
+            // qkv/gate are folded, alpha/beta are not (F16, read the raw xin):
+            // rotate a copy; mm() for Q4/Q8 reads the member xq, so the qx of
+            // the rotated copy feeds exactly the folded pair.
+            CUDA_CHECK(cudaMemcpyAsync(bz_xrot, xin, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
+            bz_rot(bz_xrot, N_EMBD, stm);
+            qx(bz_xrot, N_EMBD);
+        } else {
+            qx(xin, N_EMBD);
+        }
         mm(T(il, "attn_qkv.weight"), xin, qkv);
         mm(T(il, "attn_gate.weight"), xin, z);
         mm(T(il, "ssm_alpha.weight"), xin, alpha);
@@ -1515,6 +1618,17 @@ struct Engine {
         q27k::delta_step(S[il], S[il], convout, g, beta, o, stm);
         q27k::gated_norm_gdn(o, (const float*)T(il, "ssm_norm.weight").data, z, og, GDN_HEADS,
                              GDN_DIM, EPS, stm);
+        if (bonsai2) {
+            float* v = og;
+            if (bz_gdn_grouped) {
+                q27k::gdn_v_tiled_to_grouped(og, bz_ogp, GDN_DIM, GDN_HEADS / 3, 3, stm);
+                v = bz_ogp;
+            }
+            bz_rot(v, GDN_V, stm);
+            qx(v, GDN_V);
+            mm(T(il, "ssm_out.weight"), v, yout);
+            return;
+        }
         qx(og, GDN_V);
         mm(T(il, "ssm_out.weight"), og, yout);
     }
@@ -1537,6 +1651,9 @@ struct Engine {
             vt = kv_vtab(ci);
         }
         if (!pos_src) pos_src = d_pos;
+        // Bonsai 2: q/k/v are all folded on this input, and nothing else reads
+        // it afterwards -- rotate in place (xin is the block's own x1).
+        if (bonsai2) bz_rot(const_cast<float*>(xin), N_EMBD, st);
         qx(xin, N_EMBD, st);
         mm(T(il, "attn_q.weight"), xin, qg, st);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
@@ -1573,15 +1690,18 @@ struct Engine {
             q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, st, 1);
         }
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, st);
+        if (bonsai2) bz_rot(attnout, N_HEAD * HEAD_DIM, st);
         qx(attnout, N_HEAD * HEAD_DIM, st);
         mm(T(il, "attn_output.weight"), attnout, yout, st);
     }
 
     void ffn(int il, const float* xin, float* yout) {
+        if (bonsai2) bz_rot(const_cast<float*>(xin), N_EMBD, stm);
         qx(xin, N_EMBD);
         mm(T(il, "ffn_gate.weight"), xin, ffn_g);
         mm(T(il, "ffn_up.weight"), xin, ffn_u);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
+        if (bonsai2) bz_rot(ffn_g, N_FFN, stm);
         qx(ffn_g, N_FFN);
         mm(T(il, "ffn_down.weight"), ffn_g, yout);
     }
@@ -1601,6 +1721,7 @@ struct Engine {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
                            stm);
+        if (bonsai2) bz_unrot_embed(h, stm);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
@@ -1618,6 +1739,7 @@ struct Engine {
             }
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
+        if (bonsai2) bz_rot(x1, N_EMBD, stm);
         qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_token, d_amax, stm); // d_token becomes NEXT token
@@ -1634,6 +1756,7 @@ struct Engine {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
                            stm);
+        if (bonsai2) bz_unrot_embed(h, stm);
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
             if (attn_layer[il]) attn_block(il, x1, y);
@@ -1645,6 +1768,7 @@ struct Engine {
             q27k::add_inplace(h, y, N_EMBD, stm);
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
+        if (bonsai2) bz_rot(x1, N_EMBD, stm);
         qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 1, d_token, d_amax, stm);
@@ -1729,6 +1853,10 @@ struct Engine {
                 q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
                                 w.rows, w.cols, v.stm);
                 break;
+            case DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
             case DType::Q8_G128:
                 q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
                                 w.rows, w.cols, v.stm);
@@ -1752,6 +1880,10 @@ struct Engine {
         switch (w.dtype) {
             case DType::Q4_G64:
                 q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
+            case DType::T2_G128:
+                q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
                               w.rows, w.cols, v.stm);
                 break;
             case DType::Q8_G128:
@@ -2048,7 +2180,13 @@ struct Engine {
         if (w.dtype == DType::Q4_G64)
             q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
                             w.cols, v.stm);
-        else
+        else if (w.dtype == DType::T2_G128)
+            q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
+        else if (w.dtype != DType::Q8_G128) {
+            fprintf(stderr, "mm5: unsupported dtype\n"); // was a bare else (silent Q8 route)
+            exit(1);
+        } else
             q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
                             w.cols, v.stm);
     }
@@ -2505,6 +2643,13 @@ struct Engine {
     }
 
     void build_spec_graphs() {
+        if (!has_mtp) {
+            // No MTP block: the ladder's draft/verify graph zoo has nothing to
+            // capture. decode_step runs plain rounds (or DFlash2 when loaded).
+            fprintf(stderr, "spec graphs: skipped (pack has no MTP block; plain decode%s)\n",
+                    d2_on ? " unless DFlash2 rounds" : "");
+            return;
+        }
         // one warm (executing) round to initialize lazy CUDA state, then reset.
         // seed + reset are factored so the Phase-2 sampled graph set warms the
         // same way (its verify tail launches new kernels that also need warming).
@@ -3573,6 +3718,21 @@ struct Engine {
     // replay sample_graph, which forwards the just-emitted token and samples the
     // next. No MTP, no spec: correctness-first per the design (Phase 2 adds spec
     // rejection sampling for speed).
+    // Greedy plain round: one token per round through the captured token
+    // graph (token_launches: forward + argmax + advance). The first round
+    // emits the token the prefill tail already argmax'd into d_token, exactly
+    // like the CLI's device-chained loop after step_with.
+    int plain_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
+        if (plain_first) plain_first = false;
+        else CUDA_CHECK(cudaGraphLaunch(graph_exec, stm));
+        int tok;
+        CUDA_CHECK(cudaMemcpyAsync(&tok, d_token, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        emit[0] = tok;
+        return 1;
+    }
+
     int sample_round(int* emit) {
         if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         if (samp_first) {
@@ -3858,7 +4018,19 @@ struct Engine {
                 return;
             }
         }
-        mmT(T2(il, leaf), xT, yout, T); // T2: the int T param shadows T()
+        mmT(TP(il, leaf), xT, yout, T); // T2: the int T param shadows T()
+    }
+    // Prefill weight for (il, leaf): a T2_G128 base (Bonsai 2 Phase 2, decode
+    // GEMV only) reads its exact Q4 shadow "<name>.q4x" (repack --bonsai2-container
+    // t2) until the T2 prefill GEMM exists (Phase 3). Anything else is the base.
+    const DevTensor& TP(int il, const char* leaf) {
+        const DevTensor& base = T(il, leaf);
+        if (base.dtype != DType::T2_G128) return base;
+        char buf[128];
+        snprintf(buf, sizeof buf, "blk.%d.%s.q4x", il, leaf);
+        if (const DevTensor* s = dm.try_get(buf)) return *s;
+        fprintf(stderr, "mmT: %s is T2_G128 with no .q4x prefill shadow\n", buf);
+        exit(1);
     }
     void mmT(const DevTensor& w, const float* xT, float* yout, int T) {
         switch (w.dtype) {
@@ -3880,9 +4052,18 @@ struct Engine {
     }
 
     void gdn_block_T(int il, int T) {
-        qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "attn_qkv.weight"), x1T, qkvT, T);
-        mmT(T2(il, "attn_gate.weight"), x1T, zT, T);
+        if (bonsai2) {
+            // same split as gdn_block: folded qkv/gate read the rotated copy,
+            // unfolded alpha/beta (F16 GEMM reads the float rows) the raw one
+            CUDA_CHECK(cudaMemcpyAsync(bz_xrotT, x1T, (size_t)T * N_EMBD * 4,
+                                       cudaMemcpyDeviceToDevice, stm));
+            bz_rot_T(bz_xrotT, N_EMBD, T);
+            qxT(bz_xrotT, N_EMBD, T);
+        } else {
+            qxT(x1T, N_EMBD, T);
+        }
+        mmT(TP(il, "attn_qkv.weight"), x1T, qkvT, T);
+        mmT(TP(il, "attn_gate.weight"), x1T, zT, T);
         mmT(T2(il, "ssm_alpha.weight"), x1T, alphaT, T);
         mmT(T2(il, "ssm_beta.weight"), x1T, betarT, T);
         q27k::gdn_gates_T(alphaT, betarT, (const float*)T2(il, "ssm_a").data,
@@ -3895,20 +4076,33 @@ struct Engine {
         q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm, wy_p());
         q27k::gated_norm_gdn_T(oT, (const float*)T2(il, "ssm_norm.weight").data, zT, ogT,
                                GDN_HEADS, GDN_DIM, T, EPS, stm);
+        if (bonsai2) {
+            float* v = ogT;
+            if (bz_gdn_grouped) {
+                q27k::gdn_v_tiled_to_grouped_rows(ogT, bz_ogpT, GDN_DIM, GDN_HEADS / 3, 3, T,
+                                                  GDN_V, stm);
+                v = bz_ogpT;
+            }
+            bz_rot_T(v, GDN_V, T);
+            qxT(v, GDN_V, T);
+            mmT(TP(il, "ssm_out.weight"), v, yT, T);
+            return;
+        }
         qxT(ogT, GDN_V, T);
-        mmT(T2(il, "ssm_out.weight"), ogT, yT, T);
+        mmT(TP(il, "ssm_out.weight"), ogT, yT, T);
     }
 
     void attn_block_T(int il, int base, int T, void* const* kt, void* const* vt) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
+        if (bonsai2) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "attn_q.weight", x1T, qgT, T);
         q27k::rmsnorm_heads_T(qgT, (const float*)T2(il, "attn_q_norm.weight").data, qgT, N_HEAD,
                               HEAD_DIM, 2 * HEAD_DIM, QROW, T, EPS, stm);
-        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        mmT(TP(il, "attn_k.weight"), x1T, kT, T);
         q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
                               HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
-        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        mmT(TP(il, "attn_v.weight"), x1T, vT, T);
         q27k::rope_neox_T(qgT, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, QROW, base, T, FREQ_BASE,
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
@@ -3928,15 +4122,18 @@ struct Engine {
         if (kv_kind >= KV_T3)
             q27k::wht_T(attnT, N_HEAD, HEAD_DIM, HEAD_DIM, N_HEAD * HEAD_DIM, T, true, stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
+        if (bonsai2) bz_rot_T(attnT, N_HEAD * HEAD_DIM, T);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT_pf4(il, "attn_output.weight", attnT, yT, T);
     }
 
     void ffn_T(int il, int T) {
+        if (bonsai2) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "ffn_gate.weight", x1T, ffnGT, T);
         mmT_pf4(il, "ffn_up.weight", x1T, ffnUT, T);
         q27k::silu_mul(ffnGT, ffnUT, ffnGT, (int64_t)T * N_FFN, stm);
+        if (bonsai2) bz_rot_T(ffnGT, N_FFN, T);
         qxT(ffnGT, N_FFN, T);
         mmT_pf4(il, "ffn_down.weight", ffnGT, yT, T);
     }
@@ -3952,6 +4149,7 @@ struct Engine {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
                               N_EMBD, T, hT, stm);
+        if (bonsai2) bz_unrot_embed_T(hT, T);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm_T(hT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
@@ -3996,10 +4194,10 @@ struct Engine {
         q27k::rmsnorm_T(xmtpT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
                         EPS, stm);
         qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        mmT(TP(il, "attn_k.weight"), x1T, kT, T);
         q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
                               HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
-        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        mmT(TP(il, "attn_v.weight"), x1T, vT, T);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base + 1, T, FREQ_BASE,
                           stm);
         if (kv_kind >= KV_T3)
@@ -4703,6 +4901,7 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
             samp_first = true;
         }
+        plain_first = true;
         t.n_max = n_max;
         t.eos = eos;
         t.on_token = std::ref(on_token);
@@ -4964,6 +5163,9 @@ struct Engine {
             // rejection-verify twin; Q27_SAMPLE_PLAIN still forces the plain
             // sampler (the spec==non-spec distribution A/B lever).
             n = dflash2_round(em, t.sampling);
+        } else if (!has_mtp) {
+            // no MTP block (Bonsai 2): nothing to draft with -- plain rounds
+            n = t.sampling ? sample_round(em) : plain_round(em);
         } else {
             n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
                            : spec_round(em);
@@ -5263,7 +5465,7 @@ struct Engine {
                 // DFlash2 engine then carry unwarmed MTP rows -- a ladder
                 // config must never restore from a DFlash2 root (the launch
                 // script's ladder mode has no cache; keep it that way).
-                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (!d2_on && has_mtp) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -5327,7 +5529,7 @@ struct Engine {
                     CUDA_CHECK(cudaMemcpyAsync(x1, x1T + (size_t)(Tc - 1) * N_EMBD, (size_t)N_EMBD * 4,
                                                cudaMemcpyDeviceToDevice, stm));
                 // MTP warm needs each row's successor token; NP-1 has none
-                if (!d2_on && Tc - (has_last ? 1 : 0) > 0)
+                if (!d2_on && has_mtp && Tc - (has_last ? 1 : 0) > 0)
                     mtp_warm_T(d_prompt + c0 + 1, c0, Tc - (has_last ? 1 : 0)); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
@@ -5341,6 +5543,7 @@ struct Engine {
             if (fold_last) {
                 // token_launches' tail on the batched row: head, greedy next
                 // token, position/record advance (d_pos -> NP, d_gen[NP-1]).
+                if (bonsai2) bz_rot(x1, N_EMBD, stm);
                 qx(x1, N_EMBD);
                 mm(dm.get("output.weight"), x1, logits);
                 q27k::argmax(logits, VOCAB, d_token, d_amax, stm);

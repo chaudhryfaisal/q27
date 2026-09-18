@@ -687,4 +687,249 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- T2_G128 ternary GEMV (kernels.cuh for the layout contract) ----
+// Warp per row like k_gemv_q4; a 32-element chunk is 8 weight bytes (two
+// interleaved words), dp4a'd against the SAME even/odd activation words the
+// Q4 kernel reads. value = code - 1, so sum((c-1)*x) = dp4a(c, x) - isum.
+__device__ __forceinline__ int t2_dot32(uint2 w, const uint4 xv0, const uint4 xv1) {
+    const uint32_t M = 0x03030303u;
+    int di = 0;
+    di = __dp4a((int)(w.x & M), (int)xv0.x, di);
+    di = __dp4a((int)((w.x >> 2) & M), (int)xv0.y, di);
+    di = __dp4a((int)((w.x >> 4) & M), (int)xv0.z, di);
+    di = __dp4a((int)((w.x >> 6) & M), (int)xv0.w, di);
+    di = __dp4a((int)(w.y & M), (int)xv1.x, di);
+    di = __dp4a((int)((w.y >> 2) & M), (int)xv1.y, di);
+    di = __dp4a((int)((w.y >> 4) & M), (int)xv1.z, di);
+    di = __dp4a((int)((w.y >> 6) & M), (int)xv1.w, di);
+    return di;
+}
+__global__ void k_gemv_t2(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                          const uint2* __restrict__ xeo, const float* __restrict__ xs,
+                          const int* __restrict__ xisum, float* __restrict__ y, int64_t rows,
+                          int64_t cols) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint2* wr = (const uint2*)(W + row * (cols / 4));
+    const __half* sr = S + row * (cols / 128);
+    const int n_chunks = (int)(cols / 32);
+    float acc = 0.f;
+    for (int ch = lane; ch < n_chunks; ch += 32) {
+        const uint2 w = __ldg(wr + ch);
+        const uint4* xp = (const uint4*)(xeo + (size_t)ch * 4);
+        const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
+        const float s = __half2float(__ldg(sr + (ch >> 2))) * __ldg(xs + ch);
+        acc += s * (float)(t2_dot32(w, xv0, xv1) - __ldg(xisum + ch));
+    }
+    acc = warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
+struct T2Lanes {
+    const uint2* eo[16];
+    const float* xs[16];
+    const int* is[16];
+    float* y[16];
+};
+template <int N>
+__global__ void __launch_bounds__(256, N < Q27_GEMV_3CTA_MIN_Q4 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
+    k_gemv_t2_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                __grid_constant__ const T2Lanes L, int64_t rows, int64_t cols) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint2* wr = (const uint2*)(W + row * (cols / 4));
+    const __half* sr = S + row * (cols / 128);
+    const int n_chunks = (int)(cols / 32);
+    float acc[N];
+#pragma unroll
+    for (int n = 0; n < N; n++) acc[n] = 0.f;
+    for (int ch = lane; ch < n_chunks; ch += 32) {
+        const uint2 w = __ldg(wr + ch);
+        const float wsc = __half2float(__ldg(sr + (ch >> 2)));
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            const uint4* xp = (const uint4*)(L.eo[n] + (size_t)ch * 4);
+            const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
+            acc[n] += wsc * __ldg(L.xs[n] + ch) *
+                      (float)(t2_dot32(w, xv0, xv1) - __ldg(L.is[n] + ch));
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; n++) {
+        float v = warp_reduce(acc[n]);
+        if (lane == 0) L.y[n][row] = v;
+    }
+}
+void gemv_t2(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+             int64_t cols, cudaStream_t st) {
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    k_gemv_t2<<<blocks, 256, 0, st>>>(W, S, xq.eo, xq.scale, xq.isum, y, rows, cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+void gemv_t2_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float* const* ys,
+               int64_t rows, int64_t cols, cudaStream_t st) {
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    T2Lanes L;
+    for (int i = 0; i < 16; i++) {
+        const XQuant& qq = q[i < nb ? i : 0];
+        L.eo[i] = qq.eo; L.xs[i] = qq.scale; L.is[i] = qq.isum;
+        L.y[i] = ys[i < nb ? i : 0];
+    }
+    switch (nb) {
+        case 1: k_gemv_t2_n<1><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 2: k_gemv_t2_n<2><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 3: k_gemv_t2_n<3><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 4: k_gemv_t2_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 5: k_gemv_t2_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 6: k_gemv_t2_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 7: k_gemv_t2_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 8: k_gemv_t2_n<8><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 9: k_gemv_t2_n<9><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 10: k_gemv_t2_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 11: k_gemv_t2_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 12: k_gemv_t2_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 13: k_gemv_t2_n<13><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 14: k_gemv_t2_n<14><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 15: k_gemv_t2_n<15><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 16: k_gemv_t2_n<16><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        default: fprintf(stderr, "gemv_t2_n: bad nbatch %d\n", nb); exit(1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+// Sequential 2-bit fields (element f at field f) -> the kernel order above.
+__global__ void k_t2_interleave(uint32_t* __restrict__ w, uint64_t nwords) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nwords) return;
+    const uint32_t v = w[i];
+    uint32_t o = 0;
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+        const uint32_t e0 = (v >> (2 * (2 * b))) & 3u;      // e[2b]
+        const uint32_t e1 = (v >> (2 * (2 * b + 1))) & 3u;  // e[2b+1]
+        const uint32_t e2 = (v >> (2 * (8 + 2 * b))) & 3u;  // e[8+2b]
+        const uint32_t e3 = (v >> (2 * (9 + 2 * b))) & 3u;  // e[9+2b]
+        o |= e0 << (2 * (4 * b + 0));
+        o |= e1 << (2 * (4 * b + 1));
+        o |= e2 << (2 * (4 * b + 2));
+        o |= e3 << (2 * (4 * b + 3));
+    }
+    w[i] = o;
+}
+void t2_interleave_device(uint8_t* W, uint64_t bytes, cudaStream_t st) {
+    if (bytes % 4) { fprintf(stderr, "t2_interleave: %llu bytes not word-aligned\n",
+                             (unsigned long long)bytes); exit(1); }
+    const uint64_t n = bytes / 4;
+    k_t2_interleave<<<(unsigned)((n + 255) / 256), 256, 0, st>>>((uint32_t*)W, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- Bonsai 2 activation rotation (kernels.cuh for the contract) ----
+// One 256-thread block per 1024-element chunk; the butterfly pairs (j, j+h)
+// with the low element taking a+b and the high one a-b, each element written
+// by exactly one thread per stage -- the same operand order as the reference
+// runtime's shared-memory FWHT, so the two are bit-equal on the same input.
+// Scale 1/32 is exact in fp32, so applying it last costs nothing in bits.
+template <bool INV>
+__device__ __forceinline__ void hadamard1024_chunk(float* __restrict__ xb,
+                                                   const float* __restrict__ sb, float* s) {
+    const int j0 = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int j = j0 + 256 * i;
+        s[j] = INV ? xb[j] : xb[j] * sb[j];
+    }
+    __syncthreads();
+    for (int h = 1; h < 1024; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int idx = j0 + 256 * k;                   // 512 pairs per stage
+            const int j = ((idx / h) * 2 * h) + (idx % h);
+            const float a = s[j], b = s[j + h];
+            s[j] = a + b;
+            s[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int j = j0 + 256 * i;
+        xb[j] = INV ? (s[j] * 0.03125f) * sb[j] : s[j] * 0.03125f;
+    }
+}
+template <bool INV>
+__global__ void __launch_bounds__(256) k_hadamard1024_rows(float* __restrict__ x,
+                                                           const float* __restrict__ signs,
+                                                           long row_stride) {
+    __shared__ float s[1024];
+    hadamard1024_chunk<INV>(x + (long)blockIdx.y * row_stride + (long)blockIdx.x * 1024,
+                            signs + (long)blockIdx.x * 1024, s);
+}
+template <bool INV>
+__global__ void __launch_bounds__(256) k_hadamard1024_lanes(P3 x, const float* __restrict__ signs) {
+    __shared__ float s[1024];
+    hadamard1024_chunk<INV>(x.p[blockIdx.y] + (long)blockIdx.x * 1024,
+                            signs + (long)blockIdx.x * 1024, s);
+}
+static void hadamard_check(int width, int n) {
+    if (width <= 0 || width % 1024 != 0 || n <= 0 || n > 65535) {
+        fprintf(stderr, "hadamard1024: bad geometry width=%d n=%d\n", width, n);
+        exit(1);
+    }
+}
+void hadamard1024_rows(float* x, const float* signs, int width, int rows, long row_stride,
+                       bool inv, cudaStream_t st) {
+    hadamard_check(width, rows);
+    dim3 g(width / 1024, rows);
+    if (inv) k_hadamard1024_rows<true><<<g, 256, 0, st>>>(x, signs, row_stride);
+    else     k_hadamard1024_rows<false><<<g, 256, 0, st>>>(x, signs, row_stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+void hadamard1024(float* x, const float* signs, int width, bool inv, cudaStream_t st) {
+    hadamard1024_rows(x, signs, width, 1, width, inv, st);
+}
+void hadamard1024_lanes(P3 x, const float* signs, int width, int nlanes, bool inv,
+                        cudaStream_t st) {
+    hadamard_check(width, nlanes);
+    if (nlanes > 16) { fprintf(stderr, "hadamard1024_lanes: nlanes %d > 16\n", nlanes); exit(1); }
+    dim3 g(width / 1024, nlanes);
+    if (inv) k_hadamard1024_lanes<true><<<g, 256, 0, st>>>(x, signs);
+    else     k_hadamard1024_lanes<false><<<g, 256, 0, st>>>(x, signs);
+    CUDA_CHECK(cudaGetLastError());
+}
+// out[k*rep*hd + r*hd + h] = in[r*nk*hd + k*hd + h]; one block per row/lane.
+__global__ void k_gdn_v_perm_rows(const float* __restrict__ in, float* __restrict__ out, int hd,
+                                  int nk, int rep, long stride) {
+    const int n = hd * nk * rep;
+    const float* ir = in + (long)blockIdx.x * stride;
+    float* orow = out + (long)blockIdx.x * stride;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int h = i % hd, r = (i / hd) % rep, k = i / (hd * rep);  // i = k*rep*hd + r*hd + h
+        orow[i] = ir[r * nk * hd + k * hd + h];
+    }
+}
+__global__ void k_gdn_v_perm_lanes(CP3 in, P3 out, int hd, int nk, int rep) {
+    const int n = hd * nk * rep;
+    const float* ir = in.p[blockIdx.x];
+    float* orow = out.p[blockIdx.x];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int h = i % hd, r = (i / hd) % rep, k = i / (hd * rep);
+        orow[i] = ir[r * nk * hd + k * hd + h];
+    }
+}
+void gdn_v_tiled_to_grouped_rows(const float* in, float* out, int hd, int nk, int rep, int rows,
+                                 long stride, cudaStream_t st) {
+    if (in == out) { fprintf(stderr, "gdn_v_tiled_to_grouped: in-place not supported\n"); exit(1); }
+    k_gdn_v_perm_rows<<<rows, 256, 0, st>>>(in, out, hd, nk, rep, stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+void gdn_v_tiled_to_grouped(const float* in, float* out, int hd, int nk, int rep, cudaStream_t st) {
+    gdn_v_tiled_to_grouped_rows(in, out, hd, nk, rep, 1, (long)hd * nk * rep, st);
+}
+void gdn_v_tiled_to_grouped_lanes(CP3 in, P3 out, int hd, int nk, int rep, int nlanes,
+                                  cudaStream_t st) {
+    k_gdn_v_perm_lanes<<<nlanes, 256, 0, st>>>(in, out, hd, nk, rep);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace q27k

@@ -5,6 +5,7 @@
 
 #include "cuda_common.h"
 #include "device_model.h"
+#include "kernels.cuh"
 
 namespace q27 {
 
@@ -48,6 +49,12 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
         host_sums_[name] = hs;
     }
     CUDA_CHECK(cudaMemcpy(d.data, src.data, src.data_size, cudaMemcpyHostToDevice));
+    if (d.dtype == DType::T2_G128) {
+        // the device copy uses the dp4a-interleaved word order (kernels.cuh);
+        // the host bytes stay FORMAT.md-sequential (checksums, CPU references)
+        q27k::t2_interleave_device((uint8_t*)d.data, src.data_size);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     bytes_ += src.data_size;
     d.data_bytes = src.data_size;
     if (src.scales) {

@@ -79,6 +79,40 @@ This table is the DEFAULT tier (~5.25 bpw overall). The q6 / q6k quality tiers
 container and dtype set; the tier is recorded in the header meta as
 `quant_policy` (e.g. `q6-v1`). No new dtypes, no version bump.
 
+## Bonsai 2 packs (`quant_policy` `bonsai2-q4x-v1`, 2026-09-18)
+
+PrismML's Ternary Bonsai 2 27B is Qwen3.8-27B with every projection ternary
+(one fp16 scale per 128) in a Hadamard-rotated basis, and no MTP block. No
+new dtype: the repack stores the ternary values EXACTLY in existing
+containers (Q4_G64 nibble = trit+8 with the 128-group scale duplicated per
+64; Q8_G128 int8 = trit for `token_embd`/`output`), or in T2_G128 with
+`--bonsai2-container t2`, in which case every `blk.*` rotated matrix also
+gets an exact-Q4 shadow named `<name>.q4x` that the prefill GEMMs read.
+Header meta additions:
+
+- `"bonsai2": true`, `"bonsai2_container": "q4x" | "t2+q4x"`,
+  `"qwen35.block_count": 64` (no `nextn_predict_layers`), `general.name`
+  containing `qwen38` (the tool dialect and 3.8 template rules key on it).
+- `"hadamard": {version 1, block_size 1024, transform
+  "normalized-sylvester-walsh-hadamard", axis "input-last-dimension",
+  sign_mode "explicit", sign_widths, sign_values, weight_names,
+  inverse_weight_names ["token_embd.weight"], gdn_v_grouped}` -- the
+  `prism.hadamard.*` GGUF keys verbatim.
+- Sign vectors ALSO travel as F32 tensors `hadamard_signs.<width>` (5120,
+  6144, 17408) so the engine loads them like any F32 tensor.
+
+Runtime contract (engine.cuh `bonsai2`): before every rotated matmul the
+activation is sign-flipped then transformed per contiguous 1024-block with
+the normalized natural-order Walsh-Hadamard (`kernels.cuh hadamard1024`);
+the embedding row gets the inverse after lookup (transform, then sign);
+`ssm_out`'s input is permuted from the engine's tiled V-head order to the
+grouped order first when `gdn_v_grouped` (`gdn_v_tiled_to_grouped`).
+`ssm_alpha`/`ssm_beta` are unrotated and read the raw input.
+
+T2_G128 on the CUDA device is stored in a dp4a-interleaved word order
+(kernels.cuh `t2_interleave_device`, applied once at upload); the file and
+the host copy stay in the sequential order above.
+
 ## Per-step read budget (decode)
 
 Q4 bulk ~13.2 GB + Q8 lm_head ~1.3 GB + MTP layer ~0.4 GB + f16/f32 small tensors

@@ -47,6 +47,20 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* xqs, int nbatch,
 void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t cols,
               cudaStream_t st = 0);
 
+// ---- T2_G128 (ternary, Bonsai 2 Phase 2) ----
+// On disk (FORMAT.md): element i of a row in 2-bit field (i%4)*2 of byte i/4,
+// code c -> (c-1)*scale, fp16 scale per 128. The device copy is INTERLEAVED
+// per 16-element word so that ((w >> 2k) & 0x03030303) yields the same four
+// elements the Q4 kernels' even/odd activation words carry: field 4b+0 holds
+// e[2b], 4b+1 e[2b+1], 4b+2 e[8+2b], 4b+3 e[9+2b]. t2_interleave_device does
+// that in place right after upload (each word independent, idempotent-free:
+// apply exactly once). The dot is dp4a(codes, x) - sum(x) per 32-block.
+void t2_interleave_device(uint8_t* W, uint64_t bytes, cudaStream_t st = 0);
+void gemv_t2(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+             int64_t cols, cudaStream_t st = 0);
+void gemv_t2_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,
+               float* const* ys, int64_t rows, int64_t cols, cudaStream_t st = 0);
+
 // y = x * rsqrt(mean(x^2) + eps) * w      (single vector, n elements)
 void rmsnorm(const float* x, const float* w, float* y, int n, float eps, cudaStream_t st = 0);
 
@@ -77,5 +91,31 @@ void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st = 0, int ntok
 // verify forward quantizes every normed activation it produces).
 void rmsnorm3q(CP3 x, const float* w, P3 y, const XQ3& xq, int n, float eps, cudaStream_t st = 0,
                int ntok = 3);
+
+// ---- Bonsai 2 activation rotation (docs/plans/2026-09-18-bonsai2-ternary.md)
+// The pack stores every projection in a rotated basis W' = W R^T with
+// R = (1/32) H_1024 S per contiguous 1024-block of the INPUT dimension
+// (H natural-order Sylvester Walsh-Hadamard, S a fixed +-1 diagonal, one
+// sign vector per input width). Before such a matmul the activation gets
+// fwd: y = (1/32) H (s * x); after an embedding lookup of a rotated row it
+// gets inv: x = s * ((1/32) H y). In place, fp32, fixed operand order
+// (bitwise deterministic, CPU-equal). width % 1024 == 0; signs[width].
+void hadamard1024(float* x, const float* signs, int width, bool inv, cudaStream_t st = 0);
+// T rows at row_stride floats apart (prefill).
+void hadamard1024_rows(float* x, const float* signs, int width, int rows, long row_stride,
+                       bool inv, cudaStream_t st = 0);
+// Up to 16 lane vectors (speculative verify / multi-lane paths).
+void hadamard1024_lanes(P3 x, const float* signs, int width, int nlanes, bool inv,
+                        cudaStream_t st = 0);
+// GDN value-head order: the engine's og is tiled [rep][nk][hd] (the GGUF
+// convention); a Hadamard-folded ssm_out was folded in the training (grouped)
+// order [nk][rep][hd], so permute before the rotation:
+//   out[k*rep*hd + r*hd + h] = in[r*nk*hd + k*hd + h].
+void gdn_v_tiled_to_grouped(const float* in, float* out, int hd, int nk, int rep,
+                            cudaStream_t st = 0);
+void gdn_v_tiled_to_grouped_rows(const float* in, float* out, int hd, int nk, int rep, int rows,
+                                 long stride, cudaStream_t st = 0);
+void gdn_v_tiled_to_grouped_lanes(CP3 in, P3 out, int hd, int nk, int rep, int nlanes,
+                                  cudaStream_t st = 0);
 
 } // namespace q27k

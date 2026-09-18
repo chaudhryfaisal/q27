@@ -342,6 +342,7 @@ int main(int argc, char** argv) {
             e.prefill_chunk(d_toks + depth, depth, TT);
             if (with_head) {
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, TT, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, TT); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, TT);
                 e.mmT(head, e.x1T, d_lg, TT);
             }
@@ -919,6 +920,7 @@ int main(int argc, char** argv) {
                 const int T = std::min(PT, N - c0);
                 e.prefill_chunk(d_toks + c0, c0, T);
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, T);
                 e.mmT(head, e.x1T, d_lg, T);
                 const int nrows = std::min(T, N - 1 - c0);
@@ -1000,6 +1002,7 @@ int main(int argc, char** argv) {
                 int T = std::min(PT, N - c0);
                 e.prefill_chunk(d_toks + c0, c0, T);
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, T);
                 e.mmT(head, e.x1T, d_lg, T);
                 int nrows = std::min(T, N - 1 - c0);
@@ -1075,6 +1078,7 @@ int main(int argc, char** argv) {
                     int T = std::min(PT, C - c0);
                     e.prefill_chunk(d_toks + c0, c0, T);
                     q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                    if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                     e.qxT(e.x1T, N_EMBD, T);
                     e.mmT(head, e.x1T, d_lg, T);
                     int nrows = std::min(T, C - 1 - c0);
@@ -1253,7 +1257,7 @@ int main(int argc, char** argv) {
         e.reset();
         for (int i = 0; i < T; i++) {
             e.step_with(prompt[i]);
-            if (i + 1 < T) {
+            if (i + 1 < T && e.has_mtp) {
                 CUDA_CHECK(cudaStreamSynchronize(e.stm));
                 CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4,
                                            cudaMemcpyDeviceToDevice, e.stm));
@@ -1284,7 +1288,7 @@ int main(int argc, char** argv) {
             return out;
         };
         auto s_kc = grabh(false, 0, T);
-        auto s_mk = grabh(false, e.kv_mtp_pair(), T);
+        auto s_mk = e.has_mtp ? grabh(false, e.kv_mtp_pair(), T) : std::vector<float>();
         // pass 2: batched (chunked prefill only, no final serial token)
         e.reset();
         if (e.d_prompt_cap < N) {
@@ -1298,7 +1302,7 @@ int main(int argc, char** argv) {
             e.prefill_chunk(e.d_prompt + c0, c0, Tc);
             q27k::rmsnorm_T(e.hT, (const float*)e.dm.get("output_norm.weight").data, e.x1T,
                             N_EMBD, Tc, EPS, e.stm);
-            e.mtp_warm_T(e.d_prompt + c0 + 1, c0, Tc);
+            if (e.has_mtp) e.mtp_warm_T(e.d_prompt + c0 + 1, c0, Tc);
         }
         CUDA_CHECK(cudaStreamSynchronize(e.stm));
         int lastrow = (T - 1) % Engine::PF_T;
@@ -1307,13 +1311,13 @@ int main(int argc, char** argv) {
         auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
         auto b_kc = grabh(false, 0, T);
-        auto b_mk = grabh(false, e.kv_mtp_pair(), T);
+        auto b_mk = e.has_mtp ? grabh(false, e.kv_mtp_pair(), T) : std::vector<float>();
         printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
         printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
         printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");
         printf("ring[0]:"); maxdiff(s_ring0, b_ring0); printf("\n");
         printf("kcache :"); maxdiff(s_kc, b_kc); printf("\n");
-        printf("mtp_k  :"); maxdiff(s_mk, b_mk); printf("\n");
+        if (e.has_mtp) { printf("mtp_k  :"); maxdiff(s_mk, b_mk); printf("\n"); }
         return 0;
     }
 

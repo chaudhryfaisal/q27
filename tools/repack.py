@@ -42,6 +42,12 @@ def _forge_fork_type(name, value, blck, tsize):
 
 _forge_fork_type("Q2_0", 42, 128, 34)
 _forge_fork_type("Q1_0", 41, 128, 18)
+# Bonsai 2 (2026-09): Prism-private ternary at group 128. PTQ1_0 = {qs[24]
+# five trits/byte, qh[2] four trits/byte, fp16 d}; PQ2_0 = {fp16 d, qs[32]
+# 2-bit slots} (the Q2_0 codec at group 128). ggml.h at fork 1a07bfa.
+_forge_fork_type("PQ2_0", 142, 128, 34)
+_forge_fork_type("PTQ1_0", 143, 128, 28)
+BONSAI2_TYPES = ("PTQ1_0", "PQ2_0")
 
 MAGIC = 0x46373251  # "Q27F" LE
 VERSION = 1
@@ -280,6 +286,160 @@ def repack_t2(t):
             raise ValueError(f"{t.name}: T2 round-trip mismatch in rows {r0}:{r1}")
 
     return qs.tobytes(), scales.tobytes(), zero_frac
+
+
+def decode_bonsai2_codes(t):
+    """Bonsai 2 PTQ1_0 / PQ2_0 tensor -> (codes int8 [rows, cols] in {-1,0,+1},
+    d fp16 bytes [rows, cols/128]).
+
+    PTQ1_0 element map (fork tests/test-ptq1_0-element-map.cpp, verified there
+    against the CUDA accessor): element e of a 128-block lives in
+      e <  80: byte qs[e & 15],        base-3 digit e >> 4   (16 bytes x 5 trits)
+      e < 120: byte qs[16 + (t & 7)],  digit t >> 3, t = e-80 (8 bytes x 5 trits)
+      else   : byte qh[t & 1],         digit t >> 1, t = e-120 (2 bytes x 4 trits)
+    digit n of byte b: v = (b * 3^n) mod 256; trit = ((v*3) >> 8) - 1 -- the
+    TQ1_0-style top-byte extraction (dequantize_row_ptq1_0 / vec_dot in
+    ggml-cpu/quants.c). PQ2_0: sequential LSB-first 2-bit fields, code c -> c-1,
+    code 3 forbidden (same as the v1 Q2_0 codec, repack_t2).
+    """
+    shape = tuple(reversed([int(d) for d in t.shape]))
+    rows, cols = int(np.prod(shape[:-1])), shape[-1]
+    if cols % 128 != 0:
+        raise ValueError(f"{t.name}: cols {cols} not divisible by 128")
+    nblocks = rows * cols // 128
+    tt = t.tensor_type.name
+    raw = np.asarray(t.data)
+    if tt == "PTQ1_0":
+        blocks = raw.reshape(nblocks, 28)
+        qs, qh = blocks[:, :24], blocks[:, 24:26]
+        d = blocks[:, 26:28].copy()
+        codes = np.empty((nblocks, 128), dtype=np.int8)
+        pow3 = np.array([1, 3, 9, 27, 81], dtype=np.uint8)  # uint8 wraps mod 256, as in the codec
+
+        def trit(bytes_, n):
+            v = (bytes_ * pow3[n]).astype(np.uint8)  # uint8 * uint8 -> wraps
+            return (((v.astype(np.uint16) * 3) >> 8).astype(np.int8) - 1)
+        for n in range(5):
+            codes[:, 16 * n:16 * n + 16] = trit(qs[:, :16], n)
+            codes[:, 80 + 8 * n:80 + 8 * n + 8] = trit(qs[:, 16:24], n)
+        for n in range(4):
+            codes[:, 120 + 2 * n:120 + 2 * n + 2] = trit(qh, n)
+    elif tt == "PQ2_0":
+        blocks = raw.reshape(nblocks, 34)
+        d = blocks[:, :2].copy()
+        q = blocks[:, 2:]
+        c = np.stack([(q >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(nblocks, 128)
+        if np.any(c == 3):
+            raise ValueError(f"{t.name}: PQ2_0 code 3 present -- not strictly ternary")
+        codes = (c.astype(np.int8) - 1)
+    else:
+        raise ValueError(f"{t.name}: not a Bonsai 2 type ({tt})")
+    if np.any(codes < -1) or np.any(codes > 1):
+        raise ValueError(f"{t.name}: decoded value outside {{-1,0,1}}")
+    return codes.reshape(rows, cols), d.reshape(rows, cols // 128, 2)
+
+
+def _bonsai2_reference_deq(codes, d, rows, cols, r0, r1):
+    """Fork semantics: value = trit * d (fp16 -> f32), per 128-group."""
+    dd = d[r0:r1].copy().view(np.float16).astype(np.float32).reshape(r1 - r0, cols // 128)
+    return codes[r0:r1].astype(np.float32) * np.repeat(dd, 128, axis=1)
+
+
+def repack_bonsai2_q4x(t):
+    """Bonsai 2 ternary tensor -> EXACT Q4_G64 blobs (data, scales, zero_frac).
+
+    Nibble = trit + 8 (7/8/9), Q4 scale per 64 = the 128-group's d duplicated,
+    so FORMAT.md's (nibble-8)*scale reproduces trit*d bit-for-bit in f32. This
+    is the Phase-1 container (docs/plans/2026-09-18-bonsai2-ternary.md): the
+    model runs on the existing Q4 kernels while the rotation is the only new
+    math. Round-trip gate below.
+    """
+    codes, d = decode_bonsai2_codes(t)
+    rows, cols = codes.shape
+    nib = (codes.astype(np.int16) + 8).astype(np.uint8).reshape(rows, cols // 2, 2)
+    data = (nib[:, :, 0] | (nib[:, :, 1] << 4)).astype(np.uint8)  # even = low nibble
+    scales = np.repeat(d, 2, axis=1)  # [rows, cols/64, 2] fp16 bytes
+    zero_frac = float(np.count_nonzero(codes == 0)) / codes.size
+    step = max(1, (1 << 25) // cols)
+    s_f32 = scales.reshape(rows, cols // 64, 2).view(np.float16).astype(np.float32).reshape(rows, cols // 64)
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        ref = _bonsai2_reference_deq(codes, d, rows, cols, r0, r1)
+        q = data[r0:r1]
+        nibs = np.stack([q & 0x0F, q >> 4], axis=-1).reshape(r1 - r0, cols)
+        ours = (nibs.astype(np.float32) - 8.0) * np.repeat(s_f32[r0:r1], 64, axis=1)
+        if not np.array_equal(ref, ours):
+            raise ValueError(f"{t.name}: Q4x round-trip mismatch in rows {r0}:{r1}")
+    return data.tobytes(), scales.tobytes(), zero_frac
+
+
+def repack_bonsai2_t2(t):
+    """Bonsai 2 ternary tensor -> T2_G128 blobs (data, scales, zero_frac): the
+    FORMAT.md layout (code = trit+1 in 2-bit field (i%4)*2 of byte i/4, fp16
+    scale per 128). Lossless; the round-trip gate re-decodes the packed bytes."""
+    codes, d = decode_bonsai2_codes(t)
+    rows, cols = codes.shape
+    c = (codes.astype(np.int16) + 1).astype(np.uint8).reshape(rows, cols // 4, 4)
+    data = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
+    zero_frac = float(np.count_nonzero(codes == 0)) / codes.size
+    step = max(1, (1 << 25) // cols)
+    d_f32 = d.copy().view(np.float16).astype(np.float32).reshape(rows, cols // 128)
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        ref = _bonsai2_reference_deq(codes, d, rows, cols, r0, r1)
+        q = data[r0:r1]
+        cc = np.stack([(q >> sh) & 3 for sh in (0, 2, 4, 6)], axis=-1).reshape(r1 - r0, cols)
+        ours = (cc.astype(np.float32) - 1.0) * np.repeat(d_f32[r0:r1], 128, axis=1)
+        if not np.array_equal(ref, ours):
+            raise ValueError(f"{t.name}: T2 round-trip mismatch in rows {r0}:{r1}")
+    return data.tobytes(), d.tobytes(), zero_frac
+
+
+def repack_bonsai2_q8x(t):
+    """Bonsai 2 ternary tensor -> EXACT Q8_G128 blobs (data, scales, zero_frac):
+    int8 = trit, scale = d. Used for token_embd and output in Phase 1 (the
+    embedding lookup and the head are Q8-only paths in the CUDA engine)."""
+    codes, d = decode_bonsai2_codes(t)
+    rows, cols = codes.shape
+    zero_frac = float(np.count_nonzero(codes == 0)) / codes.size
+    step = max(1, (1 << 25) // cols)
+    d_f32 = d.copy().view(np.float16).astype(np.float32).reshape(rows, cols // 128)
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        ref = _bonsai2_reference_deq(codes, d, rows, cols, r0, r1)
+        ours = codes[r0:r1].astype(np.float32) * np.repeat(d_f32[r0:r1], 128, axis=1)
+        if not np.array_equal(ref, ours):
+            raise ValueError(f"{t.name}: Q8x round-trip mismatch in rows {r0}:{r1}")
+    return codes.tobytes(), d.tobytes(), zero_frac
+
+
+def bonsai2_hadamard_meta(reader):
+    """Copy the prism.hadamard.* keys verbatim (the engine applies the
+    activation-side transform from these; FORMAT.md 'hadamard')."""
+    out = {}
+    for f in reader.fields.values():
+        if not f.name.startswith("prism.hadamard."):
+            continue
+        v = f.contents()
+        if isinstance(v, bytes):
+            v = v.decode()
+        elif isinstance(v, list):
+            v = [x.decode() if isinstance(x, bytes) else (int(x) if isinstance(x, (np.integer,)) else x) for x in v]
+        elif isinstance(v, np.generic):
+            v = v.item()
+        out[f.name[len("prism.hadamard."):]] = v
+    for k in ("version", "block_size", "transform", "axis", "sign_mode", "sign_widths",
+              "sign_values", "weight_names"):
+        if k not in out:
+            raise ValueError(f"source GGUF is missing prism.hadamard.{k}")
+    if out["version"] != 1 or out["transform"] != "normalized-sylvester-walsh-hadamard" \
+            or out["axis"] != "input-last-dimension" or out["sign_mode"] != "explicit":
+        raise ValueError(f"unsupported prism.hadamard variant: {out}")
+    if sum(out["sign_widths"]) != len(out["sign_values"]) or any(w % out["block_size"] for w in out["sign_widths"]):
+        raise ValueError("prism.hadamard sign table inconsistent")
+    out.setdefault("inverse_weight_names", [])
+    out.setdefault("gdn_v_grouped", False)
+    return out
 
 
 def repack_b1(t):
@@ -583,6 +743,14 @@ def main():
     ap.add_argument("--mtp", default=None,
                     help="companion BF16 MTP GGUF (llama.cpp --mtp output)")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--bonsai2-container", choices=("q4x", "t2"), default="q4x",
+                    help="Bonsai 2 packs: q4x = every rotated matrix as EXACT Q4_G64 (Phase 1, "
+                         "runs on the existing kernels); t2 = T2_G128 for decode plus a "
+                         "'<name>.q4x' exact-Q4 shadow of every blk.* rotated matrix for prefill "
+                         "(Phase 2; embeddings/head stay exact Q8)")
+    ap.add_argument("--name", default=None,
+                    help="general.name to write for Bonsai 2 packs (default 'Bonsai2 Ternary Qwen38 27b'; "
+                         "must contain qwen38 for the engine's dialect/template keying)")
     ap.add_argument("--report", type=int, default=15)
     ap.add_argument("--q8", default=None,
                     help="extra tensor-name regex forced to Q8_G128 (v1.4 policy experiments)")
@@ -645,6 +813,9 @@ def main():
         raise ValueError("source GGUF is missing general.architecture")
     ternary = any(t.tensor_type.name == "Q2_0" for t in source_tensors)
     binary = any(t.tensor_type.name == "Q1_0" for t in source_tensors)
+    bonsai2 = any(t.tensor_type.name in BONSAI2_TYPES for t in source_tensors)
+    if bonsai2 and (ternary or binary or mtp_reader):
+        raise ValueError("a Bonsai 2 pack cannot be mixed with v1 Bonsai types or --mtp")
     if mtp_reader:
         bad_types = sorted({t.tensor_type.name for t in source_tensors
                             if t.tensor_type.name not in ("BF16", "F32")})
@@ -654,17 +825,24 @@ def main():
                              + ", ".join(bad_types))
     if binary and ternary:
         raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
-    if (not mtp_reader and not ternary and not binary
+    if (not mtp_reader and not ternary and not binary and not bonsai2
             and _field_value(r, "general.architecture") == "qwen35"
             and _field_value(r, "qwen35.block_count") == 64):
         raise ValueError("base-only qwen35 GGUF: supply its companion with --mtp")
 
     meta = {"q27_version": VERSION,
-            "quant_policy": args.tag or ("bonsai-t2-v1" if ternary
+            "quant_policy": args.tag or (("bonsai2-t2-v1" if args.bonsai2_container == "t2" else "bonsai2-q4x-v1") if bonsai2
+                                         else "bonsai-t2-v1" if ternary
                                          else "bonsai-b1-v1" if binary
                                          else "v1.4" if args.q8 else "v1.3"),
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
-    if ternary:
+    if bonsai2:
+        # Ternary values in exact Q4_G64 / Q8_G128 containers (trit*d bit-for-bit)
+        # plus the rotation the engine must apply to activations. No MTP block.
+        meta["bonsai2"] = True
+        meta["bonsai2_container"] = "t2+q4x" if args.bonsai2_container == "t2" else "q4x"
+        meta["hadamard"] = bonsai2_hadamard_meta(r)
+    if ternary or (bonsai2 and args.bonsai2_container == "t2"):
         meta["group_t2"] = GROUP_T2
         meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
         meta["t2_slot_order"] = "seq-lsb-first"
@@ -712,6 +890,13 @@ def main():
     if mtp_reader:
         meta["qwen35.block_count"] = 65
         meta["qwen35.nextn_predict_layers"] = 1
+    if bonsai2:
+        # The GGUF's general.name is "Hf"; the engine keys the tool dialect and
+        # the 3.8 template rules on a "qwen38" substring (api_common.h
+        # set_tool_dialect_for_model), so name the artifact for what it is.
+        meta["general.name"] = args.name or "Bonsai2 Ternary Qwen38 27b"
+        meta["qwen35.block_count"] = 64
+        meta.pop("qwen35.nextn_predict_layers", None)
     # layer map
     attn_layers, ssm_layers = set(), set()
     for t in source_tensors:
@@ -738,6 +923,11 @@ def main():
         if t.name == "output.weight" and not args.q4_head \
                 and not ternary and not binary:
             extra.append(("output_q4.weight", t))
+    if bonsai2 and args.bonsai2_container == "t2":
+        # Phase 2: decode reads T2, prefill reads the exact-Q4 shadow (engine TP()).
+        for t in r.tensors:
+            if t.tensor_type.name in BONSAI2_TYPES and t.name.startswith("blk."):
+                extra.append((t.name + ".q4x", t))
     if PF4:
         # fp4 prefill sidecars: attn+FFN projections only, per PF4_INCLUDE.
         for t in r.tensors:
@@ -764,11 +954,22 @@ def main():
             verbatim = (DTYPE_T2, repack_t2)
         elif binary and t.tensor_type.name == "Q1_0":
             verbatim = (DTYPE_B1, repack_b1)
+        elif bonsai2 and t.tensor_type.name in BONSAI2_TYPES:
+            # Phase 1 containers: exact Q8 for the two Q8-only engine paths
+            # (embedding lookup, head), exact Q4 for every rotated matrix.
+            if t.name in ("token_embd.weight", "output.weight"):
+                verbatim = (DTYPE_Q8, repack_bonsai2_q8x)
+            elif t.name.endswith(".q4x"):
+                verbatim = (DTYPE_Q4, repack_bonsai2_q4x)   # prefill shadow of a T2 base
+            elif args.bonsai2_container == "t2":
+                verbatim = (DTYPE_T2, repack_bonsai2_t2)
+            else:
+                verbatim = (DTYPE_Q4, repack_bonsai2_q4x)
         if verbatim is not None:
             vdt, fn = verbatim
             shape = tuple(reversed([int(d) for d in t.shape]))
             out = fn(t)
-            if vdt == DTYPE_T2:
+            if vdt == DTYPE_T2 or (bonsai2 and len(out) == 3):
                 data, scales, zero_frac = out
                 zero_fracs.append((zero_frac, int(np.prod(shape)), t.name))
             else:
@@ -858,6 +1059,21 @@ def main():
             blobs.append((scale_off, scales))
         del w, w_ref, deq
 
+    if bonsai2:
+        # The sign vectors also travel as F32 tensors (hadamard_signs.<width>),
+        # so the engine loads them like any F32V tensor instead of parsing a
+        # 28672-element JSON array with its hand-rolled meta scanner.
+        hm = meta["hadamard"]
+        off_s = 0
+        for w in hm["sign_widths"]:
+            vals = np.asarray(hm["sign_values"][off_s:off_s + w], dtype=np.float32)
+            off_s += w
+            data = vals.tobytes()
+            data_off = offset
+            offset = (offset + len(data) + ALIGN - 1) // ALIGN * ALIGN
+            entries.append((f"hadamard_signs.{w}", DTYPE_F32, (w,), data_off, len(data), 0, 0))
+            blobs.append((data_off, data))
+            n_bytes_out += len(data)
     meta_b = json.dumps(meta).encode()
     with open(args.output, "wb") as f:
         f.write(struct.pack("<IIII", MAGIC, VERSION, len(entries), len(meta_b)))
