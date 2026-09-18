@@ -134,6 +134,39 @@ today. That isolates the only new piece of math -- the activation rotation
   (mm5's bare else now fails loud), prefill reads the exact-Q4 `.q4x` shadow
   through TP(il, leaf), repack `--bonsai2-container t2`.
 
+- 09-18 10:48: Phase 2 first cut committed (BUILDLOG (an)): T2 kernels
+  validated, 5090 plain decode q4x 78.6 -> t2 109.9 t/s, bitwise-identical
+  tokens.
+- 09-18 11:11: DFlash2 on the ternary target committed (BUILDLOG (ao)):
+  greedy-exact vs plain with the GEMV family; 5090 t2 + DFlash2 K=7:
+  391 / 276 / 184 t/s (short / cities / 700-token), round 18.7 ms -- not
+  below the Q4 tier's 17.4 because T2 has no vgemm (MMA) verify path and
+  the rotation adds ~6 launches per layer per lane set. Next: T2 vgemm,
+  fused rotate+quantize.
+
+- 09-18 11:25 / 11:30: T2 verify GEMM (BUILDLOG (ap)) and fused rotate+
+  quantize (aq): round 14.75 ms, 233 t/s on the 700-token prompt, 346 on
+  cities -- past the Q4 production tier on this traffic, at 22.4 GB.
+- 09-18 11:39-12:16: agentic campaign leg `bonsai2` (t2q4x + DFlash2 Q8,
+  medium effort, 12 instances): gold 11/12 like every q27 leg; 37.3 turns
+  and 74.8K thinking chars per instance vs 22.0 / 34.5K on the same-day
+  Qwen3.8 config; agg 205 t/s vs 222, 3.47 vs 4.02 tok/round. Same outcome,
+  ~2x the reasoning -- a model-behaviour axis, not an engine one.
+- 09-18 ~12:00: wikitext PPL on the tier-table protocol (chunk 512, ctx 512,
+  fp8 KV, 3090): 9.2513 vs the 3.8 default tier's 7.3102 rerun on the same
+  card (+27%); chunk 2048: 8.2718 vs 6.8730 (+20%). The 08-14 tier table
+  was the chunk-512 protocol (its 7.3121 reproduces to 0.002).
+- 09-18 12:44: Phase 3 landed -- prefill.cu k_gemm_mma_T / k_gemm_mma_ntx
+  take a dtype (Q8 / Q4 / T2); the T2 leg stages 8 u32 per row per 128-K
+  stage and unpacks each interleaved word to 16 s8 (code-1) in one STS.128,
+  the g128 scale rides Q8's slot; gemm_t2_T is MMA-only (dp4a refused).
+  Gate: test_gemm_t2_shadow, the T2 GEMM against gemm_q4_T on the exact-Q4
+  image of the same matrix, BITWISE (zero differing outputs) on g32 and g64
+  at T=33 and T=300 (ntx kernel), 8/8 on the mini pack. Repack containers
+  are now q4x | t2 (pure, default) | t2+q4x (the Phase 2 layout, read only
+  under Q27_T2_PF_SHADOW=1); artifacts bonsai2-27b-t2.q27 = pure T2 9.44 GB,
+  bonsai2-27b-t2q4x.q27 = the 22.36 GB A/B pack.
+
 ## Risks and open questions
 
 - DFlash2 acceptance on the ternary target (drafter trained on BF16).

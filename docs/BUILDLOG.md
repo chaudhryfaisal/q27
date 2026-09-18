@@ -15714,6 +15714,75 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (ar): Bonsai 2 Phase 3 + the gates -- T2 prefill GEMM drops the 13 GB of Q4 shadows (9.44 GB pack, 262K auto ctx); PPL 9.25 vs 7.31, HE+ 25/30, needle 6/6, campaign gold 11/12 at 2x the reasoning
+
+**Phase 3.** prefill.cu's two MMA GEMM kernels (k_gemm_mma_T, k_gemm_mma_ntx)
+take a dtype instead of `bool Q4IN` (0 Q8, 1 Q4, 2 T2). The T2 leg stages 8
+u32 per row per 128-K stage (pad word 0x55555555 = code 1 = 0) and unpacks
+each interleaved word to 16 sequential s8 with the -1 folded in -- vgemm's
+unpack_t2 (four masked extractions + two __byte_perm + __vsub4), one STS.128
+per word -- so the mma fragments, the fp accumulation order and the scale
+slots are the Q8 leg's (T2's g128 scale rides Q8's per-row slot; the Q4 leg
+keeps its two 64-scales). gemm_t2_T is MMA-only: Q27_PREFILL=dp4a is refused
+for T2 rather than silently served. engine mmT dispatches T2_G128; TP()
+reads the `.q4x` shadow only under Q27_T2_PF_SHADOW=1 (the A/B). repack
+`--bonsai2-container` is now q4x | t2 (pure, the default) | t2+q4x (the
+Phase 2 layout). Artifacts: bonsai2-27b-t2.q27 = pure T2 9.44 GB (repack 160
+s, 403 tensors slot-verified); bonsai2-27b-t2q4x.q27 = the 22.36 GB A/B pack.
+
+Gates, in order of strength: (1) test_kernels test_gemm_t2_shadow -- the T2
+GEMM against gemm_q4_T on the exact-Q4 image of the same matrix, ZERO
+differing outputs on g32 and g64 at T=33 and T=300 (the ntx minitile
+kernel), attn_qkv and ffn_down, 8/8 on the mini pack (3090) and on the full
+pack (5090); (2) full-corpus --nll chunk 512 on pure T2 vs the shadow path
+(Q27_T2_PF_SHADOW=1 on t2q4x): mean NLL 2.224715 both, all six digits, over
+147,900 predictions; chunk 2048 on pure T2 reproduces the morning's t2q4x
+number (2.113447 / 8.2767) exactly. Serving: pure T2 leaves 23.19 GB after
+weights on the 5090 (was ~10 with the shadows), auto ctx 262144 (was 98304),
+round wall unchanged 14.88 = draft 2.22 + verify 12.53 ms (decode reads the
+same T2 tensors either way). One test_kernels casualty on T2 packs:
+test_gemv10_scaling's ffn leg called gemv_q4_n on blk.*.ffn_gate
+unconditionally (T2 rows read as nibbles ran off the allocation -> illegal
+address, sticky, exit 1 with every check PASS); now dtype-dispatched like
+its head leg, and the full t2+q4x pack runs test_kernels to ALL PASS on the
+5090 (444 checks; the T2 ffn 10-lane ratio is 0.87 at 0.043 ms -- the whole
+17408x5120 ternary matrix is 22 MB and sits in L2, so that number is not a
+weight-streaming measurement).
+
+**Tier gates.** The README's 3.8 tier table is the chunk 512 / ctx 512
+protocol (the default tier's 7.3121 reruns at 7.3102 on the 3090; chunk 2048
+gives 6.873 -- know which one you are quoting). Same ids
+(wiki.test.qwen38.i32 == the qwopus i32), fp8 KV:
+
+    protocol            Bonsai 2            Qwen3.8 default     instrument
+    chunk 512 / 512     9.2508 / 9.2513     7.3121 / 7.3102     5090 / 3090
+    chunk 2048 / 2048   8.2767 / 8.2718     6.8824 / 6.8730     5090 / 3090
+    fork llama-perplexity -c 2048 on the PTQ1_0 GGUF: 8.2643 +/- 0.056
+
++20-27% PPL for the ternary checkpoint; the port itself is within 0.15% of
+the reference fork (fp8 KV + activation quant), so the gap is the model's.
+HumanEval+-30 (benchlocal, no-think, temp 0, Docker verifier): 25/30 vs
+30/30 for every 3.8 tier (fails 0, 3, 12, 28, 29). Needle 6/6 at 270K chars
+(~90K tokens) on pure T2 + DFlash2. The fork's llama-perplexity is an
+sm_120-only build whose PDL probe aborts ("no kernel image", device 1) when
+the 3090 is visible: CUDA_VISIBLE_DEVICES=0.
+
+**Campaign** (bench/crossengine/agentic-2026-09-18-bonsai2, leg `bonsai2` in
+campaign.sh: t2q4x + DFlash2 Q8 pack, medium effort, fresh pfx root, 12
+instances): gold 11/12 -- the same set as every q27 leg and ninfer; 37.3
+turns / 74.8K thinking chars / 26.2K output tokens per instance vs 22.0 /
+34.5K / 12.6K for the same-day 3.8 DFlash2 leg (q27seed), wall 182 vs 78
+s/inst; serving 205.1 vs 222.0 t/s aggregate, 3.47 vs 4.02 tok/round (the
+3.8-trained drafter accepts a little less on the ternary target), reuse
+0.969 vs 0.962. Same outcome, twice the reasoning: the #49 axis with the
+sign flipped (ninfer's NVFP4 arm reasons shorter than the model, Bonsai 2
+longer), engine mechanics identical on both sides. turns_cmp.py knows the
+dir; the campaign README has the per-instance table.
+
+Also: tools/launch_q27_38.sh `bonsai2` mode (own pfx root, BONSAI2_MODEL);
+README tier section; FORMAT.md container update; plan log. Production stayed
+on the Qwen3.8 default tier throughout (relaunched after each 5090 window).
+
 ## 2026-09-18 (aq): fused rotate+quantize -- the rotation costs no graph node; Bonsai 2 round 14.75 ms, 233 t/s
 
 kernels.cu rotq / rotq3 (one 256-thread block per 1024-chunk: sign+load the

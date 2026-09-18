@@ -743,11 +743,12 @@ def main():
     ap.add_argument("--mtp", default=None,
                     help="companion BF16 MTP GGUF (llama.cpp --mtp output)")
     ap.add_argument("--only", default=None)
-    ap.add_argument("--bonsai2-container", choices=("q4x", "t2"), default="q4x",
-                    help="Bonsai 2 packs: q4x = every rotated matrix as EXACT Q4_G64 (Phase 1, "
-                         "runs on the existing kernels); t2 = T2_G128 for decode plus a "
-                         "'<name>.q4x' exact-Q4 shadow of every blk.* rotated matrix for prefill "
-                         "(Phase 2; embeddings/head stay exact Q8)")
+    ap.add_argument("--bonsai2-container", choices=("q4x", "t2", "t2+q4x"), default="t2",
+                    help="Bonsai 2 packs: t2 = every rotated matrix as T2_G128 (decode GEMV and "
+                         "the Phase 3 prefill GEMM read it; ~9 GB); t2+q4x = the same plus a "
+                         "'<name>.q4x' exact-Q4 shadow of every blk.* matrix (the Phase 2 layout, "
+                         "Q27_T2_PF_SHADOW=1 A/B; +13 GB); q4x = every rotated matrix as EXACT "
+                         "Q4_G64 (Phase 1). Embeddings/head stay exact Q8 in all three.")
     ap.add_argument("--name", default=None,
                     help="general.name to write for Bonsai 2 packs (default 'Bonsai2 Ternary Qwen38 27b'; "
                          "must contain qwen38 for the engine's dialect/template keying)")
@@ -831,7 +832,7 @@ def main():
         raise ValueError("base-only qwen35 GGUF: supply its companion with --mtp")
 
     meta = {"q27_version": VERSION,
-            "quant_policy": args.tag or (("bonsai2-t2-v1" if args.bonsai2_container == "t2" else "bonsai2-q4x-v1") if bonsai2
+            "quant_policy": args.tag or (("bonsai2-t2-v1" if args.bonsai2_container != "q4x" else "bonsai2-q4x-v1") if bonsai2
                                          else "bonsai-t2-v1" if ternary
                                          else "bonsai-b1-v1" if binary
                                          else "v1.4" if args.q8 else "v1.3"),
@@ -840,9 +841,9 @@ def main():
         # Ternary values in exact Q4_G64 / Q8_G128 containers (trit*d bit-for-bit)
         # plus the rotation the engine must apply to activations. No MTP block.
         meta["bonsai2"] = True
-        meta["bonsai2_container"] = "t2+q4x" if args.bonsai2_container == "t2" else "q4x"
+        meta["bonsai2_container"] = args.bonsai2_container
         meta["hadamard"] = bonsai2_hadamard_meta(r)
-    if ternary or (bonsai2 and args.bonsai2_container == "t2"):
+    if ternary or (bonsai2 and args.bonsai2_container != "q4x"):
         meta["group_t2"] = GROUP_T2
         meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
         meta["t2_slot_order"] = "seq-lsb-first"
@@ -923,8 +924,9 @@ def main():
         if t.name == "output.weight" and not args.q4_head \
                 and not ternary and not binary:
             extra.append(("output_q4.weight", t))
-    if bonsai2 and args.bonsai2_container == "t2":
-        # Phase 2: decode reads T2, prefill reads the exact-Q4 shadow (engine TP()).
+    if bonsai2 and args.bonsai2_container == "t2+q4x":
+        # Phase 2 layout: decode reads T2, prefill the exact-Q4 shadow (engine
+        # TP() under Q27_T2_PF_SHADOW=1; the Phase 3 GEMM reads T2 natively).
         for t in r.tensors:
             if t.tensor_type.name in BONSAI2_TYPES and t.name.startswith("blk."):
                 extra.append((t.name + ".q4x", t))
@@ -961,7 +963,7 @@ def main():
                 verbatim = (DTYPE_Q8, repack_bonsai2_q8x)
             elif t.name.endswith(".q4x"):
                 verbatim = (DTYPE_Q4, repack_bonsai2_q4x)   # prefill shadow of a T2 base
-            elif args.bonsai2_container == "t2":
+            elif args.bonsai2_container != "q4x":
                 verbatim = (DTYPE_T2, repack_bonsai2_t2)
             else:
                 verbatim = (DTYPE_Q4, repack_bonsai2_q4x)

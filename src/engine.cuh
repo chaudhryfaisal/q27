@@ -4086,12 +4086,15 @@ struct Engine {
         }
         mmT(TP(il, leaf), xT, yout, T); // T2: the int T param shadows T()
     }
-    // Prefill weight for (il, leaf): a T2_G128 base (Bonsai 2 Phase 2, decode
-    // GEMV only) reads its exact Q4 shadow "<name>.q4x" (repack --bonsai2-container
-    // t2) until the T2 prefill GEMM exists (Phase 3). Anything else is the base.
+    // Prefill weight for (il, leaf). A T2_G128 base runs the native T2 MMA
+    // GEMM (Bonsai 2 Phase 3, gemm_t2_T). Q27_T2_PF_SHADOW=1 routes it through
+    // the exact Q4 shadow "<name>.q4x" instead (repack --bonsai2-container
+    // t2+q4x carries one per blk.* matrix): the bitwise A/B of that GEMM on a
+    // served model, and the Phase 2 path it replaced. Anything else is the base.
     const DevTensor& TP(int il, const char* leaf) {
         const DevTensor& base = T(il, leaf);
-        if (base.dtype != DType::T2_G128) return base;
+        static const bool shadow = [] { const char* e = getenv("Q27_T2_PF_SHADOW"); return e && atoi(e) != 0; }();
+        if (base.dtype != DType::T2_G128 || !shadow) return base;
         char buf[128];
         snprintf(buf, sizeof buf, "blk.%d.%s.q4x", il, leaf);
         if (const DevTensor* s = dm.try_get(buf)) return *s;
@@ -4106,6 +4109,10 @@ struct Engine {
                 break;
             case DType::Q8_G128:
                 q27k::gemm_q8_T((const int8_t*)w.data, (const __half*)w.scales, xqT, yout,
+                                w.rows, w.cols, T, stm, splitk_p());
+                break;
+            case DType::T2_G128: // Bonsai 2: same MMA family, 2-bit staging unpack
+                q27k::gemm_t2_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
                                 w.rows, w.cols, T, stm, splitk_p());
                 break;
             case DType::F16:

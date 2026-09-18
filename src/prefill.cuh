@@ -33,6 +33,10 @@ void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, in
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
+// T2_G128 weights (Bonsai 2 Phase 3): MMA only; bitwise gemm_q4_T on the exact
+// Q4 image of the same ternary matrix.
+void gemm_t2_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st);
 // true when the current prefill route reads the g32 activation quantization

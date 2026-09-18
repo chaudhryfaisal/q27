@@ -110,6 +110,17 @@ start_engine() { # $1 label
               systemd-run --user --unit $unit $Q27ENV $D2ENV -E Q27_SYSBLK=1 $SEEDENV \
                 ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $MODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+    # bonsai2 = the candidate binary serving PrismML's Ternary Bonsai 2 27B
+    # (docs/plans/2026-09-18-bonsai2-ternary.md): T2 decode + .q4x prefill
+    # shadows, DFlash2 Q8 pack (the drafter rides the unrotated residual
+    # stream), otherwise the q27tok config. The engine detects the pack
+    # (bonsai2 meta) and rotates activations itself.
+    bonsai2)  B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server}
+              BZMODEL=${BONSAI2_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2.q27}
+              rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
+              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+                ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $BZMODEL $TOK $Q27ARGS \
+                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     *) log "unknown leg $1"; return 1 ;;

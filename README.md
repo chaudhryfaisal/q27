@@ -128,6 +128,48 @@ recipe the full 19-task suite scores **0.928 hidden / 0.895 composite**
 same suite scored 0.511 -- the recipe is the difference, not the checkpoint.
 The engine auto-selects 3.8's trained XML tool dialect from the artifact name.
 
+### Bonsai 2 27B (ternary Qwen3.8, 2026-09-18)
+
+[PrismML's Ternary Bonsai 2 27B](https://prismml.com/news/bonsai-2-27b) is
+Qwen3.8-27B with every projection ternary (one fp16 scale per 128) in a
+Hadamard-rotated basis and no MTP block. q27 serves it natively: the repack
+keeps the ternary values exact in a 2-bit container (`T2_G128`, 9.44 GB for
+the whole model, embeddings and head in exact Q8), the engine rotates the
+activations itself (sign + Walsh-Hadamard per 1024-block, fused into the
+activation quantizers), decode runs 2-bit dp4a GEMVs, prefill and the
+speculative verify run the int8 tensor-core GEMMs off a 2-bit staging
+unpack, and DFlash2 drafts against the ternary target with the Qwen3.8 Q8
+pack (the pack has no MTP head, so DFlash2 is the only drafter). Bit-exact
+containers mean the port is checkable against the reference fork: teacher-
+forced logits agree at top-1 0.9974 over 383 positions and wikitext PPL
+matches `llama-perplexity` on the same GGUF to 0.15% (8.2767 vs 8.2643 at
+2048). `docs/plans/2026-09-18-bonsai2-ternary.md` has the design and log.
+
+| tier | GB | wikitext PPL | HumanEval+ | needle | 5090 decode (DFlash2 K=7) |
+|---|--:|--:|--:|---|---|
+| Qwen3.8 default (v2) | 17.00 | 7.3121 | 30/30 | 6/6 @ ~120K | ~220 t/s |
+| Bonsai 2 (T2) | 9.44 | 9.2508 | 25/30 | 6/6 @ ~90K | 233 t/s on the 700-token prompt, 346 on cities; round 14.8 ms; plain 110 t/s |
+
+Same protocol as the table above (chunk 512, fp8 KV; the same-card pair on
+the 3090 is 9.2513 vs 7.3102). The 2.3 GB engine stack plus the 9.44 GB
+weights leave 23 GB of KV on a 32 GB card (auto context 262K). Read the PPL
+and HumanEval+ columns before picking it: it is a different checkpoint, not
+a quant tier of the one above. On the 12-instance Claude Code SWE-bench
+campaign it lands the same patches (gold 11/12, identical to the Qwen3.8
+legs) at 205 vs 222 t/s aggregate, but reasons about twice as long per
+instance (37 vs 22 API turns, 75K vs 35K thinking chars), so wall is 2.3x
+(`bench/crossengine/agentic-2026-09-18-bonsai2/`).
+
+```bash
+# Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
+# serve with the Qwen3.8 tokenizer and DFlash2 pack (tools/launch_q27_38.sh
+# has a `bonsai2` mode with this config)
+python3 tools/repack.py Ternary-Bonsai-2-27B-PTQ1_0.gguf models/bonsai2-27b-t2.q27
+Q27_KV=fp8 Q27_BATCH=0 Q27_DFLASH2=models/qwen38-dflash2-q8-serve.d2w Q27_DFLASH2_RESERVE_GB=3 \
+  ./build/q27-server models/bonsai2-27b-t2.q27 models/qwen38-27b-mtp.tok --think \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
+```
+
 ```bash
 # 1. tokenizer + your chosen tier (Apache-2.0)
 huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \

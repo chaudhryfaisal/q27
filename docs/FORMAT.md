@@ -79,18 +79,21 @@ This table is the DEFAULT tier (~5.25 bpw overall). The q6 / q6k quality tiers
 container and dtype set; the tier is recorded in the header meta as
 `quant_policy` (e.g. `q6-v1`). No new dtypes, no version bump.
 
-## Bonsai 2 packs (`quant_policy` `bonsai2-q4x-v1`, 2026-09-18)
+## Bonsai 2 packs (`quant_policy` `bonsai2-t2-v1` / `bonsai2-q4x-v1`, 2026-09-18)
 
 PrismML's Ternary Bonsai 2 27B is Qwen3.8-27B with every projection ternary
 (one fp16 scale per 128) in a Hadamard-rotated basis, and no MTP block. No
 new dtype: the repack stores the ternary values EXACTLY in existing
 containers (Q4_G64 nibble = trit+8 with the 128-group scale duplicated per
-64; Q8_G128 int8 = trit for `token_embd`/`output`), or in T2_G128 with
-`--bonsai2-container t2`, in which case every `blk.*` rotated matrix also
-gets an exact-Q4 shadow named `<name>.q4x` that the prefill GEMMs read.
-Header meta additions:
+64; Q8_G128 int8 = trit for `token_embd`/`output`) with
+`--bonsai2-container q4x`, or -- the default since Phase 3 -- in T2_G128
+(`t2`, ~9 GB: the decode GEMVs and the prefill MMA GEMM both read it). The
+`t2+q4x` layout is the Phase 2 one: T2 plus an exact-Q4 shadow named
+`<name>.q4x` per `blk.*` rotated matrix, which the prefill GEMMs read only
+under `Q27_T2_PF_SHADOW=1` (the bitwise A/B of the T2 prefill GEMM on a
+served model). Header meta additions:
 
-- `"bonsai2": true`, `"bonsai2_container": "q4x" | "t2+q4x"`,
+- `"bonsai2": true`, `"bonsai2_container": "q4x" | "t2" | "t2+q4x"`,
   `"qwen35.block_count": 64` (no `nextn_predict_layers`), `general.name`
   containing `qwen38` (the tool dialect and 3.8 template rules key on it).
 - `"hadamard": {version 1, block_size 1024, transform

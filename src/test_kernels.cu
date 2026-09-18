@@ -337,6 +337,64 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
     CUDA_CHECK(cudaFree(d_yb));
 }
 
+// Bonsai 2 Phase 3: the T2 prefill GEMM against the exact-Q4 image of the
+// same ternary matrix ("<name>.q4x", repack --bonsai2-container t2+q4x). Both
+// stagings hand the MMA identical s8 values (code-1 == nibble-8) and identical
+// per-group scale floats (the Q4 image duplicates the 128-scale into both
+// 64-groups), so every output must be BITWISE equal on the exact g32 leg and
+// the g64 serving leg alike; T=300 also reaches the ntx minitile kernel on
+// sm_120. An indexing slip in the 2-bit unpack shows as O(1) here.
+static void test_gemm_t2_shadow(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
+    const std::string sname = std::string(name) + ".q4x";
+    const q27::Tensor* base = m.find(name);
+    if (!base || base->dtype != DType::T2_G128 || !m.find(sname)) {
+        printf("  %s %s: needs a T2_G128 base with a .q4x shadow, skip\n", "test_gemm_t2_shadow",
+               name);
+        return;
+    }
+    const q27::DevTensor& d = dm.upload(name);
+    const q27::DevTensor& q = dm.upload(sname);
+    const int64_t rows = base->rows(), cols = base->cols();
+    for (int T : {33, 300}) {
+        std::vector<float> x = rand_vec((size_t)T * cols, 21 + T);
+        float *d_x, *d_ya, *d_yb;
+        CUDA_CHECK(cudaMalloc(&d_x, (size_t)T * cols * 4));
+        CUDA_CHECK(cudaMalloc(&d_ya, (size_t)T * rows * 4));
+        CUDA_CHECK(cudaMalloc(&d_yb, (size_t)T * rows * 4));
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), (size_t)T * cols * 4, cudaMemcpyHostToDevice));
+        const int Tpad = (T + 31) & ~31;
+        q27k::XQuant xq = q27k::xquant_alloc((size_t)Tpad * cols, /*g64=*/true);
+        q27k::quantize_x(d_x, (size_t)T * cols, xq);
+        q27k::quantize_x_g64(d_x, (size_t)T * cols, xq);
+        for (const char* xg : {"32", "64"}) {
+            setenv("Q27_PREFILL", "mma", 1);
+            setenv("Q27_PF_XG", xg, 1);
+            q27k::gemm_t2_T((const uint8_t*)d.data, (const __half*)d.scales, xq, d_ya, rows,
+                            cols, T, 0);
+            q27k::gemm_q4_T((const uint8_t*)q.data, (const __half*)q.scales, xq, d_yb, rows,
+                            cols, T, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsetenv("Q27_PREFILL");
+            unsetenv("Q27_PF_XG");
+            std::vector<float> ya((size_t)T * rows), yb((size_t)T * rows);
+            CUDA_CHECK(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb, yb.size() * 4, cudaMemcpyDeviceToHost));
+            double maxabs = 0;
+            size_t ndiff = 0;
+            for (size_t i = 0; i < ya.size(); i++) {
+                if (ya[i] != yb[i]) ndiff++;
+                maxabs = std::max(maxabs, (double)std::fabs(ya[i] - yb[i]));
+            }
+            char label[128];
+            snprintf(label, sizeof label, "gemm T2 vs Q4 shadow g%s T=%d %s", xg, T, name);
+            check(label, maxabs + (double)ndiff, 1e-30); // bitwise: zero differing outputs
+        }
+        CUDA_CHECK(cudaFree(d_x));
+        CUDA_CHECK(cudaFree(d_ya));
+        CUDA_CHECK(cudaFree(d_yb));
+    }
+}
+
 // Regroup gate: MMA g64 path vs the dp4a exact path fed the SAME g64
 // quantization expanded to g32 form (nat = nat64, both 32-halves of each
 // 64-group share its s64 scale, isum/eo rebuilt from nat64). Integer dots
@@ -576,27 +634,43 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     double h10 = timeit([&] { head_gemv(qs, 10, ys); });
     printf("  gemv10 head %s: 2x5=%.3fms 1x10=%.3fms ratio(10 vs 2x5)=%.2f\n",
            head_q4 ? "Q4" : "Q8", h5, h10, h10 / h5);
-    // (b) Q4 ffn_gate rotating 4 layers
+    // (b) ffn_gate rotating 4 layers -- dtype-dispatched like the head: the
+    // Qwen tiers carry Q4 here, Bonsai 2 packs T2_G128 (an unconditional
+    // gemv_q4_n read the 2-bit rows as nibbles and ran off the allocation:
+    // illegal address on the 09-18 t2 pack).
     const char* names[4] = {"blk.0.ffn_gate.weight", "blk.1.ffn_gate.weight",
                             "blk.2.ffn_gate.weight", "blk.4.ffn_gate.weight"};
     const q27::DevTensor* fd[4];
     for (int i = 0; i < 4; i++) fd[i] = &dm.upload(names[i]);
     const q27::Tensor& ft = m.get(names[0]);
+    auto ffn_gemv = [&](const q27::DevTensor* t, q27k::XQuant* q, int nb, float** y) {
+        switch (t->dtype) {
+            case q27::DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            case q27::DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            default:
+                q27k::gemv_q8_n((const int8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+        }
+    };
     int rot5 = 0, rot10 = 0;
     double f5 = timeit([&] {
         const q27::DevTensor* t = fd[rot5++ & 3];
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 5, ys,
-                        ft.rows(), cols, 0);
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs + 5, 5, ys + 5,
-                        ft.rows(), cols, 0);
+        ffn_gemv(t, qs, 5, ys);
+        ffn_gemv(t, qs + 5, 5, ys + 5);
     });
     double f10 = timeit([&] {
         const q27::DevTensor* t = fd[rot10++ & 3];
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 10, ys,
-                        ft.rows(), cols, 0);
+        ffn_gemv(t, qs, 10, ys);
     });
-    printf("  gemv10 ffn Q4 (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n", f5, f10,
-           f10 / f5);
+    printf("  gemv10 ffn %s (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n",
+           q27::dtype_name(ft.dtype), f5, f10, f10 / f5);
     // correctness: lane 7 of a fresh 10-lane HEAD run == a plain 1-lane gemv
     // (must re-run the head here -- the ffn bench above overwrote ys[]).
     // Dtype-matched to the tier's head kernel.
@@ -3900,6 +3974,8 @@ int main(int argc, char** argv) {
     test_gemm_mma_g64(dm, m, "blk.0.attn_qkv.weight");
     test_gemm_mma_g64(dm, m, "blk.0.ffn_down.weight");
     test_gemm_mma_g64(dm, m, "blk.3.attn_k.weight");
+    test_gemm_t2_shadow(dm, m, "blk.0.attn_qkv.weight"); // Bonsai 2 t2+q4x packs only
+    test_gemm_t2_shadow(dm, m, "blk.0.ffn_down.weight");
     test_gemm_mma_g64(dm, m, "output.weight");
     test_attn_mma();
     test_attn_split();
