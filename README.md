@@ -139,7 +139,9 @@ activations itself (sign + Walsh-Hadamard per 1024-block, fused into the
 activation quantizers), decode runs 2-bit dp4a GEMVs, prefill and the
 speculative verify run the int8 tensor-core GEMMs off a 2-bit staging
 unpack, and DFlash2 drafts against the ternary target with the Qwen3.8 Q8
-pack (the pack has no MTP head, so DFlash2 is the only drafter). Bit-exact
+pack (the pack has no MTP head, so DFlash2 is the only drafter). The pack
+is at [signalnine/Bonsai-2-27B-q27](https://huggingface.co/signalnine/Bonsai-2-27B-q27)
+with the tokenizer and checksums. Bit-exact
 containers mean the port is checkable against the reference fork: teacher-
 forced logits agree at top-1 0.9974 over 383 positions and wikitext PPL
 matches `llama-perplexity` on the same GGUF to 0.15% (8.2767 vs 8.2643 at
