@@ -15783,9 +15783,16 @@ after weights):**
 Speed: 3090 single-stream ladder 109 t/s on the long/code prompts (2.6-2.7
 tok/round) vs 70 plain and 93 with the Bonsai DFlash2 pack; 2-stream fused
 ~140 aggregate. The 9.87 GB pack lands in the Qwen tiers' concurrency class
-at every C, above q4s at C=1..4. Open: a single-slot A/B of this ladder vs
-the Bonsai DFlash2 pack on agentic traffic (the campaign leg), and the
-launch script's bonsai2 mode still serves the pure pack + DFlash2.
+at every C, above q4s at C=1..4.
+
+**Single-slot campaign A/B (leg bonsai2mtp: the ladder alone, batching
+default, 12 instances)**: 2.85 tok/round, 178.8 t/s aggregate, 32.8 turns,
+150 s/inst, gold 10/12 -- against the Bonsai DFlash2 pack's 3.80 / 227.7 /
+37.2 / 138 / 10/12 (bonsai2d2b). DFlash2 wins single-slot by 27%; the MTP
+pack is the multi-slot choice (512 vs 329 at C=8). tools/launch_q27_38.sh
+`bonsai2` now serves the pure T2 pack with the Bonsai drafter pack
+(BONSAI2_PACK); multi-slot = the T2+MTP pack with Q27_BATCH=1 and no
+drafter env.
 
 ## 2026-09-18 (at): Bonsai 2 in fused multi-slot rounds -- draftless members ride the floor-2 machinery; 8 slots at 16K = 329 t/s aggregate (3.1x), bitwise vs plain decode on sm_86
 

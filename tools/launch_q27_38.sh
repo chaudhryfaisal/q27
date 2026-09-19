@@ -59,9 +59,17 @@ case "$mode" in
            systemd-run --user --unit q27-38 $D2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
   ladder)  systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS ;;
   bonsai2) MODEL=${BONSAI2_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2.q27}
+           # the Bonsai-trained DFlash2 drafter (ProCreations, repacked by
+           # tools/dflash2_pack.py --q8): 3.80 vs 3.47 tok/round over the Qwen3.8
+           # pack, 227.7 vs 178.8 t/s aggregate over the MTP ladder on the
+           # single-slot campaign (BUILDLOG 2026-09-18 (as), (au)). Multi-slot
+           # wants the T2+MTP pack instead (BONSAI2_MODEL=...t2-mtp.q27 with
+           # Q27_BATCH=1 and no Q27_DFLASH2).
+           BZPACK=${BONSAI2_PACK:-/mnt/ai/models/bonsai2-27b-dflash2-bf16/bonsai2-dflash2-q8-serve.d2w}
+           BZD2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$BZPACK -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_D2_TIMING=1"
            PFX_DIR=${PFX_DIR_BONSAI2:-/dev/shm/q27-pfx-bonsai2}; mkdir -p "$PFX_DIR"
            PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
-           systemd-run --user --unit q27-38 $D2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
+           systemd-run --user --unit q27-38 $BZD2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
   *) echo "usage: $0 d2|d2-pfx|ladder|bonsai2 [-E K=V ...]" >&2; exit 2 ;;
 esac
 # readiness: key on THIS invocation (a --since window can match the previous

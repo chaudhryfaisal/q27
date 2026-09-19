@@ -120,12 +120,17 @@ start_engine() { # $1 label
     # --q8; BONSAI2_PACK overrides) -- the 2026-09-18 bonsai2 leg ran the
     # Qwen3.8 drafter on the t2+q4x pack, 3.47 tok/round; this is the
     # target-trained drafter on the pure-T2 pack.
-    bonsai2|bonsai2d2b)
+    # bonsai2mtp = the T2+MTP pack (ProCreations' head as blk.64, BUILDLOG
+    # (au)) on the MTP ladder alone -- no DFlash2, batching default like
+    # q27ladr -- the single-slot A/B against bonsai2d2b (2026-09-18).
+    bonsai2|bonsai2d2b|bonsai2mtp)
               B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server}
               BZMODEL=${BONSAI2_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2.q27}
               BZPACK=$PACK8; [ "$1" = bonsai2d2b ] && BZPACK=${BONSAI2_PACK:-/mnt/ai/models/bonsai2-27b-dflash2-bf16/bonsai2-dflash2-q8-serve.d2w}
+              BZD2ENV="-E Q27_BATCH=0 -E Q27_DFLASH2=$BZPACK -E Q27_DFLASH2_RESERVE_GB=3"
+              if [ "$1" = bonsai2mtp ]; then BZMODEL=${BONSAI2_MTP_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2-mtp.q27}; BZD2ENV=""; fi
               rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
-              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$BZPACK -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+              systemd-run --user --unit $unit $Q27ENV $BZD2ENV -E Q27_SYSBLK=1 \
                 ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $BZMODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
