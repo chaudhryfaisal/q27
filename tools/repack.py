@@ -681,6 +681,70 @@ def _require_exact_specs(label, tensors_by_name, expected_specs):
                 f"{actual_type} {actual_shape} != {expected_type} {expected_shape}")
 
 
+# HF MTP-head checkpoint (safetensors, torch layout [out, in]) -> the 15 GGUF-named
+# blk.64 tensors the engine expects (QWEN35_MTP_SPECS). Qwen3.5/3.8 use neox rope,
+# so llama.cpp's converter does not permute q/k: the HF rows are the GGUF rows.
+MTP_SAFETENSORS_MAP = {
+    "mtp.fc.weight": "nextn.eh_proj.weight",
+    "mtp.pre_fc_norm_embedding.weight": "nextn.enorm.weight",
+    "mtp.pre_fc_norm_hidden.weight": "nextn.hnorm.weight",
+    "mtp.norm.weight": "nextn.shared_head_norm.weight",
+    "mtp.layers.0.input_layernorm.weight": "attn_norm.weight",
+    "mtp.layers.0.post_attention_layernorm.weight": "post_attention_norm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight": "attn_q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight": "attn_k_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight": "attn_q.weight",
+    "mtp.layers.0.self_attn.k_proj.weight": "attn_k.weight",
+    "mtp.layers.0.self_attn.v_proj.weight": "attn_v.weight",
+    "mtp.layers.0.self_attn.o_proj.weight": "attn_output.weight",
+    "mtp.layers.0.mlp.gate_proj.weight": "ffn_gate.weight",
+    "mtp.layers.0.mlp.up_proj.weight": "ffn_up.weight",
+    "mtp.layers.0.mlp.down_proj.weight": "ffn_down.weight",
+}
+
+
+class _F32Tensor:
+    """A GGUF-tensor look-alike (name / tensor_type.name / data / shape in ne order)
+    wrapping an f32 numpy array, so the emit loop's to_f32 + policy path applies."""
+    class _TT:
+        name = "F32"
+
+    def __init__(self, name, arr):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        self.name = name
+        self.tensor_type = _F32Tensor._TT()
+        self.data = arr.reshape(-1)
+        self.shape = list(reversed(arr.shape))  # GGUF ne order (innermost first)
+
+
+def load_mtp_safetensors(path):
+    import torch
+    from safetensors import safe_open
+    out = []
+    with safe_open(path, "pt") as f:
+        keys = set(f.keys())
+        missing = set(MTP_SAFETENSORS_MAP) - keys
+        extra = keys - set(MTP_SAFETENSORS_MAP)
+        if missing or extra:
+            raise ValueError(f"--mtp-safetensors: missing {sorted(missing)}, unexpected {sorted(extra)}")
+        for hf, leaf in MTP_SAFETENSORS_MAP.items():
+            name = "blk.64." + leaf
+            arr = f.get_tensor(hf).to(torch.float32).numpy()
+            # Qwen3.5 RMSNorm is zero-centered (y = x * (1 + w)); llama.cpp's
+            # converter stores the effective multiplier 1 + w, which is what
+            # the engine's rmsnorm kernels multiply by. Verified against the
+            # Qwen3.8 pack's blk.64 norms (offset exactly 1.0, corr 1.0).
+            if name.endswith("norm.weight"):
+                arr = arr + 1.0
+            want_dtype, want_shape = QWEN35_MTP_SPECS[name]
+            if tuple(arr.shape) != tuple(want_shape):
+                raise ValueError(f"--mtp-safetensors: {hf} -> {name} shape {tuple(arr.shape)} != {want_shape}")
+            if not np.isfinite(arr).all():
+                raise ValueError(f"--mtp-safetensors: {hf} has non-finite values")
+            out.append((name, _F32Tensor(name, arr)))
+    return out
+
+
 def merge_mtp_tensors(primary, companion):
     """Join ggml-org's Qwen3.8 base and MTP GGUF views fail-closed."""
     if _field_value(primary, "general.architecture") != "qwen35":
@@ -749,6 +813,12 @@ def main():
                          "'<name>.q4x' exact-Q4 shadow of every blk.* matrix (the Phase 2 layout, "
                          "Q27_T2_PF_SHADOW=1 A/B; +13 GB); q4x = every rotated matrix as EXACT "
                          "Q4_G64 (Phase 1). Embeddings/head stay exact Q8 in all three.")
+    ap.add_argument("--mtp-safetensors", default=None,
+                    help="Bonsai 2 packs: an HF-named MTP head checkpoint (mtp.fc.weight, "
+                         "mtp.layers.0.*, mtp.norm, mtp.pre_fc_norm_*; e.g. ProCreations/"
+                         "Ternary-Bonsai-2-27B-MTP model_mtp.safetensors) appended as the "
+                         "blk.64 MTP block (Q8 matmuls, F32 norms, UNROTATED -- the engine "
+                         "skips the Hadamard rotation for that layer). Sets block_count 65.")
     ap.add_argument("--name", default=None,
                     help="general.name to write for Bonsai 2 packs (default 'Bonsai2 Ternary Qwen38 27b'; "
                          "must contain qwen38 for the engine's dialect/template keying)")
@@ -896,8 +966,9 @@ def main():
         # the 3.8 template rules on a "qwen38" substring (api_common.h
         # set_tool_dialect_for_model), so name the artifact for what it is.
         meta["general.name"] = args.name or "Bonsai2 Ternary Qwen38 27b"
-        meta["qwen35.block_count"] = 64
-        meta.pop("qwen35.nextn_predict_layers", None)
+        if not args.mtp_safetensors:
+            meta["qwen35.block_count"] = 64
+            meta.pop("qwen35.nextn_predict_layers", None)
     # layer map
     attn_layers, ssm_layers = set(), set()
     for t in source_tensors:
@@ -924,6 +995,14 @@ def main():
         if t.name == "output.weight" and not args.q4_head \
                 and not ternary and not binary:
             extra.append(("output_q4.weight", t))
+    if bonsai2 and args.mtp_safetensors:
+        mtp_st = load_mtp_safetensors(args.mtp_safetensors)
+        extra.extend(mtp_st)
+        meta["qwen35.block_count"] = 65
+        meta["qwen35.nextn_predict_layers"] = 1
+        meta["bonsai2_mtp"] = {"source": __import__("os").path.basename(args.mtp_safetensors),
+                               "layout": "hf-safetensors, unrotated, Q8 matmuls / F32 norms"}
+        print(f"MTP block from {args.mtp_safetensors}: {len(mtp_st)} tensors (blk.64.*)")
     if bonsai2 and args.bonsai2_container == "t2+q4x":
         # Phase 2 layout: decode reads T2, prefill the exact-Q4 shadow (engine
         # TP() under Q27_T2_PF_SHADOW=1; the Phase 3 GEMM reads T2 natively).

@@ -179,8 +179,17 @@ conductor's union sweep serves every slot from one weight pass (BUILDLOG
 2026-09-18 (at); `Q27_BONSAI_FUSED=0` pins members to solo rounds). On the
 5090 at 8 slots / 16K: 105 / 150 / 200 / **329 t/s** aggregate at C = 1 / 2
 / 4 / 8 against 111 / 116 / 116 / 117 time-sliced, byte-identical to plain
-decode on the 3090 gate. Half the lanes are dummies, which is why it trails
-the Qwen tiers' 531 at C=8; a real second-lane draft is the open lever.
+decode on the 3090 gate. Half the lanes are dummies there. With a drafter in
+the pack the lanes fill: ProCreations'
+[Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
+head (independent, Apache-2.0, the Qwen3.8 MTP block distilled onto Bonsai)
+repacks as the pack's blk.64 with `tools/repack.py ... --mtp-safetensors
+model_mtp.safetensors` (9.87 GB), the engine runs its ordinary gated ladder
+against the ternary target (the MTP layer stays unrotated), and the same
+ladder reads 173 / 231 / 384 / **512 t/s** at C = 1 / 2 / 4 / 8 -- the
+Qwen tiers' class from a 9.9 GB pack (BUILDLOG 2026-09-18 (au); the
+ladder is bitwise vs plain decode at 1500 CLI tokens, and the width-4-plus
+verify has the engine's own near-tie flips on either model).
 
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
@@ -250,7 +259,8 @@ under [bench/crossengine/](bench/crossengine/):
   itself measures +27% wikitext PPL and 25/30 HumanEval+ against the
   Qwen3.8 default tier and reasons about twice as long per instance --
   same patches landed, 2.3x the wall (09-18; the tier table below). Fused
-  multi-slot rounds serve it at 329 t/s aggregate over 8 slots at 16K.
+  multi-slot rounds serve it at 329 t/s aggregate over 8 slots at 16K, and
+  512 t/s with a third-party MTP head repacked into the pack.
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
@@ -675,6 +685,7 @@ competitor binaries byte-identical to 08-17):
 | **q27** q4s | 141.3 | 229.7 | 352.3 | **530.6** |
 | **q27** q5f | 134.7 | 173.8 | 299.9 | 509.7 |
 | **q27** Bonsai 2 T2 (no drafter, 09-18) | 105.5 | 150.0 | 200.4 | 328.9 |
+| **q27** Bonsai 2 T2 + MTP head (09-18) | 173.2 | 231.0 | 384.1 | 512.2 |
 | ninfer NVFP4 | 157.2 | 299.7 | 442.3 | **834.3** |
 | ninfer int8 | 137.0 | 179.5 | 219.5 | 353.6 |
 | vLLM NVFP4 | 67.4 | 121.4 | 215.7 | 438.7 |

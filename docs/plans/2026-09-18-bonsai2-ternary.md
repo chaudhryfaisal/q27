@@ -177,6 +177,13 @@ today. That isolates the only new piece of math -- the activation rotation
   plain decode; 5090 ladder 105 / 150 / 200 / 329 t/s at C=1/2/4/8 vs the
   solo-pinned control flat at ~116. BUILDLOG (at).
 
+- 09-18 18:15-18:50: the lane-1 draft = ProCreations' MTP head as blk.64
+  (repack --mtp-safetensors; norms +1, rotation exempt for il == 64, embed
+  inverse + folded-head rotation on the MTP path). CLI identity 1500 tokens;
+  the server's width >= 4 near-tie flips bisected to the engine's multi-lane
+  path (Qwen tier flips too on sm_86). 5090 ladder 173 / 231 / 384 / 512
+  t/s at C=1/2/4/8. BUILDLOG (au).
+
 ## Risks and open questions
 
 - DFlash2 acceptance on the ternary target (drafter trained on BF16).

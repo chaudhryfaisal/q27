@@ -15714,6 +15714,79 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (au): the lane-1 draft -- a third-party MTP head on the ternary target; 8 slots at 16K = 512 t/s aggregate (was 329), C=1 173 t/s (was 105)
+
+The (at) ladder left half of every fused round's lanes empty because a
+Bonsai 2 pack has no drafter. ProCreations' Ternary-Bonsai-2-27B-MTP
+(independent, Apache-2.0) is the Qwen3.8 MTP block -- donor tensors
+byte-verified against the official release in their provenance report --
+distilled onto Bonsai's hidden states. It ships as HF-named BF16 safetensors
+(mtp.fc.weight, mtp.layers.0.*, mtp.norm, mtp.pre_fc_norm_*), so the port is
+a converter path plus the rotation exemption:
+
+- repack `--mtp-safetensors <file>`: the 15 tensors mapped to blk.64.* (the
+  llama.cpp names the engine expects), Q8 matmuls, F32 norms, block_count 65
+  + nextn_predict_layers 1, meta `bonsai2_mtp`. Two traps: (1) Qwen3.5's
+  RMSNorm is zero-centered (y = x * (1 + w)) and llama.cpp stores the
+  effective multiplier, so the HF norms need +1.0 -- caught by a provenance
+  check (scratchpad mtp_provenance.py) that compared the checkpoint against
+  the Qwen3.8 pack's own blk.64: norms offset exactly 1.000 at corr 1.0,
+  every matmul row corr 0.999+ with the donor at the SAME row and nowhere
+  else (so no q/k permute; neox rope); (2) the bonsai2 meta block wrote
+  block_count 64 and popped the nextn key after the MTP insertion -- now
+  conditional.
+- engine: the "Bonsai cannot carry an MTP block" guard lifted; every bz_*
+  rotation site in attn_block / ffn / the T-row blocks gated on
+  `il < N_LAYER` (the MTP layer is a plain Qwen layer trained in the
+  unrotated space: it reads the raw hidden state); the MTP draft path gets
+  the inverse rotation after its embedding lookup (rotated rows, single and
+  lanes) and the rotation before the shared folded head (mtp_post, both
+  branches; `mtp_rotq` for the lanes); mtp_warm_T (the prefill-time MTP KV
+  warm) gets the embed inverse and reads x1T as the caller leaves it --
+  the UNROTATED output norm. With an MTP block present plain_lanes is
+  false and the engine is an ordinary gated ladder member.
+
+Artifact: bonsai2-27b-t2-mtp.q27, 9.87 GB, 870 tensors. Not redistributed
+(their checkpoint; one repack command).
+
+**Correctness gates (3090).** CLI canonical: plain decode on the pure pack
+vs `--spec` on the MTP pack, identical at 128 tokens (md5 e8a16115) and
+over 1500 tokens (d9062fb1) in every ladder configuration (default, PMIN=0,
+DEXIT=0, MAXD=4, GEMM_MIN=99), at 3.81 tokens/round. Plain decode on the
+MTP pack == the pure pack. Server: short and cities identical to plain in
+every ladder leg (1-slot, 2-slot fused, conductor off, thinking off,
+GEMV-pinned); the long and code prompts flip at near-tie word swaps
+(`_add_to_front` vs `_add_front`, `If a slot` vs `If the target slot`) at
+points that move with the round shapes. Bisected: it is not the ladder --
+DFlash2 exact mode on the PURE pack flips code@2231 at K=3/5/7 while K=1
+(width 2) matches plain, and the Qwen3.8 DEFAULT tier flips code@368
+between K=2 and K=3/7 on the same card. So the multi-lane verify is not
+width-invariant at width >= 4 on sm_86 either (the 09-07 finding, wider
+than recorded); the draftless width-2 rounds of (at) are the only fused
+shape that is bitwise vs plain. ninv_test, extended to gemv_t2 /
+gemv_t2_n, passes on the T2 pack (every family, zero diffs at T=2..16 and
+scattered slots), so the width effect lives in the shared lane path, not
+in anything Bonsai-specific. Q27_MTP_WARM=0 (skip the prefill warm) is a
+bisect lever that stays; Q27_DFLASH2_K=1 is unsupported on Q4 tiers
+("gemv_q4_n: bad nbatch 1"). The server enables the suffix drafter by
+default (the CLI does not), so width-12 suffix rounds cross gemm_min 9
+there.
+
+**Ladder (5090, 8 slots / 16K, temp 0.6, the (at) protocol; 22.76 GB free
+after weights):**
+
+    C                   1       2       4       8
+    T2 + MTP head     173.2   231.0   384.1   512.2
+    T2 draftless (at) 105.5   150.0   200.4   328.9
+    q27 q4s (08-19)   141.3   229.7   352.3   530.6
+
+Speed: 3090 single-stream ladder 109 t/s on the long/code prompts (2.6-2.7
+tok/round) vs 70 plain and 93 with the Bonsai DFlash2 pack; 2-stream fused
+~140 aggregate. The 9.87 GB pack lands in the Qwen tiers' concurrency class
+at every C, above q4s at C=1..4. Open: a single-slot A/B of this ladder vs
+the Bonsai DFlash2 pack on agentic traffic (the campaign leg), and the
+launch script's bonsai2 mode still serves the pure pack + DFlash2.
+
 ## 2026-09-18 (at): Bonsai 2 in fused multi-slot rounds -- draftless members ride the floor-2 machinery; 8 slots at 16K = 329 t/s aggregate (3.1x), bitwise vs plain decode on sm_86
 
 The conductor's fused round assumed every member drafts (MTP chain or the

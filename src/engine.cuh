@@ -1116,9 +1116,15 @@ struct Engine {
                         arch_fail(("hadamard_signs." + std::to_string(w)).c_str(),
                                   "missing or not an F32 vector of that width");
                 }
-                if (has_mtp) arch_fail("bonsai2", "a Bonsai 2 pack cannot carry an MTP block");
+                // An MTP block in a Bonsai 2 pack (2026-09-18: a third-party
+                // head distilled onto the ternary target) is a plain Qwen3.8
+                // layer trained in the UNROTATED space: its projections read
+                // the raw hidden state, only its embedding lookup (rotated
+                // rows) and its output through the folded head see the
+                // rotation. Every bz_* site below is gated on il < N_LAYER.
                 fprintf(stderr, "bonsai2: Hadamard-folded pack (block 1024, gdn_v_grouped=%d); "
-                                "activation rotation ON, MTP ladder OFF\n", (int)bz_gdn_grouped);
+                                "activation rotation ON, MTP ladder %s\n", (int)bz_gdn_grouped,
+                        has_mtp ? "ON (unrotated MTP block)" : "OFF");
             }
         }
         if (!has_mtp && !bonsai2)
@@ -1666,7 +1672,7 @@ struct Engine {
             vt = kv_vtab(ci);
         }
         if (!pos_src) pos_src = d_pos;
-        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, st); // q/k/v all folded
+        if (bonsai2 && il < N_LAYER) q27k::rotq(xin, bz_s5120, N_EMBD, xq, st); // q/k/v all folded (not the MTP layer)
         else qx(xin, N_EMBD, st);
         mm(T(il, "attn_q.weight"), xin, qg, st);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
@@ -1703,18 +1709,18 @@ struct Engine {
             q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, st, 1);
         }
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, st);
-        if (bonsai2) q27k::rotq(attnout, bz_s6144, N_HEAD * HEAD_DIM, xq, st);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(attnout, bz_s6144, N_HEAD * HEAD_DIM, xq, st);
         else qx(attnout, N_HEAD * HEAD_DIM, st);
         mm(T(il, "attn_output.weight"), attnout, yout, st);
     }
 
     void ffn(int il, const float* xin, float* yout) {
-        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
         else qx(xin, N_EMBD);
         mm(T(il, "ffn_gate.weight"), xin, ffn_g);
         mm(T(il, "ffn_up.weight"), xin, ffn_u);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
-        if (bonsai2) q27k::rotq(ffn_g, bz_s17408, N_FFN, xq, stm);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(ffn_g, bz_s17408, N_FFN, xq, stm);
         else qx(ffn_g, N_FFN);
         mm(T(il, "ffn_down.weight"), ffn_g, yout);
     }
@@ -1842,6 +1848,15 @@ struct Engine {
     }
     // qx5/mm5 twins over the MTP view (A4 thin surface: MtpLaneView shares no
     // fields with LaneView, so no adapter/friend layer -- two small helpers).
+    // Bonsai 2: the MTP lanes' head input is rotated like the main head's
+    // (rotq3 into the MTP lane view's activation slots; bitwise the
+    // hadamard-on-copy + quantize3 pair, test_hadamard1024).
+    void mtp_rotq(const MtpLaneView& v, const std::array<float*, W_PLUMB>& x, int width) {
+        q27k::CP3 in{};
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) { in.p[i] = x[i]; q.q[i] = v.xq[i]; }
+        q27k::rotq3(in, bz_signs(width), width, q, v.vw, v.stm);
+    }
     void mtp_qx(const MtpLaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
@@ -1924,6 +1939,7 @@ struct Engine {
         if (v.vw == 1) {
             q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, v.tok[0],
                                N_EMBD, v.e_hn[0], v.stm);
+            if (bonsai2) bz_unrot_embed(v.e_hn[0], v.stm); // rotated embedding rows
             q27k::rmsnorm(v.e_hn[0], en, v.e_hn[0], N_EMBD, EPS, v.stm);
             q27k::rmsnorm(v.h_src[0], hn, v.e_hn[0] + N_EMBD, N_EMBD, EPS, v.stm);
             q27k::quantize_x(v.e_hn[0], 2 * N_EMBD, v.xq[0], v.stm);
@@ -1933,6 +1949,7 @@ struct Engine {
         q27k::IP3 tk LANESV(v, tok);
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tk, N_EMBD,
                      LANESV(v, e_hn), v.stm, v.vw);
+        if (bonsai2) bz_unrot_lanes(v.e_hn, v.vw, v.stm); // rotated embedding rows
         q27k::CP3 Ec LANESV(v, e_hn);
         q27k::P3 Em LANESV(v, e_hn);
         q27k::rmsnorm3(Ec, en, Em, N_EMBD, EPS, v.stm, v.vw);
@@ -1971,7 +1988,8 @@ struct Engine {
             mtp_mm1(v, T(il, "ffn_down.weight"), v.y[0]);
             q27k::add_inplace(v.x_mtp[0], v.y[0], N_EMBD, v.stm);
             q27k::rmsnorm(v.x_mtp[0], sn, v.x1[0], N_EMBD, EPS, v.stm);
-            q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
+            if (bonsai2) q27k::rotq(v.x1[0], bz_s5120, N_EMBD, v.xq[0], v.stm); // folded head
+            else q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
             mtp_mm1(v, *head, v.lg[0]);
             return;
         }
@@ -1989,7 +2007,8 @@ struct Engine {
         mtp_mm(v, T(il, "ffn_down.weight"), v.y);
         q27k::add3(Xm, Yc, N_EMBD, v.stm, v.vw);
         q27k::rmsnorm3(Xc, sn, X1m, N_EMBD, EPS, v.stm, v.vw);
-        mtp_qx(v, v.x1, N_EMBD);
+        if (bonsai2) mtp_rotq(v, v.x1, N_EMBD); // folded head
+        else mtp_qx(v, v.x1, N_EMBD);
         mtp_mm(v, *head, v.lg);
     }
     void mtp_tail(const MtpLaneView& v) {
@@ -4192,7 +4211,7 @@ struct Engine {
 
     void attn_block_T(int il, int base, int T, void* const* kt, void* const* vt) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
-        if (bonsai2) bz_rot_T(x1T, N_EMBD, T);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "attn_q.weight", x1T, qgT, T);
         q27k::rmsnorm_heads_T(qgT, (const float*)T2(il, "attn_q_norm.weight").data, qgT, N_HEAD,
@@ -4220,18 +4239,18 @@ struct Engine {
         if (kv_kind >= KV_T3)
             q27k::wht_T(attnT, N_HEAD, HEAD_DIM, HEAD_DIM, N_HEAD * HEAD_DIM, T, true, stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
-        if (bonsai2) bz_rot_T(attnT, N_HEAD * HEAD_DIM, T);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(attnT, N_HEAD * HEAD_DIM, T);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT_pf4(il, "attn_output.weight", attnT, yT, T);
     }
 
     void ffn_T(int il, int T) {
-        if (bonsai2) bz_rot_T(x1T, N_EMBD, T);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "ffn_gate.weight", x1T, ffnGT, T);
         mmT_pf4(il, "ffn_up.weight", x1T, ffnUT, T);
         q27k::silu_mul(ffnGT, ffnUT, ffnGT, (int64_t)T * N_FFN, stm);
-        if (bonsai2) bz_rot_T(ffnGT, N_FFN, T);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(ffnGT, N_FFN, T);
         qxT(ffnGT, N_FFN, T);
         mmT_pf4(il, "ffn_down.weight", ffnGT, yT, T);
     }
@@ -4276,6 +4295,12 @@ struct Engine {
     // Warm the MTP KV cache for pairs (h(base+t), token[base+t+1]) -> stored at
     // position base+t+1. Only the K/V projections matter for warming; the MTP
     // attention/FFN outputs were always discarded here, so they are skipped.
+    // Q27_MTP_WARM=0: skip the prefill-time MTP KV warm (bisect lever, 2026-09-18:
+    // drafts then start cold -- acceptance drops, emitted text must not move).
+    static bool mtp_warm_on() {
+        static const bool on = [] { const char* e = getenv("Q27_MTP_WARM"); return !(e && atoi(e) == 0); }();
+        return on;
+    }
     void mtp_warm_T(const int* d_toks_next, int base, int T) {
         const int il = 64;
         const DevTensor& emb = dm.get("token_embd.weight");
@@ -4283,6 +4308,7 @@ struct Engine {
         // x1T currently holds output_norm(hT) (set by caller)
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks_next,
                               N_EMBD, T, embT, stm);
+        if (bonsai2) bz_unrot_embed_T(embT, T); // rotated embedding rows
         q27k::rmsnorm_T(embT, (const float*)T2(il, "nextn.enorm.weight").data, ehnT, N_EMBD, T,
                         EPS, stm, N_EMBD, 2 * N_EMBD);
         q27k::rmsnorm_T(x1T, (const float*)T2(il, "nextn.hnorm.weight").data, ehnT + N_EMBD,
@@ -5563,7 +5589,7 @@ struct Engine {
                 // DFlash2 engine then carry unwarmed MTP rows -- a ladder
                 // config must never restore from a DFlash2 root (the launch
                 // script's ladder mode has no cache; keep it that way).
-                if (!d2_on && has_mtp) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (!d2_on && has_mtp && mtp_warm_on()) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -5627,7 +5653,7 @@ struct Engine {
                     CUDA_CHECK(cudaMemcpyAsync(x1, x1T + (size_t)(Tc - 1) * N_EMBD, (size_t)N_EMBD * 4,
                                                cudaMemcpyDeviceToDevice, stm));
                 // MTP warm needs each row's successor token; NP-1 has none
-                if (!d2_on && has_mtp && Tc - (has_last ? 1 : 0) > 0)
+                if (!d2_on && has_mtp && mtp_warm_on() && Tc - (has_last ? 1 : 0) > 0)
                     mtp_warm_T(d_prompt + c0 + 1, c0, Tc - (has_last ? 1 : 0)); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);

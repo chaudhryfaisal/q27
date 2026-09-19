@@ -180,6 +180,9 @@ static void launch_run(Fam fam, const q27::DevTensor& w, float* d_ws, int T, con
         if (w.dtype == q27::DType::Q4_G64)
             q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys, w.rows,
                             w.cols, 0);
+        else if (w.dtype == q27::DType::T2_G128) // Bonsai 2 (2026-09-18)
+            q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys, w.rows,
+                            w.cols, 0);
         else
             q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, T, ys, w.rows,
                             w.cols, 0);
@@ -339,6 +342,9 @@ static void seam_leg(q27::DeviceModel& dm, const q27::DevTensor& w_down,
             if (w.dtype == q27::DType::Q4_G64)
                 q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, pay_xq[0],
                               d_y_run[0][0], w.rows, w.cols);
+            else if (w.dtype == q27::DType::T2_G128)
+                q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, pay_xq[0],
+                              d_y_run[0][0], w.rows, w.cols);
             else
                 q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, pay_xq[0],
                               d_y_run[0][0], w.rows, w.cols);
@@ -349,6 +355,9 @@ static void seam_leg(q27::DeviceModel& dm, const q27::DevTensor& w_down,
             ys[slot] = d_y_run[1][0];
             if (w.dtype == q27::DType::Q4_G64)
                 q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys,
+                                w.rows, w.cols);
+            else if (w.dtype == q27::DType::T2_G128)
+                q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys,
                                 w.rows, w.cols);
             else
                 q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, T, ys,

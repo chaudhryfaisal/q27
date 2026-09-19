@@ -16,3 +16,8 @@ it, and stop the transcribers for 3090 work. Output dir: `OUT` (default
 - `d2ab_5090.sh` -- DFlash2 drafter pack A/B on the Bonsai target: exact-mode
   identity vs plain (an sm_86 instrument; see above) and vgemm timing per
   prompt. `MODEL`, `PACKB`, `RUNS`, `TAG`, `NORELAUNCH` env overrides.
+- `mtp_provenance.py` -- layout check of an HF-named MTP head checkpoint
+  against the Qwen3.8 pack's blk.64 (row correlation, norm offset).
+- `mtp_gate_3090.sh` -- CLI canonical plain vs `--spec` on the T2+MTP pack,
+  then server identity (pure-T2 plain vs 1-slot ladder vs 2-slot fused).
+- `mtp_bisect_3090.sh` -- CLI ladder variants over 1500 tokens vs plain.
