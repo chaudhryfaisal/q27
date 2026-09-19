@@ -15714,6 +15714,77 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-18 (at): Bonsai 2 in fused multi-slot rounds -- draftless members ride the floor-2 machinery; 8 slots at 16K = 329 t/s aggregate (3.1x), bitwise vs plain decode on sm_86
+
+The conductor's fused round assumed every member drafts (MTP chain or the
+suffix drafter): width >= 2 per member, trim floor 2, the B8 cap
+re-derivation, and the outcome convention (the round forwards the pending
+token and emits it; the new pending stays unemitted). A Bonsai 2 engine has
+no MTP block, so its solo path is plain_round -- the token graph, which
+emits the pending token first and forwards it next round. Mixing the two
+per round duplicates or drops a token, and a no-drafter member did not fit
+the union view at all. Rather than teach the whole scheduler about width-1
+members, a draftless member now rides the existing machinery as a width-2
+lane pair whose second lane is a dummy that is never accepted:
+
+- engine: `plain_lanes` (= no MTP and no DFlash2 pack, set after d2_setup);
+  `plain_propose()` = suffix_propose's prep_round + width 2; the greedy and
+  sampled tails pass max_draft 0 when plain_lanes (finish_round / spec_accept
+  then commit exactly the pending token; sample_stop samples lane 0). The
+  no-MTP branch of build_spec_graphs warms the multi-lane verify at width 2
+  always (was: only with DFlash2, at K+1), so no fused round launches a
+  kernel cold inside a capture.
+- conductor: draft_widths (and the fallback Member::want_width) give such
+  members width 2 with no MTP chain, sampled bootstrap included, not a
+  suffix round (GEMM policy, telemetry); the B8 re-derivation skips them;
+  a new `always_fused` hook keeps a lone plain member on the fused path at
+  k == 1 (the convention argument above -- it must never fall through to
+  solo_round). fused_verify_round mirrors spec_verify_forward's Bonsai
+  sites: inverse rotation after embed3, norm -> rotate -> quantize at the
+  three norms (pre functions take x1q = true), post functions already
+  rotate. The Qwen path is byte-for-byte what it was (every new line is
+  behind `bonsai2` / `plain_lanes`). Q27_BONSAI_FUSED=0 pins Bonsai members
+  to solo rounds -- the control.
+
+**Identity gate (3090, bench/bonsai2/fused_gate_3090.sh)**: four greedy
+prompts (one 29-token reply, a thinking one-liner, a 700-token and a
+1500-token thinking answer) as two concurrent pairs and each alone, on five
+servers: the conductor-free 1-slot reference (Q27_BATCH=0, plain token
+graph), 1-slot fused (k=1 rounds), 2-slot fused (k=2 unions), 2-slot solo-
+pinned, 2-slot FIFO. 32/32 texts IDENTICAL to the reference. Two streams on
+the 3090: fused 44+53 t/s while overlapping (~97 aggregate) vs 65-70 solo;
+the solo-pinned and FIFO legs time-slice at ~70. A lone request in a fused
+round costs the dummy lane: 65.6 vs 69.5 t/s on the 3090, 105.5 vs 111.1 on
+the 5090. test_conductor ALL PASS.
+
+**Ladder (5090, the 08-14 protocol: --slots 8 --ctx 16384, Q27_KV=fp8
+Q27_BATCH=1, C salted streams at temp 0.6, max_tokens 8192, aggregate =
+sum(dec) / union of decode intervals; bench/ladder/ladder.py; bench/bonsai2/ladder_5090.sh)**, pure-T2
+pack, 23.19 GB free after weights, all 8 slots fit without a clamp:
+
+    C            1       2       4       8
+    fused      105.5   150.0   200.4   328.9    (3.1x)
+    solo-pin   111.1   116.4   116.1   116.9    (time-sliced, the control)
+    q27 q4s    141.3   229.7   352.3   530.6    (08-19, MTP ladder, for scale)
+
+The sampled tail (max_draft 0 + sample_stop) produced coherent text at
+temp 0.6 on both legs (the ladder is sampled). Each fused round yields one
+token per member -- half the union's lanes are dummies -- and the round wall
+at C=8 is ~24 ms for 16 lanes, the same neighbourhood as the q4s ladder's
+16-lane rounds that yield ~14 tokens. So the 329 vs 531 gap is the missing
+draft, not the kernels: a real lane-1 proposal (the MTP head port for
+Bonsai, or a shared DFlash2 drafter across members) is the lever, and the
+9.44 GB pack's extra 8 GB of KV is the reason to want it (8 slots at ~32K
+or 12 at 16K where the Qwen tiers stop at 8 x 16K).
+
+Regression on the incumbent: tools/fused_smoke on the Qwen3.8 default tier
+(3090) -- FUSED / CONDUCTOR / A2 ERROR-PATH / GRAPH SMOKE all PASS, byte-
+identical to solo (its header's build line gained src/dflash2.cu and
+build/pf4.o, which the engine has linked for weeks). NOT gated: sampled
+identity between the plain sampler and the fused sampled tail (they consume
+the RNG differently; a paired-seed probe is the instrument if it is ever
+needed).
+
 ## 2026-09-18 (as): a Bonsai-trained DFlash2 drafter (third-party) -- +7% tokens per round on code, identity clean on sm_86; and the 5090 identity gate is not an identity gate
 
 PrismML ships no MTP block for Bonsai 2 (64 blocks, no nextn tensors, no MTP

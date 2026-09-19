@@ -173,6 +173,15 @@ the same trajectory shape. Identity-gated against plain decode on the 3090
 (the 5090's greedy is not width-invariant for any drafter, a known
 instrument property; BUILDLOG 2026-09-18 (as)).
 
+Multi-slot works too: without a drafter a Bonsai member rides the fused
+round as a width-2 lane pair whose second lane is never accepted, so the
+conductor's union sweep serves every slot from one weight pass (BUILDLOG
+2026-09-18 (at); `Q27_BONSAI_FUSED=0` pins members to solo rounds). On the
+5090 at 8 slots / 16K: 105 / 150 / 200 / **329 t/s** aggregate at C = 1 / 2
+/ 4 / 8 against 111 / 116 / 116 / 117 time-sliced, byte-identical to plain
+decode on the 3090 gate. Half the lanes are dummies, which is why it trails
+the Qwen tiers' 531 at C=8; a real second-lane draft is the open lever.
+
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
 # serve with the Qwen3.8 tokenizer and DFlash2 pack (tools/launch_q27_38.sh
@@ -240,7 +249,8 @@ under [bench/crossengine/](bench/crossengine/):
   with the Qwen3.8 one), 23 GB of KV left on a 32 GB card. The checkpoint
   itself measures +27% wikitext PPL and 25/30 HumanEval+ against the
   Qwen3.8 default tier and reasons about twice as long per instance --
-  same patches landed, 2.3x the wall (09-18; the tier table below).
+  same patches landed, 2.3x the wall (09-18; the tier table below). Fused
+  multi-slot rounds serve it at 329 t/s aggregate over 8 slots at 16K.
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
@@ -664,6 +674,7 @@ competitor binaries byte-identical to 08-17):
 |---|--:|--:|--:|--:|
 | **q27** q4s | 141.3 | 229.7 | 352.3 | **530.6** |
 | **q27** q5f | 134.7 | 173.8 | 299.9 | 509.7 |
+| **q27** Bonsai 2 T2 (no drafter, 09-18) | 105.5 | 150.0 | 200.4 | 328.9 |
 | ninfer NVFP4 | 157.2 | 299.7 | 442.3 | **834.3** |
 | ninfer int8 | 137.0 | 179.5 | 219.5 | 353.6 |
 | vLLM NVFP4 | 67.4 | 121.4 | 215.7 | 438.7 |

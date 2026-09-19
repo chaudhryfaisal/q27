@@ -167,6 +167,16 @@ today. That isolates the only new piece of math -- the activation rotation
   under Q27_T2_PF_SHADOW=1); artifacts bonsai2-27b-t2.q27 = pure T2 9.44 GB,
   bonsai2-27b-t2q4x.q27 = the 22.36 GB A/B pack.
 
+- 09-18 14:20-15:10: Bonsai-trained DFlash2 drafter (ProCreations) packed
+  unchanged; +9.7% tok/round on the campaign (3.80 / 227.7 t/s); the 5090
+  identity gate finding (width non-invariance, sm_86 is the instrument);
+  v0.12.0 released; HF pack public.
+- 09-18 17:30-18:10: fused multi-slot rounds for draftless members
+  (plain_lanes, width-2 lane pair, max_draft 0, always_fused at k=1, the
+  rotation mirrored into fused_verify_round). 3090 gate 32/32 identical to
+  plain decode; 5090 ladder 105 / 150 / 200 / 329 t/s at C=1/2/4/8 vs the
+  solo-pinned control flat at ~116. BUILDLOG (at).
+
 ## Risks and open questions
 
 - DFlash2 acceptance on the ternary target (drafter trained on BF16).

@@ -380,6 +380,14 @@ struct Engine {
     // the ladder drafter and the prefill MTP warm are skipped; DFlash2 and
     // plain decode do not need it.
     bool has_mtp = true;
+    // Draftless conductor member (Bonsai 2 without a DFlash2 pack, 2026-09-18):
+    // fused rounds run this engine as a width-2 lane pair whose lane 1 is
+    // never accepted (finish/accept get max_draft 0), so every fused round
+    // emits exactly one token per member under the spec-round convention
+    // (pending unemitted) that the conductor's outcome bookkeeping assumes.
+    // Set after d2_setup() in build_spec_graphs; read by the verify tails at
+    // graph capture (host branch, init-fixed).
+    bool plain_lanes = false;
     // Bonsai 2 (docs/plans/2026-09-18-bonsai2-ternary.md): every projection
     // is stored Hadamard-rotated on its input dim; the engine rotates the
     // activation right before each such matmul (kernels.cuh hadamard1024) and
@@ -2564,7 +2572,8 @@ struct Engine {
         q27k::finish_round(d_P, d_token, drafts,
                            LANESW(d_v),
                            LANESW(x1),
-                           h_next, d_outcome, N_EMBD, d_accept_cap, v.vw - 1, v.stm);
+                           h_next, d_outcome, N_EMBD, d_accept_cap,
+                           plain_lanes ? 0 : v.vw - 1, v.stm);
     }
     void spec_verify_launches(const LaneView& v) {
         spec_verify_forward(v);
@@ -2601,7 +2610,7 @@ struct Engine {
         q27k::IP3 drafts{};
         for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
         q27k::spec_accept(logits2, d_nuc, drafts, d_samp, d_P,
-                          d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+                          d_accept_cap, plain_lanes ? 0 : v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
         q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
                              N_EMBD, v.stm);
@@ -2683,10 +2692,14 @@ struct Engine {
             // width, with the lane state the ladder's seed makes valid.
             fprintf(stderr, "spec graphs: skipped (pack has no MTP block; plain decode%s)\n",
                     getenv("Q27_DFLASH2") ? " unless DFlash2 rounds" : "");
-            if (getenv("Q27_DFLASH2")) {
+            {
+                // Warm the multi-lane verify kernels (attribute latches, first-
+                // launch state) at the width the engine will run them: K+1 for
+                // DFlash2, else 2 -- the conductor's draftless lane pair
+                // (fused rounds never launch a kernel cold: capture-illegal).
                 int kk = d2_k;
                 if (const char* k = getenv("Q27_DFLASH2_K")) kk = atoi(k);
-                const int w = std::max(2, std::min(kk + 1, W_MAX));
+                const int w = getenv("Q27_DFLASH2") ? std::max(2, std::min(kk + 1, W_MAX)) : 2;
                 int zs[W_PLUMB], z0 = 0;
                 for (int i = 0; i < W_PLUMB; i++) zs[i] = i;
                 for (int i = 0; i < W_PLUMB; i++)
@@ -2710,9 +2723,11 @@ struct Engine {
                 }
                 CUDA_CHECK(cudaStreamSynchronize(stm));
                 reset(); // GDN state, conv rings, positions churned by the warm
-                fprintf(stderr, "spec graphs: multi-lane verify warmed at width %d for DFlash2\n", w);
+                fprintf(stderr, "spec graphs: multi-lane verify warmed at width %d for %s\n", w,
+                        getenv("Q27_DFLASH2") ? "DFlash2" : "draftless fused rounds");
             }
             d2_setup();
+            plain_lanes = !d2_on;
             return;
         }
         // one warm (executing) round to initialize lazy CUDA state, then reset.
@@ -3690,6 +3705,16 @@ struct Engine {
     // and the extra staged lanes are never read (same contract as the gated
     // rounds' unread draft rows). Suffix rounds skip the MTP chain, so the
     // stale-MTP-KV note on suffix_on applies to fused rounds identically.
+    // Draftless member's round prologue (the conductor's draft_widths calls it
+    // in suffix_propose's slot): prep_round derives the two lane positions and
+    // snapshots the pending token; d_draft_L[0] keeps whatever valid id it
+    // holds (init 0), it is embedded and forwarded but max_draft 0 in the tail
+    // means it is never accepted. Width 2 = the union floor.
+    int plain_propose() {
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                         stm);
+        return 2;
+    }
     int suffix_propose() {
         if (!(!tool_split_active && suffix_on && sfx_valid && pmin_theta > 0.f &&
               h_mask_id0 < 0 &&
