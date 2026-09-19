@@ -15785,6 +15785,29 @@ tok/round) vs 70 plain and 93 with the Bonsai DFlash2 pack; 2-stream fused
 ~140 aggregate. The 9.87 GB pack lands in the Qwen tiers' concurrency class
 at every C, above q4s at C=1..4.
 
+**Width-flip hunt (tools/width_probe.cu, new).** A bitwise probe of the
+multi-lane verify against plain decode, engine-level, 3090: lane-0 forward
+through all 64 layers and the head at widths 2/4/8; a round that accepts
+the plain path's own next T tokens, flush_fold, one more step (folds T=1..4);
+a round whose drafts all fail, then a step (rejections at widths 2/4/8);
+refinish_round(m of 5) then a step (truncations m=1..4); the width-4 and
+width-8 verify captured into a CUDA graph and replayed vs eager. Every one
+is bitwise -- zero differing logits -- on the Bonsai pure-T2 pack and the
+Qwen3.8 default tier, fp8 KV, at position 70 and at position 617 (the code
+prompt plus 550 of plain decode's own tokens), after serial and after
+batched prefill. ninv_test with the T2 families passes too. So the serving
+flips at width >= 4 are not any single-round mechanism in isolation; they
+are a multi-round effect this probe does not model. What IS ruled out:
+kernel width dependence, the fold, stale rejected-lane KV rows, the
+truncation rewind, graph capture, the GEMM family (pinned), the conductor,
+thinking mode, the MTP pack, the MTP warm. Next instrument: a per-round
+lane-0 logits dump in the server (first differing round in situ). Probe
+traps for the next person: prefill_serial needs fused_smoke's d_P epilogue
+or the lanes sit at position 1; the token graph positions from d_pos
+(advance kernel) while rounds position from d_P, so a step_with after a
+round needs d_pos = d_P + 1; plain_lanes must be cleared for the tail to
+accept.
+
 **Single-slot campaign A/B (leg bonsai2mtp: the ladder alone, batching
 default, 12 instances)**: 2.85 tok/round, 178.8 t/s aggregate, 32.8 turns,
 150 s/inst, gold 10/12 -- against the Bonsai DFlash2 pack's 3.80 / 227.7 /

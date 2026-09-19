@@ -21,3 +21,6 @@ it, and stop the transcribers for 3090 work. Output dir: `OUT` (default
 - `mtp_gate_3090.sh` -- CLI canonical plain vs `--spec` on the T2+MTP pack,
   then server identity (pure-T2 plain vs 1-slot ladder vs 2-slot fused).
 - `mtp_bisect_3090.sh` -- CLI ladder variants over 1500 tokens vs plain.
+- `width_probe_3090.sh` -- runs `tools/width_probe` (bitwise multi-lane vs
+  plain: widths, folds, rejections, truncations, graph replay) at a deep
+  position: the code prompt plus 550 plain-decoded tokens.
