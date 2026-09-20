@@ -852,6 +852,378 @@ void t2_interleave_device(uint8_t* W, uint64_t bytes, cudaStream_t st) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- T3_G128 ternary GEMV (kernels.cuh for the device layout contract) ----
+// Geometry helpers shared by the relayout, the GEMVs and the T2 conversion.
+__host__ __device__ __forceinline__ int t3_tail_u32(int ni) { // u32 per lane in a tail window
+    int u = (8 * ni + 4) / 5;
+    return (u + 1) & ~1;
+}
+__host__ __device__ __forceinline__ uint64_t t3_row_bytes_hd(uint64_t cols) {
+    const uint64_t nch = cols / 32, nfull = nch / 160, tail = nch % 160;
+    uint64_t b = nfull * 1024;
+    if (tail) b += 32ull * 4ull * (uint64_t)t3_tail_u32((int)((tail + 31) / 32));
+    return b;
+}
+uint64_t t3_row_bytes(uint64_t cols) { return t3_row_bytes_hd(cols); }
+uint64_t t3_device_bytes(uint64_t rows, uint64_t cols) { return rows * t3_row_bytes_hd(cols); }
+
+// One u32 = four scaled base-3 bytes; next() pops the next (most significant
+// remaining) code of every byte into the four byte lanes of a dp4a word. The
+// two 16-bit lanes keep the *3 carry inside a lane (3 * 255 < 65536).
+// Per round: two IMADs (FMA pipe) + one PRMT + two ANDs on the INT pipe. The
+// popped code of a 16-bit lane sits alone in that lane's high byte (3*255 <
+// 1024), so one __byte_perm gathers the four codes into the four byte lanes
+// (bytes e3.1, o3.1, e3.3, o3.3); the ANDs drop them for the next round. The
+// 3090 measures this GEMV INT-issue-bound at parity with its DRAM time, so
+// every op here is a measurable fraction of the T3 decode step.
+struct T3Dec {
+    uint32_t e, o;
+    __device__ __forceinline__ void init(uint32_t w) {
+        e = w & 0x00FF00FFu;
+        o = __byte_perm(w, 0u, 0x4341); // bytes {w.1, 0, w.3, 0}
+    }
+    __device__ __forceinline__ uint32_t next() {
+        const uint32_t e3 = e * 3u, o3 = o * 3u;
+        const uint32_t d = __byte_perm(e3, o3, 0x7351); // {e3.1, o3.1, e3.3, o3.3}
+        e = e3 & 0x00FF00FFu;
+        o = o3 & 0x00FF00FFu;
+        return d;
+    }
+};
+// Words 8I..8I+7 of a unit (chunk I's eight dp4a words) from its u32s; the
+// decoders are stepped in word order across the unrolled chunk sequence, so
+// dec[] must be carried from chunk I to I+1 by the caller (static indices).
+template <int I>
+__device__ __forceinline__ void t3_chunk_words(const uint32_t* __restrict__ w, T3Dec* dec,
+                                               uint32_t (&cw)[8]) {
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        const int qu = 8 * I + q, k = qu / 5, r = qu % 5;
+        if (r == 0) dec[k].init(w[k]);
+        cw[q] = dec[k].next();
+    }
+}
+__device__ __forceinline__ int t3_dot32(const uint32_t (&cw)[8], const uint4 xv0, const uint4 xv1) {
+    int di = 0;
+    di = __dp4a((int)cw[0], (int)xv0.x, di);
+    di = __dp4a((int)cw[1], (int)xv0.y, di);
+    di = __dp4a((int)cw[2], (int)xv0.z, di);
+    di = __dp4a((int)cw[3], (int)xv0.w, di);
+    di = __dp4a((int)cw[4], (int)xv1.x, di);
+    di = __dp4a((int)cw[5], (int)xv1.y, di);
+    di = __dp4a((int)cw[6], (int)xv1.z, di);
+    di = __dp4a((int)cw[7], (int)xv1.w, di);
+    return di;
+}
+// Same float chain as k_gemv_t2 per chunk (s = wscale * xs; acc += s * (dot -
+// isum)), same lane -> chunk map and order: the two kernels are bitwise on the
+// same ternary matrix.
+__device__ __forceinline__ void t3_acc_chunk(float& acc, const uint32_t (&cw)[8], int ch,
+                                             const __half* __restrict__ sr,
+                                             const uint2* __restrict__ xeo,
+                                             const float* __restrict__ xs,
+                                             const int* __restrict__ xisum) {
+    const uint4* xp = (const uint4*)(xeo + (size_t)ch * 4);
+    const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
+    const float s = __half2float(__ldg(sr + (ch >> 2))) * __ldg(xs + ch);
+    acc += s * (float)(t3_dot32(cw, xv0, xv1) - __ldg(xisum + ch));
+}
+template <int NI>
+__device__ __forceinline__ void t3_unit_acc(float& acc, const uint32_t* __restrict__ w, int ch0,
+                                            int n_chunks, const __half* __restrict__ sr,
+                                            const uint2* __restrict__ xeo,
+                                            const float* __restrict__ xs,
+                                            const int* __restrict__ xisum) {
+    T3Dec dec[8];
+    uint32_t cw[8];
+    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); if (ch0 < n_chunks) t3_acc_chunk(acc, cw, ch0, sr, xeo, xs, xisum); }
+    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); if (ch0 + 32 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 32, sr, xeo, xs, xisum); }
+    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); if (ch0 + 64 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 64, sr, xeo, xs, xisum); }
+    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); if (ch0 + 96 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 96, sr, xeo, xs, xisum); }
+    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); if (ch0 + 128 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 128, sr, xeo, xs, xisum); }
+}
+__global__ void k_gemv_t3(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                          const uint2* __restrict__ xeo, const float* __restrict__ xs,
+                          const int* __restrict__ xisum, float* __restrict__ y, int64_t rows,
+                          int64_t cols, uint64_t row_bytes) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint8_t* wr = W + row * row_bytes;
+    const __half* sr = S + row * (cols / 128);
+    const int n_chunks = (int)(cols / 32), n_full = n_chunks / 160, tail = n_chunks % 160;
+    float acc = 0.f;
+    for (int m = 0; m < n_full; m++) {
+        // half-split window: u32 0..3 of every lane's unit sit lane-major in the
+        // first 512 B, u32 4..7 in the second, so each LDG.128 is 512 contiguous B
+        const uint4 a = __ldg((const uint4*)(wr + (size_t)m * 1024 + lane * 16));
+        const uint4 b = __ldg((const uint4*)(wr + (size_t)m * 1024 + 512 + lane * 16));
+        const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        t3_unit_acc<5>(acc, w, 160 * m + lane, n_chunks, sr, xeo, xs, xisum);
+    }
+    if (tail) {
+        const int ni = (tail + 31) / 32, nu = t3_tail_u32(ni), ch0 = 160 * n_full + lane;
+        const uint32_t* up = (const uint32_t*)(wr + (size_t)n_full * 1024 + lane * 4 * nu);
+        uint32_t w[8] = {0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u,
+                         0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u};
+        if (nu >= 2) { const uint2 v = __ldg((const uint2*)up); w[0] = v.x; w[1] = v.y; }
+        if (nu >= 4) { const uint2 v = __ldg((const uint2*)up + 1); w[2] = v.x; w[3] = v.y; }
+        if (nu >= 6) { const uint2 v = __ldg((const uint2*)up + 2); w[4] = v.x; w[5] = v.y; }
+        if (nu >= 8) { const uint2 v = __ldg((const uint2*)up + 3); w[6] = v.x; w[7] = v.y; }
+        switch (ni) { // warp-uniform
+            case 1: t3_unit_acc<1>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 2: t3_unit_acc<2>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 3: t3_unit_acc<3>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            default: t3_unit_acc<4>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+        }
+    }
+    acc = warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
+// Multi-lane twin (mirrors k_gemv_t2_n's chain: acc += wsc * xs * (dot - isum)).
+template <int N>
+__device__ __forceinline__ void t3_acc_chunk_n(float* acc, const uint32_t (&cw)[8], int ch,
+                                               const __half* __restrict__ sr, const T2Lanes& L) {
+    const float wsc = __half2float(__ldg(sr + (ch >> 2)));
+#pragma unroll
+    for (int n = 0; n < N; n++) {
+        const uint4* xp = (const uint4*)(L.eo[n] + (size_t)ch * 4);
+        const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
+        acc[n] += wsc * __ldg(L.xs[n] + ch) * (float)(t3_dot32(cw, xv0, xv1) - __ldg(L.is[n] + ch));
+    }
+}
+template <int N, int NI>
+__device__ __forceinline__ void t3_unit_acc_n(float* acc, const uint32_t* __restrict__ w, int ch0,
+                                              int n_chunks, const __half* __restrict__ sr,
+                                              const T2Lanes& L) {
+    T3Dec dec[8];
+    uint32_t cw[8];
+    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); if (ch0 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0, sr, L); }
+    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); if (ch0 + 32 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 32, sr, L); }
+    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); if (ch0 + 64 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 64, sr, L); }
+    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); if (ch0 + 96 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 96, sr, L); }
+    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); if (ch0 + 128 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 128, sr, L); }
+}
+// widths 1-2 fit T2's 4-CTA tier at 64 regs (ptxas: 52/64); 3 spills there
+template <int N>
+__global__ void __launch_bounds__(256, N < 3 ? 4 : N < Q27_GEMV_3CTA_MIN_Q4 ? 3 : 2)
+    k_gemv_t3_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                __grid_constant__ const T2Lanes L, int64_t rows, int64_t cols, uint64_t row_bytes) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint8_t* wr = W + row * row_bytes;
+    const __half* sr = S + row * (cols / 128);
+    const int n_chunks = (int)(cols / 32), n_full = n_chunks / 160, tail = n_chunks % 160;
+    float acc[N];
+#pragma unroll
+    for (int n = 0; n < N; n++) acc[n] = 0.f;
+    for (int m = 0; m < n_full; m++) {
+        // half-split window: u32 0..3 of every lane's unit sit lane-major in the
+        // first 512 B, u32 4..7 in the second, so each LDG.128 is 512 contiguous B
+        const uint4 a = __ldg((const uint4*)(wr + (size_t)m * 1024 + lane * 16));
+        const uint4 b = __ldg((const uint4*)(wr + (size_t)m * 1024 + 512 + lane * 16));
+        const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        t3_unit_acc_n<N, 5>(acc, w, 160 * m + lane, n_chunks, sr, L);
+    }
+    if (tail) {
+        const int ni = (tail + 31) / 32, nu = t3_tail_u32(ni), ch0 = 160 * n_full + lane;
+        const uint32_t* up = (const uint32_t*)(wr + (size_t)n_full * 1024 + lane * 4 * nu);
+        uint32_t w[8] = {0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u,
+                         0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u};
+        if (nu >= 2) { const uint2 v = __ldg((const uint2*)up); w[0] = v.x; w[1] = v.y; }
+        if (nu >= 4) { const uint2 v = __ldg((const uint2*)up + 1); w[2] = v.x; w[3] = v.y; }
+        if (nu >= 6) { const uint2 v = __ldg((const uint2*)up + 2); w[4] = v.x; w[5] = v.y; }
+        if (nu >= 8) { const uint2 v = __ldg((const uint2*)up + 3); w[6] = v.x; w[7] = v.y; }
+        switch (ni) {
+            case 1: t3_unit_acc_n<N, 1>(acc, w, ch0, n_chunks, sr, L); break;
+            case 2: t3_unit_acc_n<N, 2>(acc, w, ch0, n_chunks, sr, L); break;
+            case 3: t3_unit_acc_n<N, 3>(acc, w, ch0, n_chunks, sr, L); break;
+            default: t3_unit_acc_n<N, 4>(acc, w, ch0, n_chunks, sr, L); break;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; n++) {
+        float v = warp_reduce(acc[n]);
+        if (lane == 0) L.y[n][row] = v;
+    }
+}
+static void t3_check_cols(int64_t cols, const char* who) {
+    if (cols % 128) { fprintf(stderr, "%s: cols %lld not a multiple of 128\n", who, (long long)cols); exit(1); }
+}
+void gemv_t3(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+             int64_t cols, cudaStream_t st) {
+    t3_check_cols(cols, "gemv_t3");
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    k_gemv_t3<<<blocks, 256, 0, st>>>(W, S, xq.eo, xq.scale, xq.isum, y, rows, cols,
+                                      t3_row_bytes_hd((uint64_t)cols));
+    CUDA_CHECK(cudaGetLastError());
+}
+void gemv_t3_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float* const* ys,
+               int64_t rows, int64_t cols, cudaStream_t st) {
+    t3_check_cols(cols, "gemv_t3_n");
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    const uint64_t rb = t3_row_bytes_hd((uint64_t)cols);
+    T2Lanes L;
+    for (int i = 0; i < 16; i++) {
+        const XQuant& qq = q[i < nb ? i : 0];
+        L.eo[i] = qq.eo; L.xs[i] = qq.scale; L.is[i] = qq.isum;
+        L.y[i] = ys[i < nb ? i : 0];
+    }
+    switch (nb) {
+        case 1: k_gemv_t3_n<1><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 2: k_gemv_t3_n<2><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 3: k_gemv_t3_n<3><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 4: k_gemv_t3_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 5: k_gemv_t3_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 6: k_gemv_t3_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 7: k_gemv_t3_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 8: k_gemv_t3_n<8><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 9: k_gemv_t3_n<9><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 10: k_gemv_t3_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 11: k_gemv_t3_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 12: k_gemv_t3_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 13: k_gemv_t3_n<13><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 14: k_gemv_t3_n<14><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 15: k_gemv_t3_n<15><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        case 16: k_gemv_t3_n<16><<<blocks, 256, 0, st>>>(W, S, L, rows, cols, rb); break;
+        default: fprintf(stderr, "gemv_t3_n: bad nbatch %d\n", nb); exit(1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// FORMAT.md bytes (26 per 128-group, c0 least significant) -> the device
+// layout above. Thread per output u32; load-time only, so the per-element
+// base-3 division is fine. Every pad slot (tail-window words past the row's
+// chunks, unused rounds) is code 1 = byte 128.
+__device__ __forceinline__ int t3_host_code(const uint8_t* __restrict__ row26, int e) {
+    const int g = e >> 7, j = e & 127;
+    int v = row26[g * 26 + (j / 5)];
+    const int d = j % 5;
+    if (d >= 1) v /= 3;
+    if (d >= 2) v /= 3;
+    if (d >= 3) v /= 3;
+    if (d >= 4) v /= 3;
+    return v % 3;
+}
+__global__ void k_t3_relayout(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int64_t rows,
+                              int64_t cols, uint64_t row_bytes, uint64_t total_u32) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_u32) return;
+    const uint64_t row_u32 = row_bytes / 4;
+    const int64_t row = (int64_t)(idx / row_u32);
+    const int off = (int)(idx % row_u32) * 4;
+    const int n_chunks = (int)(cols / 32), n_full = n_chunks / 160;
+    int m, L, k, ni;
+    if (off < n_full * 1024) {
+        const int wo = off % 1024, half = wo / 512;
+        m = off / 1024; L = (wo % 512) / 16; k = half * 4 + (wo % 16) / 4; ni = 5;
+    } else {
+        const int tail = n_chunks - n_full * 160;
+        ni = (tail + 31) / 32;
+        const int nu = t3_tail_u32(ni), toff = off - n_full * 1024;
+        m = n_full; L = toff / (4 * nu); k = (toff % (4 * nu)) / 4;
+    }
+    const uint8_t* row26 = src + (uint64_t)row * (uint64_t)(cols / 128) * 26ull;
+    uint32_t out = 0;
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+        int V = 0;
+#pragma unroll
+        for (int r = 0; r < 5; r++) {
+            const int qu = 5 * k + r, i = qu / 8, q = qu % 8;
+            int code = 1;
+            if (i < ni) {
+                const int c = 160 * m + 32 * i + L;
+                if (c < n_chunks) code = t3_host_code(row26, 32 * c + 8 * (q / 2) + 2 * b + (q % 2));
+            }
+            V = V * 3 + code;
+        }
+        out |= (uint32_t)((V * 256 + 242) / 243) << (8 * b);
+    }
+    ((uint32_t*)dst)[idx] = out;
+}
+void t3_relayout_device(const uint8_t* src26, uint8_t* dst, int64_t rows, int64_t cols,
+                        cudaStream_t st) {
+    t3_check_cols(cols, "t3_relayout_device");
+    const uint64_t rb = t3_row_bytes_hd((uint64_t)cols), n = (uint64_t)rows * rb / 4;
+    k_t3_relayout<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(src26, dst, rows, cols, rb, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// T3 device layout -> T2 device-interleaved words (kernels.cuh order: field
+// 4b+s of the 16-code word = eo word s of that 16-run, lane b), i.e. T2 word
+// = W0 | W1<<2 | W2<<4 | W3<<6 over the four dp4a words 4h..4h+3 of chunk c
+// (16-run h). Block = one (row, window); warp = one (chunk-in-unit i, half h)
+// over the 32 lanes' units, so the first-word residue R0 = (8i+4h)%5 is
+// warp-uniform and every decode is static per instantiation.
+// lo/hi: the unit's u32 0..3 and 4..7 (a full window keeps them 512 B apart,
+// a tail unit is contiguous so hi = lo + 4)
+template <int QU0>
+__device__ __forceinline__ uint32_t t3_t2_word(const uint32_t* __restrict__ lo,
+                                               const uint32_t* __restrict__ hi) {
+    constexpr int K0 = QU0 / 5, R0 = QU0 % 5, K1 = K0 + 1;
+    uint32_t Wd[4] = {0u, 0u, 0u, 0u};
+    T3Dec d;
+    d.init(__ldg(K0 < 4 ? lo + K0 : hi + (K0 - 4)));
+#pragma unroll
+    for (int r = 0; r < 5; r++) {
+        const uint32_t x = d.next();
+        if (r >= R0 && r - R0 < 4) Wd[r - R0] = x;
+    }
+    if constexpr (R0 > 1) {
+        T3Dec d2;
+        d2.init(__ldg(K1 < 4 ? lo + K1 : hi + (K1 - 4)));
+#pragma unroll
+        for (int r = 0; r < R0 - 1; r++) Wd[5 - R0 + r] = d2.next();
+    }
+    return Wd[0] | (Wd[1] << 2) | (Wd[2] << 4) | (Wd[3] << 6);
+}
+__global__ void __launch_bounds__(320) k_t3_to_t2(const uint8_t* __restrict__ W3, uint8_t* __restrict__ W2,
+                                                 int64_t rows, int64_t cols, uint64_t row_bytes) {
+    const int n_chunks = (int)(cols / 32), n_full = n_chunks / 160, tail = n_chunks % 160;
+    const int n_win = n_full + (tail ? 1 : 0);
+    const int64_t row = blockIdx.x / n_win;
+    const int m = blockIdx.x % n_win;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int i = warp / 2, h = warp % 2;
+    const int ni = m < n_full ? 5 : (tail + 31) / 32;
+    if (i >= ni) return; // tail windows use the first 2*ni warps
+    const int c = 160 * m + 32 * i + lane;
+    if (c >= n_chunks) return;
+    const uint8_t* wr = W3 + (uint64_t)row * row_bytes;
+    const uint32_t* lo;
+    const uint32_t* hi;
+    if (m < n_full) {
+        lo = (const uint32_t*)(wr + (size_t)m * 1024 + lane * 16);
+        hi = (const uint32_t*)(wr + (size_t)m * 1024 + 512 + lane * 16);
+    } else {
+        lo = (const uint32_t*)(wr + (size_t)n_full * 1024 + lane * 4 * t3_tail_u32(ni));
+        hi = lo + 4;
+    }
+    uint32_t o;
+    switch (warp) { // warp-uniform
+        case 0: o = t3_t2_word<0>(lo, hi); break;
+        case 1: o = t3_t2_word<4>(lo, hi); break;
+        case 2: o = t3_t2_word<8>(lo, hi); break;
+        case 3: o = t3_t2_word<12>(lo, hi); break;
+        case 4: o = t3_t2_word<16>(lo, hi); break;
+        case 5: o = t3_t2_word<20>(lo, hi); break;
+        case 6: o = t3_t2_word<24>(lo, hi); break;
+        case 7: o = t3_t2_word<28>(lo, hi); break;
+        case 8: o = t3_t2_word<32>(lo, hi); break;
+        default: o = t3_t2_word<36>(lo, hi); break;
+    }
+    ((uint32_t*)(W2 + (uint64_t)row * (cols / 4)))[2 * c + h] = o;
+}
+void t3_to_t2_device(const uint8_t* W3, uint8_t* W2, int64_t rows, int64_t cols, cudaStream_t st) {
+    t3_check_cols(cols, "t3_to_t2_device");
+    const int n_chunks = (int)(cols / 32), n_win = (n_chunks + 159) / 160;
+    const unsigned blocks = (unsigned)(rows * n_win);
+    k_t3_to_t2<<<blocks, 320, 0, st>>>(W3, W2, rows, cols, t3_row_bytes_hd((uint64_t)cols));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---- Bonsai 2 activation rotation (kernels.cuh for the contract) ----
 // One 256-thread block per 1024-element chunk; the butterfly pairs (j, j+h)
 // with the low element taking a+b and the high one a-b, each element written

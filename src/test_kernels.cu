@@ -64,6 +64,13 @@ static float cpu_deq(const q27::Tensor& t, int64_t r, int64_t c) {
         __half s = ((const __half*)t.scales)[r * (t.cols() / 128) + c / 128];
         return (float)(code - 1) * __half2float(s);
     }
+    if (t.dtype == DType::T3_G128) { // FORMAT.md: 26 bytes per 128, base-3, c0 least significant
+        const int64_t g = c / 128, j = c % 128;
+        int v = t.data[r * (t.cols() / 128) * 26 + g * 26 + j / 5];
+        for (int d = 0; d < j % 5; d++) v /= 3;
+        __half s = ((const __half*)t.scales)[r * (t.cols() / 128) + g];
+        return (float)(v % 3 - 1) * __half2float(s);
+    }
     if (t.dtype == DType::F16) return __half2float(((const __half*)t.data)[r * t.cols() + c]);
     return ((const float*)t.data)[r * t.cols() + c];
 }
@@ -127,6 +134,9 @@ static void test_gemv(q27::DeviceModel& dm, const q27::Model& m, const char* nam
             break;
         case DType::T2_G128: // device copy is interleaved by upload(); reference reads host order
             q27k::gemv_t2((const uint8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
+            break;
+        case DType::T3_G128: // device copy is the window layout (upload relayout); reference reads host order
+            q27k::gemv_t3((const uint8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
             break;
         case DType::F16:
             q27k::gemv_f16((const __half*)d.data, d_x, d_y, rows, cols);
@@ -212,14 +222,18 @@ static void test_embed(q27::DeviceModel& dm, const q27::Model& m) {
     CUDA_CHECK(cudaMalloc(&d_out, cols * 4));
     CUDA_CHECK(cudaMalloc(&d_tok, 4));
     CUDA_CHECK(cudaMemcpy(d_tok, &row_i, 4, cudaMemcpyHostToDevice));
-    q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
+    // Qwen tiers carry a Q8 table, Bonsai slim packs a T2 one (own row kernel)
+    if (t.dtype == DType::T2_G128)
+        q27k::embed_row_t2((const uint8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
+    else
+        q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
     std::vector<float> got(cols);
     CUDA_CHECK(cudaMemcpy(got.data(), d_out, cols * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(d_out));
     double maxd = 0;
     for (int64_t c = 0; c < cols; c++)
         maxd = std::max(maxd, (double)std::fabs(got[c] - cpu_deq(t, row, c)));
-    check("embed_row_q8(token 1234)", maxd, 1e-6);
+    check(t.dtype == DType::T2_G128 ? "embed_row_t2(token 1234)" : "embed_row_q8(token 1234)", maxd, 1e-6);
 }
 
 static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
@@ -256,6 +270,18 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
         q27k::gemv_q8_n((const int8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
         for (int n = 0; n < NB; n++) {
             q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
+            std::vector<float> yb(rows), y1(rows);
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
+            for (int64_t r = 0; r < rows; r++)
+                maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
+        }
+    }
+    if (t.dtype == DType::T3_G128) {
+        float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
+        q27k::gemv_t3_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
+        for (int n = 0; n < NB; n++) {
+            q27k::gemv_t3((const uint8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
             std::vector<float> yb(rows), y1(rows);
             CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
@@ -620,12 +646,24 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     const q27::Tensor& ht = m.get("output.weight");
     const bool head_q4 = ht.dtype == q27::DType::Q4_G64;
     auto head_gemv = [&](q27k::XQuant* q, int nb, float** y) {
-        if (head_q4)
-            q27k::gemv_q4_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
-                            ht.rows(), cols, 0);
-        else
-            q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
-                            ht.rows(), cols, 0);
+        switch (ht.dtype) { // slim Bonsai packs carry a T2 (or T3) head
+            case q27::DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            case q27::DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            case q27::DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            default:
+                q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+        }
     };
     double h5 = timeit([&] {
         head_gemv(qs, 5, ys);
@@ -651,6 +689,10 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
                 break;
             case q27::DType::T2_G128:
                 q27k::gemv_t2_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            case q27::DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
                                 ft.rows(), cols, 0);
                 break;
             default:
@@ -679,6 +721,12 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     CUDA_CHECK(cudaMemcpy(got.data(), ys[7], 128 * 4, cudaMemcpyDeviceToHost));
     if (head_q4)
         q27k::gemv_q4((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
+    else if (ht.dtype == q27::DType::T2_G128)
+        q27k::gemv_t2((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
+    else if (ht.dtype == q27::DType::T3_G128)
+        q27k::gemv_t3((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
                       ht.rows(), cols, 0);
     else
         q27k::gemv_q8((const int8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],

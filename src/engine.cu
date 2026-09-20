@@ -212,8 +212,7 @@ int main(int argc, char** argv) {
                                  ? "output_q4.weight"
                                  : "output.weight";
             const DevTensor& hw = e.dm.get(vh);
-            d2.set_engine_head(hw.data, (const __half*)hw.scales,
-                               hw.dtype == DType::Q4_G64 ? 1 : hw.dtype == DType::T2_G128 ? 2 : 0);
+            d2.set_engine_head(hw.data, (const __half*)hw.scales, d2_head_kind(hw.dtype));
             fprintf(stderr, "dflash2: engine head (%s)\n", vh);
         }
         {

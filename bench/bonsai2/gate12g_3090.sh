@@ -12,17 +12,17 @@ sudo -n systemctl stop vox-transcriber vox-transcriber-gmrs; sleep 3
 b3=$(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv,noheader | grep GPU-5a723c5e || true)
 [ -n "$b3" ] && { log "3090 busy: $b3"; sudo -n systemctl start vox-transcriber vox-transcriber-gmrs; exit 3; }
 systemctl --user reset-failed bz-hog 2>/dev/null
-systemd-run --user --unit bz-hog -E CUDA_VISIBLE_DEVICES=1 -p StandardOutput=file:$S/hog.log -p StandardError=file:$S/hog.log python3 $S/vram_hog.py $HOG cuda:0
+systemd-run --user --unit bz-hog -E CUDA_VISIBLE_DEVICES=1 -p StandardOutput=file:$S/hog.log -p StandardError=file:$S/hog.log python3 $M/bench/bonsai2/vram_hog.py $HOG cuda:0
 for i in $(seq 1 30); do grep -q "hog: holding" $S/hog.log 2>/dev/null && break; sleep 1; done; cat $S/hog.log
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | sed -n 1p
 run_leg() { # $1 label, rest = -E envs
   local label=$1; shift
   systemctl --user reset-failed bz-server 2>/dev/null
-  systemd-run --user --unit bz-server -E CUDA_VISIBLE_DEVICES=1 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 "$@" \
-    -p StandardOutput=file:$S/g12_$label.log -p StandardError=file:$S/g12_$label.log $BIN $SLIM $TOK $ARGS --slots 1 >/dev/null
-  for i in $(seq 1 200); do c=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/health); [ "$c" = 200 ] && break; systemctl --user is-active --quiet bz-server || { log "$label died"; tail -6 $S/g12_$label.log | cut -c1-200; return 1; }; sleep 2; done
-  log "== $label"; grep -E "wsum|vram: free|\[pool\]|slot 0 ready|clamp|listening|dflash2 serving|bonsai2:" $S/g12_$label.log | cut -c1-160
-  python3 - "$label" "$S" <<'PY'
+  systemd-run --user --unit bz-server -E CUDA_VISIBLE_DEVICES=1 -E Q27_KV=${KV:-fp8} -E Q27_PRINT_WSUM=1 "$@" \
+    -p StandardOutput=file:$S/${PFX:-g12}_$label.log -p StandardError=file:$S/${PFX:-g12}_$label.log $BIN $SLIM $TOK $ARGS --slots 1 >/dev/null
+  for i in $(seq 1 200); do c=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/health); [ "$c" = 200 ] && break; systemctl --user is-active --quiet bz-server || { log "$label died"; tail -6 $S/${PFX:-g12}_$label.log | cut -c1-200; return 1; }; sleep 2; done
+  log "== $label"; grep -E "wsum|vram: free|\[pool\]|slot 0 ready|clamp|listening|dflash2 serving|bonsai2:" $S/${PFX:-g12}_$label.log | cut -c1-160
+  python3 - "$label" "$S" "${PFX:-g12}" "${REF:-$S/mg_t2plain.json}" <<'PY'
 import json, urllib.request, sys, time
 label=sys.argv[1]; S=sys.argv[2]; base="http://127.0.0.1:8090"
 def msg(prompt, n, think):
@@ -38,16 +38,16 @@ P={"short":("Reply with the single word ok.",32,False),
 out={}
 for name,(p,n,th) in P.items():
     t0=time.time(); t,ntok=msg(p,n,th); out[name]=t; print(f"  {name}: {ntok} tokens {time.time()-t0:.1f}s", flush=True)
-json.dump(out, open(f"{S}/g12_{label}.json","w"))
-ref=json.load(open(f"{S}/mg_t2plain.json")) if __import__('os').path.exists(f"{S}/mg_t2plain.json") else out
+json.dump(out, open(f"{S}/{sys.argv[3]}_{label}.json","w"))
+ref=json.load(open(sys.argv[4]))
 for k in ref:
     a=ref[k]; b=out[k]
-    if a==b: print(f"  {k:7s}: IDENTICAL to the pure-pack plain reference ({len(a)} chars)")
+    if a==b: print(f"  {k:7s}: IDENTICAL to the reference ({len(a)} chars)")
     else:
         i=next((i for i,(x,y) in enumerate(zip(a,b)) if x!=y), min(len(a),len(b)))
         print(f"  {k:7s}: DIFFER at char {i} of {len(a)}/{len(b)}")
 PY
-  grep "\[req\]" $S/g12_$label.log | sed 's/.*dec=\([0-9]*\) dec_ms=\([0-9.]*\).*rounds=\([0-9]*\) tps=\([0-9.]*\).*/    dec=\1 dec_ms=\2 rounds=\3 tps=\4/' | head -4
+  grep "\[req\]" $S/${PFX:-g12}_$label.log | sed 's/.*dec=\([0-9]*\) dec_ms=\([0-9.]*\).*rounds=\([0-9]*\) tps=\([0-9.]*\).*/    dec=\1 dec_ms=\2 rounds=\3 tps=\4/' | head -4
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | sed -n 1p
   systemctl --user stop bz-server; sleep 2
 }

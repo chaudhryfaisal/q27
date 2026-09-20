@@ -365,6 +365,21 @@ static_assert(W_PLUMB == 16, "LANESW lists 16 slots -- keep it in step with W_PL
       (V).F[7], (V).F[8], (V).F[9], (V).F[10], (V).F[11], (V).F[12],           \
       (V).F[13], (V).F[14], (V).F[15]}}
 
+// The head dtype kinds DFlash2 reads directly (dflash2.h set_engine_head):
+// fail loud on any other, since the old ternary chain mapped unknown dtypes
+// to Q8 and would read a T3 head's 1.6-bit rows as int8.
+static inline int d2_head_kind(DType t) {
+    switch (t) {
+        case DType::Q8_G128: return 0;
+        case DType::Q4_G64: return 1;
+        case DType::T2_G128: return 2;
+        default:
+            fprintf(stderr, "dflash2: engine head dtype %s unsupported (repack the head as Q8/Q4/T2)\n",
+                    dtype_name(t));
+            exit(1);
+    }
+}
+
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
     // The owning ctor keeps them in owned_*; the borrowing ctor binds refs to
@@ -401,6 +416,10 @@ struct Engine {
     float* bz_xrot = nullptr;              // rotated copy of the GDN input (alpha/beta read the raw one)
     float* bz_ogp = nullptr;               // permuted GDN value output
     float* bz_xrotT = nullptr;             // prefill twins (PF_T rows)
+    // T3_G128 packs (8 GB cards, 2026-09-20): the prefill GEMM's T2 scratch,
+    // sized for the largest T3 matrix (mmT rewrites each one into it first).
+    uint8_t* t3_pf_w = nullptr;
+    size_t t3_pf_bytes = 0;
     float* bz_ogpT = nullptr;
     float* bz_xrot_L[W_PLUMB] = {};        // multi-lane twins (speculative verify)
     float* bz_ogp_L[W_PLUMB] = {};
@@ -1610,6 +1629,17 @@ struct Engine {
             bz_s6144 = (const float*)dm.get("hadamard_signs.6144").data;
             bz_s17408 = (const float*)dm.get("hadamard_signs.17408").data;
         }
+        {
+            size_t mx = 0;
+            for (const q27::Tensor& t : dm.model().tensors)
+                if (t.dtype == DType::T3_G128) mx = std::max(mx, (size_t)t.rows() * (size_t)(t.cols() / 4));
+            if (mx) {
+                CUDA_CHECK(cudaMalloc((void**)&t3_pf_w, mx));
+                t3_pf_bytes = mx;
+                fprintf(stderr, "T3_G128 pack: prefill GEMMs read a %.1f MB T2 scratch per matrix\n",
+                        mx / 1e6);
+            }
+        }
     }
 
   public:
@@ -1640,6 +1670,10 @@ struct Engine {
                 break;
             case DType::T2_G128:
                 q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
+                              w.cols, st);
+                break;
+            case DType::T3_G128:
+                q27k::gemv_t3((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
                               w.cols, st);
                 break;
             case DType::F16:
@@ -1904,6 +1938,10 @@ struct Engine {
                 q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
                                 w.rows, w.cols, v.stm);
                 break;
+            case DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
             case DType::Q8_G128:
                 q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
                                 w.rows, w.cols, v.stm);
@@ -1931,6 +1969,10 @@ struct Engine {
                 break;
             case DType::T2_G128:
                 q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
+            case DType::T3_G128:
+                q27k::gemv_t3((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
                               w.rows, w.cols, v.stm);
                 break;
             case DType::Q8_G128:
@@ -2250,6 +2292,9 @@ struct Engine {
                             w.cols, v.stm);
         else if (w.dtype == DType::T2_G128)
             q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
+        else if (w.dtype == DType::T3_G128)
+            q27k::gemv_t3_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
                             w.cols, v.stm);
         else if (w.dtype != DType::Q8_G128) {
             fprintf(stderr, "mm5: unsupported dtype\n"); // was a bare else (silent Q8 route)
@@ -3145,7 +3190,7 @@ struct Engine {
         const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                          : "output.weight";
         const DevTensor& hw = dm.get(vh);
-        d2->set_engine_head(hw.data, (const __half*)hw.scales, hw.dtype == DType::Q4_G64 ? 1 : hw.dtype == DType::T2_G128 ? 2 : 0);
+        d2->set_engine_head(hw.data, (const __half*)hw.scales, d2_head_kind(hw.dtype));
         // reuse the engine's Q8 token embedding for the drafter's anchor/mask
         // rows (the serving pack ships no fp16 target.embed). MUST precede
         // alloc(), which caches the mask-token embedding.
@@ -4175,6 +4220,21 @@ struct Engine {
                 q27k::gemm_t2_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
                                 w.rows, w.cols, T, stm, splitk_p());
                 break;
+            case DType::T3_G128: {
+                // 8 GB packs (2026-09-20): the MMA GEMM reads T2 words, so the
+                // T3 matrix is rewritten into the engine's T2 scratch first
+                // (stream-ordered on stm; ~22 MB, the largest T3 matrix). Same
+                // codes and scales -> the GEMM output is bitwise the T2 pack's.
+                const size_t need = (size_t)w.rows * (size_t)(w.cols / 4);
+                if (!t3_pf_w || need > t3_pf_bytes) {
+                    fprintf(stderr, "mmT: T3 prefill scratch %zu B < %zu needed\n", t3_pf_bytes, need);
+                    exit(1);
+                }
+                q27k::t3_to_t2_device((const uint8_t*)w.data, t3_pf_w, w.rows, w.cols, stm);
+                q27k::gemm_t2_T(t3_pf_w, (const __half*)w.scales, xqT, yout, w.rows, w.cols, T,
+                                stm, splitk_p());
+                break;
+            }
             case DType::F16:
                 q27k::gemm_f16_T((const __half*)w.data, xT, yout, w.rows, w.cols, T, stm);
                 break;

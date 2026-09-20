@@ -53,12 +53,12 @@ MAGIC = 0x46373251  # "Q27F" LE
 VERSION = 1
 ALIGN = 256
 
-# dtype 5 is reserved for the parked T3_G128 (never emitted; see FORMAT.md).
 DTYPE_F32, DTYPE_F16, DTYPE_Q8, DTYPE_Q4, DTYPE_T2 = 0, 1, 2, 3, 4
+DTYPE_T3 = 5   # five trits per byte (FORMAT.md T3_G128); Bonsai 2 8 GB packs (2026-09-20)
 DTYPE_B1 = 6
 DTYPE_FP4 = 7  # nvfp4 sidecars: e2m1 codes 2/byte + ue4m3 scale per 16 (--pf4)
 DTYPE_NAMES = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q8: "Q8_G128", DTYPE_Q4: "Q4_G64",
-               DTYPE_T2: "T2_G128", DTYPE_B1: "B1_G128", DTYPE_FP4: "FP4_G16"}
+               DTYPE_T2: "T2_G128", DTYPE_T3: "T3_G128", DTYPE_B1: "B1_G128", DTYPE_FP4: "FP4_G16"}
 GROUP_Q4, GROUP_Q8, GROUP_T2, GROUP_B1 = 64, 128, 128, 128
 GROUP_FP4 = 16
 
@@ -392,6 +392,37 @@ def repack_bonsai2_t2(t):
         ours = (cc.astype(np.float32) - 1.0) * np.repeat(d_f32[r0:r1], 128, axis=1)
         if not np.array_equal(ref, ours):
             raise ValueError(f"{t.name}: T2 round-trip mismatch in rows {r0}:{r1}")
+    return data.tobytes(), d.tobytes(), zero_frac
+
+
+_T3_POW = np.array([1, 3, 9, 27, 81], dtype=np.uint16)
+
+
+def repack_bonsai2_t3(t):
+    """Bonsai 2 ternary tensor -> T3_G128 blobs (data, scales, zero_frac): the
+    FORMAT.md layout, 26 bytes per 128-group, byte b = sum_k code(5b+k) * 3^k
+    (code = trit + 1, c0 least significant), byte 25 = columns 125..127 with
+    its two unused slots at code 1 (the canonical pad the loader checks).
+    1.625 bits per weight plus the fp16 scale per 128; the CUDA engine relays
+    it into its own window layout at upload (kernels.cuh). Lossless; the
+    round-trip gate re-decodes the packed bytes."""
+    codes, d = decode_bonsai2_codes(t)
+    rows, cols = codes.shape
+    c = (codes.astype(np.int16) + 1).astype(np.uint16).reshape(rows, cols // 128, 128)
+    c = np.concatenate([c, np.ones((rows, cols // 128, 2), dtype=np.uint16)], axis=2)  # 130 slots
+    data = (c.reshape(rows, cols // 128, 26, 5) * _T3_POW).sum(axis=3).astype(np.uint8)
+    assert data.max() <= 242
+    zero_frac = float(np.count_nonzero(codes == 0)) / codes.size
+    step = max(1, (1 << 25) // cols)
+    d_f32 = d.copy().view(np.float16).astype(np.float32).reshape(rows, cols // 128)
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        ref = _bonsai2_reference_deq(codes, d, rows, cols, r0, r1)
+        b = data[r0:r1].astype(np.uint16)[..., None]                     # [r, g, 26, 1]
+        cc = ((b // _T3_POW) % 3).reshape(r1 - r0, cols // 128, 130)[..., :128].reshape(r1 - r0, cols)
+        ours = (cc.astype(np.float32) - 1.0) * np.repeat(d_f32[r0:r1], 128, axis=1)
+        if not np.array_equal(ref, ours):
+            raise ValueError(f"{t.name}: T3 round-trip mismatch in rows {r0}:{r1}")
     return data.tobytes(), d.tobytes(), zero_frac
 
 
@@ -807,12 +838,14 @@ def main():
     ap.add_argument("--mtp", default=None,
                     help="companion BF16 MTP GGUF (llama.cpp --mtp output)")
     ap.add_argument("--only", default=None)
-    ap.add_argument("--bonsai2-container", choices=("q4x", "t2", "t2+q4x"), default="t2",
+    ap.add_argument("--bonsai2-container", choices=("q4x", "t2", "t2+q4x", "t3"), default="t2",
                     help="Bonsai 2 packs: t2 = every rotated matrix as T2_G128 (decode GEMV and "
                          "the Phase 3 prefill GEMM read it; ~9 GB); t2+q4x = the same plus a "
                          "'<name>.q4x' exact-Q4 shadow of every blk.* matrix (the Phase 2 layout, "
                          "Q27_T2_PF_SHADOW=1 A/B; +13 GB); q4x = every rotated matrix as EXACT "
-                         "Q4_G64 (Phase 1). Embeddings/head stay exact Q8 in all three.")
+                         "Q4_G64 (Phase 1); t3 = every blk.* matrix as T3_G128 (five trits per "
+                         "byte, 1.75 bpw with scales; the 8 GB-card pack, 2026-09-20 -- pair it "
+                         "with --slim). Embeddings/head stay exact Q8 (T2 under --slim).")
     ap.add_argument("--mtp-safetensors", default=None,
                     help="Bonsai 2 packs: an HF-named MTP head checkpoint (mtp.fc.weight, "
                          "mtp.layers.0.*, mtp.norm, mtp.pre_fc_norm_*; e.g. ProCreations/"
@@ -906,7 +939,9 @@ def main():
         raise ValueError("base-only qwen35 GGUF: supply its companion with --mtp")
 
     meta = {"q27_version": VERSION,
-            "quant_policy": args.tag or (("bonsai2-t2-v1" if args.bonsai2_container != "q4x" else "bonsai2-q4x-v1") if bonsai2
+            "quant_policy": args.tag or (("bonsai2-t3-v1" if args.bonsai2_container == "t3"
+                                          else "bonsai2-t2-v1" if args.bonsai2_container != "q4x"
+                                          else "bonsai2-q4x-v1") if bonsai2
                                          else "bonsai-t2-v1" if ternary
                                          else "bonsai-b1-v1" if binary
                                          else "v1.4" if args.q8 else "v1.3"),
@@ -921,6 +956,9 @@ def main():
         meta["group_t2"] = GROUP_T2
         meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
         meta["t2_slot_order"] = "seq-lsb-first"
+    if bonsai2 and args.bonsai2_container == "t3":
+        meta["group_t3"] = 128
+        meta["t3_codes"] = "base-3 five per byte, c0 least significant, 26 B per 128; code = trit+1"
     if binary:
         # Verbatim fork Q1_0 encoding; see the repack_b1 docstring and the
         # binary-tier plan.
@@ -1046,6 +1084,8 @@ def main():
                 verbatim = (DTYPE_Q8, repack_bonsai2_q8x)
             elif t.name.endswith(".q4x"):
                 verbatim = (DTYPE_Q4, repack_bonsai2_q4x)   # prefill shadow of a T2 base
+            elif args.bonsai2_container == "t3" and t.name.startswith("blk."):
+                verbatim = (DTYPE_T3, repack_bonsai2_t3)    # 8 GB packs: the body only
             elif args.bonsai2_container != "q4x":
                 verbatim = (DTYPE_T2, repack_bonsai2_t2)
             else:

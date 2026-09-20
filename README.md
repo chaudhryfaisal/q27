@@ -151,6 +151,7 @@ matches `llama-perplexity` on the same GGUF to 0.15% (8.2767 vs 8.2643 at
 |---|--:|--:|--:|---|---|
 | Qwen3.8 default (v2) | 17.00 | 7.3121 | 30/30 | 6/6 @ ~120K | ~220 t/s |
 | Bonsai 2 (T2) | 9.44 | 9.2508 | 25/30 | 6/6 @ ~90K | 233 t/s on the 700-token prompt, 346 on cities; round 14.8 ms; plain 110 t/s |
+| Bonsai 2 (T3, `--bonsai2-container t3 --slim`) | 6.06 | 9.2513 (bitwise the T2 pack on the 3090) | same model | same model | the 8 GB-card pack; decode at the T2 pack's speed |
 
 Same protocol as the table above (chunk 512, fp8 KV; the same-card pair on
 the 3090 is 9.2513 vs 7.3102). The 2.3 GB engine stack plus the 9.44 GB
@@ -199,6 +200,19 @@ what that build actually costs. Simulated at 11.7 GB free on the 3090: 32K
 context plain, 20K with the MTP ladder, bitwise the full pack's plain
 decode; the 2.1 GB DFlash2 pack leaves only 4K there, so the MTP pack is
 the 12 GB drafter (BUILDLOG 2026-09-19 (av)).
+
+On an 8 GB card: `repack.py --bonsai2-container t3 --slim` packs the body
+as `T3_G128`, five trits per byte (1.6 bpw; 6.06 GB, or 6.49 GB with the
+MTP head). The CUDA decode GEMV reads it in a layout built to sum exactly
+what the T2 kernel sums, so the pack is bitwise the T2 pack at every width
+(400/400 matrices, same PPL to six digits, same server texts); prefill
+converts each matrix into a 22 MB T2 scratch on the fly (+4% wall). With
+`Q27_FIXED_STACK_GB=0.6` and the Ampere-default turbo5k KV, a headless 8 GB
+card (8.0 GB free) serves 45K context plain or 12K with the MTP ladder
+(`Q27_FIXED_STACK_GB=0.8`); with a display on the card (7.6 GB free) it is
+24K plain and no ladder. Decode runs at the T2 pack's speed rather than
+24% under it -- the digit extraction is exposed on the 3090 (BUILDLOG
+2026-09-20 (aw)).
 
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),

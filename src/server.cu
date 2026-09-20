@@ -670,8 +670,15 @@ int main(int argc, char** argv) {
     // for builds the per-arch calibration does not describe -- the 12g build
     // (sm_86 image only, W8, 256-row prefill) measures ~0.75 GB on a 3090
     // where the fat-binary sm_86 figure is 4.3, and the difference is the
-    // whole KV budget on a 12 GB card. Replaces kEngBase so single_fixed ==
-    // the given value; the Ampere slack drops to 0.15 GB with it.
+    // whole KV budget on a 12 GB card. 2026-09-20 (8 GB packs): the value IS
+    // the reserve. single_fixed and ENG_FIXED_BYTES equal it exactly (no
+    // graph/GDN floor, no arena-on fudge, no per-slot 256 MB) and both slacks
+    // drop to 0.15 GB: the 12 GB run measured stack + graphs + GDN + scratch
+    // at 0.54 GB beside a 0.23 GB arena, and the old floors (0.79 GB of
+    // graph + GDN constants, 0.25, 0.256, 1.0 GB Ampere slack) reserved 1.45
+    // GB against it -- more than an 8 GB card has left after a 6 GB pack.
+    // Measure it as "vram at ready" minus the pool and the arena on the
+    // target build, with the arena on.
     const double fixed_env = getenv("Q27_FIXED_STACK_GB") ? atof(getenv("Q27_FIXED_STACK_GB")) * 1e9 : -1.0;
     // M3a: chunk-sized prefill scratch. Computed from the same constants the
     // arena allocates from (not a guess): the PF_T staging set + split-attn
@@ -708,10 +715,11 @@ int main(int argc, char** argv) {
     // slack". With the arena on, no engine allocates that scratch at all --
     // it is one real allocation deducted from measured free VRAM below -- so
     // what remains in the per-slot stack is the slack alone.
-    const size_t ENG_FIXED_BYTES =
-        (size_t)(kEngBase + kEngGraphs + kEngGdn +
-                 (pf_arena_on ? 0.25e9 : 1.0e9) -
-                 (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
+    const size_t ENG_FIXED_BYTES = fixed_env > 0
+        ? (size_t)fixed_env // the measured stack, exactly (see Q27_FIXED_STACK_GB above)
+        : (size_t)(kEngBase + kEngGraphs + kEngGdn +
+                   (pf_arena_on ? 0.25e9 : 1.0e9) -
+                   (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
     // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
     // multi-slot-aware since 2026-07-18: each borrowing engine carries its
@@ -845,9 +853,10 @@ int main(int argc, char** argv) {
             // the 262144/57344/... single-slot picks). Reuses the hoisted
             // width/arch-scaled terms; kEngGdn is the M1 record+fold figure
             // (committed + snap + arena -- the spare role sets are gone).
-            const double single_fixed = base + kEngGraphs + kEngGdn -
-                                        (constrain_tools ? 0.0 : kEngMonoSave) -
-                                        (sampled_on ? 0.0 : kEngSampSave);
+            const double single_fixed = fixed_env > 0 ? fixed_env
+                                        : base + kEngGraphs + kEngGdn -
+                                          (constrain_tools ? 0.0 : kEngMonoSave) -
+                                          (sampled_on ? 0.0 : kEngSampSave);
             long budget, c;
             if (n_slots <= 1) {
                 // sm_86/89 carry a fatter, ctx-scaled graph zoo + a larger
@@ -1088,11 +1097,14 @@ int main(int argc, char** argv) {
         // Arch-scaled slack (M1b review): sm_86/89 need the 1.0 GB margin
         // issue #6 established for the ctx-scaled instantiate transient --
         // the pool is allocated BEFORE any capture and would otherwise eat it.
-        const double pool_slack = cc_arch >= 120 ? 0.25e9 : 1.0e9;
+        // Q27_FIXED_STACK_GB: the operator measured the stack, so the slack is
+        // the 0.15 GB the auto-ctx block uses and the per-slot 256 MB is gone.
+        const double pool_slack = fixed_env > 0 ? 0.15e9 : cc_arch >= 120 ? 0.25e9 : 1.0e9;
+        const double per_slot_pad = fixed_env > 0 ? 0.0 : (double)(256ull << 20);
         auto fixed_for = [&](int ns) {
             return (double)ENG_FIXED_BYTES +
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
-                   pool_slack + (double)ns * ((double)(256ull << 20) + d2_reserve);
+                   pool_slack + (double)ns * (per_slot_pad + d2_reserve);
         };
         // Elastic windows (issue #42) are pool-sized, so half of one would
         // trade every extra slot away; they get a FIXED 16K concurrent share

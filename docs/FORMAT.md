@@ -55,14 +55,21 @@ is the GEMV reduction axis for every matmul weight in this model.
 - row data is `cols/8` bytes; scales are fp16 `[rows, cols/128]`
 - effective 1.125 bits per weight
 
-### T3_G128 (experimental ternary packing, dtype 5)
+### T3_G128 (ternary, five trits per byte, dtype 5)
 - group size 128; five ternary codes are stored per byte in base 3:
   `c0 + 3*c1 + 9*c2 + 27*c3 + 81*c4`, with every byte in `[0,242]`
 - each group uses 26 bytes; byte 25 carries columns 125..127 and its unused
   slots 3 and 4 must contain code 1 (zero)
 - row data is `(cols/128)*26` bytes; scales are fp16 `[rows, cols/128]`
-- effective 1.75 bits per weight; dtype 5 is reserved and no production
-  artifacts currently use it
+- effective 1.75 bits per weight
+- emitted by `repack.py --bonsai2-container t3` for the Bonsai 2 8 GB-card
+  packs (2026-09-20, every `blk.*` matrix; embeddings/head stay T2 under
+  `--slim`). Metal reads these bytes directly (`q27_matvec_t3_g128`); the
+  CUDA engine relays them at upload into a window layout built for the
+  decode GEMV (`kernels.cuh` T3 section: scaled base-3 bytes popped a digit
+  per dp4a word, the same chunk order as `gemv_t2`, so the two GEMVs are
+  bitwise), and its prefill MMA GEMM reads a per-matrix T2 conversion of
+  it. Row bytes on the device: 5120 -> 1024, 6144 -> 1280, 17408 -> 3584.
 
 ## Quant policy (v1)
 
@@ -93,7 +100,8 @@ containers (Q4_G64 nibble = trit+8 with the 128-group scale duplicated per
 under `Q27_T2_PF_SHADOW=1` (the bitwise A/B of the T2 prefill GEMM on a
 served model). Header meta additions:
 
-- `"bonsai2": true`, `"bonsai2_container": "q4x" | "t2" | "t2+q4x"`,
+- `"bonsai2": true`, `"bonsai2_container": "q4x" | "t2" | "t2+q4x" | "t3"`
+  (each with a `-slim` suffix when `--slim` put `token_embd`/`output` in T2),
   `"qwen35.block_count": 64` (no `nextn_predict_layers`), `general.name`
   containing `qwen38` (the tool dialect and 3.8 template rules key on it).
 - `"hadamard": {version 1, block_size 1024, transform

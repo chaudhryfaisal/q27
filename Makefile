@@ -340,6 +340,11 @@ build/q27-server-12g: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h 
 build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh src/blocks.cuh $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/ninv_test.cu $(VGEMM_SRC) -o $@
 
+# T3_G128 gate (Bonsai 2 8 GB packs, 2026-09-20): the T3 pack's GEMVs (widths
+# 1/2/5/8) and its prefill T2 conversion must be bitwise the T2 pack's.
+build/t3_gate: tools/t3_gate.cu src/kernels.cuh src/device_model.h src/loader.h $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/t3_gate.cu $(VGEMM_SRC) -o $@
+
 build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@
 

@@ -190,6 +190,16 @@ today. That isolates the only new piece of math -- the activation rotation
   bitwise vs the full pack. BUILDLOG (av). The "T2 head everywhere" item
   is done by way of it.
 
+- 09-20: the 8 GB-card container -- `--bonsai2-container t3` emits the
+  FORMAT.md-reserved T3_G128 (five trits per byte, 1.6 bpw, 6.06 GB slim /
+  6.49 with the MTP head); CUDA relays it at upload into a window layout
+  whose GEMV is BITWISE gemv_t2 (tools/t3_gate: 400/400 at widths 1/2/5/8
+  + the prefill T2 conversion; PPL identical to six digits); the estimator
+  now takes Q27_FIXED_STACK_GB literally. Simulated 8.0 GB free: 45K plain /
+  12K ladder; 7.6: 24K / no ladder. Decode at the T2 pack's speed (the
+  extraction is exposed on the 3090; limiter unresolved). BUILDLOG (aw).
+  Not done: token_embd on the host (+19K tokens), a T3 head, a real 3060.
+
 ## Risks and open questions
 
 - DFlash2 acceptance on the ternary target (drafter trained on BF16).

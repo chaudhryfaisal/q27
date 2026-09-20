@@ -15714,6 +15714,106 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-20 (aw): Bonsai 2 on an 8 GB card -- T3_G128, five trits per byte, bitwise the T2 pack; 6.06 GB, 45K context at 8.0 GB free
+
+The 12 GB fit left 7.2 GB of weights against a card with ~8 GB usable, so
+no amount of estimator honesty gets there: the body has to shrink below 2
+bits per weight. Ternary has 1.58 bits of entropy; five trits in a byte is
+1.6 bpw, and FORMAT.md already reserved that container (T3_G128, dtype 5,
+26 bytes per 128-group, base-3 `c0 + 3c1 + ... + 81c4`) -- the Metal
+matvec reads it, CUDA never did. Now it does, and the file bytes are the
+Metal ones.
+
+**The device layout is chosen for identity, not for the file.** Upload
+relays the 26-byte groups into a window layout (kernels.cuh, T3 section):
+a window is 160 chunks (5120 elements); lane L of the warp owns chunks L,
+L+32, ... exactly as k_gemv_q4/t2 do, and its five chunks of a window sit
+together as one 8-u32 unit, stored half-split so both of the lane's 16-byte
+loads are 512 contiguous bytes across the warp. u32 k of a unit holds dp4a
+words 5k..5k+4 in the XQuant.eo order; each byte packs one lane's five
+codes as `V = sum code_r * 3^(4-r)`, stored scaled `ceil(V*256/243)` so
+round r pops the next code as `(q*3)>>8`, two 16-bit lanes per u32 (the
+TQ1_0 top-digit trick; `T3Dec`). The 3^5 = 243 < 256 slack is what makes
+that exact (brute-forced over all 243 values before writing a line of CUDA).
+Because the lane -> chunk map and the per-chunk float chain (`s * (dot -
+isum)`) are gemv_t2's, **gemv_t3 is bitwise gemv_t2** on the same ternary
+matrix -- not "close", the same floats. Tail windows (6144 and 17408 cols)
+pack 1 or 2 chunks per lane at 8/16 bytes. Row bytes 1024 / 1280 / 3584 for
+5120 / 6144 / 17408 = 1.60 / 1.67 / 1.65 bpw before the fp16 scale.
+
+**Prefill stays on the T2 MMA GEMM**: `mmT` rewrites a T3 matrix into a
+22 MB T2 scratch (`t3_to_t2_device`: block = one (row, window), warp = one
+(chunk-in-unit, half) so the first-word residue is warp-uniform and every
+decode is a static instantiation) and calls gemm_t2_T on it. Same codes,
+same scales, so the GEMM output is the T2 pack's by construction; the cost
+is 12 GB of extra traffic per chunk (read 5.3, write 6.5), measured +4% on
+the --nll wall at chunk 512 on the 3090 (247 vs 238 s). vgemm refuses T3
+(gemv_t3_n serves every width); the DFlash2 head hook fails loud on a T3
+head (`d2_head_kind`), so `--slim` keeps embed and head in T2.
+
+**Gate (3090, bench/bonsai2/t3_gate_3090.sh)**, T2 slim pack vs T3 slim pack:
+
+    tools/t3_gate (new)   400/400 body matrices: gemv w1/2/5/8 BITWISE vs gemv_t2, T3->T2 conversion byte-equal to the T2 upload
+    test_kernels          429 PASS / 0 FAIL on the T3 pack (cpu_deq T3 reference; the slim T2 embed test now dispatches embed_row_t2)
+    ninv_test             ALL PASS (vgemm row skipped for T3 with a note; gemv_t3_n is the contract)
+    CLI canonical         generated md5 e8a16115 on both packs (fp8, 128 greedy); T3 74.6 t/s vs T2 76.8
+    server, turbo5k       four greedy texts IDENTICAL; T3 71-74 t/s vs T2 74-76 (1 slot, Q27_BATCH=0)
+    --nll chunk 512       mean NLL 2.224766 / PPL 9.2513 on BOTH packs (the tier-table protocol)
+
+**Speed: the extraction is exposed on the 3090.** Per-matrix bench
+(t3_gate --bench, blk.0.ffn_gate 17408x5120): T2 0.033 / 0.032 / 0.098 ms at
+widths 1/2/8 (719 GB/s), T3 0.035 / 0.041 / 0.102 (544 GB/s-equivalent on
+24% fewer bytes). Two trims that should have mattered did not: gathering the
+four popped codes with one `__byte_perm` instead of shift+mask (INT-pipe
+count 21 -> 15 per u32) and the half-split window (each LDG.128 a full 512-B
+run instead of a 32-B stride) both left the numbers where they were, so the
+limiter is neither INT issue nor coalescing; the serial five-round chain per
+u32 (ILP 8 across the unit) or occupancy is next to test. The decode step
+lands at T2's speed rather than 24% under it. On a 3060 the SM-to-bandwidth
+ratio is 1.33x the 3090's, so it should sit closer to the byte floor there
+(5.3 GB at 240 GB/s = 22 ms, ~40 t/s class); unmeasured.
+
+**The estimator was the other half of the fit.** The 12 GB run left 1.87 GB
+unused: with Q27_FIXED_STACK_GB the auto-ctx block trusted the value but the
+pool block still added its floors (graph + GDN constants 0.79 GB even under
+the env, the 0.25 arena-on pad, 256 MB per slot, the 1.0 GB Ampere slack) --
+1.45 GB reserved against a stack that measures 0.54 GB (post-weights 3.87
+minus the 0.23 arena, the 1.23 pool and the 1.87 spare). On an 8 GB card
+that reservation is the whole KV budget. The env now IS the reserve:
+single_fixed and ENG_FIXED_BYTES equal it, the per-slot pad is gone under
+it, and the pool slack is 0.15 GB like the auto-ctx one. Measure it as
+"vram at ready" minus pool minus arena on the target build; 0.6 for the 12g
+plain, 0.8 with the MTP ladder (its stack measures 0.74).
+
+**8 GB simulation (bench/bonsai2/g8_3090.sh: the hog leaves N GB free on
+the 3090, 12g build, Q27_FIXED_STACK_GB per pack, Ampere-default turbo5k
+KV, --ctx 49152, reference = the full-memory turbo5k texts)**:
+
+    pack           free    post-weights  pool     ctx      at ready  t/s (3090 silicon)  identity
+    t3-slim 6.06   8.8 GB  2.59 GB       1.61 GB  49152    0.20 GB   72-74               IDENTICAL x4
+    t3-slim        8.4     2.18          1.20     49152    0.20      72-74               IDENTICAL x4
+    t3-slim        8.0     1.78          0.88     45056    0.12      72-74               IDENTICAL x4
+    t3-slim        7.6     1.39          0.48     24576    0.12      72-74               IDENTICAL x4
+    t3-mtp  6.49   8.8     2.15          1.17     49152    0.01      98-119 (2.5-3.3/rd) width>=4 flips vs plain (control below)
+    t3-mtp         8.0     1.34          0.24     12288    0.14      98-119              same
+    t3-mtp         7.6     --            OOM at boot
+
+A headless 8 GB card (~8.0-8.3 GB free before the process context) serves
+the plain pack at 45K context and the MTP ladder at 12K; with a display on
+the card (~7.6 free) it is 24K plain and no ladder. Every plain text matches
+the full-memory server byte for byte. The ladder's long/code differ from
+plain by the known width>=4 near-tie flips (BUILDLOG (au)); the T2-mtp vs
+T3-mtp control on the same 12g binary at full memory: all four texts
+IDENTICAL, same round counts (9/26/279/540), T3 97-118 t/s vs T2 105-126 --
+the T3 ladder is the T2 ladder.
+
+Not done: an 8 GB card in this machine (the 3060 numbers above are silicon
+scaling, not a measurement); the extraction limiter; token_embd on the host
+(0.34 GB = 19K more tokens of turbo5k); a T3 head (0.07 GB, the same GEMV).
+Packs: bonsai2-27b-t3-slim.q27 6.055 GB (md5 292fbb0cc5f19ffdb2f60be19ad21e97,
+wsum 3b876779744bd102), bonsai2-27b-t3-mtp-slim.q27 6.486 GB (md5
+f49b3e52ebc3903637dabd2a9e3290e5, wsum b9ab2d8221224dfd); not published.
+
 ## 2026-09-19 (av): Bonsai 2 on a 12 GB card -- slim packs (7.2 / 7.6 GB), a sm_86-only server build, and a measured fixed stack: 32K plain or 20K with the MTP ladder
 
 The question was whether the 9.44 GB pack fits a 3060. It does not: on the

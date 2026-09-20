@@ -61,6 +61,46 @@ void gemv_t2(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int6
 void gemv_t2_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,
                float* const* ys, int64_t rows, int64_t cols, cudaStream_t st = 0);
 
+// ---- T3_G128 (ternary, five trits per byte; Bonsai 2 8 GB packs, 2026-09-20) ----
+// On disk (FORMAT.md): 26 bytes per 128-group, base-3 c0 + 3c1 + 9c2 + 27c3
+// + 81c4 (code c = trit + 1), byte 25 = columns 125..127 plus two code-1 pads;
+// the Metal matvec reads that directly. The CUDA copy is a DIFFERENT layout,
+// built once at upload (t3_relayout_device), chosen so the decode GEMV sums
+// exactly the chunks gemv_t2 sums, in its order -- so gemv_t3 is bitwise
+// gemv_t2 on the same ternary matrix:
+//   a chunk is 32 elements (the activation quant block); lane L of the warp
+//   owns chunks L, L+32, L+64, ... (k_gemv_q4's map). A WINDOW is 160 chunks
+//   (5120 elements). Lane L's five chunks of window m (160m + 32i + L,
+//   i = 0..4) form one 32-byte UNIT = 8 u32; a window stores u32 0..3 of all
+//   32 units lane-major in its first 512 bytes (row + 1024m + 16L) and u32
+//   4..7 in the second (row + 1024m + 512 + 16L), so each of the lane's two
+//   16-byte loads is 512 contiguous bytes across the warp (a 32-byte lane
+//   stride measured 25% slower on the 3090). u32 k of a unit holds dp4a
+//   words 5k..5k+4 of the unit's 40 (word
+//   qu = 8i + q: chunk i, activation word q in the XQuant.eo order, byte lane
+//   b = element 32c + 8(q/2) + 2b + (q%2)). Byte b of the u32 packs lane b's
+//   five codes across those words, V = sum_r code_r * 3^(4-r), stored SCALED
+//   as ceil(V*256/243): round r then pops the next code as (q*3)>>8 with
+//   q = (q*3)&255 (the TQ1_0 top-digit trick), two 16-bit lanes per u32.
+//   A tail window (cols/32 % 160 != 0; 1 or 2 chunks per lane on this model)
+//   packs ceil(8*ni/5) u32 per lane rounded up to an even count. Pad words
+//   are code 1 (zero). t3_row_bytes: 5120 -> 1024, 6144 -> 1280, 17408 -> 3584
+//   (1.60 / 1.67 / 1.65 bits per weight before the fp16 scale per 128).
+// The prefill MMA GEMM stays gemm_t2_T: t3_to_t2_device rewrites one T3 matrix
+// into T2's device-interleaved words (a ~22 MB scratch) right before it.
+uint64_t t3_row_bytes(uint64_t cols);
+uint64_t t3_device_bytes(uint64_t rows, uint64_t cols);
+// src26: the FORMAT.md bytes (device memory), dst: t3_device_bytes(rows, cols)
+void t3_relayout_device(const uint8_t* src26, uint8_t* dst, int64_t rows, int64_t cols,
+                        cudaStream_t st = 0);
+void gemv_t3(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+             int64_t cols, cudaStream_t st = 0);
+void gemv_t3_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,
+               float* const* ys, int64_t rows, int64_t cols, cudaStream_t st = 0);
+// W3: t3 device layout; W2: rows * cols/4 bytes in the t2_interleave_device order
+void t3_to_t2_device(const uint8_t* W3, uint8_t* W2, int64_t rows, int64_t cols,
+                     cudaStream_t st = 0);
+
 // y = x * rsqrt(mean(x^2) + eps) * w      (single vector, n elements)
 void rmsnorm(const float* x, const float* w, float* y, int n, float eps, cudaStream_t st = 0);
 
