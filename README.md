@@ -191,6 +191,15 @@ Qwen tiers' class from a 9.9 GB pack (BUILDLOG 2026-09-18 (au); the
 ladder is bitwise vs plain decode at 1500 CLI tokens, and the width-4-plus
 verify has the engine's own near-tie flips on either model).
 
+On a 12 GB card (3060 class): `repack.py --slim` stores the embedding and
+head as T2 too (exact; 7.2 GB, or 7.6 GB with the MTP head), the
+`build/q27-server-12g` target is a single sm_86 image with 8 lanes and
+256-row prefill chunks, and `Q27_FIXED_STACK_GB=0.9` tells the pool sizer
+what that build actually costs. Simulated at 11.7 GB free on the 3090: 32K
+context plain, 20K with the MTP ladder, bitwise the full pack's plain
+decode; the 2.1 GB DFlash2 pack leaves only 4K there, so the MTP pack is
+the 12 GB drafter (BUILDLOG 2026-09-19 (av)).
+
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
 # serve with the Qwen3.8 tokenizer and DFlash2 pack (tools/launch_q27_38.sh

@@ -674,8 +674,7 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
     const DevTensor& emb = e0.shared_dm().get("token_embd.weight");
-    q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok, N_EMBD,
-                 LANESV(v, h), v.stm, v.vw);
+    e0.embed_lanes(emb, v.vtok, LANESV(v, h), v.stm, v.vw);
     // Bonsai 2 mirror (2026-09-18, spec_verify_forward's bz_* sites): the
     // embedding rows are stored rotated (inverse after lookup); every layer-
     // input norm becomes norm -> rotate -> quantize in one launch (the pre

@@ -24,3 +24,8 @@ it, and stop the transcribers for 3090 work. Output dir: `OUT` (default
 - `width_probe_3090.sh` -- runs `tools/width_probe` (bitwise multi-lane vs
   plain: widths, folds, rejections, truncations, graph replay) at a deep
   position: the code prompt plus 550 plain-decoded tokens.
+- `gate12g_3090.sh` + `vram_hog.py` -- the 12 GB-card simulation: a torch
+  process holds VRAM on the 3090 (HOG GB) so the server sees a 3060's free
+  memory, then `build/q27-server-12g` boots a `--slim` pack (LEGS=plain|mtp|d2,
+  SLIM=<pack>, FIXED=<Q27_FIXED_STACK_GB>) and its texts are compared with
+  the plain reference when one is present.

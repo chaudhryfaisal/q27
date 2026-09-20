@@ -1144,6 +1144,25 @@ __global__ void k_embed_rows_q8_T(const int8_t* __restrict__ emb, const __half* 
         out[(size_t)t * cols + i] = (float)row[i] * __half2float(sr[i / 128]);
 }
 
+__global__ void k_embed_rows_t2_T(const uint8_t* __restrict__ emb, const __half* __restrict__ sc,
+                                  const int* __restrict__ toks, int cols, float* __restrict__ out) {
+    int t = blockIdx.y;
+    int tok = toks[t];
+    const uint8_t* row = emb + (size_t)tok * (cols / 4);
+    const __half* sr = sc + (size_t)tok * (cols / 128);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += gridDim.x * blockDim.x) {
+        const uint32_t w = ((const uint32_t*)row)[i >> 4];
+        const int j = i & 15;
+        const int f = j < 8 ? 4 * (j >> 1) + (j & 1) : 4 * ((j - 8) >> 1) + 2 + ((j - 8) & 1);
+        out[(size_t)t * cols + i] = (float)((int)((w >> (2 * f)) & 3u) - 1) * __half2float(sr[i >> 7]);
+    }
+}
+void embed_rows_t2_T(const uint8_t* emb, const __half* scales, const int* toks, int cols, int T,
+                     float* out, cudaStream_t st) {
+    dim3 grid(20, T);
+    k_embed_rows_t2_T<<<grid, 256, 0, st>>>(emb, scales, toks, cols, out);
+    CUDA_CHECK(cudaGetLastError());
+}
 void embed_rows_q8_T(const int8_t* emb, const __half* scales, const int* toks, int cols, int T,
                      float* out, cudaStream_t st) {
     dim3 grid(20, T);

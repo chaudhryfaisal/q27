@@ -681,6 +681,34 @@ void silu_mul(const float* g, const float* u, float* o, int n, cudaStream_t st) 
     k_silu_mul<<<(n + 255) / 256, 256, 0, st>>>(g, u, o, n);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// T2_G128 embedding rows (Bonsai 2 slim packs, 2026-09-19): element e of a
+// row lives in the device-interleaved 16-code word e/16 (t2_interleave_device
+// order), value = (code - 1) * scale[e/128]. Same float per element as the
+// exact-Q8 row (int8 = trit), so lookups are bitwise the Q8 path's.
+__device__ __forceinline__ float t2_row_elem(const uint8_t* __restrict__ row, const __half* __restrict__ sr,
+                                             int64_t e) {
+    const uint32_t w = ((const uint32_t*)row)[e >> 4];
+    const int j = (int)(e & 15);
+    const int f = j < 8 ? 4 * (j >> 1) + (j & 1) : 4 * ((j - 8) >> 1) + 2 + ((j - 8) & 1);
+    const int code = (int)((w >> (2 * f)) & 3u);
+    return (float)(code - 1) * __half2float(sr[e >> 7]);
+}
+__global__ void k_embed_row_t2(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                               const int* __restrict__ d_token, int64_t cols,
+                               float* __restrict__ out) {
+    int64_t row = *d_token;
+    const uint8_t* wr = W + row * (cols / 4);
+    const __half* sr = S + row * (cols / 128);
+    for (int64_t c = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; c < cols;
+         c += (int64_t)gridDim.x * blockDim.x)
+        out[c] = t2_row_elem(wr, sr, c);
+}
+void embed_row_t2(const uint8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
+                  cudaStream_t st) {
+    k_embed_row_t2<<<8, 256, 0, st>>>(W, S, d_token, cols, out);
+    CUDA_CHECK(cudaGetLastError());
+}
 void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
                   cudaStream_t st) {
     k_embed_row_q8<<<8, 256, 0, st>>>(W, S, d_token, cols, out);

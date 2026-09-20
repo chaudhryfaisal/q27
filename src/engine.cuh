@@ -431,6 +431,27 @@ struct Engine {
         q27k::hadamard1024_rows(x, bz_signs(width), width, T, width, false, stm);
     }
     void bz_unrot_embed(float* x, cudaStream_t st) { q27k::hadamard1024(x, bz_s5120, N_EMBD, true, st); }
+    // Embedding lookups dispatched on the table's dtype: exact-Q8 (Bonsai 2
+    // t2 packs, every Qwen tier) or T2_G128 (Bonsai 2 slim packs, 2026-09-19;
+    // bitwise the Q8 lookup for an exact ternary table).
+    void embed_row(const DevTensor& emb, const int* tok, float* out, cudaStream_t st) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed_row_t2((const uint8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st);
+        else
+            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st);
+    }
+    void embed_lanes(const DevTensor& emb, q27k::IP3 tok, q27k::P3 out, cudaStream_t st, int ntok) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed3_t2((const uint8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st, ntok);
+        else
+            q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st, ntok);
+    }
+    void embed_rows_T(const DevTensor& emb, const int* toks, int T, float* out) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed_rows_t2_T((const uint8_t*)emb.data, (const __half*)emb.scales, toks, N_EMBD, T, out, stm);
+        else
+            q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, toks, N_EMBD, T, out, stm);
+    }
     void bz_unrot_embed_T(float* x, int T) {
         q27k::hadamard1024_rows(x, bz_s5120, N_EMBD, T, N_EMBD, true, stm);
     }
@@ -1738,8 +1759,7 @@ struct Engine {
     static constexpr int DFLASH_TAPS[5] = {5, 19, 33, 47, 61};
     void token_launches(float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
-                           stm);
+        embed_row(emb, d_token, h, stm);
         if (bonsai2) bz_unrot_embed(h, stm);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
@@ -1773,8 +1793,7 @@ struct Engine {
     // untouched -- this is a SEPARATE graph, never on the canonical-gated path.
     void token_launches_sampled() {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
-                           stm);
+        embed_row(emb, d_token, h, stm);
         if (bonsai2) bz_unrot_embed(h, stm);
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
@@ -1937,8 +1956,7 @@ struct Engine {
         const float* en = (const float*)T(il, "nextn.enorm.weight").data;
         const float* hn = (const float*)T(il, "nextn.hnorm.weight").data;
         if (v.vw == 1) {
-            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, v.tok[0],
-                               N_EMBD, v.e_hn[0], v.stm);
+            embed_row(emb, v.tok[0], v.e_hn[0], v.stm);
             if (bonsai2) bz_unrot_embed(v.e_hn[0], v.stm); // rotated embedding rows
             q27k::rmsnorm(v.e_hn[0], en, v.e_hn[0], N_EMBD, EPS, v.stm);
             q27k::rmsnorm(v.h_src[0], hn, v.e_hn[0] + N_EMBD, N_EMBD, EPS, v.stm);
@@ -1947,8 +1965,7 @@ struct Engine {
             return;
         }
         q27k::IP3 tk LANESV(v, tok);
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tk, N_EMBD,
-                     LANESV(v, e_hn), v.stm, v.vw);
+        embed_lanes(emb, tk, LANESV(v, e_hn), v.stm, v.vw);
         if (bonsai2) bz_unrot_lanes(v.e_hn, v.vw, v.stm); // rotated embedding rows
         q27k::CP3 Ec LANESV(v, e_hn);
         q27k::P3 Em LANESV(v, e_hn);
@@ -2522,9 +2539,7 @@ struct Engine {
         // MUST be mirrored there and re-gated with fused_smoke (build line
         // in tools/fused_smoke.cu's header).
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok,
-                     N_EMBD, LANESV(v, h), v.stm,
-                     v.vw);
+        embed_lanes(emb, v.vtok, LANESV(v, h), v.stm, v.vw);
         if (bonsai2) bz_unrot_lanes(v.h, v.vw, v.stm);
         q27k::CP3 Hc LANESV(v, h),
             Yc LANESV(v, y);
@@ -3135,7 +3150,8 @@ struct Engine {
         // rows (the serving pack ships no fp16 target.embed). MUST precede
         // alloc(), which caches the mask-token embedding.
         const DevTensor& ew = dm.get("token_embd.weight");
-        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales,
+                             ew.dtype == DType::T2_G128 ? 2 : 0);
         if (bonsai2) d2->set_bonsai2_signs(bz_s5120); // rotated embed table + folded head
         d2->alloc(4096); // sliding ring (window 2048 + headroom)
         set_round_width(d2_w);
@@ -4264,8 +4280,7 @@ struct Engine {
     // compute change) -- prefill stays byte-identical when taps == nullptr.
     void prefill_chunk(const int* d_toks, int base, int T, float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
-                              N_EMBD, T, hT, stm);
+        embed_rows_T(emb, d_toks, T, hT);
         if (bonsai2) bz_unrot_embed_T(hT, T);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
@@ -4306,8 +4321,7 @@ struct Engine {
         const DevTensor& emb = dm.get("token_embd.weight");
         const int KVROW = N_KV * HEAD_DIM;
         // x1T currently holds output_norm(hT) (set by caller)
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks_next,
-                              N_EMBD, T, embT, stm);
+        embed_rows_T(emb, d_toks_next, T, embT);
         if (bonsai2) bz_unrot_embed_T(embT, T); // rotated embedding rows
         q27k::rmsnorm_T(embT, (const float*)T2(il, "nextn.enorm.weight").data, ehnT, N_EMBD, T,
                         EPS, stm, N_EMBD, 2 * N_EMBD);

@@ -320,6 +320,17 @@ build/q27-server-w8: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h s
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
+# 12GB-card (3060-class, sm_86 only) server (2026-09-19, Bonsai 2 slim packs):
+# W_MAX=8 lanes, 256-row prefill chunks (the arena is 1/4 of the 1024-row one),
+# a single sm_86 image (kEngBase is mostly module images on Ampere). Same
+# sources, own binary; pair it with a `repack.py --slim` pack.
+build/q27-server-12g: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/unicode_tables.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
+                     src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
+                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -Xcompiler -Wall -DQ27_W_MAX=8 -DQ27_PF_T=256 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
+
 # Continuous-batching gates (docs/plans/2026-07-14-continuous-batching.md):
 #   ninv_test      -- N-invariance: per-lane weight-kernel output must be bitwise
 #                     independent of union width and slot (the batching contract).

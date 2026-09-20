@@ -46,6 +46,8 @@ bool prefill_g32_needed();
 // Batched small ops. Layout everywhere: [T][dim] token-major contiguous.
 void embed_rows_q8_T(const int8_t* emb, const __half* scales, const int* toks, int cols, int T,
                      float* out, cudaStream_t st);
+void embed_rows_t2_T(const uint8_t* emb, const __half* scales, const int* toks, int cols, int T,
+                     float* out, cudaStream_t st);
 void rmsnorm_T(const float* x, const float* w, float* y, int n, int T, float eps,
                cudaStream_t st, int in_row = 0, int out_row = 0);
 void rmsnorm_heads_T(const float* x, const float* w, float* y, int n_heads, int head_dim,

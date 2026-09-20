@@ -138,8 +138,11 @@ bool metal_weight_dtype_supported(DType dtype) {
     return false;
 }
 void validate_cuda_tensor(const Tensor& tensor) {
-    if(tensor.name=="token_embd.weight" && tensor.dtype!=DType::Q8_G128)
-        throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128");
+    // the embedding lookups are Q8 (every Qwen tier, Bonsai 2 t2 packs) or
+    // T2 (Bonsai 2 slim packs, 2026-09-19); no Q4/F16/B1 row kernels exist
+    if(tensor.name=="token_embd.weight" && tensor.dtype!=DType::Q8_G128 &&
+       tensor.dtype!=DType::T2_G128)
+        throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128 or T2_G128");
     if(!cuda_weight_dtype_supported(tensor.dtype))
         throw std::runtime_error("q27 CUDA: unsupported weight dtype " +
                                  std::string(dtype_name(tensor.dtype)) +

@@ -666,7 +666,13 @@ int main(int argc, char** argv) {
     // Q27_SAMPLED=0 and overcommitted ~0.3-0.55 GB.
     const double kEngMonoSave = cc_arch >= 89 ? 0.01e9 : 0.015e9;
     const double kEngSampSave = cc_arch >= 89 ? 0.03e9 : 0.05e9;
-    const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+    // Q27_FIXED_STACK_GB (2026-09-19): the single-slot non-KV stack, measured,
+    // for builds the per-arch calibration does not describe -- the 12g build
+    // (sm_86 image only, W8, 256-row prefill) measures ~0.75 GB on a 3090
+    // where the fat-binary sm_86 figure is 4.3, and the difference is the
+    // whole KV budget on a 12 GB card. Replaces kEngBase so single_fixed ==
+    // the given value; the Ampere slack drops to 0.15 GB with it.
+    const double fixed_env = getenv("Q27_FIXED_STACK_GB") ? atof(getenv("Q27_FIXED_STACK_GB")) * 1e9 : -1.0;
     // M3a: chunk-sized prefill scratch. Computed from the same constants the
     // arena allocates from (not a guess): the PF_T staging set + split-attn
     // partials + fp4 pair + g64 FFN staging + WY/split-K panels. Charged ONCE
@@ -693,6 +699,8 @@ int main(int argc, char** argv) {
     // 48 GDN layers). MIRRORS Engine gdn_state_bytes -- the 11 spare role
     // sets of the retired rotation are gone (was (W_MAX+1) x 0.157e9).
     const double kEngGdn = 2 * 0.157e9 + (Q27_W_MAX - 1) * 3.95e6;
+    const double kEngBase = fixed_env > 0 ? std::max(0.0, fixed_env - kEngGraphs - kEngGdn)
+                                          : cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
     // per-slot non-KV = single-engine stack + co-residency scratch (the
     // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
     // this + KV so it agrees with what auto-ctx sized for.
@@ -831,7 +839,7 @@ int main(int argc, char** argv) {
             // to spare. >8-width graph slope on sm_89 is UNMEASURED; it
             // deliberately shares sm_86's fat slope below (under-pick beats
             // a dead boot).
-            const double base = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+            const double base = kEngBase; // per-arch calibration, or Q27_FIXED_STACK_GB
             // SINGLE-slot non-KV stack (base + GDN state + graph zoo - capture
             // saves): this is what N==1 uses, and it must stay exact (drives
             // the 262144/57344/... single-slot picks). Reuses the hoisted
@@ -849,7 +857,7 @@ int main(int argc, char** argv) {
                 // cap (issue #6, NHClimber87: sized 184320 -> OOM). Give
                 // Ampere/Ada ~1 GB of real headroom; sm_120 (32GB, cap usually
                 // binds) keeps the tight margin.
-                const double slack = cc_arch >= 120 ? 0.25e9 : 1.0e9;
+                const double slack = fixed_env > 0 ? 0.15e9 : cc_arch >= 120 ? 0.25e9 : 1.0e9;
                 budget = (long)((double)free_b - single_fixed - slack);
                 c = budget > 0 ? (long)(budget / per_tok) : 0;
             } else {

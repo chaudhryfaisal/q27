@@ -220,7 +220,8 @@ int main(int argc, char** argv) {
             // serving packs drop target.embed/target.head: use the engine's Q8
             // embedding like the server does (Bonsai: inverse-rotated inside)
             const DevTensor& ew = e.dm.get("token_embd.weight");
-            d2.set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+            d2.set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales,
+                                ew.dtype == DType::T2_G128 ? 2 : 0);
         }
         if (e.bonsai2) d2.set_bonsai2_signs(e.bz_s5120); // rotated embed table + folded head
         float* d_vtaps;
@@ -1199,8 +1200,7 @@ int main(int argc, char** argv) {
         e.reset();
         const DevTensor& emb = e.dm.get("token_embd.weight");
         CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
-                           N_EMBD, e.h, e.stm);
+        e.embed_row(emb, e.d_token, e.h, e.stm);
         q27k::rmsnorm(e.h, (const float*)e.T(0, "attn_norm.weight").data, e.x1, N_EMBD, EPS,
                       e.stm);
         e.gdn_block(0, e.x1, e.y);
@@ -1213,8 +1213,7 @@ int main(int argc, char** argv) {
         // batched layer 0, T=1
         e.reset();
         CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
-                              N_EMBD, 1, e.hT, e.stm);
+        e.embed_rows_T(emb, e.d_token, 1, e.hT);
         q27k::rmsnorm_T(e.hT, (const float*)e.T(0, "attn_norm.weight").data, e.x1T, N_EMBD, 1,
                         EPS, e.stm);
         e.gdn_block_T(0, 1);

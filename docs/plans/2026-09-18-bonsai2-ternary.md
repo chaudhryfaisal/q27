@@ -184,6 +184,12 @@ today. That isolates the only new piece of math -- the activation rotation
   path (Qwen tier flips too on sm_86). 5090 ladder 173 / 231 / 384 / 512
   t/s at C=1/2/4/8. BUILDLOG (au).
 
+- 09-19: the 12 GB-card attempt -- `--slim` packs (T2 embed + head, 7.2 /
+  7.6 GB), `q27-server-12g` (sm_86 only, W8, PF_T 256), Q27_FIXED_STACK_GB
+  for the pool sizer; simulated at 11.7 GB free: 32K plain / 20K ladder,
+  bitwise vs the full pack. BUILDLOG (av). The "T2 head everywhere" item
+  is done by way of it.
+
 ## Risks and open questions
 
 - DFlash2 acceptance on the ternary target (drafter trained on BF16).

@@ -599,7 +599,7 @@ void Dflash2::alloc(int cap) {
         D2CHECK(cudaMalloc(&d_mask_tok, 4));
         const int mtok = D2_MASK;
         D2CHECK(cudaMemcpy(d_mask_tok, &mtok, 4, cudaMemcpyHostToDevice));
-        q27k::embed_row_q8(eembed_data, eembed_scales, d_mask_tok, D2_H, maskrow, 0);
+        engine_embed_row(d_mask_tok, maskrow, 0);
         if (bz_signs) q27k::hadamard1024(maskrow, bz_signs, D2_H, true, 0); // rotated table
     } else {
         k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
@@ -759,7 +759,7 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     char nm[64];
     // anchor row (engine Q8 embed, device anchor) + K mask rows
     if (eembed_data) {
-        q27k::embed_row_q8(eembed_data, eembed_scales, d_anchor_tok, D2_H, nx, st);
+        engine_embed_row(d_anchor_tok, nx, st);
         if (bz_signs) q27k::hadamard1024(nx, bz_signs, D2_H, true, st); // rotated table
     }
     for (int r = 1; r < W; r++)

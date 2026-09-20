@@ -819,6 +819,10 @@ def main():
                          "Ternary-Bonsai-2-27B-MTP model_mtp.safetensors) appended as the "
                          "blk.64 MTP block (Q8 matmuls, F32 norms, UNROTATED -- the engine "
                          "skips the Hadamard rotation for that layer). Sets block_count 65.")
+    ap.add_argument("--slim", action="store_true",
+                    help="Bonsai 2 t2 packs: token_embd and output as T2_G128 too (exact; the "
+                         "engine's T2 embedding lookups and head GEMV are bitwise the Q8 ones) and "
+                         "no output_q4.weight copy -- 9.44 -> ~7.5 GB, the 12 GB-card pack (2026-09-19)")
     ap.add_argument("--name", default=None,
                     help="general.name to write for Bonsai 2 packs (default 'Bonsai2 Ternary Qwen38 27b'; "
                          "must contain qwen38 for the engine's dialect/template keying)")
@@ -911,7 +915,7 @@ def main():
         # Ternary values in exact Q4_G64 / Q8_G128 containers (trit*d bit-for-bit)
         # plus the rotation the engine must apply to activations. No MTP block.
         meta["bonsai2"] = True
-        meta["bonsai2_container"] = args.bonsai2_container
+        meta["bonsai2_container"] = args.bonsai2_container + ("-slim" if args.slim else "")
         meta["hadamard"] = bonsai2_hadamard_meta(r)
     if ternary or (bonsai2 and args.bonsai2_container != "q4x"):
         meta["group_t2"] = GROUP_T2
@@ -993,7 +997,7 @@ def main():
         # MTP draft head copy: only for non-quantized-head packs and pack
         # types that carry MTP (no MTP in ternary/binary packs).
         if t.name == "output.weight" and not args.q4_head \
-                and not ternary and not binary:
+                and not ternary and not binary and not (bonsai2 and args.slim):
             extra.append(("output_q4.weight", t))
     if bonsai2 and args.mtp_safetensors:
         mtp_st = load_mtp_safetensors(args.mtp_safetensors)
@@ -1038,7 +1042,7 @@ def main():
         elif bonsai2 and t.tensor_type.name in BONSAI2_TYPES:
             # Phase 1 containers: exact Q8 for the two Q8-only engine paths
             # (embedding lookup, head), exact Q4 for every rotated matrix.
-            if t.name in ("token_embd.weight", "output.weight"):
+            if t.name in ("token_embd.weight", "output.weight") and not args.slim:
                 verbatim = (DTYPE_Q8, repack_bonsai2_q8x)
             elif t.name.endswith(".q4x"):
                 verbatim = (DTYPE_Q4, repack_bonsai2_q4x)   # prefill shadow of a T2 base

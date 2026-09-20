@@ -15714,6 +15714,53 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-19 (av): Bonsai 2 on a 12 GB card -- slim packs (7.2 / 7.6 GB), a sm_86-only server build, and a measured fixed stack: 32K plain or 20K with the MTP ladder
+
+The question was whether the 9.44 GB pack fits a 3060. It does not: on the
+3090 the server's own accounting put 4.25 GB of non-KV stack beside the
+weights (24 - 9.44 weights - 10.31 KV pool), which is the whole card on a
+12 GB part. Three levers, all landed:
+
+- **`repack.py --slim`**: token_embd and output as T2_G128 too (exact -- an
+  int8 trit in a 2-bit box), no output_q4 copy. Three new kernels
+  (embed_row_t2 / embed3_t2 / embed_rows_t2_T over the device-interleaved
+  words, kernels.cuh order) behind engine helpers embed_row / embed_lanes /
+  embed_rows_T that dispatch on the table's dtype at all nine lookup sites
+  (decode, sampled, the MTP draft path single and lanes, the verify forward,
+  the fused round, prefill, the MTP warm, the CLI); DFlash2's engine-embed
+  hook takes a kind. The loader contract that pinned token_embd to Q8 now
+  admits T2 (test_loader_contracts updated; Q4 is the illegal example).
+  Pure slim 7.20 GB (wsum 36e2d6597bac3347), slim + MTP 7.63 GB (wsum
+  b5069c622882b042).
+- **`build/q27-server-12g`** (Makefile): a single sm_86 image, W_MAX=8,
+  256-row prefill chunks. On Ampere the calibrated base (1.77 GB) is mostly
+  module images for three architectures plus the 1024-row arena; this build
+  measures ~0.75 GB of total non-KV stack (free 3.87 GB post-weights, 2.83
+  at ready with an 8K KV).
+- **`Q27_FIXED_STACK_GB`** (server): the estimator's per-arch calibration
+  cannot describe that build, refused the paged pool ("pool -0.41 GB") and
+  fell back to an 8K per-slot KV with 2.8 GB unused. The env replaces
+  kEngBase so the single-slot fixed stack equals the given value (Ampere
+  slack 0.15 GB with it). 0.9 is the 12g figure.
+
+**Gate (3090, bench/bonsai2/gate12g_3090.sh + vram_hog.py)**: a torch
+process holds 12.4 GB so the server sees 11.70 GB free (a 3060's usable
+memory, slightly pessimistic). 12g build + slim pack + FIXED 0.9:
+
+    leg                         pack   post-weights  pool     ctx     at ready  t/s (3090 silicon)     identity vs pure-pack plain
+    plain                       7.20   3.87 GB       1.23 GB  32768   1.87 GB   74-77 (vs 70 Q8 head)  IDENTICAL x4 (T2 embed + head are exact)
+    MTP ladder (slim+mtp)       7.63   3.43 GB       0.80 GB  20480   1.69 GB   102-127                short/cities identical; long/code the known width>=4 flips
+    DFlash2 (Bonsai pack)       7.20   3.87 GB       0.23 GB  4096    0.48 GB   123-182                same flip class
+
+So a 12 GB card serves Bonsai 2 at 32K context plain or 20K with the MTP
+ladder; the 2.1 GB DFlash2 pack costs the context (4K), so the MTP pack is
+the 12 GB drafter. Speed on a real 3060 scales with bandwidth (360 vs 936
+GB/s): expect ~30 t/s plain, ~45 with the ladder. The ctx caps come from
+the pool's "entitlable window" rule with 1.7-1.9 GB still free at ready,
+so there is headroom in the policy if a 12 GB user wants it. Slim packs
+are local for now (md5 12ee25013ee2985f1236170bd2a6abec /
+5cecaf4544b96843bf6f3fdfe413c9b0); publishing is a separate call.
+
 ## 2026-09-18 (au): the lane-1 draft -- a third-party MTP head on the ternary target; 8 slots at 16K = 512 t/s aggregate (was 329), C=1 173 t/s (was 105)
 
 The (at) ladder left half of every fused round's lanes empty because a

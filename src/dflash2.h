@@ -115,11 +115,19 @@ struct Dflash2 {
     // packed fp16 target.embed -- saves 2.5 GB of VRAM (= more KV/ctx).
     const int8_t* eembed_data = nullptr;
     const __half* eembed_scales = nullptr;
+    int eembed_kind = 0; // 0 = Q8_G128, 2 = T2_G128 (Bonsai 2 slim packs)
     int* d_anchor_tok = nullptr;
     int* d_mask_tok = nullptr;
-    void set_engine_embed(const int8_t* data, const __half* scales) {
+    void set_engine_embed(const int8_t* data, const __half* scales, int kind = 0) {
         eembed_data = data;
         eembed_scales = scales;
+        eembed_kind = kind;
+    }
+    void engine_embed_row(const int* tok, float* out, cudaStream_t st) {
+        if (eembed_kind == 2)
+            q27k::embed_row_t2((const uint8_t*)eembed_data, eembed_scales, tok, D2_H, out, st);
+        else
+            q27k::embed_row_q8(eembed_data, eembed_scales, tok, D2_H, out, st);
     }
     // Bonsai 2 (docs/plans/2026-09-18-bonsai2-ternary.md): the engine's
     // token_embd rows are Hadamard-rotated (inverse after lookup) and its

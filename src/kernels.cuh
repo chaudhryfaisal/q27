@@ -70,6 +70,10 @@ void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_
 // out[0..cols) = dequantized row *d_token of a Q8_G128 matrix (embedding lookup)
 void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
                   cudaStream_t st = 0);
+// same over a T2_G128 embedding (device-interleaved words; bitwise the Q8 row
+// for an exact ternary table -- Bonsai 2 slim packs)
+void embed_row_t2(const uint8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
+                  cudaStream_t st = 0);
 
 // Grid-merged multi-token variants for the speculative round: identical
 // per-token work distribution, tokens mapped to an extra grid dimension
