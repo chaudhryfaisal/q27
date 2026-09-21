@@ -261,13 +261,13 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-09-18)
+## State of the engine (2026-09-21)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.13.0](https://github.com/signalnine/q27/releases).
+release: [v0.14.0](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -283,7 +283,10 @@ under [bench/crossengine/](bench/crossengine/):
   Qwen3.8 default tier and reasons about twice as long per instance --
   same patches landed, 2.3x the wall (09-18; the tier table below). Fused
   multi-slot rounds serve it at 329 t/s aggregate over 8 slots at 16K, and
-  512 t/s with a third-party MTP head repacked into the pack.
+  512 t/s with a third-party MTP head repacked into the pack. Small cards
+  (v0.14.0): slim packs and a sm_86 build put it on 12 GB (32K context),
+  and a five-trits-per-byte container, bitwise the 2-bit pack, on 8 GB
+  (6.06 GB, 45K context headless; `tools/install-bonsai2-8gb.sh`).
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
