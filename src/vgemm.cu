@@ -364,8 +364,14 @@ int vgemm_z(int64_t rows, int64_t cols) {
 size_t vgemm_ws_bytes_model(const q27::Model& m, int64_t min_rows) {
     size_t mx = 0;
     for (const q27::Tensor& t : m.tensors) {
+        // T3_G128 never runs the vgemm (vgemm_verify refuses it), but the
+        // workspace must exist: the conductor's union view asserts on it
+        // (build_union_view), and a T3 pack's only other matmuls are the
+        // Q8 MTP block -- a T3 body without one sized the workspace to zero
+        // and every fused round died at the assert (2026-09-21, the first
+        // 8 GB-card install without Q27_BATCH=0).
         if (t.dtype != q27::DType::Q4_G64 && t.dtype != q27::DType::Q8_G128 &&
-            t.dtype != q27::DType::T2_G128) continue;
+            t.dtype != q27::DType::T2_G128 && t.dtype != q27::DType::T3_G128) continue;
         const int64_t rows = (int64_t)t.rows(), cols = (int64_t)t.cols();
         if (rows < min_rows) continue;          // stays on the GEMV
         if (cols % VG_KB_MULT != 0) continue;   // ineligible; vgemm_verify refuses it

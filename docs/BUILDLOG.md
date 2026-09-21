@@ -15807,6 +15807,19 @@ T3-mtp control on the same 12g binary at full memory: all four texts
 IDENTICAL, same round counts (9/26/279/540), T3 97-118 t/s vs T2 105-126 --
 the T3 ladder is the T2 ladder.
 
+**09-21 follow-up, found by the installer test**: with the server DEFAULTS
+(conductor on, no Q27_BATCH=0 -- the one configuration none of the gates
+above ran) the T3 plain pack died at `build_union_view`'s
+`assert(vgemm_ws() != nullptr)`: vgemm_ws_bytes_model sized the workspace
+from Q4/Q8/T2 tensors only, and a T3 body without the Q8 MTP block has
+none, so the pointer was null. T3 shapes now size it (vgemm still refuses
+T3; the view only needs the buffer to exist). Re-gated with the conductor on
+(gate12g leg `fusedplain`): texts IDENTICAL x4 at full memory and at 8.0 GB
+free (45056 ctx again), but 59-60 t/s against 72-74 with Q27_BATCH=0 -- the
+k=1 fused round runs the width-2 GEMV, which is where gemv_t3_n loses most
+(0.041 vs 0.033 ms per ffn matrix). Single-slot 8 GB serving should set
+Q27_BATCH=0; the installer's run.sh does.
+
 Not done: an 8 GB card in this machine (the 3060 numbers above are silicon
 scaling, not a measurement); the extraction limiter; token_embd on the host
 (0.34 GB = 19K more tokens of turbo5k); a T3 head (0.07 GB, the same GEMV).
