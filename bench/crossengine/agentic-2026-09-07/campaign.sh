@@ -94,12 +94,44 @@ start_engine() { # $1 label
     # q27tok = the same config on a CANDIDATE binary (Q27_CANDIDATE, default
     # the master worktree's build): 2026-09-10 tokenizer fix (the tool tags as
     # added tokens) + 3.8 history rendering, against q27v0113c as the control.
-    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow)
+    # q27seed = the candidate binary with Q27_SEED=random: a fresh seed per
+    # request instead of seed 0 for every one (2026-09-17, issue #49 -- are the
+    # 12 q27 instances one draw of the first-move style, or twelve?)
+    # q27ladr = the candidate binary WITHOUT DFlash2 (MTP ladder + suffix
+    # drafter, batching default), otherwise the q27tok config: does the
+    # drafter change trajectory length? (2026-09-17; 09-07 had lad 12.7 turns
+    # vs d2 17.2-17.5, ninfer 13.8.)
+    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow|q27seed|q27ladr)
               B=$Q27; [ "$1" = q27pre0113 ] && B=$Q/build/q27-server.pre-v0.11.3
-              case "$1" in q27tok*) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
+              case "$1" in q27tok*|q27seed|q27ladr) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
+              D2ENV="-E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3"; [ "$1" = q27ladr ] && D2ENV=""
+              SEEDENV=""; [ "$1" = q27seed ] && SEEDENV="-E Q27_SEED=random"
               rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
-              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+              systemd-run --user --unit $unit $Q27ENV $D2ENV -E Q27_SYSBLK=1 $SEEDENV \
                 ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $MODEL $TOK $Q27ARGS \
+                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+    # bonsai2 = the candidate binary serving PrismML's Ternary Bonsai 2 27B
+    # (docs/plans/2026-09-18-bonsai2-ternary.md): T2 decode + .q4x prefill
+    # shadows, DFlash2 Q8 pack (the drafter rides the unrotated residual
+    # stream), otherwise the q27tok config. The engine detects the pack
+    # (bonsai2 meta) and rotates activations itself.
+    # bonsai2d2b = the same on the third-party Bonsai-trained DFlash2 drafter
+    # (ProCreations/Ternary-Bonsai-2-27B-DFlash2 packed by tools/dflash2_pack.py
+    # --q8; BONSAI2_PACK overrides) -- the 2026-09-18 bonsai2 leg ran the
+    # Qwen3.8 drafter on the t2+q4x pack, 3.47 tok/round; this is the
+    # target-trained drafter on the pure-T2 pack.
+    # bonsai2mtp = the T2+MTP pack (ProCreations' head as blk.64, BUILDLOG
+    # (au)) on the MTP ladder alone -- no DFlash2, batching default like
+    # q27ladr -- the single-slot A/B against bonsai2d2b (2026-09-18).
+    bonsai2|bonsai2d2b|bonsai2mtp)
+              B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server}
+              BZMODEL=${BONSAI2_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2.q27}
+              BZPACK=$PACK8; [ "$1" = bonsai2d2b ] && BZPACK=${BONSAI2_PACK:-/mnt/ai/models/bonsai2-27b-dflash2-bf16/bonsai2-dflash2-q8-serve.d2w}
+              BZD2ENV="-E Q27_BATCH=0 -E Q27_DFLASH2=$BZPACK -E Q27_DFLASH2_RESERVE_GB=3"
+              if [ "$1" = bonsai2mtp ]; then BZMODEL=${BONSAI2_MTP_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2-mtp.q27}; BZD2ENV=""; fi
+              rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
+              systemd-run --user --unit $unit $Q27ENV $BZD2ENV -E Q27_SYSBLK=1 \
+                ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $BZMODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
@@ -114,7 +146,7 @@ start_engine() { # $1 label
 }
 stop_engine() { systemctl --user stop $1-eval 2>/dev/null; sleep 3
   # a leg's cache root is scratch: drop it so it cannot crowd the next leg
-  case "$1" in q27prod) rm -rf /dev/shm/q27-pfx-campaign ;; q27*) rm -rf /dev/shm/q27-pfx-$1 ;; esac
+  case "$1" in q27prod) rm -rf /dev/shm/q27-pfx-campaign ;; q27*|bonsai*) rm -rf /dev/shm/q27-pfx-$1 ;; esac
   # the next leg binds :8081 too; ninfer exits on EADDRINUSE (09-09 probes)
   for i in $(seq 1 30); do ss -ltn | grep -q ':8081 ' || break; sleep 1; done
   # and for the old server's TIME_WAIT sockets: a q27 bind right after a

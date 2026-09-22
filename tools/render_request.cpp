@@ -19,18 +19,44 @@ using json = nlohmann::json;
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s model.tok out.i32 request.json [request.json ...] [--think] [--text OUT]\n",
+                "usage: %s model.tok out.i32 request.json [request.json ...] [--think] [--text OUT] [--dialect xml|json]\n"
+                "  --dialect: tool-call dialect of the rendered preamble. The server picks it from the\n"
+                "  artifact's general.name (qwen38 -> xml); this tool has no artifact, so without the\n"
+                "  flag or Q27_TOOL_DIALECT it infers from the model.tok path name and says so.\n",
                 argv[0]);
         return 2;
     }
     bool think_flag = false;
     const char* text_out = nullptr;
+    const char* dialect = nullptr;
     std::vector<const char*> reqs;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--think")) think_flag = true;
         else if (!strcmp(argv[i], "--text") && i + 1 < argc) text_out = argv[++i];
+        else if (!strcmp(argv[i], "--dialect") && i + 1 < argc) dialect = argv[++i];
         else reqs.push_back(argv[i]);
     }
+    // Tool dialect (2026-09-17): every raw-prompt arm rendered here before
+    // today carried the 3.6 JSON preamble for a 3.8 artifact because the
+    // server-side default keys on general.name, which a .tok does not carry --
+    // 83 tokens short of the served prompt and a different instruction block.
+    // --dialect or Q27_TOOL_DIALECT decides; otherwise infer from the path.
+    if (dialect) {
+        if (strcmp(dialect, "xml") && strcmp(dialect, "json")) {
+            fprintf(stderr, "--dialect must be xml or json\n");
+            return 2;
+        }
+        setenv("Q27_TOOL_DIALECT", dialect, 1);
+    }
+    if (!getenv("Q27_TOOL_DIALECT")) {
+        std::string norm;
+        for (const char* c = argv[1]; *c; c++)
+            if (isalnum((unsigned char)*c)) norm += (char)tolower((unsigned char)*c);
+        q27::tool_dialect_xml_default() = norm.find("qwen38") != std::string::npos;
+    }
+    fprintf(stderr, "tool dialect: %s (%s)\n", q27::tool_dialect_xml() ? "xml" : "json",
+            dialect ? "--dialect" : getenv("Q27_TOOL_DIALECT") ? "Q27_TOOL_DIALECT"
+                                                                : "inferred from the model.tok path; pass --dialect to override");
     q27::Tokenizer tok(argv[1]);
     std::string all;
     for (const char* path : reqs) {

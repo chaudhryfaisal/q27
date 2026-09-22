@@ -23,6 +23,9 @@ for seq in [int(x) for x in open(sel).read().split()]:
     ths = []
     for seed in range(1, N + 1):
         samp = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.05, seed=seed, stream=False)
+        # RT_TEMP / RT_TOPK override the sampler (greedy arm: RT_TEMP=0 RT_TOPK=1)
+        if os.environ.get("RT_TEMP"): samp["temperature"] = float(os.environ["RT_TEMP"])
+        if os.environ.get("RT_TOPK"): samp["top_k"] = int(os.environ["RT_TOPK"])
         if mode == "q27":
             url = "/v1/completions"; b = dict(prompt=prompt, max_tokens=max_tokens, **samp)
         else:
@@ -45,8 +48,9 @@ for seq in [int(x) for x in open(sel).read().split()]:
         think = len(text.split("</think>")[0].strip()) if closed else len(text.strip())
         after = text.split("</think>", 1)[1] if closed else ""
         tools = FN.findall(after)
+        narr = after.split("<tool_call>", 1)[0].strip() if tools else after.strip()  # visible text before the first call
         row = dict(seq=seq, seed=seed, think=think, closed=closed, tools=tools, out=ntok, prompt=npr,
-                   stop=stop, text_after=len(after.strip()), secs=round(dt, 2))
+                   stop=stop, text_after=len(after.strip()), narr=len(narr), secs=round(dt, 2))
         out.write(json.dumps(row) + "\n"); out.flush(); ths.append(think)
     ths.sort()
     print(f"  seq {seq:4d}: think median {ths[len(ths)//2] if ths else -1:6d} mean {sum(ths)/max(1,len(ths)):7.0f} (n={len(ths)})", flush=True)

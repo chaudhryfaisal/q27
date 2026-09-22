@@ -1,0 +1,12 @@
+{"seq": 1, "seed": 1, "think": 203, "closed": true, "tools": ["Bash"], "out": 119, "prompt": 25006, "stop": "stop", "text_after": 292, "narr": 75, "secs": 1.82}
+{"seq": 2, "seed": 1, "think": 238, "closed": true, "tools": ["Bash"], "out": 136, "prompt": 25068, "stop": "stop", "text_after": 354, "narr": 142, "secs": 1.89}
+{"seq": 3, "seed": 1, "think": 362, "closed": true, "tools": ["Bash", "Bash"], "out": 233, "prompt": 27157, "stop": "stop", "text_after": 528, "narr": 110, "secs": 2.87}
+{"seq": 4, "seed": 1, "think": 382, "closed": true, "tools": ["Bash", "Bash"], "out": 231, "prompt": 25201, "stop": "stop", "text_after": 506, "narr": 72, "secs": 2.34}
+{"seq": 5, "seed": 1, "think": 221, "closed": true, "tools": ["Bash", "Read"], "out": 146, "prompt": 25163, "stop": "stop", "text_after": 385, "narr": 91, "secs": 7.34}
+{"seq": 6, "seed": 1, "think": 379, "closed": true, "tools": ["Bash", "Bash"], "out": 232, "prompt": 25746, "stop": "stop", "text_after": 548, "narr": 65, "secs": 2.57}
+{"seq": 7, "seed": 1, "think": 180, "closed": true, "tools": ["Bash"], "out": 155, "prompt": 25583, "stop": "stop", "text_after": 397, "narr": 121, "secs": 2.12}
+{"seq": 8, "seed": 1, "think": 320, "closed": true, "tools": ["Bash"], "out": 195, "prompt": 25150, "stop": "stop", "text_after": 437, "narr": 112, "secs": 2.28}
+{"seq": 9, "seed": 1, "think": 202, "closed": true, "tools": ["Read"], "out": 96, "prompt": 25950, "stop": "stop", "text_after": 182, "narr": 63, "secs": 2.06}
+{"seq": 10, "seed": 1, "think": 490, "closed": true, "tools": ["Bash", "Bash"], "out": 259, "prompt": 25755, "stop": "stop", "text_after": 574, "narr": 112, "secs": 2.67}
+{"seq": 11, "seed": 1, "think": 242, "closed": true, "tools": ["Read"], "out": 109, "prompt": 26235, "stop": "stop", "text_after": 186, "narr": 63, "secs": 2.21}
+{"seq": 12, "seed": 1, "think": 354, "closed": true, "tools": ["Read"], "out": 141, "prompt": 25279, "stop": "stop", "text_after": 183, "narr": 59, "secs": 1.98}
