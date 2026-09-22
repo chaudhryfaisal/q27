@@ -3223,7 +3223,12 @@ struct Engine {
         // accumulation order of the int8 products), deterministic run-to-run
         // (no atomics) and outside the canonical contract by construction --
         // serving greedy was already not width-invariant across depth configs.
-        if (const char* vg = getenv("Q27_D2_VGEMM"); !vg || atoi(vg)) v.gemm_min = d2_w;
+        // T4 port Phase D2: vgemm is stubbed MMA below sm_80 — force the gemv
+        // verify there (silent zeros otherwise). Explicit VGEMM=0 keeps
+        // working everywhere; explicit =1 on sm_75 still means vgemm (sharp
+        // edge, for A/B only).
+        if (const char* vg = getenv("Q27_D2_VGEMM");
+            (!vg && q27k::image_arch() >= 800) || (vg && atoi(vg))) v.gemm_min = d2_w;
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
         spec_verify_forward(v, d2_vtaps);

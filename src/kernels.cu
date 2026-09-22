@@ -720,6 +720,10 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 // interleaved words), dp4a'd against the SAME even/odd activation words the
 // Q4 kernel reads. value = code - 1, so sum((c-1)*x) = dp4a(c, x) - isum.
 // (t2_dot32 now lives in kernels.cuh, shared with the prefill T-row kernel.)
+// T4 port Phase 4.6: tried __launch_bounds__(256, 2) here — decode mean
+// 23.3 vs 24.1 baseline (-3%, no occupancy headroom on Turing for this
+// shape); reverted. Remaining decode gap is pass-count (rotation), not
+// occupancy — kernel fusion is future work, see LOG.
 __global__ void k_gemv_t2(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                           const uint2* __restrict__ xeo, const float* __restrict__ xs,
                           const int* __restrict__ xisum, float* __restrict__ y, int64_t rows,

@@ -46,7 +46,14 @@ struct Dflash2 {
     std::map<std::string, D2Tensor> w;
     std::vector<char> pack; // host backing (codebooks are walked host-side)
     void load(const char* path);
-    const D2Tensor& T(const std::string& name) const { return w.at(name); }
+    const D2Tensor& T(const std::string& name) const {
+        // Log-and-throw (was bare w.at): names the missing key on stderr
+        // before out_of_range propagates (the server turns it into a 500).
+        // Added T4 port Phase D2.
+        auto it = w.find(name);
+        if (it == w.end()) fprintf(stderr, "dflash2: T() missing tensor '%s' (have %zu)\n", name.c_str(), w.size());
+        return w.at(name);
+    }
     const __half* f16(const std::string& n) const { return (const __half*)T(n).dev; }
     const float* f32(const std::string& n) const { return (const float*)T(n).dev; }
     // Quantized matmul: quantize the W-column activation once, then the

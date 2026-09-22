@@ -203,7 +203,11 @@ int main(int argc, char** argv) {
         }
         q27d2::Dflash2 d2;
         d2.load(d2_pack.c_str());
-        d2.alloc(NP + n_gen + 64);
+        // Engine head/embed BEFORE alloc (same order as the server's
+        // d2_setup): serving packs drop target.embed/target.head, and
+        // alloc() caches the mask-token embedding. Fixed T4 port Phase D2
+        // (the CLI P1c order predates --no-embed serving packs and aborted
+        // on f16("target.embed.weight")).
         // Phase 2: drafter logits through the engine's quantized head (the
         // fp16 pack head measured 10.4 ms/round at 240 GB/s). Opt-out for
         // the numerics A/B: Q27_D2_FP16HEAD=1.
@@ -223,6 +227,7 @@ int main(int argc, char** argv) {
                                 ew.dtype == DType::T2_G128 ? 2 : 0);
         }
         if (e.bonsai2) d2.set_bonsai2_signs(e.bz_s5120); // rotated embed table + folded head
+        d2.alloc(NP + n_gen + 64);
         float* d_vtaps;
         CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
         // prompt: eager tapped steps, ingest each committed position
