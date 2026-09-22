@@ -50,15 +50,35 @@ static __device__ __forceinline__ void mma_e4m3(float& d0, float& d1, float& d2,
 #endif
 }
 static __device__ __forceinline__ void cpasync16(void* smem, const void* gmem, int src_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
                  "r"(src_bytes));
+#else
+    // sm_75 (T4 port Phase 1): no cp.async pre-Ampere. Synchronous 16B
+    // copy, same zero-tail contract as prefill.cu's wrapper. Uniformly
+    // reached; the call-site __syncthreads() after wait_all covers
+    // visibility. Never on a live sm_75 path (fdmma needs sm_89+).
+    const unsigned char* g = (const unsigned char*)gmem;
+    unsigned char* s = (unsigned char*)smem;
+#pragma unroll
+    for (int i = 0; i < 16; i++) s[i] = (i < src_bytes) ? g[i] : 0;
+#endif
 }
 static __device__ __forceinline__ void cpasync_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.commit_group;\n" ::);
+#else
+    // sm_75: synchronous copy needs no commit.
+#endif
 }
 static __device__ __forceinline__ void cpasync_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.wait_all;\n" ::);
+#else
+    // sm_75: copy already complete; call-site __syncthreads() follows.
+    // (No barrier here: dead-warp guards below forbid adding one.)
+#endif
 }
 
 // smem: s_q [96][LDQ] | s_kraw x2 [PP][LDK] | s_vraw x2 [PP][HD] |
@@ -529,12 +549,19 @@ static __device__ __forceinline__ void h16_mma(float& d0, float& d1, float& d2, 
                                                uint32_t a0, uint32_t a1, uint32_t a2,
                                                uint32_t a3, uint32_t b0, uint32_t b1, float c0,
                                                float c1, float c2, float c3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
         : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2),
           "f"(c3));
+#else
+    // sm_75 (T4 port Phase 1): m16n8k16 needs sm_80+ (Turing max is
+    // m16n8k8 -- Phase 4.4). Accumulate-identity, same as mma_e4m3 above;
+    // never on a live sm_75 path (H16 dispatch needs arch >= 80).
+    d0 = c0; d1 = c1; d2 = c2; d3 = c3;
+#endif
 }
 static __device__ __forceinline__ void h16_ldm_x2_trans(uint32_t& r0, uint32_t& r1,
                                                         const void* p) {

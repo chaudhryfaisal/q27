@@ -719,19 +719,7 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 // Warp per row like k_gemv_q4; a 32-element chunk is 8 weight bytes (two
 // interleaved words), dp4a'd against the SAME even/odd activation words the
 // Q4 kernel reads. value = code - 1, so sum((c-1)*x) = dp4a(c, x) - isum.
-__device__ __forceinline__ int t2_dot32(uint2 w, const uint4 xv0, const uint4 xv1) {
-    const uint32_t M = 0x03030303u;
-    int di = 0;
-    di = __dp4a((int)(w.x & M), (int)xv0.x, di);
-    di = __dp4a((int)((w.x >> 2) & M), (int)xv0.y, di);
-    di = __dp4a((int)((w.x >> 4) & M), (int)xv0.z, di);
-    di = __dp4a((int)((w.x >> 6) & M), (int)xv0.w, di);
-    di = __dp4a((int)(w.y & M), (int)xv1.x, di);
-    di = __dp4a((int)((w.y >> 2) & M), (int)xv1.y, di);
-    di = __dp4a((int)((w.y >> 4) & M), (int)xv1.z, di);
-    di = __dp4a((int)((w.y >> 6) & M), (int)xv1.w, di);
-    return di;
-}
+// (t2_dot32 now lives in kernels.cuh, shared with the prefill T-row kernel.)
 __global__ void k_gemv_t2(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                           const uint2* __restrict__ xeo, const float* __restrict__ xs,
                           const int* __restrict__ xisum, float* __restrict__ y, int64_t rows,

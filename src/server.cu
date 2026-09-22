@@ -548,6 +548,19 @@ int main(int argc, char** argv) {
             // run there closes it.
             setenv("Q27_KV", "turbo5k", 0);
             setenv("Q27_FD", "mma", 0);
+        } else if (cc_arch < 80) {
+            // T4 port Phase 2 (Turing sm_75: this binary's only device):
+            // walking skeleton -- width-1 non-speculative decode, all MMA
+            // off. fp16 KV (the engine also forces fp16 over fp8 requests);
+            // fd2 verify (spec3 auto-falls-through below sm_80); no suffix
+            // drafts, no union GEMM (vgemm has no non-MMA leg), no
+            // conductor batching (Phase 4.8 to re-measure). Prefill GEMM +
+            // attention fallbacks are image-gated in prefill.cu, so no env
+            // needed for those. setenv(overwrite=0): explicit user env wins.
+            setenv("Q27_KV", "fp16", 0);
+            setenv("Q27_SUFFIX", "0", 0);
+            setenv("Q27_BATCH_GEMM", "0", 0);
+            setenv("Q27_BATCH", "0", 0);
         }
         setenv("Q27_PMIN", "0.5", 0);
         setenv("Q27_MAXD", "auto7", 0);

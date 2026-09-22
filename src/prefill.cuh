@@ -34,9 +34,14 @@ void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, in
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 // T2_G128 weights (Bonsai 2 Phase 3): MMA only; bitwise gemm_q4_T on the exact
-// Q4 image of the same ternary matrix.
+// Q4 image of the same ternary matrix. T4 port Phase 2: on a sub-sm_80 image
+// (or Q27_PREFILL=dp4a) falls back to a dp4a row-loop over gemv_t2 -- same
+// g32 quants, same T-major y, slow but correct.
 void gemm_t2_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
+// Loaded-image __CUDA_ARCH__ as a host int, cached (k_arch_probe). The
+// routing signal for sm_75 default fallbacks (T4 port Phase 2).
+int image_arch();
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st);
 // true when the current prefill route reads the g32 activation quantization

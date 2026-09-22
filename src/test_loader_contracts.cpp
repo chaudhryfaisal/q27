@@ -14,7 +14,9 @@ int main() {
             return 1;
         }
     }
-    for (DType dtype : {DType::T3_G128, DType::B1_G128}) {
+    // T3_G128 has been CUDA-served since 2026-09-20 (gemv_t3 + T2 prefill
+    // scratch, t3_gate 400/400 bitwise); only B1_G128 is still refused.
+    for (DType dtype : {DType::B1_G128}) {
         if (q27::cuda_weight_dtype_supported(dtype)) {
             std::fprintf(stderr, "CUDA-unsupported packed dtype accepted: %s\n",
                          q27::dtype_name(dtype));

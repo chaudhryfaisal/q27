@@ -56,6 +56,23 @@ void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t c
 // that in place right after upload (each word independent, idempotent-free:
 // apply exactly once). The dot is dp4a(codes, x) - sum(x) per 32-block.
 void t2_interleave_device(uint8_t* W, uint64_t bytes, cudaStream_t st = 0);
+// 32-element dot shared by the decode GEMV (kernels.cu) and the prefill
+// T-row kernel (prefill.cu, T4 port Phase 4.2): dp4a over the two
+// interleaved weight words against the even/odd activation words.
+// (Moved here from kernels.cu so both TUs share the identical sequence.)
+__device__ __forceinline__ int t2_dot32(uint2 w, const uint4 xv0, const uint4 xv1) {
+    const uint32_t M = 0x03030303u;
+    int di = 0;
+    di = __dp4a((int)(w.x & M), (int)xv0.x, di);
+    di = __dp4a((int)((w.x >> 2) & M), (int)xv0.y, di);
+    di = __dp4a((int)((w.x >> 4) & M), (int)xv0.z, di);
+    di = __dp4a((int)((w.x >> 6) & M), (int)xv0.w, di);
+    di = __dp4a((int)(w.y & M), (int)xv1.x, di);
+    di = __dp4a((int)((w.y >> 2) & M), (int)xv1.y, di);
+    di = __dp4a((int)((w.y >> 4) & M), (int)xv1.z, di);
+    di = __dp4a((int)((w.y >> 6) & M), (int)xv1.w, di);
+    return di;
+}
 void gemv_t2(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
              int64_t cols, cudaStream_t st = 0);
 void gemv_t2_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,

@@ -13,12 +13,18 @@ namespace q27k {
 static __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3, uint32_t a0,
                                               uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                               uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int z = 0;
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
         : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
+#else
+    // sm_75 (T4 port Phase 1): m16n8k32 needs sm_80+. Zero stub -- never
+    // on a live sm_75 path (Phase 2 routes verify to non-MMA fallbacks).
+    d0 = 0; d1 = 0; d2 = 0; d3 = 0;
+#endif
 }
 
 // MODE 0: store straight to the per-lane outputs (z == 1 -- no workspace, no

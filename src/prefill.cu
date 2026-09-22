@@ -33,6 +33,25 @@ __global__ void k_arch_probe(int* out) {
 #endif
 }
 
+// Loaded-image arch as a host int, cached (T4 port Phase 2): the routing
+// signal for sm_75 default fallbacks (prefill GEMM/attention). Same probe
+// the fp8 path uses below; single-arch T4 image always reports 750.
+int image_arch() {
+    static int arch = -1;
+    if (arch < 0) {
+        int* d_arch = nullptr;
+        int h_arch = 0;
+        if (cudaMalloc(&d_arch, 4) == cudaSuccess) {
+            k_arch_probe<<<1, 1>>>(d_arch);
+            if (cudaMemcpy(&h_arch, d_arch, 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+                h_arch = 0;
+            cudaFree(d_arch);
+        }
+        arch = h_arch;
+    }
+    return arch;
+}
+
 // Compile-time A/B for the prefill GEMM B-operand (activation) load. Default
 // LDMB=1: ldmatrix.x2 loads the n8k32 activation fragment once per subtile in
 // place of 4 scalar smem loads. Spike 2026-07-13 (tools/gemm_ldm_spike.cu):
@@ -115,6 +134,85 @@ __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restr
                     di = __dp4a((int)((wv[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
                 }
                 acc[tt] += ws * s_xs[cc * XSP + tt] * (float)(di - 8 * s_is[cc * XSP + tt]);
+            }
+        }
+    }
+    if (!wr) return;
+#pragma unroll
+    for (int i = 0; i < TB; i++) {
+        float v = warp_reduce_f(acc[i]);
+        if (lane == 0 && i < nt) y[(size_t)(t0 + i) * rows + row] = v;
+    }
+}
+
+// T2 T-row dp4a kernel (T4 port Phase 4.2): k_gemm_q4_T's tiling with the T2
+// dot. Weight rows are 2-bit interleaved (cols/4 B/row, read as one uint2
+// per 32-chunk); the per-128 fp16 scale rides sr[ch>>2]; the dot is
+// t2_dot32(w, xv0, xv1) - isum with the staged even/odd activation words in
+// the same uint4 order k_gemv_t2 reads them. Per-lane chunk order matches
+// the serial walk (CS=32 stride), so output is BITWISE the gemv_t2 row-loop
+// -- the Phase 4.2 gate. Replaces T-times weight traffic of the row-loop
+// with one tiled sweep (weights DRAM / tile, activations L2-resident).
+template <int TB, int CS>
+__global__ void k_gemm_t2_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                            const uint2* __restrict__ eo, const float* __restrict__ xs,
+                            const int* __restrict__ xisum, float* __restrict__ y,
+                            int64_t rows, int64_t cols, int T, int t0) {
+    constexpr int RB = 16;
+    constexpr int EOP = TB * 4 + 1, XSP = TB + 1; // padded rows (bank conflicts)
+    extern __shared__ unsigned char smem_raw[];
+    uint2* s_eo = (uint2*)smem_raw;
+    float* s_xs = (float*)(s_eo + CS * EOP);
+    int* s_is = (int*)(s_xs + CS * XSP);
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    int64_t row = (int64_t)blockIdx.x * RB + warp;
+    const int nt = min(TB, T - t0);
+    const int n_chunks = (int)(cols / 32);
+    const size_t ept = (size_t)n_chunks * 4;
+    const uint2* wr = row < rows ? (const uint2*)(W + row * (cols / 4)) : nullptr;
+    const __half* sr = row < rows ? S + row * (cols / 128) : nullptr;
+
+    float acc[TB];
+#pragma unroll
+    for (int i = 0; i < TB; i++) acc[i] = 0.f;
+
+    for (int c0 = 0; c0 < n_chunks; c0 += CS) {
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < CS * TB * 4; idx += blockDim.x) {
+            int u = idx & 3, r = idx >> 2, tt = r % TB, cc = r / TB;
+            s_eo[cc * EOP + tt * 4 + u] =
+                (c0 + cc < n_chunks && tt < nt)
+                    ? __ldg(eo + (size_t)(t0 + tt) * ept + (size_t)(c0 + cc) * 4 + u)
+                    : make_uint2(0, 0);
+        }
+        for (int idx = threadIdx.x; idx < CS * TB; idx += blockDim.x) {
+            int tt = idx % TB, cc = idx / TB;
+            bool ok = c0 + cc < n_chunks && tt < nt;
+            s_xs[cc * XSP + tt] =
+                ok ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
+            s_is[cc * XSP + tt] =
+                ok ? __ldg(xisum + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0;
+        }
+        __syncthreads();
+        if (!wr) continue;
+#pragma unroll
+        for (int cc = lane; cc < CS; cc += 32) {
+            const int ch = c0 + cc;
+            if (ch >= n_chunks) break;
+            uint2 w = __ldg(wr + ch);
+            float ws = __half2float(__ldg(sr + (ch >> 2)));
+#pragma unroll
+            for (int tt = 0; tt < TB; tt++) {
+                if (tt >= nt) break;
+                uint2 x0 = s_eo[cc * EOP + tt * 4 + 0];
+                uint2 x1 = s_eo[cc * EOP + tt * 4 + 1];
+                uint2 x2 = s_eo[cc * EOP + tt * 4 + 2];
+                uint2 x3 = s_eo[cc * EOP + tt * 4 + 3];
+                uint4 xv0 = make_uint4(x0.x, x0.y, x1.x, x1.y);
+                uint4 xv1 = make_uint4(x2.x, x2.y, x3.x, x3.y);
+                int di = t2_dot32(w, xv0, xv1);
+                acc[tt] += ws * s_xs[cc * XSP + tt] * (float)(di - s_is[cc * XSP + tt]);
             }
         }
     }
@@ -209,12 +307,18 @@ __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restri
 static __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3, uint32_t a0,
                                               uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                               uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int z = 0;
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
         : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
+#else
+    // sm_75 (T4 port Phase 1): m16n8k32 needs sm_80+. Zero stub -- the
+    // caller must arch-gate (Phase 2 routes sm_75 to the dp4a fallback).
+    d0 = 0; d1 = 0; d2 = 0; d3 = 0;
+#endif
 }
 
 // Accumulating form (c = d): lets two K=32 steps of a 64-group chain in int32
@@ -222,11 +326,17 @@ static __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3
 static __device__ __forceinline__ void mma_s8_acc(int& d0, int& d1, int& d2, int& d3, uint32_t a0,
                                                   uint32_t a1, uint32_t a2, uint32_t a3,
                                                   uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // sm_75 (T4 port Phase 1): see mma_s8 above. Accumulate-identity keeps
+    // d (this form chains, so zeroing would corrupt the chain on a live
+    // path -- but no live path reaches here on sm_75).
+#endif
 }
 
 // Q4IN: weights arrive nibble-packed (Q4_G64, scale per 64) and are unpacked
@@ -818,7 +928,8 @@ static int gemm_splitk_nsp(int64_t blocks, int nsm, int T, int n_stages) {
 // can flip paths in-process via setenv.
 static bool prefill_use_mma() {
     const char* e = getenv("Q27_PREFILL");
-    return !(e && !strcmp(e, "dp4a"));
+    if (e) return !(e && !strcmp(e, "dp4a")); // explicit env always wins (tests flip in-process)
+    return q27k::image_arch() >= 800; // T4 port Phase 2: sm_75 image defaults to the dp4a legs
 }
 
 // Activation-regroup dispatch: Q27_PF_XG=32 selects the exact legacy path
@@ -1020,8 +1131,37 @@ void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int
 void gemm_t2_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (!prefill_use_mma()) {
-        fprintf(stderr, "gemm_t2_T: T2_G128 prefill has no dp4a leg (Q27_PREFILL=dp4a)\n");
-        exit(1);
+        // T4 port Phase 4.2: double-buffered-by-tiling T-row dp4a kernel
+        // (one weight sweep, not T). Q27_T2_PF_LOOP=1 keeps the Phase-2
+        // scalar row-loop for the bitwise A/B gate.
+        const char* le = getenv("Q27_T2_PF_LOOP");
+        if (le && atoi(le) != 0) {
+            const size_t ept = (size_t)(cols / 8), nst = (size_t)(cols / 32);
+            for (int t = 0; t < T; t++) {
+                XQuant row;
+                row.eo = xq.eo + (size_t)t * ept;
+                row.scale = xq.scale + (size_t)t * nst;
+                row.isum = xq.isum + (size_t)t * nst;
+                gemv_t2(W, S, row, y + (size_t)t * rows, rows, cols, st);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        constexpr int TB = 32, CS = 32, RB = 16;
+        constexpr size_t SM = (size_t)CS * (TB * 4 + 1) * sizeof(uint2) +
+                              (size_t)CS * (TB + 1) * (sizeof(float) + sizeof(int));
+        static bool attr = false;
+        if (!attr) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_gemm_t2_T<TB, CS>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+            attr = true;
+        }
+        dim3 grid((unsigned)((rows + RB - 1) / RB));
+        for (int t0 = 0; t0 < T; t0 += TB)
+            k_gemm_t2_T<TB, CS><<<grid, RB * 32, SM, st>>>(W, S, xq.eo, xq.scale, xq.isum, y,
+                                                           rows, cols, T, t0);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     launch_gemm_mma<2>(W, S, xq, y, rows, cols, T, st, sk);
 }
@@ -1424,12 +1564,20 @@ static __device__ __forceinline__ void mma_f16(float& d0, float& d1, float& d2, 
                                                uint32_t a0, uint32_t a1, uint32_t a2,
                                                uint32_t a3, uint32_t b0, uint32_t b1, float c0,
                                                float c1, float c2, float c3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
         : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2),
           "f"(c3));
+#else
+    // sm_75 (T4 port Phase 1): m16n8k16 needs sm_80+. Accumulate-identity
+    // no-op, same pattern as mma_e4m3 below -- the caller must arch-gate
+    // (Phase 2 routes sm_75 to the non-MMA fallback; this stub is never
+    // on a live path).
+    d0 = c0; d1 = c1; d2 = c2; d3 = c3;
+#endif
 }
 
 // fp8 e4m3 QK^T: mma.sync.m16n8k32 (4 fp8/reg, f32 accumulate). sm_89+ only
@@ -1462,15 +1610,36 @@ static __device__ __forceinline__ uint32_t h2u(__half2 h) {
 // 30% of the deep-context stall per the 2026-07-07 ncu attribution) by
 // prefetching the next PP-tile's raw fp8 while the current tile's MMAs run.
 static __device__ __forceinline__ void cpasync16(void* smem, const void* gmem, int src_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
                  "r"(src_bytes));
+#else
+    // sm_75 (T4 port Phase 1): no cp.async pre-Ampere. Synchronous 16B
+    // copy with the same zero-tail contract (bytes [src_bytes,16) are
+    // zero). Call sites already __syncthreads() before consuming, and the
+    // cpa branches are block-uniform, so this is a correct drop-in;
+    // double-buffering the schedule is Phase 4.2 work.
+    const unsigned char* g = (const unsigned char*)gmem;
+    unsigned char* s = (unsigned char*)smem;
+#pragma unroll
+    for (int i = 0; i < 16; i++) s[i] = (i < src_bytes) ? g[i] : 0;
+#endif
 }
 static __device__ __forceinline__ void cpasync_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.commit_group;\n" ::);
+#else
+    // sm_75: synchronous copy above needs no commit.
+#endif
 }
 static __device__ __forceinline__ void cpasync_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("cp.async.wait_all;\n" ::);
+#else
+    // sm_75: copy already complete; call-site __syncthreads() covers
+    // cross-thread visibility.
+#endif
 }
 
 // transposed 8x8 b16 fragment loads for the PV phase: one x2 per (n, h)
@@ -2564,7 +2733,9 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row,
                                 int head_dim, float scale, cudaStream_t st) {
     const char* e = getenv("Q27_ATTN_PF");
     const bool use_mma =
-        !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads;
+        !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads &&
+        q27k::image_arch() >= 800; // T4 port Phase 2: sm_75 image takes FA-lite
+                                   // (f16-MMA needs 84 KB > Turing's 64 KB ceiling)
     if (use_mma) {
         constexpr int TT = 16, PP = 32, LDH = 256 + 8;
         // fp8 adds one PP-tile of raw K+V (16 KB) for the cp.async prefetch;

@@ -10,6 +10,12 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 
 .PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
+# T4 (Turing, sm_75) CLI (T4 port Phase 2, 2026-09-22): same engine sources
+# as build/q27 above, single sm_75 image, W_MAX=8, PF_T=256. Drives the
+# canonical-output smoke test and the short-bench suite on the T4.
+build/q27-t4: src/engine.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_75,code=sm_75 -Xcompiler -Wall -DQ27_W_MAX=8 -DQ27_PF_T=256 src/engine.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 build/q27: src/engine.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) src/engine.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
@@ -305,6 +311,14 @@ build/turbo3_test: tools/turbo3_test.cu src/turbo3.cuh | build
 build/turbo5_test: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/turbo5_test.cu -o $@
 
+# T4 (Turing, sm_75) KV-codec gates (T4 port Phase 4.1): the turbo3/turbo5
+# codecs are dp4a/shfl-only and run as-is on Turing; these single-arch
+# builds gate them bitwise vs the CPU reference on real T4 hardware.
+build/turbo3_test-t4: tools/turbo3_test.cu src/turbo3.cuh | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_75,code=sm_75 -Xcompiler -Wall tools/turbo3_test.cu -o $@
+build/turbo5_test-t4: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_75,code=sm_75 -Xcompiler -Wall tools/turbo5_test.cu -o $@
+
 build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/i8g64_test.cu -o $@
 
@@ -331,6 +345,20 @@ build/q27-server-12g: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h 
 	$(NVCC) -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -Xcompiler -Wall -DQ27_W_MAX=8 -DQ27_PF_T=256 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
+# T4 (Turing, sm_75) server (T4 port Phase 1, 2026-09-22): single sm_75
+# image, W_MAX=8 lanes (engine.cuh:70 static_assert forbids <8 — the plan's
+# "start at 4" does not compile), 256-row prefill chunks like the 12g
+# target above. Links build/pf4.o exactly as 12g does: the sm_120a object
+# is dead code on sm_75 (q27k::pf4_on() runtime-gates on sm_120), so this
+# keeps the proven link shape instead of exclude+stub. Same sources
+# otherwise; new target + new flags only, no shared path touched.
+build/q27-server-t4: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/unicode_tables.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
+                     src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
+                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_75,code=sm_75 -Xcompiler -Wall -DQ27_W_MAX=8 -DQ27_PF_T=256 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
+
 # Continuous-batching gates (docs/plans/2026-07-14-continuous-batching.md):
 #   ninv_test      -- N-invariance: per-lane weight-kernel output must be bitwise
 #                     independent of union width and slot (the batching contract).
@@ -344,6 +372,11 @@ build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh src/blocks.cuh
 # 1/2/5/8) and its prefill T2 conversion must be bitwise the T2 pack's.
 build/t3_gate: tools/t3_gate.cu src/kernels.cuh src/device_model.h src/loader.h $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/t3_gate.cu $(VGEMM_SRC) -o $@
+
+# T4 (Turing, sm_75) T3 gate (T4 port Phase 2, 2026-09-22): same sources,
+# single sm_75 image. Pure-dp4a comparison gate, runs as-is on Turing.
+build/t3_gate-t4: tools/t3_gate.cu src/kernels.cuh src/device_model.h src/loader.h $(VGEMM_SRC) | build
+	$(NVCC) -O2 -std=c++17 -gencode arch=compute_75,code=sm_75 -Xcompiler -Wall -DQ27_W_MAX=8 -DQ27_PF_T=256 tools/t3_gate.cu $(VGEMM_SRC) -o $@
 
 build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@

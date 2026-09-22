@@ -1104,6 +1104,14 @@ struct Engine {
                   : kve && !strcmp(kve, "turbo5k") ? KV_T5K
                   : kve && !strcmp(kve, "int8g64") ? KV_I8G64
                                                    : KV_F16;
+        // T4 port Phase 2: fp8 KV has no e4m3 verify/prefill path on sm_75.
+        // Force fp16 (loudly) rather than silently serving stubs. Turbo
+        // formats are untouched (dp4a codecs + fd2 verify, Phase 4.1 to confirm).
+        if (kv_fp8 && q27k::image_arch() < 800) {
+            fprintf(stderr, "KV cache: fp8 requested but the sm_75 image has no e4m3 path -- forcing fp16\n");
+            kv_fp8 = false;
+            kv_kind = KV_F16;
+        }
         if (kv_fp8) fprintf(stderr, "KV cache: fp8 E4M3 (opt-in, 34 KB/token)\n");
         else if (kv_kind == KV_T3)
             fprintf(stderr, "KV cache: turbo3 3-bit K+V (opt-in, ~13.4 KB/token)\n");
