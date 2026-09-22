@@ -2770,6 +2770,12 @@ struct Engine {
     }
 
     void build_spec_graphs() {
+        // Runtime prefill policy, not capture-shaping: read before the
+        // no-MTP early return below. Packs without an MTP block otherwise
+        // keep the member default 32 while the server profile defaults 2,
+        // routing NP<32 prompts to the serial path, whose MTP lookahead
+        // throws on the missing blk.64 (500 on short prompts, 2026-09-22).
+        if (const char* e = getenv("Q27_PF_BATCH_MIN")) pf_batch_min = std::max(2, atoi(e));
         if (!has_mtp) {
             // No MTP block: the ladder's draft/verify graph zoo has nothing to
             // capture. decode_step runs plain rounds, or DFlash2 rounds when a
@@ -2848,7 +2854,8 @@ struct Engine {
         // same binary, GEMM off, must reproduce the old round AND byte-identical
         // output -- gate 5).
         if (const char* e = getenv("Q27_GEMM_MIN")) gemm_min = atoi(e);
-        if (const char* e = getenv("Q27_PF_BATCH_MIN")) pf_batch_min = std::max(2, atoi(e));
+        // (Q27_PF_BATCH_MIN is read at build_spec_graphs entry so no-MTP
+        // packs honor it too -- see above.)
         // Canonical coupling (same failure class as the gemm_min guardrail):
         // the canonical bitwise prompt is 5 tokens, i.e. SERIAL-path under the
         // default 32. The chunked path rounds differently (measured: greedy
@@ -5791,7 +5798,10 @@ struct Engine {
             d2_prefill_align(prompt, 0); // serial path: cold ring
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
-                if (i + 1 < prompt.size()) {
+                // MTP lookahead for the next token: nothing to draft with on
+                // packs without an MTP block (blk.64 absent -- the T() lookup
+                // throws), and decode runs plain rounds there anyway.
+                if (i + 1 < prompt.size() && has_mtp) {
                     CUDA_CHECK(cudaStreamSynchronize(stm));
                     CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
                                                stm));
