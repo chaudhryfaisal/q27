@@ -15820,10 +15820,13 @@ k=1 fused round runs the width-2 GEMV, which is where gemv_t3_n loses most
 (0.041 vs 0.033 ms per ffn matrix). Single-slot 8 GB serving should set
 Q27_BATCH=0; the installer's run.sh does.
 
-**09-22 field report (an RTX 3060 Ti 8 GB, driver 580.126, CUDA 13.4, a
-display ON the card, tools/bench-bonsai2-8gb.sh)**: wsum 3b876779744bd102
+**09-22 field report (an RTX 3060 Ti 8 GB, driver 580.126, CUDA 13.4,
+headless via `init 3` -- nvidia-smi's display_active=Enabled only means a
+cable, tools/bench-bonsai2-8gb.sh)**: wsum 3b876779744bd102
 (the upload is right), free 1.68 GB post-weights, pool 0.70 GB, ctx 36864,
-0.20 GB at ready. Decode **41.1-42.5 t/s** plain (the 3090 does 72-75 on the
+0.20 GB at ready -- so a real 8 GB card exposes ~7.9 GB, and the
+"45K at 8.0 GB free" row above is what 8.3 GB would buy; **36.9K is the
+headless 8 GB number**. Decode **41.1-42.5 t/s** plain (the 3090 does 72-75 on the
 same build), prefill **481 tok/s** on a 5,267-token prompt (3090: 1,060).
 The 3060 Ti's byte floor is 12.5 ms/token (5.6 GB at 448 GB/s) against the
 24 ms measured, and the 3090's 6 ms against 13.7: the T3 decode step is
