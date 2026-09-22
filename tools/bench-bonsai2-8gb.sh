@@ -32,7 +32,7 @@ bench_pack() { # $1 pack file, $2 stack GB, $3 label, $4 expected md5s "short:..
     sleep 2
   done
   grep -E "wsum|vram: free|\[pool\] (paged|ctx|--ctx|cannot|sizing)|KV cache|clamping" "$log" | sed 's/^/   /'
-  python3 - "$PORT" "$expect" <<'PY'
+  python3 - "$PORT" "$expect" "$DIR/bench-replies-$label.json" <<'PY'
 import json, urllib.request, sys, time, hashlib
 port, expect = sys.argv[1], dict(kv.split(":") for kv in sys.argv[2].split())
 base = f"http://127.0.0.1:{port}"
@@ -50,11 +50,15 @@ P = {"short": ("Reply with the single word ok.", 32, False),
      "long": ("Write a 300-word explanation of how a hash table handles collisions, with a short Python example.", 700, True),
      "code": ("Write a Python module with a class LRUCache(capacity) supporting get(key) and put(key, value) in O(1), with docstrings and a small pytest test file. Explain the data structure choice briefly first.", 1500, True)}
 print("   prompt   out_tok   wall_s   md5 (vs mine)")
+replies = {}
 for name, (p, n, th) in P.items():
     text, ntok, wall = msg(p, n, th)
+    replies[name] = text
     h = hashlib.md5(text.encode()).hexdigest()
     verdict = "MATCH" if expect.get(name) == h else f"DIFFERS (mine {expect.get(name, '?')[:8]})"
     print(f"   {name:7s}  {ntok:6d}   {wall:6.1f}   {h[:8]} {verdict}")
+json.dump(replies, open(sys.argv[3], "w"), indent=1)
+print(f"   replies saved to {sys.argv[3]} (paste a DIFFERS one back and I can find the position)")
 # prefill: one long prompt, one output token, no thinking
 para = ("The hash table keeps an array of buckets and a hash function that maps each key to one of them; "
         "when two keys land in the same bucket the table either chains them in a list or probes for the next free slot, "
