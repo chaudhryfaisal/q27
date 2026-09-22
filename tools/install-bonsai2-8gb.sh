@@ -112,5 +112,8 @@ cat <<EOF
    Anthropic API: http://127.0.0.1:$PORT/v1/messages   (any x-api-key)
    OpenAI API:    http://127.0.0.1:$PORT/v1/chat/completions
    Claude Code:   ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT ANTHROPIC_API_KEY=local claude
+                  (its stock prompt + tool schemas need more than a 24K window: if the
+                  [pool] ctx below is 24K or less -- a desktop on the card, or the MTP
+                  pack -- run it as: claude --bare --system-prompt ".")
    logs:          $DIR/server.log (the [pool] lines say how much context you got)
 EOF
