@@ -207,11 +207,12 @@ MTP head). The CUDA decode GEMV reads it in a layout built to sum exactly
 what the T2 kernel sums, so the pack is bitwise the T2 pack at every width
 (400/400 matrices, same PPL to six digits, same server texts); prefill
 converts each matrix into a 22 MB T2 scratch on the fly (+4% wall). With
-`Q27_FIXED_STACK_GB=0.6` and the Ampere-default turbo5k KV, a headless 8 GB
-card (8.0 GB free) serves 45K context plain or 12K with the MTP ladder
-(`Q27_FIXED_STACK_GB=0.8`); with a display on the card (7.6 GB free) it is
-24K plain and no ladder. Decode runs at the T2 pack's speed rather than
-24% under it -- the digit extraction is exposed on the 3090 (BUILDLOG
+`Q27_FIXED_STACK_GB=0.6` and the Ampere-default turbo5k KV, a headless
+RTX 3060 Ti measures 36.9K context, 42 t/s decode and 481 tok/s prefill
+(first field report, 09-22); the 3090 simulation put 45K at 8.0 GB free,
+12K with the MTP ladder (`Q27_FIXED_STACK_GB=0.8`), and 24K plain with a
+display on the card. Decode runs at the T2 pack's speed rather than 24%
+under it -- the digit extraction is exposed on the 3090 (BUILDLOG
 2026-09-20 (aw)).
 
 ```bash
@@ -286,7 +287,8 @@ under [bench/crossengine/](bench/crossengine/):
   512 t/s with a third-party MTP head repacked into the pack. Small cards
   (v0.14.0): slim packs and a sm_86 build put it on 12 GB (32K context),
   and a five-trits-per-byte container, bitwise the 2-bit pack, on 8 GB
-  (6.06 GB, 45K context headless; `tools/install-bonsai2-8gb.sh`).
+  (6.06 GB; a 3060 Ti measures 36.9K context at 42 t/s;
+  `tools/install-bonsai2-8gb.sh`).
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)

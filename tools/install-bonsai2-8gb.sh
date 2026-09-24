@@ -10,12 +10,13 @@
 # toolkit 12.8 or newer at /usr/local/cuda, gcc/g++, make, git, curl. Nothing
 # here runs sudo; install those first if the preflight complains.
 #
-#   bash install-bonsai2-8gb.sh            # plain pack: 45K context headless on 8 GB
+#   bash install-bonsai2-8gb.sh            # plain pack: ~37K context headless on 8 GB (3060 Ti measured)
 #   bash install-bonsai2-8gb.sh --mtp      # + the MTP head: faster, 12K context on 8 GB
 #   BONSAI2_DIR=/somewhere bash install-bonsai2-8gb.sh
 #
-# 8 GB cards: run it headless (nothing else on the GPU). With a desktop on the
-# card you get ~24K context with the plain pack and the MTP pack does not fit.
+# 8 GB cards: run it headless (`sudo init 3`, nothing else on the GPU): 36.9K
+# context measured on a 3060 Ti. With a desktop on the card expect ~24K with the
+# plain pack, and the MTP pack may not fit.
 # 12 GB cards: same script, more context.
 set -euo pipefail
 
@@ -112,5 +113,8 @@ cat <<EOF
    Anthropic API: http://127.0.0.1:$PORT/v1/messages   (any x-api-key)
    OpenAI API:    http://127.0.0.1:$PORT/v1/chat/completions
    Claude Code:   ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT ANTHROPIC_API_KEY=local claude
+                  (its stock prompt + tool schemas need more than a 24K window: if the
+                  [pool] ctx below is 24K or less -- a desktop on the card, or the MTP
+                  pack -- run it as: claude --bare --system-prompt ".")
    logs:          $DIR/server.log (the [pool] lines say how much context you got)
 EOF
